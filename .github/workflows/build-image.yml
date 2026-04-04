@@ -6,9 +6,12 @@ on:
     tags:
       - 'image-v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm  # ARM64 runner — matches Apple Silicon guest architecture
     steps:
       - uses: actions/checkout@v4
 
@@ -16,6 +19,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
 
       - name: Build guest agent
         run: |
@@ -29,8 +35,12 @@ jobs:
       - name: Package image
         run: |
           cd /tmp/lumina-image
+          ls -lh
           tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img
+          echo "--- Package ---"
           ls -lh /tmp/lumina-image-default.tar.gz
+          echo "--- SHA256 ---"
+          sha256sum /tmp/lumina-image-default.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -43,3 +53,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: /tmp/lumina-image-default.tar.gz
+          body: |
+            ## Lumina VM Image (default)
+
+            Alpine Linux aarch64 base image for Lumina VMs.
+
+            **Install:** `lumina pull` or download manually and extract to `~/.lumina/images/default/`
+
+            **Contents:** vmlinuz, initrd, rootfs.img (Alpine 3.20 + lumina-agent + python3, git, curl)
