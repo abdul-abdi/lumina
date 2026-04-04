@@ -35,6 +35,7 @@ jobs:
       - name: Package image
         run: |
           cd /tmp/lumina-image
+          sudo chmod 644 vmlinuz initrd rootfs.img
           ls -lh
           tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img
           echo "--- Package ---"
