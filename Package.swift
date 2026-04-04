@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Lumina",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     products: [
         .library(name: "Lumina", targets: ["Lumina"]),
         .executable(name: "lumina", targets: ["lumina-cli"]),

@@ -10,7 +10,7 @@ Build Lumina — a Swift CLI/library wrapping Apple's Virtualization.framework t
 
 ## What's Done
 
-All 13 implementation tasks complete + post-review fixes + `lumina pull` pipeline:
+All implementation tasks complete + concurrency fixes + entitlement automation:
 
 ### Source Files (all compile, 28 tests pass)
 - `Sources/Lumina/` — Types, Protocol, DiskClone, ImageStore, SerialConsole, CommandRunner, VM, Lumina, ImagePuller
@@ -19,48 +19,80 @@ All 13 implementation tasks complete + post-review fixes + `lumina pull` pipelin
 - `Guest/build-image.sh` — Alpine image builder (Linux native + macOS Docker shim)
 - `Tests/LuminaTests/` — 22 unit tests + 6 gated integration tests
 
+### Build System
+- `Makefile` — `make build` (build + codesign), `make run`, `make install`, `make test`
+- `lumina.entitlements` — `com.apple.security.virtualization` + `com.apple.security.hypervisor`
+- SPM cannot embed entitlements; Makefile wraps `swift build` + `codesign` as one step
+
 ### CI/CD
 - `.github/workflows/ci.yml` — Swift build + unit tests on macos-15
-- `.github/workflows/build-image.yml` — Builds VM image on arm64 Linux, publishes to GitHub Releases on `image-v*` tags
+- `.github/workflows/build-image.yml` — Builds VM image on arm64 Linux, publishes to GitHub Releases on `lumina-v*` tags
 
 ### Release
-- `lumina-v0.1.0` release exists at https://github.com/abdul-abdi/lumina/releases/tag/lumina-v0.1.0
-- Contains `lumina-image-default.tar.gz` (46MB) with proper vmlinuz (8.8MB), initrd (9.6MB), rootfs.img (1GB)
-- `lumina pull` code works but image has NOT been pulled locally yet
+- `lumina-v0.1.0` release at https://github.com/abdul-abdi/lumina/releases/tag/lumina-v0.1.0
+- Contains `lumina-image-default.tar.gz` (46MB) with vmlinuz (9.2MB), initrd (10MB), rootfs.img (1GB)
+- `lumina pull` works — image pulled locally to `~/.lumina/images/default/`
 
 ## Where We Left Off
 
-**No image exists locally.** The old broken image was cleaned, the fixed release is on GitHub, but `lumina pull --force` was interrupted before it could download. Need to:
+**BLOCKED: macOS 26 (Tahoe) Virtualization.framework OS-level bug.**
 
-1. `lumina pull` (or `lumina pull --force` if old broken image still exists) to download the fixed image
-2. `lumina run "echo hello"` to test full VM boot + exec + teardown
-3. If boot fails, debug via serial console (VM.serialOutput property exists, but CLI --verbose flag was removed — may need to re-add or print serial on error)
+The code is correct but Virtualization.framework cannot start any Linux VM on macOS 26.x. This is a known Apple bug:
+- Matches [apple/container#1254](https://github.com/apple/container/issues/1254) (macOS 26.3 ARM64)
+- Even the most minimal VM config (kernel only, no disk/initrd) fails with VZErrorDomain Code=1
+- XPC service spawns, TCC passes, then internal error breadcrumb `0x73d317ba00000321`
+- No workaround exists — needs Apple fix in a future macOS update
 
-## Known Issues to Watch For
+**To test when macOS is fixed:**
+```bash
+make build
+make run ARGS='"echo hello"'
+```
 
-1. **VZVirtualMachine threading** — VM actor uses a dedicated DispatchQueue. If boot fails with threading errors, may need to run VZ operations on MainActor instead.
-2. **vsock connection** — CommandRunner retries 40x at 50ms intervals (2s total). If guest agent takes longer to start, increase retries.
-3. **initrd compatibility** — The initrd is Alpine's `initramfs-virt`. VZLinuxBootLoader needs it to be compatible with the kernel. If boot hangs, try without initrd (set `initialRamdiskURL` to nil and use `root=/dev/vda rw` kernel cmdline).
-4. **CommandRunner is blocking** — `readLine` is byte-by-byte synchronous FileHandle reads. Will block the cooperative thread pool. Acceptable for v0.1 but monitor.
-5. **`defer { Task { shutdown } }`** — Orphaned effect pattern in Lumina.run(). VM cleanup may not complete if process exits immediately. Works for CLI, problematic for library use.
-6. **CI workflow (ci.yml)** — macos-15 runner may need Swift 6 toolchain setup step if it ships with Swift 5.x.
+**To run integration tests:**
+```bash
+swift build --build-tests
+codesign --entitlements lumina.entitlements --force -s - .build/debug/LuminaPackageTests.xctest
+LUMINA_INTEGRATION_TESTS=1 swift test
+```
 
-## Post-Review Fixes Already Applied
-- Timeout propagated from RunOptions → VM.exec() → CommandRunner → guest agent
-- Pipe FileHandles closed in shutdownVM()
-- Unused --verbose flag removed from CLI
-- ImagePuller has robust error handling (network, 404, rate limit, corruption, missing files)
+## Fixes Applied This Session
 
-## What Failed / What We Learned
-- Build script originally used `find` with `-o` to locate initrd — matched wrong 6-byte file. Fixed by referencing known paths (`$BOOT_ROOT/boot/initramfs-virt`).
-- initrd had root-only permissions (`-rw-------`), broke tar packaging. Fixed with `chmod 644` before tar.
-- macOS CI needed macos-15 (macos-14 has Swift 5.10, we need Swift 6.0+).
-- Image build CI uses `ubuntu-24.04-arm` for native aarch64 chroot.
+### 1. Swift 6 Concurrency — Custom SerialExecutor (correct fix)
+- **Problem:** `VM` actor and `VZVirtualMachine`'s dedicated DispatchQueue were two separate serialization domains ("complected" per Hickey). `nonisolated(unsafe)` told the compiler to stop checking the one thing it should check.
+- **Fix:** `VMExecutor` (custom `SerialExecutor`) backs the actor with the same `DispatchQueue` that VZ uses. One serialization domain, no unsafe escape hatches. VZ methods call directly with `await` — no completion-handler trampolines needed.
+- **Reference:** [SE-0392 Custom Actor Executors](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0392-custom-actor-executors.md)
 
-## Architecture (for context)
+### 2. Entitlements Automation — Makefile
+- **Problem:** `swift build` produces unsigned binary. VZ requires `com.apple.security.virtualization` entitlement. SPM has no entitlements support.
+- **Fix:** `Makefile` with `make build` = `swift build` + `codesign`. Confirmed by [Tart project](https://github.com/cirruslabs/tart/discussions/85) using identical pattern.
+
+### 3. VZGenericPlatformConfiguration
+- Added `config.platform = VZGenericPlatformConfiguration()` for ARM64 Linux on Apple Silicon.
+
+### 4. Deployment Target → macOS 14
+- Bumped from macOS 13 to 14 for `ExecutorJob` API (custom `SerialExecutor` support).
+
+### 5. Integration Test Gate
+- Changed from image-availability to explicit `LUMINA_INTEGRATION_TESTS=1` env var gate, since test binary needs codesigning.
+
+### 6. Release Renamed
+- `image-v0.1.0` → `lumina-v0.1.0` (tag, release title, CI workflow trigger, ImagePuller default tag)
+
+## Known Issues
+
+1. **macOS 26 VZ bug** — BLOCKER. See above. Test on macOS 15 (Sequoia) or wait for Apple fix.
+2. **CommandRunner `@unchecked Sendable`** — Mutable state with no synchronization. Latent race if multiple execs overlap. Fix: make it an actor or add a lock.
+3. **Fake streaming** — `stream()` buffers then emits, not true real-time. Honest doc comment added. Real vsock streaming in v0.2.
+4. **Byte-by-byte `readLine`** — Blocks cooperative thread pool. Acceptable for v0.1.
+5. **Guest agent has no heartbeat** — Silent guest death = host hangs forever waiting for exit message.
+6. **64KB message size limit** — Commands with large stdout lines may truncate or crash parser.
+
+## Architecture
 ```
 Lumina.run("echo hi")
-  → VM actor (boot VZVirtualMachine on dedicated DispatchQueue)
+  → VM actor (custom SerialExecutor backed by DispatchQueue)
+    → VZVirtualMachine (created on same queue, thread-affinity satisfied)
     → DiskClone (APFS COW clone of rootfs.img)
     → CommandRunner (vsock port 1024, NDJSON protocol)
       → Guest agent (Go, /bin/sh -c, streams stdout/stderr)
@@ -68,5 +100,6 @@ Lumina.run("echo hi")
   → VM.shutdown() + DiskClone.remove()
 ```
 
-## Roundtable Review
-Full persona review saved at `~/Developer/roundtables/2026-04-05-lumina-project-review.md` (Karpathy, PG, Hickey, Carmack). Key consensus: architecture is right, `lumina pull` was critical missing piece (now done), pooling is next priority for agent use.
+## Roundtable Reviews
+- `~/Developer/roundtables/2026-04-05-lumina-project-review.md` — Initial architecture review
+- `~/Developer/roundtables/2026-04-05-lumina-session-review.md` — Session review (concurrency model, entitlements, VZ boot debugging). Key consensus: custom SerialExecutor is correct, `nonisolated(unsafe)` must go, VZ Code=1 is OS bug.

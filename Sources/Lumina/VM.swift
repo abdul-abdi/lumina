@@ -1,9 +1,32 @@
 // Sources/Lumina/VM.swift
 import Foundation
-import Virtualization
+@preconcurrency import Virtualization
+
+/// Custom executor that pins all actor work to a specific DispatchQueue.
+/// This satisfies VZVirtualMachine's thread-affinity requirement by making
+/// the actor's isolation domain the same queue VZ was created with.
+final class VMExecutor: SerialExecutor {
+    let queue: DispatchQueue
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let unownedJob = UnownedJob(job)
+        let unownedExecutor = asUnownedSerialExecutor()
+        queue.async {
+            unownedJob.runSynchronously(on: unownedExecutor)
+        }
+    }
+
+    func asUnownedSerialExecutor() -> UnownedSerialExecutor {
+        UnownedSerialExecutor(ordinary: self)
+    }
+}
 
 public actor VM {
-    nonisolated(unsafe) private var virtualMachine: VZVirtualMachine?
+    private var virtualMachine: VZVirtualMachine?
     private var commandRunner: CommandRunner?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
@@ -12,14 +35,23 @@ public actor VM {
     private var _state: VMState = .idle
     private var pipeHandles: [FileHandle] = []
 
-    /// Dedicated serial queue for VZVirtualMachine operations.
-    private let vmQueue = DispatchQueue(label: "com.lumina.vm", qos: .userInitiated)
+    /// The actor executor, backed by a serial DispatchQueue.
+    /// VZVirtualMachine is created with executor.queue so all VZ calls
+    /// happen on the correct queue automatically.
+    private nonisolated let executor: VMExecutor
+
+    nonisolated public var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
 
     public var state: VMState { _state }
 
     public init(options: VMOptions = .default) {
         self.options = options
         self.imageStore = ImageStore()
+        self.executor = VMExecutor(
+            queue: DispatchQueue(label: "com.lumina.vm", qos: .userInitiated)
+        )
     }
 
     public func boot() async throws(LuminaError) {
@@ -40,6 +72,7 @@ public actor VM {
 
         // Configure VM
         let config = VZVirtualMachineConfiguration()
+        config.platform = VZGenericPlatformConfiguration()
         config.cpuCount = options.cpuCount
         config.memorySize = options.memory
 
@@ -105,9 +138,8 @@ public actor VM {
             throw .bootFailed(underlying: error)
         }
 
-        // Create and start VM on dedicated queue
-        let queue = self.vmQueue
-        let vm = VZVirtualMachine(configuration: config, queue: queue)
+        // Create VM on the executor's queue (same queue the actor runs on)
+        let vm = VZVirtualMachine(configuration: config, queue: executor.queue)
         self.virtualMachine = vm
 
         do {
