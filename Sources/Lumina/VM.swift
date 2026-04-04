@@ -3,7 +3,7 @@ import Foundation
 import Virtualization
 
 public actor VM {
-    private var virtualMachine: VZVirtualMachine?
+    nonisolated(unsafe) private var virtualMachine: VZVirtualMachine?
     private var commandRunner: CommandRunner?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
