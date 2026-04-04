@@ -25,8 +25,10 @@ public struct Lumina {
             throw .timeout
         }
 
-        // Execute
-        let result = try await vm.exec(command)
+        // Execute with remaining time budget
+        let remaining = options.timeout - elapsed
+        let remainingSeconds = Int(remaining.components.seconds)
+        let result = try await vm.exec(command, timeout: max(remainingSeconds, 1))
 
         let totalWallTime = ContinuousClock.now - start
         return RunResult(

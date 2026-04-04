@@ -10,6 +10,7 @@ public actor VM {
     private let imageStore: ImageStore
     private var clone: DiskClone?
     private var _state: VMState = .idle
+    private var pipeHandles: [FileHandle] = []
 
     /// Dedicated serial queue for VZVirtualMachine operations.
     private let vmQueue = DispatchQueue(label: "com.lumina.vm", qos: .userInitiated)
@@ -70,8 +71,8 @@ public actor VM {
             fileHandleForWriting: guestToHostWrite
         )
         config.serialPorts = [serialPort]
-        // Keep hostToGuestWrite alive so pipe stays open (unused in v0.1)
-        _ = hostToGuestWrite
+        // Track all pipe handles for cleanup in shutdownVM()
+        pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
         // Start reading serial output in background
         let console = self.serialConsole
@@ -136,6 +137,7 @@ public actor VM {
 
     public func exec(
         _ command: String,
+        timeout: Int = 60,
         env: [String: String] = [:]
     ) async throws(LuminaError) -> RunResult {
         guard _state == .ready, let runner = commandRunner else {
@@ -147,7 +149,7 @@ public actor VM {
 
         let result: RunResult
         do {
-            result = try runner.exec(command: command, timeout: 60, env: env)
+            result = try runner.exec(command: command, timeout: timeout, env: env)
         } catch {
             _state = .ready
             throw error
@@ -209,6 +211,11 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
+        // Close pipe file handles to prevent FD leaks
+        for handle in pipeHandles {
+            try? handle.close()
+        }
+        pipeHandles = []
         clone?.remove()
         clone = nil
     }

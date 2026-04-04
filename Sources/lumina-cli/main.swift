@@ -33,9 +33,6 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Number of CPU cores")
     var cpus: Int = 2
 
-    @Flag(name: .long, help: "Print serial console output (debug)")
-    var verbose = false
-
     func run() async throws {
         let options = RunOptions(
             timeout: parseDuration(timeout),
