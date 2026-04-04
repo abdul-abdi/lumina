@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+Guest/lumina-agent/lumina-agent
+*.o
+*.dSYM
