@@ -80,7 +80,12 @@ struct Run: AsyncParsableCommand {
                     throw ExitCode(result.exitCode)
                 }
             } catch let error as LuminaError {
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+                switch error {
+                case .guestCrashed(let serialOutput):
+                    FileHandle.standardError.write(Data("lumina: guest crashed\n--- serial output ---\n\(serialOutput)\n--- end serial ---\n".utf8))
+                default:
+                    FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+                }
                 throw ExitCode.failure
             }
         }

@@ -78,8 +78,24 @@ public actor VM {
 
         // Boot loader
         let bootLoader = VZLinuxBootLoader(kernelURL: imagePaths.kernel)
-        bootLoader.initialRamdiskURL = imagePaths.initrd
-        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw quiet"
+
+        // If the image includes a guest agent binary, create a combined initrd
+        // that injects the agent + custom init into the Alpine initramfs.
+        // This avoids requiring the rootfs to have lumina-agent pre-installed.
+        if let agentURL = imagePaths.agent {
+            let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
+            try InitrdPatcher.createCombinedInitrd(
+                baseInitrd: imagePaths.initrd,
+                agentBinary: agentURL,
+                modulesDir: imagePaths.modulesDir,
+                outputURL: combinedInitrd
+            )
+            bootLoader.initialRamdiskURL = combinedInitrd
+        } else {
+            bootLoader.initialRamdiskURL = imagePaths.initrd
+        }
+
+        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw modules=virtio_blk,ext4"
         config.bootLoader = bootLoader
 
         // Disk
@@ -138,12 +154,22 @@ public actor VM {
             throw .bootFailed(underlying: error)
         }
 
-        // Create VM on the executor's queue (same queue the actor runs on)
-        let vm = VZVirtualMachine(configuration: config, queue: executor.queue)
+        // Create VM on the executor's queue.
+        // Note: VZ start/stop use completion-handler dispatch because Swift's
+        // ObjC async bridge doesn't guarantee the call lands on the actor's
+        // executor — only the continuation does. Explicit dispatch is required.
+        let queue = executor.queue
+        let vm = VZVirtualMachine(configuration: config, queue: queue)
         self.virtualMachine = vm
 
         do {
-            try await vm.start()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                queue.async {
+                    vm.start { result in
+                        cont.resume(with: result)
+                    }
+                }
+            }
         } catch {
             clone?.remove()
             _state = .idle
@@ -151,16 +177,32 @@ public actor VM {
         }
 
         // Connect CommandRunner via vsock
-        guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
+        // Access vm.socketDevices on the VZ queue (thread-affinity requirement)
+        let socketDevice: VZVirtioSocketDevice
+        do {
+            socketDevice = try await withCheckedThrowingContinuation { cont in
+                queue.async {
+                    if let device = vm.socketDevices.first as? VZVirtioSocketDevice {
+                        cont.resume(returning: device)
+                    } else {
+                        cont.resume(throwing: VMError.noSocketDevice)
+                    }
+                }
+            }
+        } catch {
             await shutdownVM()
-            throw .bootFailed(underlying: VMError.noSocketDevice)
+            throw .bootFailed(underlying: error)
         }
 
-        let runner = CommandRunner(socketDevice: socketDevice)
+        let runner = CommandRunner(socketDevice: socketDevice, queue: queue)
         do {
             try await runner.connect()
         } catch {
+            let serial = serialConsole.output
             await shutdownVM()
+            if !serial.isEmpty {
+                throw .guestCrashed(serialOutput: serial)
+            }
             throw error
         }
         self.commandRunner = runner
@@ -235,10 +277,13 @@ public actor VM {
 
     private func shutdownVM() async {
         if let vm = virtualMachine {
-            do {
-                try await vm.stop()
-            } catch {
-                // stop() is already a hard kill; ignore errors
+            let queue = executor.queue
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                queue.async {
+                    vm.stop(completionHandler: { _ in
+                        cont.resume()
+                    })
+                }
             }
             virtualMachine = nil
         }

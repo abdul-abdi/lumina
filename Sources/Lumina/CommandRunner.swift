@@ -1,6 +1,6 @@
 // Sources/Lumina/CommandRunner.swift
 import Foundation
-import Virtualization
+@preconcurrency import Virtualization
 
 enum ConnectionState: Sendable, Equatable {
     case disconnected
@@ -13,17 +13,19 @@ enum ConnectionState: Sendable, Equatable {
 
 final class CommandRunner: @unchecked Sendable {
     private let socketDevice: VZVirtioSocketDevice
+    private let queue: DispatchQueue
     private var connection: VZVirtioSocketConnection?
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
     private var state: ConnectionState = .disconnected
 
     private static let vsockPort: UInt32 = 1024
-    private static let maxRetries = 40       // 40 * 50ms = 2s max
-    private static let retryInterval: UInt64 = 50_000_000 // 50ms in nanoseconds
+    private static let maxRetries = 200      // 200 * 100ms = 20s max (VM boot takes time)
+    private static let retryInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
 
-    init(socketDevice: VZVirtioSocketDevice) {
+    init(socketDevice: VZVirtioSocketDevice, queue: DispatchQueue) {
         self.socketDevice = socketDevice
+        self.queue = queue
     }
 
     func connect() async throws(LuminaError) {
@@ -31,7 +33,22 @@ final class CommandRunner: @unchecked Sendable {
 
         for _ in 0..<Self.maxRetries {
             do {
-                let conn = try await socketDevice.connect(toPort: Self.vsockPort)
+                // VZVirtioSocketDevice.connect(toPort:) must be called on the
+                // VZ queue. Swift's ObjC async bridge does NOT guarantee the
+                // call executes on the caller's queue — only the continuation
+                // resumes there. Dispatch explicitly to satisfy VZ's assertion.
+                let conn: VZVirtioSocketConnection = try await withCheckedThrowingContinuation { cont in
+                    queue.async { [socketDevice] in
+                        socketDevice.connect(toPort: Self.vsockPort) { result in
+                            switch result {
+                            case .success(let connection):
+                                cont.resume(returning: connection)
+                            case .failure(let error):
+                                cont.resume(throwing: error)
+                            }
+                        }
+                    }
+                }
                 self.connection = conn
                 // VZVirtioSocketConnection exposes a raw file descriptor;
                 // create FileHandles for reading and writing from it.

@@ -1,5 +1,7 @@
 .build/
 .swiftpm/
+.claude/
+.DS_Store
 Guest/lumina-agent/lumina-agent
 *.o
 *.dSYM

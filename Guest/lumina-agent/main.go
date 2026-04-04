@@ -187,14 +187,19 @@ func sendJSON(conn net.Conn, v interface{}) {
 	conn.Write(data)
 }
 
-// vsock listener using golang.org/x/sys/unix
+// vsockListener implements net.Listener using raw syscalls.
+// Go's net.FileListener doesn't understand AF_VSOCK, so we
+// handle accept/close manually and wrap accepted fds as net.Conn.
+type vsockListener struct {
+	fd int
+}
+
 func listenVsock(port int) (net.Listener, error) {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, fmt.Errorf("socket: %w", err)
 	}
 
-	// Bind to VMADDR_CID_ANY on the specified port
 	sa := &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: uint32(port)}
 	if err := unix.Bind(fd, sa); err != nil {
 		unix.Close(fd)
@@ -206,11 +211,43 @@ func listenVsock(port int) (net.Listener, error) {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 
-	file := os.NewFile(uintptr(fd), "vsock-listener")
-	ln, err := net.FileListener(file)
-	file.Close()
-	if err != nil {
-		return nil, fmt.Errorf("file listener: %w", err)
-	}
-	return ln, nil
+	return &vsockListener{fd: fd}, nil
 }
+
+func (l *vsockListener) Accept() (net.Conn, error) {
+	nfd, _, err := unix.Accept(l.fd)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(nfd), "vsock-conn")
+	conn := &vsockConn{file: file}
+	return conn, nil
+}
+
+func (l *vsockListener) Close() error {
+	return unix.Close(l.fd)
+}
+
+func (l *vsockListener) Addr() net.Addr {
+	return vsockAddr{}
+}
+
+// vsockConn wraps an os.File as a net.Conn for vsock connections.
+type vsockConn struct {
+	file *os.File
+}
+
+func (c *vsockConn) Read(b []byte) (int, error)  { return c.file.Read(b) }
+func (c *vsockConn) Write(b []byte) (int, error) { return c.file.Write(b) }
+func (c *vsockConn) Close() error                { return c.file.Close() }
+
+func (c *vsockConn) LocalAddr() net.Addr                { return vsockAddr{} }
+func (c *vsockConn) RemoteAddr() net.Addr                { return vsockAddr{} }
+func (c *vsockConn) SetDeadline(t time.Time) error      { return c.file.SetDeadline(t) }
+func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.file.SetReadDeadline(t) }
+func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.file.SetWriteDeadline(t) }
+
+type vsockAddr struct{}
+
+func (vsockAddr) Network() string { return "vsock" }
+func (vsockAddr) String() string  { return "vsock" }
