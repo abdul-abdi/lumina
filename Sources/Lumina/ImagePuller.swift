@@ -5,7 +5,7 @@ import CryptoKit
 /// Downloads pre-built VM images from GitHub Releases.
 public struct ImagePuller: Sendable {
     public static let defaultRepo = "abdul-abdi/lumina"
-    public static let defaultTag = "image-v0.1.0"
+    public static let defaultTag = "lumina-v0.1.0"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
 
     private let repo: String

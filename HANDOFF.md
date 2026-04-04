@@ -24,7 +24,7 @@ All 13 implementation tasks complete + post-review fixes + `lumina pull` pipelin
 - `.github/workflows/build-image.yml` — Builds VM image on arm64 Linux, publishes to GitHub Releases on `image-v*` tags
 
 ### Release
-- `image-v0.1.0` release exists at https://github.com/abdul-abdi/lumina/releases/tag/image-v0.1.0
+- `lumina-v0.1.0` release exists at https://github.com/abdul-abdi/lumina/releases/tag/lumina-v0.1.0
 - Contains `lumina-image-default.tar.gz` (46MB) with proper vmlinuz (8.8MB), initrd (9.6MB), rootfs.img (1GB)
 - `lumina pull` code works but image has NOT been pulled locally yet
 
