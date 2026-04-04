@@ -34,6 +34,21 @@ struct Run: AsyncParsableCommand {
     var cpus: Int = 2
 
     func run() async throws {
+        // Auto-pull image if not present
+        let puller = ImagePuller()
+        if !puller.imageExists() {
+            FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+            do {
+                try await puller.pull { msg in
+                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
+                }
+            } catch {
+                FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+                FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
+                throw ExitCode.failure
+            }
+        }
+
         let options = RunOptions(
             timeout: parseDuration(timeout),
             memory: parseMemory(memory),
@@ -75,15 +90,33 @@ struct Run: AsyncParsableCommand {
 // MARK: - Pull
 
 struct Pull: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Pull the default Alpine image")
+    static let configuration = CommandConfiguration(abstract: "Pull the default Alpine image from GitHub Releases")
+
+    @Flag(name: .long, help: "Re-download even if image already exists")
+    var force = false
 
     func run() async throws {
-        print("Image pull from GitHub releases is not yet implemented.")
-        print("To build the image locally:")
-        print("  cd Guest && ./build-image.sh")
-        print("")
-        print("Or place vmlinuz, initrd, and rootfs.img in:")
-        print("  ~/.lumina/images/default/")
+        let puller = ImagePuller()
+
+        if puller.imageExists() && !force {
+            print("Image 'default' already exists. Use --force to re-download.")
+            return
+        }
+
+        if puller.imageExists() && force {
+            // Remove existing image before re-pulling
+            ImageStore().clean(name: "default")
+        }
+
+        do {
+            try await puller.pull { msg in
+                print(msg)
+            }
+            print("Done! Run 'lumina run \"echo hello\"' to test.")
+        } catch {
+            FileHandle.standardError.write(Data("lumina pull: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
     }
 }
 

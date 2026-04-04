@@ -1,15 +1,57 @@
 #!/bin/bash
 # Guest/build-image.sh
 # Builds the default Alpine Linux image for Lumina VMs.
-# Requires: root (or sudo), qemu-img, and the lumina-agent binary already built.
+#
+# On macOS: automatically runs inside a Docker container (requires Docker Desktop).
+# On Linux: runs natively (requires root/sudo).
 #
 # Output: ~/.lumina/images/default/{vmlinuz, initrd, rootfs.img}
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
 OUTPUT_DIR="${1:-$HOME/.lumina/images/default}"
+
+# --- macOS: delegate to Docker ---
+if [[ "$(uname)" == "Darwin" ]]; then
+    echo "=== macOS detected — building inside Docker ==="
+
+    if ! command -v docker &>/dev/null; then
+        echo "Error: Docker is required to build images on macOS."
+        echo "Install Docker Desktop: https://www.docker.com/products/docker-desktop/"
+        exit 1
+    fi
+
+    if ! docker info &>/dev/null; then
+        echo "Error: Docker daemon is not running. Start Docker Desktop and try again."
+        exit 1
+    fi
+
+    # Build guest agent if not already built
+    AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
+    if [ ! -f "$AGENT_BINARY" ]; then
+        echo "--- Building guest agent (Go cross-compile) ---"
+        (cd "$SCRIPT_DIR/lumina-agent" && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .)
+    fi
+
+    mkdir -p "$OUTPUT_DIR"
+
+    docker run --rm --platform linux/arm64 \
+        -v "$SCRIPT_DIR:/guest:ro" \
+        -v "$OUTPUT_DIR:/out" \
+        alpine:3.20 sh -c "
+            apk add --no-cache e2fsprogs bash curl &&
+            bash /guest/build-image.sh /out
+        "
+
+    echo "=== Done (via Docker) ==="
+    echo "Image saved to: $OUTPUT_DIR"
+    ls -lh "$OUTPUT_DIR"/
+    exit 0
+fi
+
+# --- Linux: native build ---
+AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
 WORK_DIR=$(mktemp -d)
 ALPINE_VERSION="3.20"
 ALPINE_ARCH="aarch64"
@@ -79,7 +121,7 @@ mkfs.ext4 -q -F "$WORK_DIR/rootfs.img"
 # 4. Mount and populate rootfs
 echo "--- Populating rootfs ---"
 mkdir -p "$WORK_DIR/rootfs"
-sudo mount -o loop "$WORK_DIR/rootfs.img" "$WORK_DIR/rootfs"
+sudo mount -t ext4 -o loop "$WORK_DIR/rootfs.img" "$WORK_DIR/rootfs"
 
 sudo tar xzf "$WORK_DIR/$MINIROOTFS" -C "$WORK_DIR/rootfs"
 
