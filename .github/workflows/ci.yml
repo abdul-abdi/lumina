@@ -8,9 +8,12 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14  # Apple Silicon runner
+    runs-on: macos-15  # Apple Silicon runner with Swift 6
     steps:
       - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
 
       - name: Build
         run: swift build
