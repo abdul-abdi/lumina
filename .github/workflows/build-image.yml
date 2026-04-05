@@ -36,8 +36,12 @@ jobs:
         run: |
           cd /tmp/lumina-image
           sudo chmod 644 vmlinuz initrd rootfs.img
-          ls -lh
-          tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img
+          [ -f lumina-agent ] && sudo chmod 755 lumina-agent
+          [ -d modules ] && sudo chmod 644 modules/*
+          ls -lhR
+          tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img \
+            $([ -f lumina-agent ] && echo lumina-agent) \
+            $([ -d modules ] && echo modules/)
           echo "--- Package ---"
           ls -lh /tmp/lumina-image-default.tar.gz
           echo "--- SHA256 ---"
@@ -61,4 +65,9 @@ jobs:
 
             **Install:** `lumina pull` or download manually and extract to `~/.lumina/images/default/`
 
-            **Contents:** vmlinuz, initrd, rootfs.img (Alpine 3.20 + lumina-agent + python3, git, curl)
+            **Contents:**
+            - `vmlinuz` — raw ARM64 Image (decompressed, compatible with VZLinuxBootLoader)
+            - `initrd` — Alpine initramfs
+            - `rootfs.img` — Alpine 3.20 ext4 (python3, git, curl)
+            - `lumina-agent` — guest agent binary (linux/arm64)
+            - `modules/` — vsock kernel modules (.ko.gz)

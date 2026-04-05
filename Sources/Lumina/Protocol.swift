@@ -13,6 +13,7 @@ public enum GuestMessage: Sendable, Equatable {
     case ready
     case output(stream: OutputStream, data: String)
     case exit(code: Int32)
+    case heartbeat
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -60,6 +61,8 @@ enum LuminaProtocol {
                 throw LuminaError.protocolError("Malformed exit message: missing code")
             }
             return .exit(code: Int32(code))
+        case "heartbeat":
+            return .heartbeat
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }

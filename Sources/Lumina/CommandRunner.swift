@@ -1,5 +1,6 @@
 // Sources/Lumina/CommandRunner.swift
 import Foundation
+import os
 @preconcurrency import Virtualization
 
 enum ConnectionState: Sendable, Equatable {
@@ -8,35 +9,49 @@ enum ConnectionState: Sendable, Equatable {
     case waitingForReady
     case ready
     case executing
-    case finished
+    case failed
 }
 
 final class CommandRunner: @unchecked Sendable {
     private let socketDevice: VZVirtioSocketDevice
     private let queue: DispatchQueue
-    private var connection: VZVirtioSocketConnection?
-    private var inputHandle: FileHandle?
-    private var outputHandle: FileHandle?
-    private var state: ConnectionState = .disconnected
+
+    // All mutable state protected by `lock`.
+    // CommandRunner is @unchecked Sendable because we guarantee thread safety
+    // via NSLock rather than actor isolation (blocking I/O precludes actors).
+    private let lock = NSLock()
+    private var _connection: VZVirtioSocketConnection?
+    private var _inputHandle: FileHandle?
+    private var _outputHandle: FileHandle?
+    private var _state: ConnectionState = .disconnected
+
+    // Read buffer for the buffered line reader. Only accessed from the active
+    // read path (exec or execStream) — never concurrent because the state
+    // machine prevents overlapping executions.
+    private var readBuffer = Data()
 
     private static let vsockPort: UInt32 = 1024
-    private static let maxRetries = 200      // 200 * 100ms = 20s max (VM boot takes time)
-    private static let retryInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
+    private static let maxRetries = 200      // 200 * 100ms = 20s max
+    private static let retryInterval: UInt64 = 100_000_000 // 100ms
+
+    var state: ConnectionState {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state
+    }
 
     init(socketDevice: VZVirtioSocketDevice, queue: DispatchQueue) {
         self.socketDevice = socketDevice
         self.queue = queue
     }
 
+    // MARK: - Connect
+
     func connect() async throws(LuminaError) {
-        state = .connecting
+        setState(.connecting)
 
         for _ in 0..<Self.maxRetries {
             do {
-                // VZVirtioSocketDevice.connect(toPort:) must be called on the
-                // VZ queue. Swift's ObjC async bridge does NOT guarantee the
-                // call executes on the caller's queue — only the continuation
-                // resumes there. Dispatch explicitly to satisfy VZ's assertion.
                 let conn: VZVirtioSocketConnection = try await withCheckedThrowingContinuation { cont in
                     queue.async { [socketDevice] in
                         socketDevice.connect(toPort: Self.vsockPort) { result in
@@ -49,90 +64,55 @@ final class CommandRunner: @unchecked Sendable {
                         }
                     }
                 }
-                self.connection = conn
-                // VZVirtioSocketConnection exposes a raw file descriptor;
-                // create FileHandles for reading and writing from it.
-                let fd = conn.fileDescriptor
-                self.inputHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-                self.outputHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+                setConnection(conn)
                 break
             } catch {
                 try? await Task.sleep(nanoseconds: Self.retryInterval)
             }
         }
 
-        guard connection != nil else {
-            state = .disconnected
+        let (connected, input) = getConnectionInfo()
+
+        guard connected, let input else {
+            setState(.disconnected)
             throw .connectionFailed
         }
 
-        // Wait for ready handshake
-        state = .waitingForReady
-        guard let input = inputHandle else {
-            state = .disconnected
-            throw .connectionFailed
-        }
-
+        setState(.waitingForReady)
         let readyData = try readLine(from: input)
         let msg: GuestMessage
         do {
             msg = try LuminaProtocol.decodeGuest(readyData)
         } catch let error as LuminaError {
-            state = .disconnected
+            setState(.disconnected)
             throw error
         } catch {
-            state = .disconnected
+            setState(.disconnected)
             throw .protocolError("Failed to decode guest message: \(error)")
         }
         guard msg == .ready else {
-            state = .disconnected
+            setState(.disconnected)
             throw .protocolError("Expected ready message, got: \(msg)")
         }
 
-        state = .ready
+        setState(.ready)
     }
 
+    // MARK: - Buffered Exec (returns complete result)
+
     func exec(command: String, timeout: Int, env: [String: String] = [:]) throws(LuminaError) -> RunResult {
-        guard state == .ready, let input = inputHandle, let output = outputHandle else {
-            throw .connectionFailed
-        }
+        let (input, _) = try beginExec(command: command, timeout: timeout, env: env)
 
-        state = .executing
-
-        // Send exec message
-        let execMsg = HostMessage.exec(cmd: command, timeout: timeout, env: env)
-        let msgData: Data
-        do {
-            msgData = try LuminaProtocol.encode(execMsg)
-        } catch {
-            state = .ready
-            throw .protocolError("Failed to encode host message: \(error)")
-        }
-        output.write(msgData)
-
-        // Collect output
         var stdout = ""
         var stderr = ""
-        var exitCode: Int32 = 1
-
         let deadline = ContinuousClock.now + .seconds(timeout)
 
         while ContinuousClock.now < deadline {
-            let lineData = try readLine(from: input)
-            let guestMsg: GuestMessage
-            do {
-                guestMsg = try LuminaProtocol.decodeGuest(lineData)
-            } catch let error as LuminaError {
-                state = .ready
-                throw error
-            } catch {
-                state = .ready
-                throw .protocolError("Failed to decode guest message: \(error)")
-            }
+            let guestMsg = try readGuestMessage(from: input)
 
             switch guestMsg {
             case .ready:
-                state = .ready
+                setState(.ready)
                 throw .protocolError("Unexpected ready message during execution")
             case .output(let stream, let data):
                 switch stream {
@@ -140,38 +120,200 @@ final class CommandRunner: @unchecked Sendable {
                 case .stderr: stderr += data
                 }
             case .exit(let code):
-                exitCode = code
-                state = .finished
-                return RunResult(stdout: stdout, stderr: stderr, exitCode: exitCode, wallTime: .zero)
+                setState(.ready)
+                return RunResult(stdout: stdout, stderr: stderr, exitCode: code, wallTime: .zero)
+            case .heartbeat:
+                continue
             }
         }
 
-        state = .finished
+        setState(.failed)
         throw .timeout
+    }
+
+    // MARK: - Streaming Exec (yields chunks in real time)
+
+    func execStream(
+        command: String,
+        timeout: Int,
+        env: [String: String] = [:]
+    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
+        let (input, _) = try beginExec(command: command, timeout: timeout, env: env)
+        let runner = self
+
+        // Cancellation flag — thread-safe via os_unfair_lock (macOS 14+).
+        // Set by onTermination when the consumer drops the stream.
+        // The read loop checks it after each message. The blocked
+        // availableData call unblocks naturally via heartbeats (5s)
+        // or VM shutdown closing the connection.
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
+
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { @Sendable _ in
+                cancelled.withLock { $0 = true }
+            }
+
+            Task.detached {
+                let deadline = ContinuousClock.now + .seconds(timeout)
+                do {
+                    while ContinuousClock.now < deadline {
+                        if cancelled.withLock({ $0 }) {
+                            runner.setState(.ready)
+                            continuation.finish()
+                            return
+                        }
+
+                        let guestMsg = try runner.readGuestMessage(from: input)
+
+                        if cancelled.withLock({ $0 }) {
+                            runner.setState(.ready)
+                            continuation.finish()
+                            return
+                        }
+
+                        switch guestMsg {
+                        case .ready:
+                            runner.setState(.ready)
+                            continuation.finish(throwing: LuminaError.protocolError(
+                                "Unexpected ready message during execution"
+                            ))
+                            return
+                        case .output(let stream, let data):
+                            continuation.yield(stream == .stdout ? .stdout(data) : .stderr(data))
+                        case .exit(let code):
+                            runner.setState(.ready)
+                            continuation.yield(.exit(code))
+                            continuation.finish()
+                            return
+                        case .heartbeat:
+                            continue
+                        }
+                    }
+                    runner.setState(.failed)
+                    continuation.finish(throwing: LuminaError.timeout)
+                } catch {
+                    runner.setState(.failed)
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 
     // MARK: - Private
 
-    // Tech debt: readLine is byte-by-byte — acceptable for v0.1 NDJSON but should use buffered reader in v0.2
+    private func setState(_ newState: ConnectionState) {
+        lock.lock()
+        _state = newState
+        lock.unlock()
+    }
+
+    /// Store a new vsock connection and create file handles for I/O.
+    private func setConnection(_ conn: VZVirtioSocketConnection) {
+        let fd = conn.fileDescriptor
+        lock.lock()
+        _connection = conn
+        _inputHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        _outputHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        lock.unlock()
+    }
+
+    /// Read connection state under lock (safe to call from async contexts).
+    private func getConnectionInfo() -> (connected: Bool, input: FileHandle?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (_connection != nil, _inputHandle)
+    }
+
+    /// Validate state, transition to executing, send the exec message.
+    /// Returns the input/output handles for the caller to read from.
+    ///
+    /// The check-and-transition is atomic under a single lock acquisition
+    /// to prevent TOCTOU races if exec is called concurrently.
+    private func beginExec(
+        command: String, timeout: Int, env: [String: String]
+    ) throws(LuminaError) -> (input: FileHandle, output: FileHandle) {
+        lock.lock()
+        guard _state == .ready, let input = _inputHandle, let output = _outputHandle else {
+            lock.unlock()
+            throw .connectionFailed
+        }
+        _state = .executing
+        readBuffer = Data()
+        lock.unlock()
+
+        let execMsg = HostMessage.exec(cmd: command, timeout: timeout, env: env)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(execMsg)
+        } catch {
+            setState(.ready)
+            throw .protocolError("Failed to encode host message: \(error)")
+        }
+        output.write(msgData)
+
+        return (input, output)
+    }
+
+    /// Read one newline-delimited message and decode it.
+    private func readGuestMessage(from handle: FileHandle) throws(LuminaError) -> GuestMessage {
+        let lineData = try readLine(from: handle)
+        do {
+            return try LuminaProtocol.decodeGuest(lineData)
+        } catch let error as LuminaError {
+            throw error
+        } catch {
+            throw .protocolError("Failed to decode guest message: \(error)")
+        }
+    }
+
+    /// Buffered line reader — reads available data and returns complete
+    /// newline-delimited messages.
+    ///
+    /// Uses `availableData` instead of `readData(ofLength:)` because VZ
+    /// vsock file descriptors behave like pipes on macOS: readData(ofLength: N)
+    /// blocks until exactly N bytes arrive, rather than returning a partial
+    /// read like a POSIX socket. `availableData` correctly returns whatever
+    /// bytes are pending without over-blocking.
     private func readLine(from handle: FileHandle) throws(LuminaError) -> Data {
-        var buffer = Data()
+        // Check if there's already a complete line in the buffer
+        if let line = extractLine() {
+            return line
+        }
+
+        // Read more data until we get a complete line
         while true {
-            let byte = handle.readData(ofLength: 1)
-            if byte.isEmpty {
-                if buffer.isEmpty {
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                // EOF — return whatever is in the buffer
+                if readBuffer.isEmpty {
                     throw .connectionFailed
                 }
-                break
+                let remaining = readBuffer
+                readBuffer = Data()
+                return remaining
             }
-            if byte[0] == UInt8(ascii: "\n") {
-                buffer.append(byte)
-                break
-            }
-            buffer.append(byte)
-            if buffer.count > LuminaProtocol.maxMessageSize {
+
+            readBuffer.append(chunk)
+
+            if readBuffer.count > LuminaProtocol.maxMessageSize {
+                readBuffer = Data()
                 throw .protocolError("Message exceeds 64KB limit")
             }
+
+            if let line = extractLine() {
+                return line
+            }
         }
-        return buffer
+    }
+
+    /// Extract a complete line (including the newline) from readBuffer, or nil.
+    private func extractLine() -> Data? {
+        guard let newlineIndex = readBuffer.firstIndex(of: UInt8(ascii: "\n")) else {
+            return nil
+        }
+        let lineEnd = readBuffer.index(after: newlineIndex)
+        let line = Data(readBuffer[readBuffer.startIndex..<lineEnd])
+        readBuffer.removeSubrange(readBuffer.startIndex..<lineEnd)
+        return line
     }
 }

@@ -239,28 +239,19 @@ public actor VM {
         )
     }
 
-    /// Note: v0.1 is buffered-then-emit, not true real-time streaming. True streaming in v0.2.
+    /// Stream output chunks from a command in real time.
+    /// Each output message from the guest agent is yielded as it arrives.
+    /// Returns the stream directly from CommandRunner — no intermediate wrapping.
     public func stream(
         _ command: String,
+        timeout: Int = 60,
         env: [String: String] = [:]
-    ) -> AsyncThrowingStream<OutputChunk, Error> {
-        AsyncThrowingStream { continuation in
-            Task { [self] in
-                do {
-                    let result = try await self.exec(command, env: env)
-                    if !result.stdout.isEmpty {
-                        continuation.yield(.stdout(result.stdout))
-                    }
-                    if !result.stderr.isEmpty {
-                        continuation.yield(.stderr(result.stderr))
-                    }
-                    continuation.yield(.exit(result.exitCode))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
+    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
         }
+        _state = .executing
+        return try runner.execStream(command: command, timeout: timeout, env: env)
     }
 
     public func shutdown() async {

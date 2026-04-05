@@ -32,3 +32,14 @@ import Testing
     #expect(OutputChunk.exit(0) == OutputChunk.exit(0))
     #expect(OutputChunk.exit(0) != OutputChunk.exit(1))
 }
+
+@Test func connectionStateEquality() {
+    #expect(ConnectionState.disconnected == ConnectionState.disconnected)
+    #expect(ConnectionState.ready != ConnectionState.executing)
+    #expect(ConnectionState.connecting != ConnectionState.waitingForReady)
+}
+
+@Test func guestMessageHeartbeatEquality() {
+    #expect(GuestMessage.heartbeat == GuestMessage.heartbeat)
+    #expect(GuestMessage.heartbeat != GuestMessage.ready)
+}

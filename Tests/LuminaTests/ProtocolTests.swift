@@ -57,6 +57,12 @@ import Testing
     }
 }
 
+@Test func decodeHeartbeatMessage() throws {
+    let data = Data("{\"type\":\"heartbeat\"}\n".utf8)
+    let msg = try Protocol.decodeGuest(data)
+    #expect(msg == .heartbeat)
+}
+
 @Test func decodeUnknownType() {
     let data = Data("{\"type\":\"unknown\"}\n".utf8)
     #expect(throws: LuminaError.self) {

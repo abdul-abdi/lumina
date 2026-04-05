@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,10 +18,16 @@ import (
 )
 
 const (
-	vsockPort     = 1024
-	maxChunkSize  = 65536 // 64KB
-	agentStartMsg = "lumina-agent starting"
+	vsockPort         = 1024
+	maxChunkSize      = 65536 // 64KB
+	heartbeatInterval = 5 * time.Second
+	agentStartMsg     = "lumina-agent starting"
 )
+
+// writeMu serializes all writes to the vsock connection.
+// Required because heartbeat goroutine and command execution
+// goroutines may write concurrently.
+var writeMu sync.Mutex
 
 // Protocol messages
 
@@ -43,6 +50,10 @@ type ExitMsg struct {
 }
 
 type ReadyMsg struct {
+	Type string `json:"type"`
+}
+
+type HeartbeatMsg struct {
 	Type string `json:"type"`
 }
 
@@ -69,30 +80,55 @@ func main() {
 	// Send ready message
 	sendJSON(conn, ReadyMsg{Type: "ready"})
 
-	// Read exec request
+	// Start heartbeat — paused during command execution
+	ctx, cancelHeartbeat := context.WithCancel(context.Background())
+	go heartbeat(ctx, conn)
+
+	// Command loop — accept multiple exec requests on the same connection
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, maxChunkSize*2), maxChunkSize*2)
-	if !scanner.Scan() {
-		fmt.Fprintln(os.Stderr, "failed to read exec request")
-		os.Exit(1)
+
+	for scanner.Scan() {
+		var req ExecRequest
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid request: %v\n", err)
+			continue
+		}
+
+		if req.Type != "exec" {
+			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", req.Type)
+			continue
+		}
+
+		// Pause heartbeat during execution
+		cancelHeartbeat()
+
+		exitCode := executeCommand(conn, req)
+		sendJSON(conn, ExitMsg{Type: "exit", Code: exitCode})
+
+		// Resume heartbeat
+		ctx, cancelHeartbeat = context.WithCancel(context.Background())
+		go heartbeat(ctx, conn)
 	}
 
-	var req ExecRequest
-	if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid exec request: %v\n", err)
-		os.Exit(1)
+	cancelHeartbeat()
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "scanner error: %v\n", err)
 	}
+}
 
-	if req.Type != "exec" {
-		fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", req.Type)
-		os.Exit(1)
+func heartbeat(ctx context.Context, conn net.Conn) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sendJSON(conn, HeartbeatMsg{Type: "heartbeat"})
+		}
 	}
-
-	// Execute command
-	exitCode := executeCommand(conn, req)
-
-	// Send exit
-	sendJSON(conn, ExitMsg{Type: "exit", Code: exitCode})
 }
 
 func executeCommand(conn net.Conn, req ExecRequest) int {
@@ -184,7 +220,9 @@ func sendJSON(conn net.Conn, v interface{}) {
 		return
 	}
 	data = append(data, '\n')
+	writeMu.Lock()
 	conn.Write(data)
+	writeMu.Unlock()
 }
 
 // vsockListener implements net.Listener using raw syscalls.

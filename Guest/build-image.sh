@@ -40,7 +40,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
         -v "$SCRIPT_DIR:/guest:ro" \
         -v "$OUTPUT_DIR:/out" \
         alpine:3.20 sh -c "
-            apk add --no-cache e2fsprogs bash curl &&
+            apk add --no-cache e2fsprogs bash curl grep &&
             bash /guest/build-image.sh /out
         "
 
@@ -195,12 +195,65 @@ sudo umount "$WORK_DIR/rootfs"
 # ============================================================
 echo "--- Step 5: Saving to $OUTPUT_DIR ---"
 mkdir -p "$OUTPUT_DIR"
-cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
+
+# --- 5a: Decompress vmlinuz to raw ARM64 Image ---
+# VZLinuxBootLoader on macOS requires an uncompressed kernel image.
+# Alpine's vmlinuz-virt is an EFI stub wrapping a gzip-compressed kernel.
+RAW_CHECK=$(dd if="$VMLINUZ" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
+if [ "$RAW_CHECK" = "41524d64" ]; then
+    echo "  vmlinuz is already a raw ARM64 Image — copying as-is"
+    cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
+else
+    echo "  Decompressing vmlinuz to raw ARM64 Image..."
+    GZIP_OFFSET=$(LC_ALL=C grep -abom1 $'\x1f\x8b\x08' "$VMLINUZ" | head -1 | cut -d: -f1)
+    if [ -z "$GZIP_OFFSET" ]; then
+        echo "Warning: vmlinuz is neither raw ARM64 Image nor contains gzip stream"
+        echo "  Copying as-is — VZLinuxBootLoader may reject this kernel"
+        cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
+    else
+        tail -c +$((GZIP_OFFSET + 1)) "$VMLINUZ" | gunzip > "$OUTPUT_DIR/vmlinuz"
+        # Verify the decompressed kernel has ARM64 Image magic
+        VERIFY=$(dd if="$OUTPUT_DIR/vmlinuz" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
+        if [ "$VERIFY" != "41524d64" ]; then
+            echo "  Warning: Decompressed kernel missing ARM64 Image magic (got: $VERIFY)"
+        fi
+    fi
+fi
+
+# --- 5b: Copy initrd (unmodified — InitrdPatcher handles agent injection at runtime) ---
 cp "$INITRD" "$OUTPUT_DIR/initrd"
+
+# --- 5c: Copy rootfs ---
 cp "$WORK_DIR/rootfs.img" "$OUTPUT_DIR/rootfs.img"
+
+# --- 5d: Copy guest agent binary ---
+if [ -f "$AGENT_BINARY" ]; then
+    cp "$AGENT_BINARY" "$OUTPUT_DIR/lumina-agent"
+    chmod 755 "$OUTPUT_DIR/lumina-agent"
+else
+    echo "  Warning: lumina-agent binary not found — image will not include guest agent"
+fi
+
+# --- 5e: Extract vsock kernel modules ---
+KVER_DIR=$(find "$BOOT_ROOT/lib/modules" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+if [ -n "$KVER_DIR" ]; then
+    mkdir -p "$OUTPUT_DIR/modules"
+    find "$KVER_DIR" \( -name "vsock*.ko*" -o -name "vmw_vsock*.ko*" \) -exec cp {} "$OUTPUT_DIR/modules/" \; 2>/dev/null
+    MODULE_COUNT=$(ls "$OUTPUT_DIR/modules/" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$MODULE_COUNT" -gt 0 ]; then
+        echo "  modules:    $(ls "$OUTPUT_DIR/modules/" | tr '\n' ' ')"
+    else
+        echo "  Warning: No vsock kernel modules found"
+        rmdir "$OUTPUT_DIR/modules" 2>/dev/null
+    fi
+else
+    echo "  Warning: No kernel modules directory found"
+fi
 
 echo "=== Done ==="
 echo "Image saved to: $OUTPUT_DIR"
 echo "  vmlinuz:    $(du -h "$OUTPUT_DIR/vmlinuz" | cut -f1)"
 echo "  initrd:     $(du -h "$OUTPUT_DIR/initrd" | cut -f1)"
 echo "  rootfs.img: $(du -h "$OUTPUT_DIR/rootfs.img" | cut -f1)"
+[ -f "$OUTPUT_DIR/lumina-agent" ] && echo "  agent:      $(du -h "$OUTPUT_DIR/lumina-agent" | cut -f1)"
+[ -d "$OUTPUT_DIR/modules" ] && echo "  modules:    $(du -sh "$OUTPUT_DIR/modules/" | cut -f1)"

@@ -40,11 +40,11 @@ public struct Lumina {
     }
 
     /// Stream output from a command in a disposable VM.
-    /// Note: v0.1 buffers then emits (not true real-time streaming). True line-by-line streaming in v0.2.
+    /// Output chunks are yielded in real time as the guest agent sends them.
     public static func stream(
         _ command: String,
         options: RunOptions = .default
-    ) -> AsyncThrowingStream<OutputChunk, Error> {
+    ) -> AsyncThrowingStream<OutputChunk, any Error> {
         AsyncThrowingStream { continuation in
             Task {
                 do {
@@ -54,8 +54,11 @@ public struct Lumina {
 
                     try await vm.boot()
 
-                    // Delegate to VM.stream() which handles exec + chunking
-                    let chunks = await vm.stream(command)
+                    let elapsed = ContinuousClock.now
+                    let remaining = options.timeout - (ContinuousClock.now - elapsed)
+                    let remainingSeconds = max(Int(remaining.components.seconds), 1)
+
+                    let chunks = try await vm.stream(command, timeout: remainingSeconds)
                     for try await chunk in chunks {
                         continuation.yield(chunk)
                     }
