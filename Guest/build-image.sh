@@ -40,8 +40,17 @@ if [ -z "$MKE2FS" ]; then
         fi
     done
 fi
-if [ -z "$MKE2FS" ]; then
-    echo "Error: mke2fs not found."
+DEBUGFS=$(command -v debugfs 2>/dev/null || true)
+if [ -z "$DEBUGFS" ]; then
+    for prefix in /opt/homebrew /usr/local; do
+        if [ -x "$prefix/opt/e2fsprogs/sbin/debugfs" ]; then
+            DEBUGFS="$prefix/opt/e2fsprogs/sbin/debugfs"
+            break
+        fi
+    done
+fi
+if [ -z "$MKE2FS" ] || [ -z "$DEBUGFS" ]; then
+    echo "Error: e2fsprogs tools (mke2fs, debugfs) not found."
     if [[ "$(uname)" == "Darwin" ]]; then
         echo "  Install: brew install e2fsprogs"
     else
@@ -143,6 +152,16 @@ chmod 755 "$ROOTFS_DIR/sbin/init"
 
 echo "--- Step 5: Creating rootfs.img (ext4, no mount/sudo) ---"
 "$MKE2FS" -t ext4 -d "$ROOTFS_DIR" -b 4096 -q "$WORK_DIR/rootfs.img" "${ROOTFS_SIZE_MB}M"
+
+# Fix file ownership — mke2fs -d copies host UIDs (e.g. 501 on macOS).
+# Set all files/dirs to root:root so the rootfs has correct metadata.
+UID_FIX="$WORK_DIR/fix_uids.cmds"
+(cd "$ROOTFS_DIR" && find . -mindepth 1) | while IFS= read -r entry; do
+    entry="${entry#./}"
+    echo "set_inode_field \"$entry\" uid 0"
+    echo "set_inode_field \"$entry\" gid 0"
+done > "$UID_FIX"
+"$DEBUGFS" -w -f "$UID_FIX" "$WORK_DIR/rootfs.img" >/dev/null 2>&1
 
 # ============================================================
 # Step 6: Copy outputs
