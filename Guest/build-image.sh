@@ -216,6 +216,7 @@ if [ -n "${KMOD_DIR:-}" ]; then
     find "$KMOD_DIR" \( \
         -name "virtio_blk.ko*" -o \
         -name "virtio_net.ko*" -o \
+        -name "af_packet.ko" -o -name "af_packet.ko.*" -o \
         -name "failover.ko*" -o \
         -name "net_failover.ko*" -o \
         -name "ext4.ko*" -o \
