@@ -119,7 +119,7 @@ enum InitrdPatcher {
             "# Boot: ext4 deps → ext4 → virtio_blk/net",
             "# Agent: vsock chain",
             "# Mounts: fuse → virtiofs",
-            "for m in crc32c_generic.ko.gz libcrc32c.ko.gz crc16.ko.gz mbcache.ko.gz jbd2.ko.gz ext4.ko.gz virtio_blk.ko.gz net_failover.ko.gz virtio_net.ko.gz vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz fuse.ko.gz virtiofs.ko.gz; do",
+            "for m in crc32c_generic.ko.gz libcrc32c.ko.gz crc16.ko.gz mbcache.ko.gz jbd2.ko.gz ext4.ko.gz virtio_blk.ko.gz failover.ko.gz net_failover.ko.gz virtio_net.ko.gz vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz fuse.ko.gz virtiofs.ko.gz; do",
             "  if [ -f \"/lumina-modules/$m\" ]; then",
             "    gunzip -f \"/lumina-modules/$m\" 2>/dev/null",
             "    insmod \"/lumina-modules/${m%.gz}\" 2>/dev/null",
