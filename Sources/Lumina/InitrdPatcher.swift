@@ -54,7 +54,7 @@ enum InitrdPatcher {
         }
 
         // Build the supplementary cpio archive (newc format)
-        let initScript = Self.customInitScript(hasModules: !moduleFiles.isEmpty)
+        let initScript = Self.customInitScript()
         var cpio = Data()
         cpio.append(cpioEntry(path: ".", mode: 0o40755, data: Data()))
         cpio.append(cpioEntry(path: "init", mode: 0o100755, data: Data(initScript.utf8)))
@@ -90,7 +90,7 @@ enum InitrdPatcher {
 
     // MARK: - Custom Init Script
 
-    private static func customInitScript(hasModules: Bool = false) -> String {
+    private static func customInitScript() -> String {
         // No leading whitespace — this script is written verbatim into the cpio.
         // Each line must start at column 0 for the shell to parse correctly.
         var lines: [String] = [
@@ -115,27 +115,17 @@ enum InitrdPatcher {
             "  esac",
             "done",
             "",
-            "# Load virtio modules for block device + networking",
-            "modprobe virtio_blk 2>/dev/null",
-            "modprobe virtio_net 2>/dev/null",
-            "modprobe ext4 2>/dev/null",
+            "# Load kernel modules from initramfs overlay (insmod in dependency order)",
+            "# Boot: ext4 deps → ext4 → virtio_blk/net",
+            "# Agent: vsock chain",
+            "# Mounts: fuse → virtiofs",
+            "for m in crc32c_generic.ko.gz libcrc32c.ko.gz crc16.ko.gz mbcache.ko.gz jbd2.ko.gz ext4.ko.gz virtio_blk.ko.gz net_failover.ko.gz virtio_net.ko.gz vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz fuse.ko.gz virtiofs.ko.gz; do",
+            "  if [ -f \"/lumina-modules/$m\" ]; then",
+            "    gunzip -f \"/lumina-modules/$m\" 2>/dev/null",
+            "    insmod \"/lumina-modules/${m%.gz}\" 2>/dev/null",
+            "  fi",
+            "done",
         ]
-
-        // Load vsock + virtiofs modules before switch_root (they live in the
-        // initramfs, not on the rootfs, so modprobe won't find them after
-        // switch_root).
-        if hasModules {
-            lines += [
-                "",
-                "# Load kernel modules from initramfs overlay (in dependency order)",
-                "for m in vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz fuse.ko.gz virtiofs.ko.gz; do",
-                "  if [ -f \"/lumina-modules/$m\" ]; then",
-                "    gunzip -f \"/lumina-modules/$m\" 2>/dev/null",
-                "    insmod \"/lumina-modules/${m%.gz}\" 2>/dev/null",
-                "  fi",
-                "done",
-            ]
-        }
 
         lines += [
             "",

@@ -95,11 +95,7 @@ public actor VM {
             bootLoader.initialRamdiskURL = imagePaths.initrd
         }
 
-        var modules = "virtio_blk,virtio_net,ext4"
-        if !options.mounts.isEmpty {
-            modules += ",virtiofs"
-        }
-        var cmdLine = "console=hvc0 root=/dev/vda rw modules=\(modules)"
+        var cmdLine = "console=hvc0 root=/dev/vda rw"
 
         // Encode mount specs as kernel param so the init script can mount them.
         // Format: lumina_mounts=tag:path,tag:path

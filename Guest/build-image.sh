@@ -1,83 +1,52 @@
 #!/bin/bash
 # Guest/build-image.sh
 # Builds the default Alpine Linux image for Lumina VMs.
+# Works natively on macOS and Linux — no Docker, no sudo.
 #
-# On macOS: automatically runs inside a Docker container (requires Docker Desktop).
-# On Linux: runs natively (requires root/sudo + e2fsprogs).
-#
-# Output: ~/.lumina/images/default/{vmlinuz, initrd, rootfs.img}
+# Prerequisites: e2fsprogs (brew install e2fsprogs), curl, Go (for agent)
+# Output: ~/.lumina/images/default/{vmlinuz, initrd, rootfs.img, lumina-agent, modules/}
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${1:-$HOME/.lumina/images/default}"
-
-# --- macOS: delegate to Docker ---
-if [[ "$(uname)" == "Darwin" ]]; then
-    echo "=== macOS detected — building inside Docker ==="
-
-    if ! command -v docker &>/dev/null; then
-        echo "Error: Docker is required to build images on macOS."
-        echo "Install Docker Desktop: https://www.docker.com/products/docker-desktop/"
-        exit 1
-    fi
-
-    if ! docker info &>/dev/null; then
-        echo "Error: Docker daemon is not running. Start Docker Desktop and try again."
-        exit 1
-    fi
-
-    # Build guest agent if not already built
-    AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
-    if [ ! -f "$AGENT_BINARY" ]; then
-        echo "--- Building guest agent (Go cross-compile) ---"
-        (cd "$SCRIPT_DIR/lumina-agent" && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .)
-    fi
-
-    mkdir -p "$OUTPUT_DIR"
-
-    docker run --rm --platform linux/arm64 \
-        -v "$SCRIPT_DIR:/guest:ro" \
-        -v "$OUTPUT_DIR:/out" \
-        alpine:3.20 sh -c "
-            apk add --no-cache e2fsprogs bash curl grep &&
-            bash /guest/build-image.sh /out
-        "
-
-    echo "=== Done (via Docker) ==="
-    echo "Image saved to: $OUTPUT_DIR"
-    ls -lh "$OUTPUT_DIR"/
-    exit 0
-fi
-
-# --- Linux: native build ---
-AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
 WORK_DIR=$(mktemp -d)
 ALPINE_VERSION="3.20"
 ALPINE_ARCH="aarch64"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}"
-ROOTFS_SIZE="1G"
+ROOTFS_SIZE_MB=1024
 
-cleanup() {
-    echo "Cleaning up..."
-    sudo umount "$WORK_DIR/rootfs" 2>/dev/null || true
-    rm -rf "$WORK_DIR"
-}
+cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
 echo "=== Lumina Image Builder ==="
 echo "Output: $OUTPUT_DIR"
-echo "Work dir: $WORK_DIR"
 
-# Check prerequisites
+# --- Prerequisites ---
+
+AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
 if [ ! -f "$AGENT_BINARY" ]; then
-    echo "Error: lumina-agent binary not found at $AGENT_BINARY"
-    echo "Build it first: cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags='-s -w' -o lumina-agent ."
-    exit 1
+    echo "--- Building guest agent (Go cross-compile) ---"
+    (cd "$SCRIPT_DIR/lumina-agent" && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .)
 fi
 
-if ! command -v mkfs.ext4 &>/dev/null; then
-    echo "Error: mkfs.ext4 not found. Install e2fsprogs: apt-get install e2fsprogs (or apk add e2fsprogs)"
+# Find mke2fs — Homebrew installs e2fsprogs outside PATH on macOS
+MKE2FS=$(command -v mke2fs 2>/dev/null || true)
+if [ -z "$MKE2FS" ]; then
+    for prefix in /opt/homebrew /usr/local; do
+        if [ -x "$prefix/opt/e2fsprogs/sbin/mke2fs" ]; then
+            MKE2FS="$prefix/opt/e2fsprogs/sbin/mke2fs"
+            break
+        fi
+    done
+fi
+if [ -z "$MKE2FS" ]; then
+    echo "Error: mke2fs not found."
+    if [[ "$(uname)" == "Darwin" ]]; then
+        echo "  Install: brew install e2fsprogs"
+    else
+        echo "  Install: apt-get install e2fsprogs"
+    fi
     exit 1
 fi
 
@@ -89,114 +58,99 @@ MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
 curl -fSL "${ALPINE_MIRROR}/releases/${ALPINE_ARCH}/${MINIROOTFS}" -o "$WORK_DIR/$MINIROOTFS"
 
 # ============================================================
-# Step 2: Get kernel + initramfs from Alpine linux-virt package
+# Step 2: Download linux-virt APK, extract kernel + modules
 # ============================================================
-echo "--- Step 2: Installing Alpine virt kernel ---"
-BOOT_ROOT="$WORK_DIR/apk-root"
-mkdir -p "$BOOT_ROOT"
-tar xzf "$WORK_DIR/$MINIROOTFS" -C "$BOOT_ROOT"
+echo "--- Step 2: Fetching Alpine virt kernel ---"
 
-# Install linux-virt via chroot to get vmlinuz + initramfs
-sudo cp /etc/resolv.conf "$BOOT_ROOT/etc/resolv.conf" 2>/dev/null || true
-
-# Mount necessary filesystems for chroot
-sudo mount -t proc proc "$BOOT_ROOT/proc" 2>/dev/null || true
-sudo mount -t sysfs sys "$BOOT_ROOT/sys" 2>/dev/null || true
-sudo mount --bind /dev "$BOOT_ROOT/dev" 2>/dev/null || true
-
-sudo chroot "$BOOT_ROOT" /sbin/apk add --no-cache linux-virt
-
-# Unmount chroot filesystems
-sudo umount "$BOOT_ROOT/dev" 2>/dev/null || true
-sudo umount "$BOOT_ROOT/sys" 2>/dev/null || true
-sudo umount "$BOOT_ROOT/proc" 2>/dev/null || true
-
-# Find kernel and initrd at their known paths
-VMLINUZ="$BOOT_ROOT/boot/vmlinuz-virt"
-INITRD="$BOOT_ROOT/boot/initramfs-virt"
-
-if [ ! -f "$VMLINUZ" ]; then
-    echo "Error: vmlinuz-virt not found at $VMLINUZ"
-    echo "Contents of $BOOT_ROOT/boot/:"
-    ls -la "$BOOT_ROOT/boot/" 2>/dev/null || echo "(directory does not exist)"
+# Get package version from APKINDEX
+curl -fsSL "${ALPINE_MIRROR}/main/${ALPINE_ARCH}/APKINDEX.tar.gz" \
+    | tar xzf - -C "$WORK_DIR" APKINDEX 2>/dev/null
+PKGVER=$(awk '/^P:linux-virt$/,/^$/' "$WORK_DIR/APKINDEX" | awk -F: '/^V:/{print $2}')
+if [ -z "$PKGVER" ]; then
+    echo "Error: could not determine linux-virt package version"
     exit 1
 fi
+echo "  linux-virt: $PKGVER"
 
-if [ ! -f "$INITRD" ]; then
-    echo "Error: initramfs-virt not found at $INITRD"
-    echo "Contents of $BOOT_ROOT/boot/:"
-    ls -la "$BOOT_ROOT/boot/" 2>/dev/null || echo "(directory does not exist)"
+# APK files are gzip tarballs — extract directly, no chroot needed
+curl -fSL "${ALPINE_MIRROR}/main/${ALPINE_ARCH}/linux-virt-${PKGVER}.apk" \
+    -o "$WORK_DIR/linux-virt.apk"
+mkdir -p "$WORK_DIR/kernel"
+tar xzf "$WORK_DIR/linux-virt.apk" -C "$WORK_DIR/kernel"
+
+VMLINUZ="$WORK_DIR/kernel/boot/vmlinuz-virt"
+KMOD_DIR=$(find "$WORK_DIR/kernel/lib/modules" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+
+if [ ! -f "$VMLINUZ" ]; then
+    echo "Error: vmlinuz-virt not found in linux-virt package"
+    echo "Contents of boot/:"
+    ls -la "$WORK_DIR/kernel/boot/" 2>/dev/null || echo "(missing)"
     exit 1
 fi
 
 echo "  vmlinuz:    $(du -h "$VMLINUZ" | cut -f1)"
-echo "  initramfs:  $(du -h "$INITRD" | cut -f1)"
 
 # ============================================================
-# Step 3: Create rootfs.img (ext4)
+# Step 3: Create minimal initrd (busybox only)
 # ============================================================
-echo "--- Step 3: Creating rootfs.img ---"
-dd if=/dev/zero of="$WORK_DIR/rootfs.img" bs=1 count=0 seek="$ROOTFS_SIZE" 2>/dev/null
-mkfs.ext4 -q -F "$WORK_DIR/rootfs.img"
+# The stock Alpine initramfs is generated by mkinitfs during `apk add`,
+# which requires chroot. Instead, create a minimal initrd containing
+# only busybox — InitrdPatcher appends the custom init, agent, and
+# kernel modules at boot time.
+echo "--- Step 3: Creating minimal initrd ---"
+INITRD_DIR="$WORK_DIR/initrd-root"
+mkdir -p "$INITRD_DIR"/{bin,lib,proc,sys,dev,tmp,sysroot}
+# Busybox is dynamically linked against musl — include the dynamic linker
+tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" bin/busybox lib/ld-musl-aarch64.so.1
+chmod 755 "$INITRD_DIR/bin/busybox"
+# ld-musl-aarch64.so.1 may be a symlink to libc.musl-*.so.1 — resolve it
+if [ -L "$INITRD_DIR/lib/ld-musl-aarch64.so.1" ]; then
+    LIBC_TARGET=$(readlink "$INITRD_DIR/lib/ld-musl-aarch64.so.1")
+    tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" "lib/$LIBC_TARGET"
+fi
+(cd "$INITRD_DIR" && ln -s busybox bin/sh)
+
+(cd "$INITRD_DIR" && find . | cpio -o -H newc 2>/dev/null) | gzip > "$WORK_DIR/initrd"
+echo "  initrd:     $(du -h "$WORK_DIR/initrd" | cut -f1)"
 
 # ============================================================
-# Step 4: Populate rootfs
+# Step 4: Build rootfs directory tree + ext4 image
 # ============================================================
-echo "--- Step 4: Populating rootfs ---"
-mkdir -p "$WORK_DIR/rootfs"
-sudo mount -t ext4 -o loop "$WORK_DIR/rootfs.img" "$WORK_DIR/rootfs"
-
-# Extract Alpine base
-sudo tar xzf "$WORK_DIR/$MINIROOTFS" -C "$WORK_DIR/rootfs"
+echo "--- Step 4: Building rootfs ---"
+ROOTFS_DIR="$WORK_DIR/rootfs"
+mkdir -p "$ROOTFS_DIR"
+tar xzf "$WORK_DIR/$MINIROOTFS" -C "$ROOTFS_DIR"
 
 # Install lumina-agent
-sudo mkdir -p "$WORK_DIR/rootfs/usr/local/bin"
-sudo cp "$AGENT_BINARY" "$WORK_DIR/rootfs/usr/local/bin/lumina-agent"
-sudo chmod +x "$WORK_DIR/rootfs/usr/local/bin/lumina-agent"
+mkdir -p "$ROOTFS_DIR/usr/local/bin"
+cp "$AGENT_BINARY" "$ROOTFS_DIR/usr/local/bin/lumina-agent"
+chmod 755 "$ROOTFS_DIR/usr/local/bin/lumina-agent"
 
-# Create minimal init script (no OpenRC — direct exec)
-sudo tee "$WORK_DIR/rootfs/sbin/init" > /dev/null << 'INITEOF'
+# Minimal init script (fallback — InitrdPatcher's lumina-init overrides this)
+rm -f "$ROOTFS_DIR/sbin/init"
+cat > "$ROOTFS_DIR/sbin/init" << 'INITEOF'
 #!/bin/sh
-# Lumina minimal init
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
-
-# Set hostname
 hostname lumina
-
-# Configure networking (for outbound NAT)
 ip link set lo up 2>/dev/null
 ip link set eth0 up 2>/dev/null
 udhcpc -i eth0 -s /usr/share/udhcpc/default.script -q 2>/dev/null &
-
-# Start lumina-agent
 exec /usr/local/bin/lumina-agent
 INITEOF
-sudo chmod +x "$WORK_DIR/rootfs/sbin/init"
+chmod 755 "$ROOTFS_DIR/sbin/init"
 
-# Install extra tools in the rootfs via chroot
-echo "--- Installing extra tools in rootfs ---"
-sudo cp /etc/resolv.conf "$WORK_DIR/rootfs/etc/resolv.conf" 2>/dev/null || true
-sudo mount -t proc proc "$WORK_DIR/rootfs/proc" 2>/dev/null || true
-sudo mount -t sysfs sys "$WORK_DIR/rootfs/sys" 2>/dev/null || true
-sudo mount --bind /dev "$WORK_DIR/rootfs/dev" 2>/dev/null || true
-
-sudo chroot "$WORK_DIR/rootfs" /sbin/apk add --no-cache \
-    python3 git curl ca-certificates 2>/dev/null || echo "Warning: could not install extra tools (non-fatal)"
-
-sudo umount "$WORK_DIR/rootfs/dev" 2>/dev/null || true
-sudo umount "$WORK_DIR/rootfs/sys" 2>/dev/null || true
-sudo umount "$WORK_DIR/rootfs/proc" 2>/dev/null || true
-sudo umount "$WORK_DIR/rootfs"
+echo "--- Step 5: Creating rootfs.img (ext4, no mount/sudo) ---"
+"$MKE2FS" -t ext4 -d "$ROOTFS_DIR" -b 4096 -q "$WORK_DIR/rootfs.img" "${ROOTFS_SIZE_MB}M"
 
 # ============================================================
-# Step 5: Copy outputs
+# Step 6: Copy outputs
 # ============================================================
-echo "--- Step 5: Saving to $OUTPUT_DIR ---"
+echo "--- Step 6: Saving to $OUTPUT_DIR ---"
 mkdir -p "$OUTPUT_DIR"
 
-# --- 5a: Decompress vmlinuz to raw ARM64 Image ---
+# --- 6a: Decompress vmlinuz to raw ARM64 Image ---
 # VZLinuxBootLoader on macOS requires an uncompressed kernel image.
 # Alpine's vmlinuz-virt is an EFI stub wrapping a gzip-compressed kernel.
 RAW_CHECK=$(dd if="$VMLINUZ" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
@@ -205,16 +159,18 @@ if [ "$RAW_CHECK" = "41524d64" ]; then
     cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
 else
     echo "  Decompressing vmlinuz to raw ARM64 Image..."
-    GZIP_OFFSET=$(LC_ALL=C grep -abom1 $'\x1f\x8b\x08' "$VMLINUZ" | head -1 | cut -d: -f1)
+    GZIP_OFFSET=$(python3 -c "
+import sys
+data = open(sys.argv[1], 'rb').read()
+idx = data.find(b'\x1f\x8b\x08')
+print(idx if idx >= 0 else '')
+" "$VMLINUZ")
     if [ -z "$GZIP_OFFSET" ]; then
-        echo "Warning: vmlinuz is neither raw ARM64 Image nor contains gzip stream"
+        echo "  Warning: vmlinuz is neither raw ARM64 Image nor contains gzip stream"
         echo "  Copying as-is — VZLinuxBootLoader may reject this kernel"
         cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
     else
-        # gunzip may report "trailing garbage" (exit 2) because the kernel
-        # image has data after the gzip stream. This is expected and harmless.
         tail -c +$((GZIP_OFFSET + 1)) "$VMLINUZ" | gunzip > "$OUTPUT_DIR/vmlinuz" 2>/dev/null || true
-        # Verify the decompressed kernel has ARM64 Image magic
         VERIFY=$(dd if="$OUTPUT_DIR/vmlinuz" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
         if [ "$VERIFY" != "41524d64" ]; then
             echo "  Warning: Decompressed kernel missing ARM64 Image magic (got: $VERIFY)"
@@ -222,30 +178,42 @@ else
     fi
 fi
 
-# --- 5b: Copy initrd (unmodified — InitrdPatcher handles agent injection at runtime) ---
-cp "$INITRD" "$OUTPUT_DIR/initrd"
+# --- 6b: Copy initrd ---
+cp "$WORK_DIR/initrd" "$OUTPUT_DIR/initrd"
 
-# --- 5c: Copy rootfs ---
+# --- 6c: Copy rootfs ---
 cp "$WORK_DIR/rootfs.img" "$OUTPUT_DIR/rootfs.img"
 
-# --- 5d: Copy guest agent binary ---
-if [ -f "$AGENT_BINARY" ]; then
-    cp "$AGENT_BINARY" "$OUTPUT_DIR/lumina-agent"
-    chmod 755 "$OUTPUT_DIR/lumina-agent"
-else
-    echo "  Warning: lumina-agent binary not found — image will not include guest agent"
-fi
+# --- 6d: Copy guest agent binary ---
+cp "$AGENT_BINARY" "$OUTPUT_DIR/lumina-agent"
+chmod 755 "$OUTPUT_DIR/lumina-agent"
 
-# --- 5e: Extract vsock + virtiofs kernel modules ---
-KVER_DIR=$(find "$BOOT_ROOT/lib/modules" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
-if [ -n "$KVER_DIR" ]; then
+# --- 6e: Extract kernel modules ---
+# Boot modules: virtio_blk, virtio_net, ext4 + deps (all =m in virt kernel)
+# Agent modules: vsock chain
+# Mount modules: fuse + virtiofs
+if [ -n "${KMOD_DIR:-}" ]; then
     mkdir -p "$OUTPUT_DIR/modules"
-    find "$KVER_DIR" \( -name "vsock*.ko*" -o -name "vmw_vsock*.ko*" -o -name "fuse.ko*" -o -name "virtiofs.ko*" \) -exec cp {} "$OUTPUT_DIR/modules/" \; 2>/dev/null
+    find "$KMOD_DIR" \( \
+        -name "virtio_blk.ko*" -o \
+        -name "virtio_net.ko*" -o \
+        -name "net_failover.ko*" -o \
+        -name "ext4.ko*" -o \
+        -name "jbd2.ko*" -o \
+        -name "mbcache.ko*" -o \
+        -name "crc16.ko*" -o \
+        -name "crc32c_generic.ko*" -o \
+        -name "libcrc32c.ko*" -o \
+        -name "vsock.ko" -o -name "vsock.ko.*" -o \
+        -name "vmw_vsock*.ko*" -o \
+        -name "fuse.ko*" -o \
+        -name "virtiofs.ko*" \
+    \) -exec cp {} "$OUTPUT_DIR/modules/" \; 2>/dev/null
     MODULE_COUNT=$(ls "$OUTPUT_DIR/modules/" 2>/dev/null | wc -l | tr -d ' ')
     if [ "$MODULE_COUNT" -gt 0 ]; then
         echo "  modules:    $(ls "$OUTPUT_DIR/modules/" | tr '\n' ' ')"
     else
-        echo "  Warning: No vsock/virtiofs kernel modules found"
+        echo "  Warning: No kernel modules found"
         rmdir "$OUTPUT_DIR/modules" 2>/dev/null
     fi
 else
