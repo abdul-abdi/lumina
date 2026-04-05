@@ -128,7 +128,7 @@ enum InitrdPatcher {
             lines += [
                 "",
                 "# Load kernel modules from initramfs overlay (in dependency order)",
-                "for m in vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz virtiofs.ko.gz; do",
+                "for m in vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz fuse.ko.gz virtiofs.ko.gz; do",
                 "  if [ -f \"/lumina-modules/$m\" ]; then",
                 "    gunzip -f \"/lumina-modules/$m\" 2>/dev/null",
                 "    insmod \"/lumina-modules/${m%.gz}\" 2>/dev/null",
