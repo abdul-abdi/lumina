@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: macos-15  # Apple Silicon runner with Swift 6
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
