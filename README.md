@@ -17,67 +17,93 @@ One function call. ~1.5s cold start. Zero host access.
 
 </div>
 
-```swift
-let result = try await Lumina.run("echo hello")
-print(result.stdout) // "hello\n"
-```
+---
+
+## Get Started
 
 ```bash
-$ lumina run "uname -a"
-Linux lumina 6.6.63-0-virt #1-Alpine aarch64 GNU/Linux
+make install                        # build from source
+lumina run "echo hello world"       # image auto-pulls on first run
 ```
+
+## Features
+
+| | Feature | Example |
+|---|---------|---------|
+| ⚡ | **Instant VMs** | ~1.5s cold start, APFS copy-on-write clones |
+| 🔒 | **Full isolation** | No host filesystem, credentials, or process access |
+| 📡 | **Live streaming** | `--stream` for real-time stdout/stderr |
+| 📁 | **File transfers** | `--copy local:remote` / `--download remote:local` |
+| 📂 | **Directory mounts** | `--mount host:guest` via virtio-fs |
+| 🔑 | **Environment vars** | `-e KEY=VAL` (repeatable) |
+| 🔄 | **Smart output** | Auto-JSON when piped, text on TTY |
+| 🧹 | **Self-cleaning** | Orphaned clones removed via signal handlers + `atexit` |
 
 ---
 
-## Install
+## Usage
+
+### CLI
 
 ```bash
-# From source
-make install
-
-# Image auto-pulls on first run, or pull manually:
-lumina pull
-```
-
-## Quick Start
-
-```bash
-lumina run "echo hello world"
+# Basics
+lumina run "echo hello"
 lumina run --stream "make build"
 lumina run --timeout 2m --memory 1GB --cpus 4 "cargo test"
 
-# Pass environment variables
+# Environment variables
 lumina run -e API_KEY=sk-123 -e DEBUG=1 "env | grep API"
 
-# Copy files into the VM, run, download results
-lumina run --copy ./input.csv:/tmp/input.csv \
-           --download /tmp/output.csv:./output.csv \
-           "python3 process.py /tmp/input.csv /tmp/output.csv"
+# File transfers
+lumina run --copy ./data.csv:/tmp/data.csv \
+           --download /tmp/results.json:./results.json \
+           "python3 process.py"
 
-# Mount a host directory (virtio-fs)
-lumina run --mount ./src:/mnt/src "ls /mnt/src"
+# Mount a host directory
+lumina run --mount ./src:/mnt/src "cat /mnt/src/README.md"
 ```
 
-## Swift Library
+<details>
+<summary><strong>Full CLI Reference</strong></summary>
 
-Two layers — pick your level of control:
+```bash
+# Execution
+lumina run <command>                          # run, print stdout
+lumina run --stream <command>                 # stream output live
+lumina run --timeout 30s <command>            # custom timeout (30s, 5m)
+lumina run --memory 1GB --cpus 4 <command>    # resource config
+lumina run -e KEY=VAL <command>               # env vars (repeatable)
+lumina run --copy local:remote <command>      # upload before exec
+lumina run --download remote:local <command>  # download after exec
+lumina run --mount host:guest <command>       # virtio-fs sharing
+
+# Output format (auto-detects: JSON when piped, text on TTY)
+lumina run --text <command>                   # force text output
+LUMINA_FORMAT=json lumina run <command>       # force JSON output
+
+# Image management
+lumina pull                                   # download default image
+lumina pull --force                           # re-download
+lumina images                                 # list cached images
+lumina clean                                  # remove orphaned clones
+lumina --version
+```
+
+</details>
+
+### Swift Library
 
 ```swift
 import Lumina
 
-// Layer 1: One-shot — boot, exec, teardown in one call
+// One-shot — boot, exec, teardown in one call
 let result = try await Lumina.run("cargo test", options: RunOptions(
     timeout: .seconds(120),
-    memory: 1024 * 1024 * 1024,  // 1GB
+    memory: 1024 * 1024 * 1024,
     cpuCount: 4,
-    env: ["CI": "true", "RUST_LOG": "debug"]
+    env: ["CI": "true"]
 ))
-
-// File transfers
-let result = try await Lumina.run("python3 /tmp/process.py", options: RunOptions(
-    uploads: [FileUpload(localPath: inputURL, remotePath: "/tmp/process.py")],
-    downloads: [FileDownload(remotePath: "/tmp/out.json", localPath: outputURL)]
-))
+print(result.stdout)
 
 // Stream output in real time
 for try await chunk in Lumina.stream("make build") {
@@ -87,47 +113,29 @@ for try await chunk in Lumina.stream("make build") {
     case .exit(let code):   print("Exit: \(code)")
     }
 }
+```
 
-// Layer 2: Lifecycle — explicit control, connection reuse
+<details>
+<summary><strong>Advanced: File Transfers, Lifecycle API, NetworkProvider</strong></summary>
+
+```swift
+// File transfers
+let result = try await Lumina.run("python3 /tmp/process.py", options: RunOptions(
+    uploads: [FileUpload(localPath: inputURL, remotePath: "/tmp/process.py")],
+    downloads: [FileDownload(remotePath: "/tmp/out.json", localPath: outputURL)]
+))
+
+// Lifecycle API — explicit control, connection reuse
 let vm = VM(options: VMOptions(cpuCount: 4))
 try await vm.boot()
 try await vm.uploadFiles([FileUpload(localPath: scriptURL, remotePath: "/tmp/run.sh")])
 let r1 = try await vm.exec("chmod +x /tmp/run.sh && /tmp/run.sh")
 try await vm.downloadFiles([FileDownload(remotePath: "/tmp/results.json", localPath: resultsURL)])
 await vm.shutdown()
+
+// Custom networking — implement the NetworkProvider protocol
+let vm = VM(options: VMOptions(networkProvider: MyCustomProvider()))
 ```
-
-<details>
-<summary><strong>CLI Reference</strong></summary>
-
-```bash
-# Execution
-lumina run <command>                          # run, print stdout
-lumina run --stream <command>                 # stream output live
-lumina run --timeout 30s <command>            # custom timeout (30s, 5m)
-lumina run --memory 1GB --cpus 4 <command>    # resource config
-
-# Environment variables
-lumina run -e KEY=VAL <command>               # pass env vars (repeatable)
-
-# File transfers
-lumina run --copy local:remote <command>      # upload file before exec
-lumina run --download remote:local <command>  # download file after exec
-lumina run --mount host:guest <command>       # virtio-fs directory sharing
-
-# Output format (auto-detects: JSON when piped, text on TTY)
-lumina run --text <command>                   # force human-readable output
-LUMINA_FORMAT=json lumina run <command>       # force JSON output
-
-# Image management
-lumina pull                                   # download default image
-lumina pull --force                           # re-download image
-lumina images                                 # list cached images
-lumina clean                                  # remove orphaned clones
-lumina --version
-```
-
-Output auto-detection: JSON when stdout is piped (`lumina run "echo hi" | jq`), human-readable text when running in a terminal. Override with `--text` or `LUMINA_FORMAT`.
 
 </details>
 
@@ -239,24 +247,26 @@ Timeout strategy: the host enforces deadlines on its side. The guest receives a 
 ## Building from Source
 
 ```bash
-# Build + codesign (required for Virtualization.framework entitlements)
-make build
-
-# Run tests
+make build               # build + codesign (entitlements required)
 make test                # unit tests
 make test-integration    # e2e tests (requires VM image)
-
-# Other targets
 make release             # optimized build + codesign
-make run ARGS="echo hi"  # build, sign, and run in one step
+make run ARGS="echo hi"  # build, sign, and run
 make clean               # remove .build/
+```
 
+<details>
+<summary><strong>Building Components Separately</strong></summary>
+
+```bash
 # Build guest agent (cross-compile Go → linux/arm64)
 cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
 # Build VM image (requires e2fsprogs: brew install e2fsprogs)
 cd Guest && sudo ./build-image.sh
 ```
+
+</details>
 
 ## Requirements
 
