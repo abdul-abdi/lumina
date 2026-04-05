@@ -159,7 +159,7 @@ sequenceDiagram
     IS-->>CLI: kernel, initrd, rootfs, agent
     CLI->>DC: create APFS COW clone
     DC-->>CLI: ephemeral rootfs copy
-    CLI->>IP: inject agent + vsock modules
+    CLI->>IP: inject agent + kernel modules
     IP-->>CLI: combined initramfs
     CLI->>VM: boot(VZVirtualMachine)
     Note over VM: Dedicated SerialExecutor
@@ -265,7 +265,7 @@ make clean               # remove .build/
 cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
 # Build VM image (requires e2fsprogs: brew install e2fsprogs)
-cd Guest && sudo ./build-image.sh
+cd Guest && bash build-image.sh
 ```
 
 </details>
