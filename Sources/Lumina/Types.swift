@@ -1,6 +1,42 @@
 // Sources/Lumina/Types.swift
 import Foundation
 
+// MARK: - File Transfer
+
+public struct FileUpload: Sendable {
+    public let localPath: URL
+    public let remotePath: String
+    public let mode: String
+
+    public init(localPath: URL, remotePath: String, mode: String = "0644") {
+        self.localPath = localPath
+        self.remotePath = remotePath
+        self.mode = mode
+    }
+}
+
+public struct FileDownload: Sendable {
+    public let remotePath: String
+    public let localPath: URL
+
+    public init(remotePath: String, localPath: URL) {
+        self.remotePath = remotePath
+        self.localPath = localPath
+    }
+}
+
+public struct MountPoint: Sendable {
+    public let hostPath: URL
+    public let guestPath: String
+    public let readOnly: Bool
+
+    public init(hostPath: URL, guestPath: String, readOnly: Bool = false) {
+        self.hostPath = hostPath
+        self.guestPath = guestPath
+        self.readOnly = readOnly
+    }
+}
+
 // MARK: - Run Options
 
 public struct RunOptions: Sendable {
@@ -9,6 +45,9 @@ public struct RunOptions: Sendable {
     public var cpuCount: Int
     public var image: String
     public var env: [String: String]
+    public var uploads: [FileUpload]
+    public var downloads: [FileDownload]
+    public var mounts: [MountPoint]
 
     public static let `default` = RunOptions()
 
@@ -17,13 +56,19 @@ public struct RunOptions: Sendable {
         memory: UInt64 = 512 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
-        env: [String: String] = [:]
+        env: [String: String] = [:],
+        uploads: [FileUpload] = [],
+        downloads: [FileDownload] = [],
+        mounts: [MountPoint] = []
     ) {
         self.timeout = timeout
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
         self.env = env
+        self.uploads = uploads
+        self.downloads = downloads
+        self.mounts = mounts
     }
 }
 
@@ -34,6 +79,7 @@ public struct VMOptions: Sendable {
     public var cpuCount: Int
     public var image: String
     public var networkProvider: any NetworkProvider
+    public var mounts: [MountPoint]
 
     public static let `default` = VMOptions()
 
@@ -41,12 +87,14 @@ public struct VMOptions: Sendable {
         memory: UInt64 = 512 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
-        networkProvider: any NetworkProvider = NATNetworkProvider()
+        networkProvider: any NetworkProvider = NATNetworkProvider(),
+        mounts: [MountPoint] = []
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
         self.networkProvider = networkProvider
+        self.mounts = mounts
     }
 
     public init(from runOptions: RunOptions) {
@@ -54,6 +102,7 @@ public struct VMOptions: Sendable {
         self.cpuCount = runOptions.cpuCount
         self.image = runOptions.image
         self.networkProvider = NATNetworkProvider()
+        self.mounts = runOptions.mounts
     }
 }
 
@@ -103,6 +152,8 @@ public enum LuminaError: Error, Sendable {
     case timeout
     case guestCrashed(serialOutput: String)
     case protocolError(String)
+    case uploadFailed(path: String, reason: String)
+    case downloadFailed(path: String, reason: String)
 }
 
 // MARK: - Parsing Helpers

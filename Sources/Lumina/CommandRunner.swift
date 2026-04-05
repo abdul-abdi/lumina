@@ -124,6 +124,8 @@ final class CommandRunner: @unchecked Sendable {
                 return RunResult(stdout: stdout, stderr: stderr, exitCode: code, wallTime: .zero)
             case .heartbeat:
                 continue
+            case .uploadAck, .uploadDone, .uploadError, .downloadData, .downloadError:
+                throw .protocolError("Unexpected file transfer message during execution")
             }
         }
 
@@ -187,6 +189,12 @@ final class CommandRunner: @unchecked Sendable {
                             return
                         case .heartbeat:
                             continue
+                        case .uploadAck, .uploadDone, .uploadError, .downloadData, .downloadError:
+                            runner.setState(.failed)
+                            continuation.finish(throwing: LuminaError.protocolError(
+                                "Unexpected file transfer message during execution"
+                            ))
+                            return
                         }
                     }
                     runner.setState(.failed)
@@ -197,6 +205,149 @@ final class CommandRunner: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    // MARK: - File Upload
+
+    /// Upload a file to the guest via the vsock protocol.
+    /// Must be called in the `ready` state (after connect, before exec).
+    /// Sends base64-encoded chunks with ACK backpressure.
+    func upload(_ file: FileUpload) throws(LuminaError) {
+        let (input, output) = try getReadyHandles()
+
+        let fileData: Data
+        do {
+            fileData = try Data(contentsOf: file.localPath)
+        } catch {
+            throw .uploadFailed(path: file.remotePath, reason: "Cannot read local file: \(error)")
+        }
+
+        // 48KB raw → ~64KB base64 encoded, fits within the 64KB message limit
+        let chunkSize = 48 * 1024
+        let totalChunks = max(1, (fileData.count + chunkSize - 1) / chunkSize)
+
+        for seq in 0..<totalChunks {
+            let start = seq * chunkSize
+            let end = min(start + chunkSize, fileData.count)
+            let chunk = fileData[start..<end]
+            let b64 = chunk.base64EncodedString()
+            let isEof = seq == totalChunks - 1
+
+            let msg = HostMessage.upload(
+                path: file.remotePath, data: b64, mode: file.mode, seq: seq, eof: isEof
+            )
+            let msgData: Data
+            do {
+                msgData = try LuminaProtocol.encode(msg)
+            } catch {
+                throw .protocolError("Failed to encode upload message: \(error)")
+            }
+            output.write(msgData)
+
+            // Wait for ACK or error
+            let response = try readGuestMessage(from: input)
+            switch response {
+            case .uploadAck(let ackSeq):
+                guard ackSeq == seq else {
+                    throw .uploadFailed(path: file.remotePath, reason: "Seq mismatch: expected \(seq), got \(ackSeq)")
+                }
+            case .uploadError(_, let errorStr):
+                throw .uploadFailed(path: file.remotePath, reason: errorStr)
+            case .heartbeat:
+                // Heartbeat during upload — re-read for the actual ACK
+                let retry = try readGuestMessage(from: input)
+                switch retry {
+                case .uploadAck(let ackSeq):
+                    guard ackSeq == seq else {
+                        throw .uploadFailed(path: file.remotePath, reason: "Seq mismatch after heartbeat")
+                    }
+                case .uploadError(_, let errorStr):
+                    throw .uploadFailed(path: file.remotePath, reason: errorStr)
+                default:
+                    throw .protocolError("Expected upload_ack, got: \(retry)")
+                }
+            default:
+                throw .protocolError("Expected upload_ack, got: \(response)")
+            }
+        }
+
+        // Wait for upload_done confirmation
+        while true {
+            let done = try readGuestMessage(from: input)
+            switch done {
+            case .uploadDone:
+                return
+            case .uploadError(_, let errorStr):
+                throw .uploadFailed(path: file.remotePath, reason: errorStr)
+            case .heartbeat:
+                continue
+            default:
+                throw .protocolError("Expected upload_done, got: \(done)")
+            }
+        }
+    }
+
+    // MARK: - File Download
+
+    /// Download a file from the guest via the vsock protocol.
+    /// Must be called in the `ready` state (after exec completes).
+    func download(_ file: FileDownload) throws(LuminaError) {
+        let (input, output) = try getReadyHandles()
+
+        let msg = HostMessage.downloadReq(path: file.remotePath)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode download_req: \(error)")
+        }
+        output.write(msgData)
+
+        // Receive chunks until eof
+        var fileData = Data()
+        var expectedSeq = 0
+        var receivedEof = false
+
+        while !receivedEof {
+            let response = try readGuestMessage(from: input)
+            switch response {
+            case .downloadData(_, let b64, let seq, let eof):
+                guard seq == expectedSeq else {
+                    throw .downloadFailed(path: file.remotePath, reason: "Seq mismatch: expected \(expectedSeq), got \(seq)")
+                }
+                guard let chunk = Data(base64Encoded: b64) else {
+                    throw .downloadFailed(path: file.remotePath, reason: "Invalid base64 in chunk \(seq)")
+                }
+                fileData.append(chunk)
+                expectedSeq += 1
+                receivedEof = eof
+            case .downloadError(_, let errorStr):
+                throw .downloadFailed(path: file.remotePath, reason: errorStr)
+            case .heartbeat:
+                continue
+            default:
+                throw .protocolError("Expected download_data, got: \(response)")
+            }
+        }
+
+        // Write to local path
+        do {
+            try fileData.write(to: file.localPath)
+        } catch {
+            throw .downloadFailed(path: file.remotePath, reason: "Cannot write local file: \(error)")
+        }
+    }
+
+    /// Get input/output handles when in `ready` state. Used by upload/download.
+    private func getReadyHandles() throws(LuminaError) -> (input: FileHandle, output: FileHandle) {
+        lock.lock()
+        guard _state == .ready, let input = _inputHandle, let output = _outputHandle else {
+            lock.unlock()
+            throw .connectionFailed
+        }
+        readBuffer = Data()
+        lock.unlock()
+        return (input, output)
     }
 
     // MARK: - Private

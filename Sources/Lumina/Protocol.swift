@@ -5,6 +5,8 @@ import Foundation
 
 public enum HostMessage: Sendable {
     case exec(cmd: String, timeout: Int, env: [String: String])
+    case upload(path: String, data: String, mode: String, seq: Int, eof: Bool)
+    case downloadReq(path: String)
 }
 
 // MARK: - Guest Messages (received from guest)
@@ -14,6 +16,11 @@ public enum GuestMessage: Sendable, Equatable {
     case output(stream: OutputStream, data: String)
     case exit(code: Int32)
     case heartbeat
+    case uploadAck(seq: Int)
+    case uploadDone(path: String)
+    case uploadError(path: String, error: String)
+    case downloadData(path: String, data: String, seq: Int, eof: Bool)
+    case downloadError(path: String, error: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -31,6 +38,10 @@ enum LuminaProtocol {
         switch message {
         case .exec(let cmd, let timeout, let env):
             dict = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+        case .upload(let path, let dataStr, let mode, let seq, let eof):
+            dict = ["type": "upload", "path": path, "data": dataStr, "mode": mode, "seq": seq, "eof": eof]
+        case .downloadReq(let path):
+            dict = ["type": "download_req", "path": path]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -63,6 +74,36 @@ enum LuminaProtocol {
             return .exit(code: Int32(code))
         case "heartbeat":
             return .heartbeat
+        case "upload_ack":
+            guard let seq = json["seq"] as? Int else {
+                throw LuminaError.protocolError("Malformed upload_ack: missing seq")
+            }
+            return .uploadAck(seq: seq)
+        case "upload_done":
+            guard let path = json["path"] as? String else {
+                throw LuminaError.protocolError("Malformed upload_done: missing path")
+            }
+            return .uploadDone(path: path)
+        case "upload_error":
+            guard let path = json["path"] as? String,
+                  let errorStr = json["error"] as? String else {
+                throw LuminaError.protocolError("Malformed upload_error: missing path/error")
+            }
+            return .uploadError(path: path, error: errorStr)
+        case "download_data":
+            guard let path = json["path"] as? String,
+                  let dataStr = json["data"] as? String,
+                  let seq = json["seq"] as? Int,
+                  let eof = json["eof"] as? Bool else {
+                throw LuminaError.protocolError("Malformed download_data: missing fields")
+            }
+            return .downloadData(path: path, data: dataStr, seq: seq, eof: eof)
+        case "download_error":
+            guard let path = json["path"] as? String,
+                  let errorStr = json["error"] as? String else {
+                throw LuminaError.protocolError("Malformed download_error: missing path/error")
+            }
+            return .downloadError(path: path, error: errorStr)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }

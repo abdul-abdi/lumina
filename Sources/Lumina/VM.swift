@@ -95,7 +95,19 @@ public actor VM {
             bootLoader.initialRamdiskURL = imagePaths.initrd
         }
 
-        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw modules=virtio_blk,virtio_net,ext4"
+        var modules = "virtio_blk,virtio_net,ext4"
+        if !options.mounts.isEmpty {
+            modules += ",virtiofs"
+        }
+        var cmdLine = "console=hvc0 root=/dev/vda rw modules=\(modules)"
+
+        // Encode mount specs as kernel param so the init script can mount them.
+        // Format: lumina_mounts=tag:path,tag:path
+        if !options.mounts.isEmpty {
+            let specs = options.mounts.enumerated().map { "lumina\($0.offset):\($0.element.guestPath)" }
+            cmdLine += " lumina_mounts=\(specs.joined(separator: ","))"
+        }
+        bootLoader.commandLine = cmdLine
         config.bootLoader = bootLoader
 
         // Disk
@@ -148,6 +160,20 @@ public actor VM {
         // vsock
         let vsockDevice = VZVirtioSocketDeviceConfiguration()
         config.socketDevices = [vsockDevice]
+
+        // Directory sharing (virtio-fs) for --mount
+        if !options.mounts.isEmpty {
+            var sharingDevices: [VZDirectorySharingDeviceConfiguration] = []
+            for (index, mount) in options.mounts.enumerated() {
+                let sharedDir = VZSharedDirectory(url: mount.hostPath, readOnly: mount.readOnly)
+                let share = VZSingleDirectoryShare(directory: sharedDir)
+                let tag = "lumina\(index)"
+                let device = VZVirtioFileSystemDeviceConfiguration(tag: tag)
+                device.share = share
+                sharingDevices.append(device)
+            }
+            config.directorySharingDevices = sharingDevices
+        }
 
         // Entropy
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
@@ -237,6 +263,46 @@ public actor VM {
     ) async -> Result<RunResult, LuminaError> {
         do {
             return .success(try await exec(command, timeout: timeout, env: env))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    // MARK: - File Transfer
+
+    /// Upload files to the guest. Must be called after boot(), before exec().
+    public func uploadFiles(_ uploads: [FileUpload]) throws(LuminaError) {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot upload from state: \(_state)"))
+        }
+        for file in uploads {
+            try runner.upload(file)
+        }
+    }
+
+    /// Download files from the guest. Must be called after exec() completes.
+    public func downloadFiles(_ downloads: [FileDownload]) throws(LuminaError) {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
+        }
+        for file in downloads {
+            try runner.download(file)
+        }
+    }
+
+    func uploadFilesResult(_ uploads: [FileUpload]) -> Result<Void, LuminaError> {
+        do {
+            try uploadFiles(uploads)
+            return .success(())
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    func downloadFilesResult(_ downloads: [FileDownload]) -> Result<Void, LuminaError> {
+        do {
+            try downloadFiles(downloads)
+            return .success(())
         } catch {
             return .failure(error)
         }

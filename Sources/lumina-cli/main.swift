@@ -95,6 +95,15 @@ struct Run: AsyncParsableCommand {
     @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
     var env: [String] = []
 
+    @Option(name: .long, help: "Copy file into VM (local:remote, repeatable)")
+    var copy: [String] = []
+
+    @Option(name: .long, help: "Download file from VM after command (remote:local, repeatable)")
+    var download: [String] = []
+
+    @Option(name: .long, help: "Mount host directory into VM (host:guest, repeatable)")
+    var mount: [String] = []
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -140,11 +149,61 @@ struct Run: AsyncParsableCommand {
             parsedEnv[key] = value
         }
 
+        var parsedUploads: [FileUpload] = []
+        for spec in copy {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'. Use local:remote format\n".utf8))
+                throw ExitCode.failure
+            }
+            let localStr = String(spec[spec.startIndex..<colonIndex])
+            let remote = String(spec[spec.index(after: colonIndex)...])
+            let localURL = URL(fileURLWithPath: localStr)
+            guard FileManager.default.fileExists(atPath: localURL.path) else {
+                FileHandle.standardError.write(Data("lumina: file not found: \(localStr)\n".utf8))
+                throw ExitCode.failure
+            }
+            // Detect executable files and set mode accordingly
+            let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
+            parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
+        }
+
+        var parsedDownloads: [FileDownload] = []
+        for spec in download {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --download '\(spec)'. Use remote:local format\n".utf8))
+                throw ExitCode.failure
+            }
+            let remote = String(spec[spec.startIndex..<colonIndex])
+            let localStr = String(spec[spec.index(after: colonIndex)...])
+            let localURL = URL(fileURLWithPath: localStr)
+            parsedDownloads.append(FileDownload(remotePath: remote, localPath: localURL))
+        }
+
+        var parsedMounts: [MountPoint] = []
+        for spec in mount {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --mount '\(spec)'. Use host:guest format\n".utf8))
+                throw ExitCode.failure
+            }
+            let hostStr = String(spec[spec.startIndex..<colonIndex])
+            let guest = String(spec[spec.index(after: colonIndex)...])
+            let hostURL = URL(fileURLWithPath: hostStr)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
+                FileHandle.standardError.write(Data("lumina: not a directory: \(hostStr)\n".utf8))
+                throw ExitCode.failure
+            }
+            parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guest))
+        }
+
         let options = RunOptions(
             timeout: parsedTimeout,
             memory: parsedMemory,
             cpuCount: cpus,
-            env: parsedEnv
+            env: parsedEnv,
+            uploads: parsedUploads,
+            downloads: parsedDownloads,
+            mounts: parsedMounts
         )
 
         let format = resolveOutputFormat(textFlag: text)
@@ -242,6 +301,10 @@ private func handleTextError(_ error: any Error, timeout: String) throws -> Neve
             FileHandle.standardError.write(Data("lumina: command timed out after \(timeout)\n".utf8))
         case .guestCrashed(let serialOutput):
             FileHandle.standardError.write(Data("lumina: guest crashed\n--- serial output ---\n\(serialOutput)\n--- end serial ---\n".utf8))
+        case .uploadFailed(let path, let reason):
+            FileHandle.standardError.write(Data("lumina: upload failed for '\(path)': \(reason)\n".utf8))
+        case .downloadFailed(let path, let reason):
+            FileHandle.standardError.write(Data("lumina: download failed for '\(path)': \(reason)\n".utf8))
         default:
             FileHandle.standardError.write(Data("lumina: \(luminaError)\n".utf8))
         }

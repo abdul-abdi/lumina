@@ -121,13 +121,14 @@ enum InitrdPatcher {
             "modprobe ext4 2>/dev/null",
         ]
 
-        // Load vsock modules before switch_root (they live in the initramfs,
-        // not on the rootfs, so modprobe won't find them after switch_root).
+        // Load vsock + virtiofs modules before switch_root (they live in the
+        // initramfs, not on the rootfs, so modprobe won't find them after
+        // switch_root).
         if hasModules {
             lines += [
                 "",
-                "# Load vsock kernel modules (in dependency order)",
-                "for m in vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz; do",
+                "# Load kernel modules from initramfs overlay (in dependency order)",
+                "for m in vsock.ko.gz vmw_vsock_virtio_transport_common.ko.gz vmw_vsock_virtio_transport.ko.gz virtiofs.ko.gz; do",
                 "  if [ -f \"/lumina-modules/$m\" ]; then",
                 "    gunzip -f \"/lumina-modules/$m\" 2>/dev/null",
                 "    insmod \"/lumina-modules/${m%.gz}\" 2>/dev/null",
@@ -211,6 +212,25 @@ enum InitrdPatcher {
             "# multi-second delays to DNS resolution.",
             "mkdir -p /etc",
             "echo \"nameserver $LUMINA_GW\" > /etc/resolv.conf",
+            "",
+            "# Mount virtio-fs shares (lumina_mounts=tag:path,tag:path from cmdline)",
+            "LUMINA_MOUNTS=",
+            "for param in $(cat /proc/cmdline); do",
+            "  case \"$param\" in",
+            "    lumina_mounts=*) LUMINA_MOUNTS=\"${param#lumina_mounts=}\" ;;",
+            "  esac",
+            "done",
+            "if [ -n \"$LUMINA_MOUNTS\" ]; then",
+            "  OLD_IFS=\"$IFS\"",
+            "  IFS=','",
+            "  for spec in $LUMINA_MOUNTS; do",
+            "    tag=\"${spec%%:*}\"",
+            "    mpath=\"${spec#*:}\"",
+            "    mkdir -p \"$mpath\"",
+            "    mount -t virtiofs \"$tag\" \"$mpath\" 2>/dev/null",
+            "  done",
+            "  IFS=\"$OLD_IFS\"",
+            "fi",
             "",
             "exec /usr/local/bin/lumina-agent",
             "INITEOF",

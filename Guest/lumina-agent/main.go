@@ -4,12 +4,15 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -36,6 +39,20 @@ type ExecRequest struct {
 	Cmd     string            `json:"cmd"`
 	Timeout int               `json:"timeout"`
 	Env     map[string]string `json:"env"`
+}
+
+type UploadMsg struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
+	Data string `json:"data"`
+	Mode string `json:"mode"`
+	Seq  int    `json:"seq"`
+	Eof  bool   `json:"eof"`
+}
+
+type DownloadReqMsg struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
 }
 
 type OutputMsg struct {
@@ -90,19 +107,48 @@ func main() {
 	scanner.Buffer(make([]byte, maxChunkSize*2), maxChunkSize*2)
 
 	for scanner.Scan() {
-		var req ExecRequest
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+		// Parse just the type field to dispatch
+		var header struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &header); err != nil {
 			fmt.Fprintf(os.Stderr, "invalid request: %v\n", err)
 			continue
 		}
 
-		if req.Type != "exec" {
-			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", req.Type)
-			continue
-		}
+		switch header.Type {
+		case "exec":
+			var req ExecRequest
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid exec request: %v\n", err)
+				continue
+			}
+			exitCode := executeCommand(conn, req)
+			sendJSON(conn, ExitMsg{Type: "exit", Code: exitCode})
 
-		exitCode := executeCommand(conn, req)
-		sendJSON(conn, ExitMsg{Type: "exit", Code: exitCode})
+		case "upload":
+			var msg UploadMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				sendJSON(conn, map[string]interface{}{
+					"type": "upload_error", "path": "", "error": err.Error(),
+				})
+				continue
+			}
+			handleUpload(conn, scanner, msg)
+
+		case "download_req":
+			var msg DownloadReqMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				sendJSON(conn, map[string]interface{}{
+					"type": "download_error", "path": "", "error": err.Error(),
+				})
+				continue
+			}
+			handleDownload(conn, msg)
+
+		default:
+			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", header.Type)
+		}
 	}
 
 	cancelHeartbeat()
@@ -181,6 +227,116 @@ func executeCommand(conn net.Conn, req ExecRequest) int {
 		return 1
 	}
 	return 0
+}
+
+func handleUpload(conn net.Conn, scanner *bufio.Scanner, first UploadMsg) {
+	// Ensure parent directory exists
+	dir := filepath.Dir(first.Path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		sendJSON(conn, map[string]interface{}{
+			"type": "upload_error", "path": first.Path, "error": err.Error(),
+		})
+		return
+	}
+
+	// Create/truncate the file
+	f, err := os.Create(first.Path)
+	if err != nil {
+		sendJSON(conn, map[string]interface{}{
+			"type": "upload_error", "path": first.Path, "error": err.Error(),
+		})
+		return
+	}
+	defer f.Close()
+
+	// Write first chunk
+	chunk, err := base64.StdEncoding.DecodeString(first.Data)
+	if err != nil {
+		sendJSON(conn, map[string]interface{}{
+			"type": "upload_error", "path": first.Path, "error": "base64 decode: " + err.Error(),
+		})
+		return
+	}
+	if _, err := f.Write(chunk); err != nil {
+		sendJSON(conn, map[string]interface{}{
+			"type": "upload_error", "path": first.Path, "error": err.Error(),
+		})
+		return
+	}
+	sendJSON(conn, map[string]interface{}{"type": "upload_ack", "seq": first.Seq})
+
+	// Read remaining chunks if not EOF
+	if !first.Eof {
+		for scanner.Scan() {
+			var msg UploadMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				sendJSON(conn, map[string]interface{}{
+					"type": "upload_error", "path": first.Path, "error": err.Error(),
+				})
+				return
+			}
+			// Skip heartbeat-like messages during upload
+			if msg.Type != "upload" {
+				continue
+			}
+
+			chunk, err := base64.StdEncoding.DecodeString(msg.Data)
+			if err != nil {
+				sendJSON(conn, map[string]interface{}{
+					"type": "upload_error", "path": first.Path, "error": "base64 decode: " + err.Error(),
+				})
+				return
+			}
+			if _, err := f.Write(chunk); err != nil {
+				sendJSON(conn, map[string]interface{}{
+					"type": "upload_error", "path": first.Path, "error": err.Error(),
+				})
+				return
+			}
+			sendJSON(conn, map[string]interface{}{"type": "upload_ack", "seq": msg.Seq})
+
+			if msg.Eof {
+				break
+			}
+		}
+	}
+
+	// Set file permissions
+	if first.Mode != "" {
+		mode, err := strconv.ParseUint(first.Mode, 8, 32)
+		if err == nil {
+			os.Chmod(first.Path, os.FileMode(mode))
+		}
+	}
+
+	sendJSON(conn, map[string]interface{}{"type": "upload_done", "path": first.Path})
+}
+
+func handleDownload(conn net.Conn, req DownloadReqMsg) {
+	data, err := os.ReadFile(req.Path)
+	if err != nil {
+		sendJSON(conn, map[string]interface{}{
+			"type": "download_error", "path": req.Path, "error": err.Error(),
+		})
+		return
+	}
+
+	// Send in 48KB raw chunks (~64KB base64)
+	const chunkSize = 48 * 1024
+	seq := 0
+	for offset := 0; offset < len(data) || seq == 0; offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[offset:end]
+		b64 := base64.StdEncoding.EncodeToString(chunk)
+		eof := end >= len(data)
+		sendJSON(conn, map[string]interface{}{
+			"type": "download_data", "path": req.Path, "data": b64, "seq": seq, "eof": eof,
+		})
+		seq++
+	}
 }
 
 func streamPipe(conn net.Conn, stream string, pipe io.ReadCloser) {

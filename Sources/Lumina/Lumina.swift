@@ -19,9 +19,19 @@ public struct Lumina {
                 throw LuminaError.timeout
             }
 
+            // Upload files before exec
+            if !options.uploads.isEmpty {
+                try await vm.uploadFilesResult(options.uploads).get()
+            }
+
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
             let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env).get()
+
+            // Download files after exec
+            if !options.downloads.isEmpty {
+                try await vm.downloadFilesResult(options.downloads).get()
+            }
 
             let totalWallTime = ContinuousClock.now - start
             return RunResult(
@@ -50,6 +60,12 @@ public struct Lumina {
                         guard elapsed < options.timeout else {
                             throw LuminaError.timeout
                         }
+
+                        // Upload files before exec
+                        if !options.uploads.isEmpty {
+                            try await vm.uploadFilesResult(options.uploads).get()
+                        }
+
                         let remaining = options.timeout - elapsed
                         let remainingSeconds = max(Int(remaining.components.seconds), 1)
 
@@ -57,6 +73,12 @@ public struct Lumina {
                         for try await chunk in chunks {
                             continuation.yield(chunk)
                         }
+
+                        // Download files after stream completes
+                        if !options.downloads.isEmpty {
+                            try await vm.downloadFilesResult(options.downloads).get()
+                        }
+
                         continuation.finish()
                     }
                 } catch {

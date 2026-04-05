@@ -236,16 +236,16 @@ else
     echo "  Warning: lumina-agent binary not found — image will not include guest agent"
 fi
 
-# --- 5e: Extract vsock kernel modules ---
+# --- 5e: Extract vsock + virtiofs kernel modules ---
 KVER_DIR=$(find "$BOOT_ROOT/lib/modules" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
 if [ -n "$KVER_DIR" ]; then
     mkdir -p "$OUTPUT_DIR/modules"
-    find "$KVER_DIR" \( -name "vsock*.ko*" -o -name "vmw_vsock*.ko*" \) -exec cp {} "$OUTPUT_DIR/modules/" \; 2>/dev/null
+    find "$KVER_DIR" \( -name "vsock*.ko*" -o -name "vmw_vsock*.ko*" -o -name "virtiofs.ko*" \) -exec cp {} "$OUTPUT_DIR/modules/" \; 2>/dev/null
     MODULE_COUNT=$(ls "$OUTPUT_DIR/modules/" 2>/dev/null | wc -l | tr -d ' ')
     if [ "$MODULE_COUNT" -gt 0 ]; then
         echo "  modules:    $(ls "$OUTPUT_DIR/modules/" | tr '\n' ' ')"
     else
-        echo "  Warning: No vsock kernel modules found"
+        echo "  Warning: No vsock/virtiofs kernel modules found"
         rmdir "$OUTPUT_DIR/modules" 2>/dev/null
     fi
 else
