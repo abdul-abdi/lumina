@@ -211,7 +211,9 @@ else
         echo "  Copying as-is — VZLinuxBootLoader may reject this kernel"
         cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
     else
-        tail -c +$((GZIP_OFFSET + 1)) "$VMLINUZ" | gunzip > "$OUTPUT_DIR/vmlinuz"
+        # gunzip may report "trailing garbage" (exit 2) because the kernel
+        # image has data after the gzip stream. This is expected and harmless.
+        tail -c +$((GZIP_OFFSET + 1)) "$VMLINUZ" | gunzip > "$OUTPUT_DIR/vmlinuz" 2>/dev/null || true
         # Verify the decompressed kernel has ARM64 Image magic
         VERIFY=$(dd if="$OUTPUT_DIR/vmlinuz" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
         if [ "$VERIFY" != "41524d64" ]; then
