@@ -101,12 +101,12 @@ echo "--- Step 3: Creating minimal initrd ---"
 INITRD_DIR="$WORK_DIR/initrd-root"
 mkdir -p "$INITRD_DIR"/{bin,lib,proc,sys,dev,tmp,sysroot}
 # Busybox is dynamically linked against musl — include the dynamic linker
-tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" bin/busybox lib/ld-musl-aarch64.so.1
+tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" ./bin/busybox ./lib/ld-musl-aarch64.so.1
 chmod 755 "$INITRD_DIR/bin/busybox"
 # ld-musl-aarch64.so.1 may be a symlink to libc.musl-*.so.1 — resolve it
 if [ -L "$INITRD_DIR/lib/ld-musl-aarch64.so.1" ]; then
     LIBC_TARGET=$(readlink "$INITRD_DIR/lib/ld-musl-aarch64.so.1")
-    tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" "lib/$LIBC_TARGET"
+    tar xzf "$WORK_DIR/$MINIROOTFS" -C "$INITRD_DIR" "./lib/$LIBC_TARGET"
 fi
 (cd "$INITRD_DIR" && ln -s busybox bin/sh)
 
