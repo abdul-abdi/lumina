@@ -8,6 +8,7 @@ public struct RunOptions: Sendable {
     public var memory: UInt64
     public var cpuCount: Int
     public var image: String
+    public var env: [String: String]
 
     public static let `default` = RunOptions()
 
@@ -15,12 +16,14 @@ public struct RunOptions: Sendable {
         timeout: Duration = .seconds(60),
         memory: UInt64 = 512 * 1024 * 1024,
         cpuCount: Int = 2,
-        image: String = "default"
+        image: String = "default",
+        env: [String: String] = [:]
     ) {
         self.timeout = timeout
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
+        self.env = env
     }
 }
 
@@ -30,23 +33,27 @@ public struct VMOptions: Sendable {
     public var memory: UInt64
     public var cpuCount: Int
     public var image: String
+    public var networkProvider: any NetworkProvider
 
     public static let `default` = VMOptions()
 
     public init(
         memory: UInt64 = 512 * 1024 * 1024,
         cpuCount: Int = 2,
-        image: String = "default"
+        image: String = "default",
+        networkProvider: any NetworkProvider = NATNetworkProvider()
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
+        self.networkProvider = networkProvider
     }
 
     public init(from runOptions: RunOptions) {
         self.memory = runOptions.memory
         self.cpuCount = runOptions.cpuCount
         self.image = runOptions.image
+        self.networkProvider = NATNetworkProvider()
     }
 }
 

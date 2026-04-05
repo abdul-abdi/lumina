@@ -11,9 +11,6 @@ private func installSignalHandlers() {
     for sig: Int32 in [SIGINT, SIGTERM] {
         var action = sigaction()
         action.__sigaction_u.__sa_handler = { signum in
-            // Remove clones owned by this process. cleanOrphans() would skip
-            // them because our process is still alive during the handler.
-            // Delete PID files first so cleanOrphans sees them as orphans.
             let pid = "\(getpid())"
             let runsDir = DiskClone.defaultRunsDir
             if let entries = try? FileManager.default.contentsOfDirectory(
@@ -27,7 +24,6 @@ private func installSignalHandlers() {
                     }
                 }
             }
-            // Restore default and re-raise so parent gets correct exit status
             signal(signum, SIG_DFL)
             raise(signum)
         }
@@ -35,6 +31,32 @@ private func installSignalHandlers() {
         action.sa_flags = 0
         sigaction(sig, &action, nil)
     }
+}
+
+// MARK: - Output Format
+
+/// Determine output format: JSON (for agents/pipes) or text (for humans/TTYs).
+/// Priority: LUMINA_FORMAT env > --text flag > isatty() auto-detection.
+private enum OutputFormat {
+    case json
+    case text
+}
+
+private func resolveOutputFormat(textFlag: Bool) -> OutputFormat {
+    // 1. LUMINA_FORMAT env var takes highest priority
+    if let envFormat = ProcessInfo.processInfo.environment["LUMINA_FORMAT"]?.lowercased() {
+        switch envFormat {
+        case "json": return .json
+        case "text", "human": return .text
+        default: break
+        }
+    }
+
+    // 2. --text flag explicitly requests human-readable
+    if textFlag { return .text }
+
+    // 3. Auto-detect: TTY → text, pipe → JSON
+    return isatty(STDOUT_FILENO) != 0 ? .text : .json
 }
 
 @main
@@ -55,8 +77,11 @@ struct Run: AsyncParsableCommand {
     @Argument(help: "Command to run in the VM")
     var command: String
 
-    @Flag(name: .long, help: "Stream stdout/stderr in real time")
+    @Flag(name: .long, help: "Stream output in real time (NDJSON when piped, raw when TTY)")
     var stream = false
+
+    @Flag(name: .long, help: "Force human-readable text output (default when TTY)")
+    var text = false
 
     @Option(name: .long, help: "Timeout (e.g. 30s, 5m)")
     var timeout: String = "60s"
@@ -67,9 +92,10 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Number of CPU cores")
     var cpus: Int = 2
 
+    @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
+    var env: [String] = []
+
     func run() async throws {
-        // sigaction covers SIGINT/SIGTERM, atexit covers normal exit.
-        // SIGKILL is uncatchable — orphans from that are cleaned at next VM boot.
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
 
@@ -103,54 +129,113 @@ struct Run: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
+        var parsedEnv: [String: String] = [:]
+        for pair in env {
+            guard let eqIndex = pair.firstIndex(of: "=") else {
+                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL format\n".utf8))
+                throw ExitCode.failure
+            }
+            let key = String(pair[pair.startIndex..<eqIndex])
+            let value = String(pair[pair.index(after: eqIndex)...])
+            parsedEnv[key] = value
+        }
+
         let options = RunOptions(
             timeout: parsedTimeout,
             memory: parsedMemory,
-            cpuCount: cpus
+            cpuCount: cpus,
+            env: parsedEnv
         )
 
+        let format = resolveOutputFormat(textFlag: text)
+
         if stream {
-            do {
-                let chunks = Lumina.stream(command, options: options)
-                for try await chunk in chunks {
+            try await runStreaming(options: options, format: format)
+        } else {
+            try await runBuffered(options: options, format: format)
+        }
+    }
+
+    // MARK: - Buffered (non-streaming)
+
+    private func runBuffered(options: RunOptions, format: OutputFormat) async throws {
+        let start = ContinuousClock.now
+        do {
+            let result = try await Lumina.run(command, options: options)
+            let ms = millisSince(start)
+            switch format {
+            case .json:
+                printResultJSON(result, durationMs: ms)
+            case .text:
+                print(result.stdout, terminator: "")
+                if !result.stderr.isEmpty {
+                    FileHandle.standardError.write(Data(result.stderr.utf8))
+                }
+            }
+            if !result.success {
+                throw ExitCode(result.exitCode)
+            }
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            let ms = millisSince(start)
+            switch format {
+            case .json:
+                printErrorJSON(error, durationMs: ms)
+            case .text:
+                try handleTextError(error, timeout: timeout)
+            }
+            throw ExitCode.failure
+        }
+    }
+
+    // MARK: - Streaming
+
+    private func runStreaming(options: RunOptions, format: OutputFormat) async throws {
+        let start = ContinuousClock.now
+        do {
+            let chunks = Lumina.stream(command, options: options)
+            for try await chunk in chunks {
+                switch format {
+                case .json:
+                    // NDJSON: one JSON object per line
+                    switch chunk {
+                    case .stdout(let data):
+                        printNDJSON(["stream": "stdout", "data": data])
+                    case .stderr(let data):
+                        printNDJSON(["stream": "stderr", "data": data])
+                    case .exit(let code):
+                        printNDJSON(["exit_code": Int(code), "duration_ms": millisSince(start)])
+                        if code != 0 { throw ExitCode(code) }
+                    }
+                case .text:
                     switch chunk {
                     case .stdout(let data):
                         print(data, terminator: "")
                     case .stderr(let data):
                         FileHandle.standardError.write(Data(data.utf8))
                     case .exit(let code):
-                        if code != 0 {
-                            throw ExitCode(code)
-                        }
+                        if code != 0 { throw ExitCode(code) }
                     }
                 }
-            } catch {
-                try handleRunError(error, timeout: timeout)
             }
-        } else {
-            do {
-                let result = try await Lumina.run(command, options: options)
-                print(result.stdout, terminator: "")
-                if !result.stderr.isEmpty {
-                    FileHandle.standardError.write(Data(result.stderr.utf8))
-                }
-                if !result.success {
-                    throw ExitCode(result.exitCode)
-                }
-            } catch {
-                try handleRunError(error, timeout: timeout)
+        } catch let exitCode as ExitCode {
+            throw exitCode
+        } catch {
+            switch format {
+            case .json:
+                printNDJSON(["error": String(describing: error), "duration_ms": millisSince(start)])
+            case .text:
+                try handleTextError(error, timeout: timeout)
             }
+            throw ExitCode.failure
         }
     }
 }
 
-// MARK: - Error Handling
+// MARK: - Error Handling (text mode)
 
-/// Shared error handler for both streaming and non-streaming paths.
-/// Handles LuminaError with specific messages, passes through ExitCode,
-/// and catches anything else (including typed-throws that lost their type
-/// crossing actor boundaries) with a generic message.
-private func handleRunError(_ error: any Error, timeout: String) throws -> Never {
+private func handleTextError(_ error: any Error, timeout: String) throws -> Never {
     if let luminaError = error as? LuminaError {
         switch luminaError {
         case .timeout:
@@ -166,6 +251,59 @@ private func handleRunError(_ error: any Error, timeout: String) throws -> Never
         FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
     }
     throw ExitCode.failure
+}
+
+// MARK: - JSON Output
+
+private struct ResultJSON: Encodable {
+    var stdout: String?
+    var stderr: String?
+    var exit_code: Int?
+    var error: String?
+    var duration_ms: Int
+}
+
+private func printResultJSON(_ result: RunResult, durationMs: Int) {
+    let r = ResultJSON(
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: Int(result.exitCode),
+        duration_ms: durationMs
+    )
+    encodeAndPrint(r)
+}
+
+private func printErrorJSON(_ error: any Error, durationMs: Int) {
+    let r = ResultJSON(error: String(describing: error), duration_ms: durationMs)
+    encodeAndPrint(r)
+}
+
+/// Print an NDJSON line (used for streaming output).
+private func printNDJSON(_ dict: [String: Any]) {
+    // Use JSONSerialization for heterogeneous dicts, then ensure no literal newlines
+    guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .fragmentsAllowed]),
+          var str = String(data: data, encoding: .utf8) else { return }
+    // JSONSerialization doesn't escape newlines in string values — replace them
+    str = str.replacingOccurrences(of: "\n", with: "\\n")
+    str = str.replacingOccurrences(of: "\r", with: "\\r")
+    str = str.replacingOccurrences(of: "\t", with: "\\t")
+    print(str)
+    // Flush stdout for real-time streaming
+    fflush(stdout)
+}
+
+private func encodeAndPrint<T: Encodable>(_ value: T) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    if let data = try? encoder.encode(value),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+}
+
+private func millisSince(_ start: ContinuousClock.Instant) -> Int {
+    let elapsed = ContinuousClock.now - start
+    return Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
 }
 
 // MARK: - Pull
@@ -185,7 +323,6 @@ struct Pull: AsyncParsableCommand {
         }
 
         if puller.imageExists() && force {
-            // Remove existing image before re-pulling
             ImageStore().clean(name: "default")
         }
 
@@ -212,9 +349,7 @@ struct Images: ParsableCommand {
         if names.isEmpty {
             print("No images found. Run 'lumina pull' first.")
         } else {
-            for name in names {
-                print(name)
-            }
+            for name in names { print(name) }
         }
     }
 }

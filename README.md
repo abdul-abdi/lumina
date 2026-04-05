@@ -2,34 +2,54 @@
 
 **Native Apple Workload Runtime for Agents** — `subprocess.run()` for virtual machines.
 
-Lumina is a lightweight Swift CLI and library that wraps Apple's Virtualization.framework to provide instant, disposable VMs on Mac. One function call boots a minimal Linux VM, runs your command, captures output, and tears everything down.
+[![CI](https://github.com/abdul-abdi/lumina/actions/workflows/ci.yml/badge.svg)](https://github.com/abdul-abdi/lumina/actions/workflows/ci.yml)
+[![Swift 6](https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white)](https://swift.org)
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B%20Sonoma-000?logo=apple)](https://developer.apple.com/macos/)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-333)](https://support.apple.com/en-us/116943)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Quick Start
+Boot a disposable Linux VM, run a command, get the output. One function call. ~1.5s cold start. Zero host access.
+
+![demo](demo.gif)
+
+```swift
+let result = try await Lumina.run("echo hello")
+print(result.stdout) // "hello\n"
+```
 
 ```bash
-# Install from source
+$ lumina run "uname -a"
+Linux lumina 6.6.63-0-virt #1-Alpine aarch64 GNU/Linux
+```
+
+---
+
+## Install
+
+```bash
+# From source
 make install
 
 # Pull the pre-built Alpine image (~50MB)
 lumina pull
+```
 
-# Run a command in a disposable VM
+## Quick Start
+
+```bash
 lumina run "echo hello world"
-lumina run --timeout 30s "pip install numpy && python -c 'import numpy; print(numpy.__version__)'"
 lumina run --stream "make build"
+lumina run --timeout 2m --memory 1GB --cpus 4 "cargo test"
 ```
 
 ## Swift Library
 
+Two layers — pick your level of control:
+
 ```swift
 import Lumina
 
-// Simple — one function call
-let result = try await Lumina.run("echo hello")
-print(result.stdout)  // "hello\n"
-print(result.success) // true
-
-// With options
+// Layer 1: One-shot — boot, exec, teardown in one call
 let result = try await Lumina.run("cargo test", options: RunOptions(
     timeout: .seconds(120),
     memory: 1024 * 1024 * 1024,  // 1GB
@@ -41,11 +61,11 @@ for try await chunk in Lumina.stream("make build") {
     switch chunk {
     case .stdout(let text): print(text, terminator: "")
     case .stderr(let text): print(text, terminator: "", to: &stderr)
-    case .exit(let code): print("Exit: \(code)")
+    case .exit(let code):   print("Exit: \(code)")
     }
 }
 
-// Explicit VM lifecycle (connection reuse)
+// Layer 2: Lifecycle — explicit control, connection reuse
 let vm = VM(options: VMOptions(cpuCount: 4))
 try await vm.boot()
 let r1 = try await vm.exec("apt-get install -y python3")
@@ -53,88 +73,137 @@ let r2 = try await vm.exec("python3 script.py")
 await vm.shutdown()
 ```
 
-## CLI
+<details>
+<summary><strong>CLI Reference</strong></summary>
 
 ```bash
-lumina run "echo hello"                      # run, print stdout
-lumina run --stream "make build"             # stream output live
-lumina run --timeout 30s "pip install numpy" # custom timeout
-lumina run --memory 1GB --cpus 4 "cargo test" # resource config
+lumina run <command>                          # run, print stdout
+lumina run --stream <command>                 # stream output live
+lumina run --timeout 30s <command>            # custom timeout (30s, 5m)
+lumina run --memory 1GB --cpus 4 <command>    # resource config
 
-lumina pull                                  # download default image
-lumina pull --force                          # re-download image
-lumina images                                # list cached images
-lumina clean                                 # remove orphaned clones
+lumina pull                                   # download default image
+lumina pull --force                           # re-download image
+lumina images                                 # list cached images
+lumina clean                                  # remove orphaned clones
 lumina --version
+```
+
+</details>
+
+---
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A["lumina run &#34;cmd&#34;"] --> B[ImageStore]
+    B -->|resolve| C[DiskClone]
+    C -->|APFS COW clone| D[InitrdPatcher]
+    D -->|inject agent + modules| E[VM Actor]
+    E -->|VZVirtualMachine| F[CommandRunner]
+    F -->|vsock:1024| G[Guest Agent]
+    G -->|stream output| F
+    F -->|RunResult| A
+
+    style A fill:#1a1a2e,stroke:#e94560,color:#fff
+    style B fill:#16213e,stroke:#0f3460,color:#fff
+    style C fill:#16213e,stroke:#0f3460,color:#fff
+    style D fill:#16213e,stroke:#0f3460,color:#fff
+    style E fill:#1a1a2e,stroke:#0f3460,color:#fff
+    style F fill:#16213e,stroke:#0f3460,color:#fff
+    style G fill:#1a1a2e,stroke:#16213e,color:#fff
+```
+
+1. **ImageStore** resolves `~/.lumina/images/default/` — kernel, initrd, rootfs, agent binary
+2. **DiskClone** creates an APFS copy-on-write clone (instant, near-zero disk cost)
+3. **InitrdPatcher** builds a concatenated initramfs — injects the guest agent + vsock kernel modules via cpio newc overlay
+4. **VM actor** boots `VZVirtualMachine` on a dedicated `SerialExecutor` (thread-affinity guarantee)
+5. **CommandRunner** connects over virtio-socket, waits for the `ready` handshake
+6. **Guest agent** (Go, linux/arm64) executes commands in process groups, streams chunked output
+7. VM shuts down, clone deleted — every run is fully isolated
+
+<details>
+<summary><strong>Guest Agent Protocol</strong></summary>
+
+Newline-delimited JSON over virtio-socket (port 1024, max 64KB per message):
+
+```mermaid
+sequenceDiagram
+    participant H as Host (CommandRunner)
+    participant G as Guest (lumina-agent)
+
+    G->>H: {"type":"ready"}
+    H->>G: {"type":"exec","cmd":"...","timeout":N,"env":{}}
+    loop streaming
+        G->>H: {"type":"output","stream":"stdout","data":"..."}
+        G->>H: {"type":"output","stream":"stderr","data":"..."}
+    end
+    G->>H: {"type":"exit","code":0}
+    Note over G,H: Connection supports reuse — send another exec
+    loop idle
+        G-->>H: {"type":"heartbeat"} (every 5s)
+    end
+```
+
+Timeout strategy: the host enforces deadlines on its side. The guest receives a safety-net timeout at 3x the host value — loose enough to never race, tight enough to clean up if the host crashes.
+
+</details>
+
+<details>
+<summary><strong>Architecture Deep Dive</strong></summary>
+
+### Two-Layer API
+
+| Layer | Entry Point | Use Case |
+|-------|------------|----------|
+| **Convenience** | `Lumina.run()` / `Lumina.stream()` | One-shot commands. `withVM` scope handles full lifecycle. |
+| **Lifecycle** | `VM` actor | Multi-command sessions. Explicit `boot()`, `exec()`, `shutdown()`. |
+
+### Internal Components
+
+| Component | Role | Key Detail |
+|-----------|------|------------|
+| **VM** | Actor wrapping `VZVirtualMachine` | Custom `VMExecutor` (SerialExecutor) pins all VZ calls to a dedicated DispatchQueue |
+| **CommandRunner** | vsock protocol + state machine | `ConnectionState` enum with explicit transitions, NSLock for thread safety |
+| **InitrdPatcher** | Initramfs injection | Builds cpio newc archives, concatenates with base initrd — Linux extracts both |
+| **DiskClone** | Per-run ephemeral COW clones | PID file–based orphan detection; cleanup via `atexit` + signal handlers |
+| **ImageStore** | Long-lived image cache | Resolves kernel + initrd + rootfs + optional agent + optional kernel modules |
+| **SerialConsole** | Serial output capture | Reads `hvc0` for crash diagnostics; surfaced in `LuminaError.guestCrashed` |
+
+### Design Constraints
+
+- Zero shared mutable state between concurrent runs
+- Zero external Swift dependencies (library target) — only `Virtualization.framework`
+- All public types are `Sendable`
+- Guest agent uses raw `AF_VSOCK` syscalls (Go's `net` doesn't support vsock)
+
+</details>
+
+---
+
+## Building from Source
+
+```bash
+# Build + codesign (required for Virtualization.framework entitlements)
+make build
+
+# Run tests
+make test                # unit tests
+make test-integration    # e2e tests (requires VM image)
+
+# Build guest agent (cross-compile Go → linux/arm64)
+cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
+
+# Build VM image (requires e2fsprogs: brew install e2fsprogs)
+cd Guest && sudo ./build-image.sh
 ```
 
 ## Requirements
 
 - macOS 14+ (Sonoma)
 - Apple Silicon (M1/M2/M3/M4)
-- Go 1.21+ (to build guest agent from source)
-
-## How It Works
-
-1. Creates an APFS copy-on-write clone of a minimal Alpine Linux image (~50MB)
-2. Boots a VM via Apple's Virtualization.framework (~1.5s)
-3. Injects a guest agent + vsock kernel modules into the initramfs at boot time
-4. Connects to the guest agent over virtio-socket (port 1024)
-5. Sends your command, streams stdout/stderr back in real time
-6. Tears down the VM and deletes the clone
-
-Every run is fully isolated. The VM has no access to your host filesystem, credentials, or other processes.
-
-## Architecture
-
-```
-lumina run "echo hello"
-  → ImageStore resolves ~/.lumina/images/default/
-  → DiskClone creates APFS COW clone of rootfs.img
-  → InitrdPatcher injects agent + modules into initramfs
-  → VM actor boots VZVirtualMachine (custom SerialExecutor)
-  → CommandRunner connects via vsock, gets "ready" handshake
-  → Sends exec message, streams output chunks, gets exit code
-  → VM shuts down, clone deleted
-```
-
-Two-layer API:
-- **Layer 1 (Convenience):** `Lumina.run()` / `Lumina.stream()` — boot, exec, teardown in one call
-- **Layer 2 (Lifecycle):** `VM` actor — explicit `boot()`, `exec()`, `shutdown()` for multi-command sessions
-
-### Guest Agent Protocol
-
-Newline-delimited JSON over virtio-socket (port 1024):
-
-| Direction | Message |
-|-----------|---------|
-| Guest → Host | `{"type":"ready"}` |
-| Host → Guest | `{"type":"exec","cmd":"...","timeout":N,"env":{}}` |
-| Guest → Host | `{"type":"output","stream":"stdout\|stderr","data":"..."}` |
-| Guest → Host | `{"type":"exit","code":N}` |
-| Guest → Host | `{"type":"heartbeat"}` (every 5s when idle) |
-
-The guest agent supports connection reuse — multiple exec commands on a single connection.
-
-## Building from Source
-
-```bash
-# Build + codesign (debug)
-make build
-
-# Build guest agent (cross-compile Go for linux/arm64)
-cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
-
-# Build VM image (requires Docker on macOS)
-cd Guest && bash build-image.sh
-
-# Run tests
-make test              # unit tests (25)
-make test-integration  # e2e tests (4, requires VM image)
-
-# Install to /usr/local/bin
-make install
-```
+- Go 1.21+ (guest agent build only)
 
 ## License
 

@@ -95,7 +95,7 @@ public actor VM {
             bootLoader.initialRamdiskURL = imagePaths.initrd
         }
 
-        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw modules=virtio_blk,ext4"
+        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw modules=virtio_blk,virtio_net,ext4"
         config.bootLoader = bootLoader
 
         // Disk
@@ -134,9 +134,15 @@ public actor VM {
             }
         }
 
-        // Network
+        // Network (pluggable via NetworkProvider protocol)
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
-        networkDevice.attachment = VZNATNetworkDeviceAttachment()
+        do {
+            networkDevice.attachment = try options.networkProvider.createAttachment()
+        } catch {
+            clone?.remove()
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
         config.networkDevices = [networkDevice]
 
         // vsock
