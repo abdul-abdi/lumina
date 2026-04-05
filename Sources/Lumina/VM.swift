@@ -209,6 +209,33 @@ public actor VM {
         _state = .ready
     }
 
+    // MARK: - Internal Result API
+    // Used by Lumina.swift to avoid typed-throws boxing across actor boundaries.
+    // Swift 6 can lose the concrete LuminaError type when errors cross from a
+    // custom-executor actor back to the caller. Catching inside the actor and
+    // returning Result preserves the type as a value.
+
+    func bootResult() async -> Result<Void, LuminaError> {
+        do {
+            try await boot()
+            return .success(())
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    func execResult(
+        _ command: String,
+        timeout: Int = 60,
+        env: [String: String] = [:]
+    ) async -> Result<RunResult, LuminaError> {
+        do {
+            return .success(try await exec(command, timeout: timeout, env: env))
+        } catch {
+            return .failure(error)
+        }
+    }
+
     public func exec(
         _ command: String,
         timeout: Int = 60,

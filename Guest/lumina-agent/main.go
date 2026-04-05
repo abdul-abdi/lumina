@@ -80,7 +80,8 @@ func main() {
 	// Send ready message
 	sendJSON(conn, ReadyMsg{Type: "ready"})
 
-	// Start heartbeat — paused during command execution
+	// Start heartbeat — runs continuously, including during command execution,
+	// so the host can check its deadline between heartbeats.
 	ctx, cancelHeartbeat := context.WithCancel(context.Background())
 	go heartbeat(ctx, conn)
 
@@ -100,15 +101,8 @@ func main() {
 			continue
 		}
 
-		// Pause heartbeat during execution
-		cancelHeartbeat()
-
 		exitCode := executeCommand(conn, req)
 		sendJSON(conn, ExitMsg{Type: "exit", Code: exitCode})
-
-		// Resume heartbeat
-		ctx, cancelHeartbeat = context.WithCancel(context.Background())
-		go heartbeat(ctx, conn)
 	}
 
 	cancelHeartbeat()

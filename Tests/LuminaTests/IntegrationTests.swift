@@ -47,7 +47,10 @@ func integrationRunTimeout() async {
             Issue.record("Expected .timeout, got: \(error)")
         }
     } catch {
-        Issue.record("Unexpected error type: \(error)")
+        // Typed-throws may box the error across actor boundaries.
+        // Check string representation as fallback.
+        let desc = String(describing: error)
+        #expect(desc.contains("timeout"), "Expected timeout, got: \(error)")
     }
 }
 

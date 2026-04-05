@@ -229,6 +229,11 @@ final class CommandRunner: @unchecked Sendable {
     ///
     /// The check-and-transition is atomic under a single lock acquisition
     /// to prevent TOCTOU races if exec is called concurrently.
+    ///
+    /// Timeout enforcement is handled on the host side (the deadline loop in
+    /// `exec()` / `execStream()`). The guest receives a safety-net timeout at
+    /// 2x the host value — loose enough to never race with the host, tight
+    /// enough to clean up if the host crashes or the vsock connection drops.
     private func beginExec(
         command: String, timeout: Int, env: [String: String]
     ) throws(LuminaError) -> (input: FileHandle, output: FileHandle) {
@@ -241,7 +246,11 @@ final class CommandRunner: @unchecked Sendable {
         readBuffer = Data()
         lock.unlock()
 
-        let execMsg = HostMessage.exec(cmd: command, timeout: timeout, env: env)
+        // Safety net: guest timeout must be well beyond host deadline + heartbeat interval
+        // so the host always detects the timeout first. Minimum 30s to handle short timeouts
+        // where 2x would still race with the 5s heartbeat cadence.
+        let guestTimeout = max(timeout * 3, 30)
+        let execMsg = HostMessage.exec(cmd: command, timeout: guestTimeout, env: env)
         let msgData: Data
         do {
             msgData = try LuminaProtocol.encode(execMsg)

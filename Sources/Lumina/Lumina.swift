@@ -4,39 +4,33 @@ import Foundation
 public struct Lumina {
     /// Run a command in a disposable VM, return result when complete.
     /// The VM is created, booted, used, and destroyed automatically.
+    /// Throws `LuminaError` on failure.
     public static func run(
         _ command: String,
         options: RunOptions = .default
-    ) async throws(LuminaError) -> RunResult {
-        let vmOptions = VMOptions(from: options)
-        let vm = VM(options: vmOptions)
+    ) async throws -> RunResult {
+        try await withVM(options: options) { vm in
+            let start = ContinuousClock.now
 
-        let start = ContinuousClock.now
+            try await vm.bootResult().get()
 
-        // Ensure shutdown on all paths
-        defer { Task { await vm.shutdown() } }
+            let elapsed = ContinuousClock.now - start
+            guard elapsed < options.timeout else {
+                throw LuminaError.timeout
+            }
 
-        // Boot with timeout awareness
-        try await vm.boot()
+            let remaining = options.timeout - elapsed
+            let remainingSeconds = Int(remaining.components.seconds)
+            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1)).get()
 
-        // Check if we've already exceeded total timeout during boot
-        let elapsed = ContinuousClock.now - start
-        guard elapsed < options.timeout else {
-            throw .timeout
+            let totalWallTime = ContinuousClock.now - start
+            return RunResult(
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exitCode: result.exitCode,
+                wallTime: totalWallTime
+            )
         }
-
-        // Execute with remaining time budget
-        let remaining = options.timeout - elapsed
-        let remainingSeconds = Int(remaining.components.seconds)
-        let result = try await vm.exec(command, timeout: max(remainingSeconds, 1))
-
-        let totalWallTime = ContinuousClock.now - start
-        return RunResult(
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.exitCode,
-            wallTime: totalWallTime
-        )
     }
 
     /// Stream output from a command in a disposable VM.
@@ -48,25 +42,47 @@ public struct Lumina {
         AsyncThrowingStream { continuation in
             Task {
                 do {
-                    let vmOptions = VMOptions(from: options)
-                    let vm = VM(options: vmOptions)
-                    defer { Task { await vm.shutdown() } }
+                    try await withVM(options: options) { vm in
+                        let start = ContinuousClock.now
+                        try await vm.bootResult().get()
 
-                    try await vm.boot()
+                        let elapsed = ContinuousClock.now - start
+                        guard elapsed < options.timeout else {
+                            throw LuminaError.timeout
+                        }
+                        let remaining = options.timeout - elapsed
+                        let remainingSeconds = max(Int(remaining.components.seconds), 1)
 
-                    let elapsed = ContinuousClock.now
-                    let remaining = options.timeout - (ContinuousClock.now - elapsed)
-                    let remainingSeconds = max(Int(remaining.components.seconds), 1)
-
-                    let chunks = try await vm.stream(command, timeout: remainingSeconds)
-                    for try await chunk in chunks {
-                        continuation.yield(chunk)
+                        let chunks = try await vm.stream(command, timeout: remainingSeconds)
+                        for try await chunk in chunks {
+                            continuation.yield(chunk)
+                        }
+                        continuation.finish()
                     }
-                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
+        }
+    }
+
+    // MARK: - Private
+
+    /// Lifecycle scope: creates a VM, runs the body, and always shuts down.
+    /// One shutdown call site, guaranteed to run on every path.
+    private static func withVM<T: Sendable>(
+        options: RunOptions,
+        body: @Sendable (VM) async throws -> T
+    ) async throws -> T {
+        let vmOptions = VMOptions(from: options)
+        let vm = VM(options: vmOptions)
+        do {
+            let result = try await body(vm)
+            await vm.shutdown()
+            return result
+        } catch {
+            await vm.shutdown()
+            throw error
         }
     }
 }

@@ -34,6 +34,15 @@ struct Run: AsyncParsableCommand {
     var cpus: Int = 2
 
     func run() async throws {
+        // Best-effort orphan cleanup on normal exit. atexit does NOT run on
+        // signal death (SIGTERM/SIGKILL) — those are cleaned at next VM boot.
+        atexit { DiskClone.cleanOrphans() }
+
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            FileHandle.standardError.write(Data("lumina: command cannot be empty\n".utf8))
+            throw ExitCode.failure
+        }
+
         // Auto-pull image if not present
         let puller = ImagePuller()
         if !puller.imageExists() {
@@ -49,25 +58,39 @@ struct Run: AsyncParsableCommand {
             }
         }
 
+        guard let parsedTimeout = parseDuration(timeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 30s, 5m\n".utf8))
+            throw ExitCode.failure
+        }
+
+        guard let parsedMemory = parseMemory(memory) else {
+            FileHandle.standardError.write(Data("lumina: invalid memory '\(memory)'. Use e.g. 512MB, 1GB\n".utf8))
+            throw ExitCode.failure
+        }
+
         let options = RunOptions(
-            timeout: parseDuration(timeout),
-            memory: parseMemory(memory),
+            timeout: parsedTimeout,
+            memory: parsedMemory,
             cpuCount: cpus
         )
 
         if stream {
-            let chunks = Lumina.stream(command, options: options)
-            for try await chunk in chunks {
-                switch chunk {
-                case .stdout(let data):
-                    print(data, terminator: "")
-                case .stderr(let data):
-                    FileHandle.standardError.write(Data(data.utf8))
-                case .exit(let code):
-                    if code != 0 {
-                        throw ExitCode(code)
+            do {
+                let chunks = Lumina.stream(command, options: options)
+                for try await chunk in chunks {
+                    switch chunk {
+                    case .stdout(let data):
+                        print(data, terminator: "")
+                    case .stderr(let data):
+                        FileHandle.standardError.write(Data(data.utf8))
+                    case .exit(let code):
+                        if code != 0 {
+                            throw ExitCode(code)
+                        }
                     }
                 }
+            } catch {
+                try handleRunError(error, timeout: timeout)
             }
         } else {
             do {
@@ -79,17 +102,35 @@ struct Run: AsyncParsableCommand {
                 if !result.success {
                     throw ExitCode(result.exitCode)
                 }
-            } catch let error as LuminaError {
-                switch error {
-                case .guestCrashed(let serialOutput):
-                    FileHandle.standardError.write(Data("lumina: guest crashed\n--- serial output ---\n\(serialOutput)\n--- end serial ---\n".utf8))
-                default:
-                    FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-                }
-                throw ExitCode.failure
+            } catch {
+                try handleRunError(error, timeout: timeout)
             }
         }
     }
+}
+
+// MARK: - Error Handling
+
+/// Shared error handler for both streaming and non-streaming paths.
+/// Handles LuminaError with specific messages, passes through ExitCode,
+/// and catches anything else (including typed-throws that lost their type
+/// crossing actor boundaries) with a generic message.
+private func handleRunError(_ error: any Error, timeout: String) throws -> Never {
+    if let luminaError = error as? LuminaError {
+        switch luminaError {
+        case .timeout:
+            FileHandle.standardError.write(Data("lumina: command timed out after \(timeout)\n".utf8))
+        case .guestCrashed(let serialOutput):
+            FileHandle.standardError.write(Data("lumina: guest crashed\n--- serial output ---\n\(serialOutput)\n--- end serial ---\n".utf8))
+        default:
+            FileHandle.standardError.write(Data("lumina: \(luminaError)\n".utf8))
+        }
+    } else if let exitCode = error as? ExitCode {
+        throw exitCode
+    } else {
+        FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+    }
+    throw ExitCode.failure
 }
 
 // MARK: - Pull
@@ -158,28 +199,4 @@ struct Clean: ParsableCommand {
     }
 }
 
-// MARK: - Parsing Helpers
-
-func parseDuration(_ str: String) -> Duration {
-    let trimmed = str.trimmingCharacters(in: .whitespaces).lowercased()
-    if trimmed.hasSuffix("s") {
-        let num = Int(trimmed.dropLast()) ?? 60
-        return .seconds(num)
-    } else if trimmed.hasSuffix("m") {
-        let num = Int(trimmed.dropLast()) ?? 1
-        return .seconds(num * 60)
-    }
-    return .seconds(Int(trimmed) ?? 60)
-}
-
-func parseMemory(_ str: String) -> UInt64 {
-    let trimmed = str.trimmingCharacters(in: .whitespaces).uppercased()
-    if trimmed.hasSuffix("GB") {
-        let num = UInt64(trimmed.dropLast(2)) ?? 1
-        return num * 1024 * 1024 * 1024
-    } else if trimmed.hasSuffix("MB") {
-        let num = UInt64(trimmed.dropLast(2)) ?? 512
-        return num * 1024 * 1024
-    }
-    return UInt64(trimmed) ?? 512 * 1024 * 1024
-}
+// Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift

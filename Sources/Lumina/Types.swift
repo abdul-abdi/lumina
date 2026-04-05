@@ -97,3 +97,34 @@ public enum LuminaError: Error, Sendable {
     case guestCrashed(serialOutput: String)
     case protocolError(String)
 }
+
+// MARK: - Parsing Helpers
+
+/// Parse a human-readable duration string (e.g. "30s", "5m") into a Duration.
+/// Returns nil on invalid input. Bare numbers are treated as seconds.
+public func parseDuration(_ str: String) -> Duration? {
+    let trimmed = str.trimmingCharacters(in: .whitespaces).lowercased()
+    if trimmed.hasSuffix("s") {
+        guard let num = Int(trimmed.dropLast()) else { return nil }
+        return .seconds(num)
+    } else if trimmed.hasSuffix("m") {
+        guard let num = Int(trimmed.dropLast()) else { return nil }
+        return .seconds(num * 60)
+    }
+    guard let num = Int(trimmed) else { return nil }
+    return .seconds(num)
+}
+
+/// Parse a human-readable memory string (e.g. "512MB", "1GB") into bytes.
+/// Returns nil on invalid input. Requires MB or GB suffix.
+public func parseMemory(_ str: String) -> UInt64? {
+    let trimmed = str.trimmingCharacters(in: .whitespaces).uppercased()
+    if trimmed.hasSuffix("GB") {
+        guard let num = UInt64(trimmed.dropLast(2)), num > 0 else { return nil }
+        return num * 1024 * 1024 * 1024
+    } else if trimmed.hasSuffix("MB") {
+        guard let num = UInt64(trimmed.dropLast(2)), num > 0 else { return nil }
+        return num * 1024 * 1024
+    }
+    return nil
+}
