@@ -75,7 +75,7 @@ swift test --verbose
 swift build 2>&1 | head -50   # Swift compiler is the type checker
 
 # Build guest agent (cross-compile Go for linux/arm64)
-cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent
+cd Guest/lumina-agent && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent
 
 # Build Alpine image
 cd Guest && bash build-image.sh
@@ -117,7 +117,7 @@ After editing Swift files in `Sources/` or `Tests/`:
 - Only run full `swift test` when changing integration-level code (VM, Lumina.swift) or before completing a task
 
 After editing Go files in `Guest/lumina-agent/`:
-- Run `cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent` to verify it compiles
+- Run `cd Guest/lumina-agent && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent` to verify it compiles
 
 Before completing any task:
 - Run `swift build` (must succeed with zero errors)

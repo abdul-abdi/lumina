@@ -46,9 +46,12 @@ test-integration: build
 run: build
 	$(BINARY_DEBUG) run $(ARGS)
 
-# Install to /usr/local/bin
+# Install (default: ~/.local, override: make install PREFIX=/usr/local)
+PREFIX ?= $(HOME)/.local
 install: release
-	install -m 755 $(BINARY_RELEASE) /usr/local/bin/lumina
+	@mkdir -p $(PREFIX)/bin
+	install -m 755 $(BINARY_RELEASE) $(PREFIX)/bin/lumina
+	@echo "Installed to $(PREFIX)/bin/lumina"
 
 clean:
 	swift package clean

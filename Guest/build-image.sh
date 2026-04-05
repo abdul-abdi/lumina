@@ -27,7 +27,7 @@ echo "Output: $OUTPUT_DIR"
 AGENT_BINARY="$SCRIPT_DIR/lumina-agent/lumina-agent"
 if [ ! -f "$AGENT_BINARY" ]; then
     echo "--- Building guest agent (Go cross-compile) ---"
-    (cd "$SCRIPT_DIR/lumina-agent" && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .)
+    (cd "$SCRIPT_DIR/lumina-agent" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .)
 fi
 
 # Find mke2fs — Homebrew installs e2fsprogs outside PATH on macOS

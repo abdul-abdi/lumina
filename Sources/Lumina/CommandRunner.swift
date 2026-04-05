@@ -383,7 +383,7 @@ final class CommandRunner: @unchecked Sendable {
     ///
     /// Timeout enforcement is handled on the host side (the deadline loop in
     /// `exec()` / `execStream()`). The guest receives a safety-net timeout at
-    /// 2x the host value — loose enough to never race with the host, tight
+    /// 3x the host value — loose enough to never race with the host, tight
     /// enough to clean up if the host crashes or the vsock connection drops.
     private func beginExec(
         command: String, timeout: Int, env: [String: String]

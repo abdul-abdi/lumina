@@ -5,79 +5,126 @@
 Output demo.gif
 
 Require lumina
+Require jq
 
-Set Shell "zsh"
-Set FontSize 15
-Set Width 1000
-Set Height 550
+Set Shell "bash"
+Set FontSize 16
+Set FontFamily "JetBrains Mono"
+Set Width 1100
+Set Height 600
 Set Theme "Catppuccin Mocha"
 Set Padding 24
-Set TypingSpeed 40ms
+Set TypingSpeed 35ms
 Set PlaybackSpeed 0.8
 Set WindowBar Colorful
 Set MarginFill "#1e1e2e"
 Set BorderRadius 8
 Set Margin 16
+Set CursorBlink true
+Set LoopOffset 80%
+Set Framerate 30
 
-# If lumina isn't on PATH after `make install`, build and add it:
-# Env PATH ".build/arm64-apple-macosx/debug:/opt/homebrew/bin:/usr/bin:/bin"
+# Uncomment and adjust PATH if lumina isn't on your PATH after `make install`:
+# Env PATH "$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+Env PS1 "$ "
 
-# --- Scene 1: Version check ---
+# ═══════════════════════════════════════════════════
+# Scene 1: Version
+# ═══════════════════════════════════════════════════
+
+Sleep 500ms
 Type "lumina --version"
-Sleep 300ms
+Sleep 200ms
 Enter
-Sleep 1.5s
-
-# --- Scene 2: Simple command — shows the core concept ---
-Type "# Run a command in a disposable Linux VM"
-Enter
-Sleep 500ms
-Type `lumina run "echo hello from Lumina"`
-Sleep 400ms
-Enter
-
-# VM boot (~1.5s) + exec + teardown
-Sleep 5s
-
-# Pause to read the output
-Sleep 1.5s
-
-# --- Scene 3: Prove it's a real VM ---
-Type "# It's a real aarch64 Linux kernel"
-Enter
-Sleep 500ms
-Type `lumina run "uname -a"`
-Sleep 400ms
-Enter
-
-Sleep 5s
-Sleep 1.5s
-
-# --- Scene 4: Streaming output ---
-Type "# Stream output in real time"
-Enter
-Sleep 500ms
-Type `lumina run --stream "echo step 1 && sleep 0.5 && echo step 2 && sleep 0.5 && echo step 3"`
-Sleep 400ms
-Enter
-
-# Streaming takes ~3s of command time + VM overhead
-Sleep 7s
-Sleep 1.5s
-
-# --- Scene 5: Resource configuration ---
-Type "# Custom resources: 1GB RAM, 4 CPUs, 2 minute timeout"
-Enter
-Sleep 500ms
-Type `lumina run --memory 1GB --cpus 4 --timeout 2m "free -h && nproc"`
-Sleep 400ms
-Enter
-
-Sleep 6s
 Sleep 2s
 
-# --- End: let the final output breathe ---
-Sleep 1s
+# ═══════════════════════════════════════════════════
+# Scene 2: The core concept
+# ═══════════════════════════════════════════════════
+
+Type "# Boot a disposable Linux VM, run a command, get the output"
+Enter
+Sleep 400ms
+Type `lumina run "echo hello from Lumina"`
+Sleep 300ms
+Enter
+
+Sleep 12s
+
+# ═══════════════════════════════════════════════════
+# Scene 3: Prove it's real
+# ═══════════════════════════════════════════════════
+
+Type "clear"
+Enter
+Sleep 300ms
+Type "# It's a real aarch64 Linux kernel"
+Enter
+Sleep 400ms
+Type `lumina run "uname -srm"`
+Sleep 300ms
+Enter
+
+Sleep 12s
+
+# ═══════════════════════════════════════════════════
+# Scene 4: JSON piping
+# ═══════════════════════════════════════════════════
+
+Type "clear"
+Enter
+Sleep 300ms
+Type "# Pipe-friendly: auto-JSON when not a TTY"
+Enter
+Sleep 400ms
+Type `lumina run "echo hello" | jq .`
+Sleep 300ms
+Enter
+
+Sleep 12s
+
+# ═══════════════════════════════════════════════════
+# Scene 5: Streaming
+# ═══════════════════════════════════════════════════
+
+Type "clear"
+Enter
+Sleep 300ms
+Type "# Stream output in real time"
+Enter
+Sleep 400ms
+Type `lumina run --stream "echo step 1 && sleep 0.3 && echo step 2 && sleep 0.3 && echo step 3"`
+Sleep 300ms
+Enter
+
+Sleep 14s
+
+# ═══════════════════════════════════════════════════
+# Scene 6: Env vars + resources
+# ═══════════════════════════════════════════════════
+
+Type "clear"
+Enter
+Sleep 300ms
+Type "# Custom resources + environment variables"
+Enter
+Sleep 400ms
+Type `lumina run --memory 1GB --cpus 4 -e NAME=Lumina 'echo Hi from $NAME && nproc'`
+Sleep 300ms
+Enter
+
+Sleep 12s
+
+# ═══════════════════════════════════════════════════
+# Scene 7: Closing
+# ═══════════════════════════════════════════════════
+
+Type "clear"
+Enter
+Sleep 300ms
 Type "# Every run is fully isolated. VM destroyed after each command."
+Enter
+Sleep 300ms
+Type "# subprocess.run() for virtual machines."
 Enter
 Sleep 3s
