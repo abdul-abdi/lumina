@@ -35,7 +35,7 @@ Linux lumina 6.6.63-0-virt #1-Alpine aarch64 GNU/Linux
 # From source
 make install
 
-# Pull the pre-built Alpine image (~50MB)
+# Image auto-pulls on first run, or pull manually:
 lumina pull
 ```
 
@@ -45,6 +45,17 @@ lumina pull
 lumina run "echo hello world"
 lumina run --stream "make build"
 lumina run --timeout 2m --memory 1GB --cpus 4 "cargo test"
+
+# Pass environment variables
+lumina run -e API_KEY=sk-123 -e DEBUG=1 "env | grep API"
+
+# Copy files into the VM, run, download results
+lumina run --copy ./input.csv:/tmp/input.csv \
+           --download /tmp/output.csv:./output.csv \
+           "python3 process.py /tmp/input.csv /tmp/output.csv"
+
+# Mount a host directory (virtio-fs)
+lumina run --mount ./src:/mnt/src "ls /mnt/src"
 ```
 
 ## Swift Library
@@ -58,7 +69,14 @@ import Lumina
 let result = try await Lumina.run("cargo test", options: RunOptions(
     timeout: .seconds(120),
     memory: 1024 * 1024 * 1024,  // 1GB
-    cpuCount: 4
+    cpuCount: 4,
+    env: ["CI": "true", "RUST_LOG": "debug"]
+))
+
+// File transfers
+let result = try await Lumina.run("python3 /tmp/process.py", options: RunOptions(
+    uploads: [FileUpload(localPath: inputURL, remotePath: "/tmp/process.py")],
+    downloads: [FileDownload(remotePath: "/tmp/out.json", localPath: outputURL)]
 ))
 
 // Stream output in real time
@@ -73,8 +91,9 @@ for try await chunk in Lumina.stream("make build") {
 // Layer 2: Lifecycle — explicit control, connection reuse
 let vm = VM(options: VMOptions(cpuCount: 4))
 try await vm.boot()
-let r1 = try await vm.exec("apt-get install -y python3")
-let r2 = try await vm.exec("python3 script.py")
+try await vm.uploadFiles([FileUpload(localPath: scriptURL, remotePath: "/tmp/run.sh")])
+let r1 = try await vm.exec("chmod +x /tmp/run.sh && /tmp/run.sh")
+try await vm.downloadFiles([FileDownload(remotePath: "/tmp/results.json", localPath: resultsURL)])
 await vm.shutdown()
 ```
 
@@ -82,17 +101,33 @@ await vm.shutdown()
 <summary><strong>CLI Reference</strong></summary>
 
 ```bash
+# Execution
 lumina run <command>                          # run, print stdout
 lumina run --stream <command>                 # stream output live
 lumina run --timeout 30s <command>            # custom timeout (30s, 5m)
 lumina run --memory 1GB --cpus 4 <command>    # resource config
 
+# Environment variables
+lumina run -e KEY=VAL <command>               # pass env vars (repeatable)
+
+# File transfers
+lumina run --copy local:remote <command>      # upload file before exec
+lumina run --download remote:local <command>  # download file after exec
+lumina run --mount host:guest <command>       # virtio-fs directory sharing
+
+# Output format (auto-detects: JSON when piped, text on TTY)
+lumina run --text <command>                   # force human-readable output
+LUMINA_FORMAT=json lumina run <command>       # force JSON output
+
+# Image management
 lumina pull                                   # download default image
 lumina pull --force                           # re-download image
 lumina images                                 # list cached images
 lumina clean                                  # remove orphaned clones
 lumina --version
 ```
+
+Output auto-detection: JSON when stdout is piped (`lumina run "echo hi" | jq`), human-readable text when running in a terminal. Override with `--text` or `LUMINA_FORMAT`.
 
 </details>
 
@@ -155,7 +190,14 @@ sequenceDiagram
     end
 ```
 
-Timeout strategy: the host enforces deadlines on its side. The guest receives a safety-net timeout at 3x the host value — loose enough to never race, tight enough to clean up if the host crashes.
+**File transfers** use the same vsock connection with ACK-based backpressure:
+
+| Direction | Messages |
+|-----------|----------|
+| Upload (host → guest) | `upload` → `upload_ack` per 48KB chunk → `upload_done` |
+| Download (guest → host) | `download_req` → `download_data` per 48KB chunk (seq + EOF) |
+
+Timeout strategy: the host enforces deadlines on its side. The guest receives a safety-net timeout at 3x the host value (minimum 30s) — loose enough to never race, tight enough to clean up if the host crashes.
 
 </details>
 
@@ -167,7 +209,7 @@ Timeout strategy: the host enforces deadlines on its side. The guest receives a 
 | Layer | Entry Point | Use Case |
 |-------|------------|----------|
 | **Convenience** | `Lumina.run()` / `Lumina.stream()` | One-shot commands. `withVM` scope handles full lifecycle. |
-| **Lifecycle** | `VM` actor | Multi-command sessions. Explicit `boot()`, `exec()`, `shutdown()`. |
+| **Lifecycle** | `VM` actor | Multi-command sessions. Explicit `boot()`, `exec()`, `shutdown()`, `uploadFiles()`, `downloadFiles()`. |
 
 ### Internal Components
 
@@ -178,6 +220,8 @@ Timeout strategy: the host enforces deadlines on its side. The guest receives a 
 | **InitrdPatcher** | Initramfs injection | Builds cpio newc archives, concatenates with base initrd — Linux extracts both |
 | **DiskClone** | Per-run ephemeral COW clones | PID file–based orphan detection; cleanup via `atexit` + signal handlers |
 | **ImageStore** | Long-lived image cache | Resolves kernel + initrd + rootfs + optional agent + optional kernel modules |
+| **ImagePuller** | GitHub Releases downloader | SHA256 verification, auto-pull on first run |
+| **NetworkProvider** | Pluggable network backend | Default: `NATNetworkProvider` (VZ NAT). Protocol allows custom implementations. |
 | **SerialConsole** | Serial output capture | Reads `hvc0` for crash diagnostics; surfaced in `LuminaError.guestCrashed` |
 
 ### Design Constraints
@@ -186,6 +230,7 @@ Timeout strategy: the host enforces deadlines on its side. The guest receives a 
 - Zero external Swift dependencies (library target) — only `Virtualization.framework`
 - All public types are `Sendable`
 - Guest agent uses raw `AF_VSOCK` syscalls (Go's `net` doesn't support vsock)
+- Static networking in guest (192.168.64.4/24) — avoids DHCP latency, DNS uses gateway as nameserver
 
 </details>
 
@@ -200,6 +245,11 @@ make build
 # Run tests
 make test                # unit tests
 make test-integration    # e2e tests (requires VM image)
+
+# Other targets
+make release             # optimized build + codesign
+make run ARGS="echo hi"  # build, sign, and run in one step
+make clean               # remove .build/
 
 # Build guest agent (cross-compile Go → linux/arm64)
 cd Guest/lumina-agent && GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
