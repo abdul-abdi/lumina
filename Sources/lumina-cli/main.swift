@@ -3,6 +3,40 @@ import ArgumentParser
 import Foundation
 import Lumina
 
+// Install signal handlers via sigaction. sigaction is stronger than signal() —
+// it can't be silently overridden. The handler cleans orphaned COW clones, then
+// re-raises the signal with default disposition so the parent process gets the
+// correct wait status (128 + signal).
+private func installSignalHandlers() {
+    for sig: Int32 in [SIGINT, SIGTERM] {
+        var action = sigaction()
+        action.__sigaction_u.__sa_handler = { signum in
+            // Remove clones owned by this process. cleanOrphans() would skip
+            // them because our process is still alive during the handler.
+            // Delete PID files first so cleanOrphans sees them as orphans.
+            let pid = "\(getpid())"
+            let runsDir = DiskClone.defaultRunsDir
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: runsDir, includingPropertiesForKeys: nil
+            ) {
+                for entry in entries {
+                    let pidFile = entry.appendingPathComponent(".pid")
+                    if let content = try? String(contentsOf: pidFile, encoding: .utf8),
+                       content.trimmingCharacters(in: .whitespacesAndNewlines) == pid {
+                        try? FileManager.default.removeItem(at: entry)
+                    }
+                }
+            }
+            // Restore default and re-raise so parent gets correct exit status
+            signal(signum, SIG_DFL)
+            raise(signum)
+        }
+        sigemptyset(&action.sa_mask)
+        action.sa_flags = 0
+        sigaction(sig, &action, nil)
+    }
+}
+
 @main
 struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -34,8 +68,9 @@ struct Run: AsyncParsableCommand {
     var cpus: Int = 2
 
     func run() async throws {
-        // Best-effort orphan cleanup on normal exit. atexit does NOT run on
-        // signal death (SIGTERM/SIGKILL) — those are cleaned at next VM boot.
+        // sigaction covers SIGINT/SIGTERM, atexit covers normal exit.
+        // SIGKILL is uncatchable — orphans from that are cleaned at next VM boot.
+        installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
 
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
