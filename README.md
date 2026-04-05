@@ -21,6 +21,8 @@ One function call. ~1.5s cold start. Zero host access.
 
 ## Get Started
 
+> **Requires:** macOS 14+ (Sonoma) · Apple Silicon (M1/M2/M3/M4) · Go 1.21+ (guest agent only)
+
 ```bash
 make install                        # build from source
 lumina run "echo hello world"       # image auto-pulls on first run
@@ -268,12 +270,3 @@ cd Guest && sudo ./build-image.sh
 
 </details>
 
-## Requirements
-
-- macOS 14+ (Sonoma)
-- Apple Silicon (M1/M2/M3/M4)
-- Go 1.21+ (guest agent build only)
-
-## License
-
-MIT
