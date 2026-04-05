@@ -1,3 +1,5 @@
+<div align="center">
+
 # Lumina
 
 **Native Apple Workload Runtime for Agents** — `subprocess.run()` for virtual machines.
@@ -8,9 +10,12 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-333)](https://support.apple.com/en-us/116943)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Boot a disposable Linux VM, run a command, get the output. One function call. ~1.5s cold start. Zero host access.
+Boot a disposable Linux VM, run a command, get the output.<br>
+One function call. ~1.5s cold start. Zero host access.
 
 ![demo](demo.gif)
+
+</div>
 
 ```swift
 let result = try await Lumina.run("echo hello")
@@ -96,32 +101,36 @@ lumina --version
 ## How It Works
 
 ```mermaid
-flowchart LR
-    A["lumina run &#34;cmd&#34;"] --> B[ImageStore]
-    B -->|resolve| C[DiskClone]
-    C -->|APFS COW clone| D[InitrdPatcher]
-    D -->|inject agent + modules| E[VM Actor]
-    E -->|VZVirtualMachine| F[CommandRunner]
-    F -->|vsock:1024| G[Guest Agent]
-    G -->|stream output| F
-    F -->|RunResult| A
+sequenceDiagram
+    participant CLI as lumina run
+    participant IS as ImageStore
+    participant DC as DiskClone
+    participant IP as InitrdPatcher
+    participant VM as VM Actor
+    participant CR as CommandRunner
+    participant GA as Guest Agent
 
-    style A fill:#1a1a2e,stroke:#e94560,color:#fff
-    style B fill:#16213e,stroke:#0f3460,color:#fff
-    style C fill:#16213e,stroke:#0f3460,color:#fff
-    style D fill:#16213e,stroke:#0f3460,color:#fff
-    style E fill:#1a1a2e,stroke:#0f3460,color:#fff
-    style F fill:#16213e,stroke:#0f3460,color:#fff
-    style G fill:#1a1a2e,stroke:#16213e,color:#fff
+    CLI->>IS: resolve("default")
+    IS-->>CLI: kernel, initrd, rootfs, agent
+    CLI->>DC: create APFS COW clone
+    DC-->>CLI: ephemeral rootfs copy
+    CLI->>IP: inject agent + vsock modules
+    IP-->>CLI: combined initramfs
+    CLI->>VM: boot(VZVirtualMachine)
+    Note over VM: Dedicated SerialExecutor
+    VM->>CR: connect vsock:1024
+    CR->>GA: waiting...
+    GA-->>CR: {"type":"ready"}
+    CR->>GA: {"type":"exec","cmd":"..."}
+    loop streaming
+        GA-->>CR: {"type":"output","stream":"stdout","data":"..."}
+    end
+    GA-->>CR: {"type":"exit","code":0}
+    CR-->>CLI: RunResult
+    CLI->>VM: shutdown()
+    VM->>DC: delete clone
+    Note over CLI,GA: Every run is fully isolated
 ```
-
-1. **ImageStore** resolves `~/.lumina/images/default/` — kernel, initrd, rootfs, agent binary
-2. **DiskClone** creates an APFS copy-on-write clone (instant, near-zero disk cost)
-3. **InitrdPatcher** builds a concatenated initramfs — injects the guest agent + vsock kernel modules via cpio newc overlay
-4. **VM actor** boots `VZVirtualMachine` on a dedicated `SerialExecutor` (thread-affinity guarantee)
-5. **CommandRunner** connects over virtio-socket, waits for the `ready` handshake
-6. **Guest agent** (Go, linux/arm64) executes commands in process groups, streams chunked output
-7. VM shuts down, clone deleted — every run is fully isolated
 
 <details>
 <summary><strong>Guest Agent Protocol</strong></summary>
