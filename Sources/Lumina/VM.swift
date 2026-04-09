@@ -46,6 +46,9 @@ public actor VM {
 
     public var state: VMState { _state }
 
+    /// Expose the current disk clone for image creation workflows.
+    public var diskClone: DiskClone? { clone }
+
     public init(options: VMOptions = .default) {
         self.options = options
         self.imageStore = ImageStore()

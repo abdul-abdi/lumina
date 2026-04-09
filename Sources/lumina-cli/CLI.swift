@@ -334,8 +334,16 @@ struct Pull: AsyncParsableCommand {
 
 // MARK: - Images
 
-struct Images: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "List cached images")
+struct Images: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Manage cached images",
+        subcommands: [ImageList.self, ImageCreate.self, ImageRemove.self, ImageInspect.self],
+        defaultSubcommand: ImageList.self
+    )
+}
+
+struct ImageList: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "list", abstract: "List cached images")
 
     func run() throws {
         let store = ImageStore()
@@ -344,6 +352,71 @@ struct Images: ParsableCommand {
             print("No images found. Run 'lumina pull' first.")
         } else {
             for name in names { print(name) }
+        }
+    }
+}
+
+struct ImageCreate: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "create", abstract: "Create a custom image")
+
+    @Argument(help: "Name for the new image")
+    var name: String
+
+    @Option(name: .long, help: "Base image to build from")
+    var from: String = "default"
+
+    @Option(name: [.customLong("run")], help: "Command to run for setup")
+    var buildCommand: String
+
+    func run() async throws {
+        FileHandle.standardError.write(Data("Creating image '\(name)' from '\(from)'...\n".utf8))
+        do {
+            try await Lumina.createImage(name: name, from: from, command: buildCommand)
+            print("Image '\(name)' created successfully.")
+        } catch {
+            FileHandle.standardError.write(Data("lumina: image create failed: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct ImageRemove: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "remove", abstract: "Remove a cached image")
+
+    @Argument(help: "Image name to remove")
+    var name: String
+
+    func run() throws {
+        let store = ImageStore()
+        do {
+            try store.removeImage(name: name)
+            print("Image '\(name)' removed.")
+        } catch {
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct ImageInspect: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "inspect", abstract: "Show image details")
+
+    @Argument(help: "Image name")
+    var name: String
+
+    func run() throws {
+        let store = ImageStore()
+        let info = try store.inspect(name: name)
+        let dict: [String: Any] = [
+            "name": info.name,
+            "base": info.base ?? "none",
+            "command": info.command ?? "none",
+            "size_bytes": info.sizeBytes,
+            "created": ISO8601DateFormatter().string(from: info.created)
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .prettyPrinted]),
+           let str = String(data: data, encoding: .utf8) {
+            print(str)
         }
     }
 }

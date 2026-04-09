@@ -212,6 +212,28 @@ public struct VolumeMount: Sendable {
     }
 }
 
+// MARK: - Image Types
+
+public struct ImageInfo: Sendable {
+    public let name: String
+    public let base: String?
+    public let command: String?
+    public let created: Date
+    public let sizeBytes: UInt64
+}
+
+public struct ImageMeta: Sendable, Codable {
+    public let base: String?
+    public let command: String?
+    public let created: Date
+
+    public init(base: String?, command: String?, created: Date) {
+        self.base = base
+        self.command = command
+        self.created = created
+    }
+}
+
 // MARK: - Errors
 
 public enum LuminaError: Error, Sendable {
