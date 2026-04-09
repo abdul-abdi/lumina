@@ -142,6 +142,76 @@ public enum VMState: Sendable, Equatable {
     case shutdown
 }
 
+// MARK: - Session Types
+
+public struct SessionOptions: Sendable {
+    public var cpuCount: Int
+    public var memory: UInt64
+    public var image: String
+    public var timeout: Duration
+    public var env: [String: String]
+    public var volumes: [VolumeMount]
+
+    public init(
+        cpuCount: Int = 2,
+        memory: UInt64 = 512 * 1024 * 1024,
+        image: String = "default",
+        timeout: Duration = .seconds(60),
+        env: [String: String] = [:],
+        volumes: [VolumeMount] = []
+    ) {
+        self.cpuCount = cpuCount
+        self.memory = memory
+        self.image = image
+        self.timeout = timeout
+        self.env = env
+        self.volumes = volumes
+    }
+}
+
+public struct SessionInfo: Sendable, Codable {
+    public let sid: String
+    public let pid: Int32
+    public let image: String
+    public let cpuCount: Int
+    public let memory: UInt64
+    public let created: Date
+    public var status: SessionState
+
+    public init(
+        sid: String,
+        pid: Int32,
+        image: String,
+        cpuCount: Int,
+        memory: UInt64,
+        created: Date,
+        status: SessionState
+    ) {
+        self.sid = sid
+        self.pid = pid
+        self.image = image
+        self.cpuCount = cpuCount
+        self.memory = memory
+        self.created = created
+        self.status = status
+    }
+}
+
+public enum SessionState: String, Sendable, Codable, Equatable {
+    case running
+    case dead
+}
+
+public struct VolumeMount: Sendable {
+    public let name: String
+    public let guestPath: String
+
+    public init(name: String, guestPath: String) {
+        self.name = name
+        self.guestPath = guestPath
+    }
+}
+
 // MARK: - Errors
 
 public enum LuminaError: Error, Sendable {
@@ -154,6 +224,9 @@ public enum LuminaError: Error, Sendable {
     case protocolError(String)
     case uploadFailed(path: String, reason: String)
     case downloadFailed(path: String, reason: String)
+    case sessionNotFound(String)
+    case sessionDead(String)
+    case sessionFailed(String)
 }
 
 // MARK: - Parsing Helpers
