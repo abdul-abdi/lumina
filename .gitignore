@@ -6,3 +6,6 @@ Guest/lumina-agent/lumina-agent
 *.o
 *.dSYM
 HANDOFF.md
+CLAUDE.md
+LUMINA-V1.md
+docs/

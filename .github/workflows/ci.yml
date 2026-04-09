@@ -21,4 +21,4 @@ jobs:
         run: swift build
 
       - name: Unit Tests
-        run: swift test --filter "TypesTests|ProtocolTests|DiskCloneTests|ImageStoreTests|SerialConsoleTests"
+        run: swift test --filter "TypesTests|ParsingTests|ProtocolTests|DiskCloneTests|ImageStoreTests|SerialConsoleTests|SessionTests|SessionProtocolTests|SessionServerTests|SessionClientTests|VolumeStoreTests|NetworkSwitchTests|NetworkTests"
