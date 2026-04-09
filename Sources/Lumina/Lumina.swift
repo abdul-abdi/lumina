@@ -112,6 +112,23 @@ public struct Lumina {
         }
     }
 
+    /// Run a closure with a private network of VMs.
+    /// All VMs share a virtual switch for VM-to-VM communication.
+    public static func withNetwork<T: Sendable>(
+        _ name: String = "default",
+        body: @Sendable (Network) async throws -> T
+    ) async throws -> T {
+        let network = Network(name: name)
+        do {
+            let result = try await body(network)
+            await network.shutdown()
+            return result
+        } catch {
+            await network.shutdown()
+            throw error
+        }
+    }
+
     // MARK: - Internal
 
     /// Lifecycle scope: creates a VM, runs the body, and always shuts down.

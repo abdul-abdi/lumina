@@ -80,6 +80,9 @@ public struct VMOptions: Sendable {
     public var image: String
     public var networkProvider: any NetworkProvider
     public var mounts: [MountPoint]
+    public var privateNetworkFd: Int32?  // Raw fd, not FileHandle (FileHandle isn't Sendable)
+    public var networkHosts: [String: String]?
+    public var networkIP: String?
 
     public static let `default` = VMOptions()
 
@@ -88,13 +91,19 @@ public struct VMOptions: Sendable {
         cpuCount: Int = 2,
         image: String = "default",
         networkProvider: any NetworkProvider = NATNetworkProvider(),
-        mounts: [MountPoint] = []
+        mounts: [MountPoint] = [],
+        privateNetworkFd: Int32? = nil,
+        networkHosts: [String: String]? = nil,
+        networkIP: String? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
         self.networkProvider = networkProvider
         self.mounts = mounts
+        self.privateNetworkFd = privateNetworkFd
+        self.networkHosts = networkHosts
+        self.networkIP = networkIP
     }
 
     public init(from runOptions: RunOptions) {
@@ -103,6 +112,9 @@ public struct VMOptions: Sendable {
         self.image = runOptions.image
         self.networkProvider = NATNetworkProvider()
         self.mounts = runOptions.mounts
+        self.privateNetworkFd = nil
+        self.networkHosts = nil
+        self.networkIP = nil
     }
 }
 

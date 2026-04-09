@@ -93,6 +93,15 @@ public actor VM {
                 modulesDir: imagePaths.modulesDir,
                 outputURL: combinedInitrd
             )
+            // Append network overlay if private networking is configured
+            if let hosts = options.networkHosts, let ip = options.networkIP {
+                try InitrdPatcher.appendNetworkOverlay(
+                    initrdURL: combinedInitrd,
+                    hosts: hosts,
+                    ip: ip
+                )
+            }
+
             bootLoader.initialRamdiskURL = combinedInitrd
         } else {
             bootLoader.initialRamdiskURL = imagePaths.initrd
@@ -105,6 +114,9 @@ public actor VM {
         if !options.mounts.isEmpty {
             let specs = options.mounts.enumerated().map { "lumina\($0.offset):\($0.element.guestPath)" }
             cmdLine += " lumina_mounts=\(specs.joined(separator: ","))"
+        }
+        if let ip = options.networkIP {
+            cmdLine += " lumina_ip=\(ip)"
         }
         bootLoader.commandLine = cmdLine
         config.bootLoader = bootLoader
@@ -154,7 +166,17 @@ public actor VM {
             _state = .idle
             throw .bootFailed(underlying: error)
         }
-        config.networkDevices = [networkDevice]
+        var networkDevices: [VZVirtioNetworkDeviceConfiguration] = [networkDevice]
+
+        // Private network interface (eth1) for VM-to-VM networking
+        if let netFd = options.privateNetworkFd {
+            let privateNet = VZVirtioNetworkDeviceConfiguration()
+            // Create FileHandle from raw fd here on the actor's executor (FileHandle isn't Sendable)
+            let netHandle = FileHandle(fileDescriptor: netFd, closeOnDealloc: false)
+            privateNet.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: netHandle)
+            networkDevices.append(privateNet)
+        }
+        config.networkDevices = networkDevices
 
         // vsock
         let vsockDevice = VZVirtioSocketDeviceConfiguration()
