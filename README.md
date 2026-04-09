@@ -47,6 +47,7 @@ AI agents need to run untrusted code. The question is where.
 | **Dependencies** | Zero — ships as one binary | Docker daemon | Cloud account + SSH keys |
 | **macOS native** | Yes — `VZVirtualMachine` | Linux-first (Docker Desktop is a VM) | N/A |
 | **Agent-friendly output** | JSON by default when piped | Text only (needs parsing) | Text only |
+| **Persistent sessions** | Built-in — ~0ms exec after first boot | N/A | SSH sessions |
 
 Lumina is purpose-built for the pattern: *boot, run, destroy*. No daemon, no container registry, no cloud credentials. Just a function call.
 
@@ -56,9 +57,13 @@ Lumina is purpose-built for the pattern: *boot, run, destroy*. No daemon, no con
 |---|---------|--------|
 | ⚡ | **Instant VMs** | ~2s cold start, APFS copy-on-write clones |
 | 🔒 | **Full isolation** | No host filesystem, credentials, or process access |
+| 🔄 | **Persistent sessions** | Boot once, exec many — ~0ms per command |
+| 🐍 | **Custom images** | `images create python --run "apk add python3"` |
+| 💾 | **Named volumes** | Persistent storage across VMs and sessions |
+| 🌐 | **VM-to-VM networking** | Private ethernet switch for multi-VM setups |
 | 📡 | **Live streaming** | `--stream` for real-time stdout/stderr |
 | 📁 | **File transfers** | `--copy local:remote` / `--download remote:local` |
-| 📂 | **Directory mounts** | `--mount host:guest` via virtio-fs |
+| 📂 | **Directory mounts** | `--mount host:guest` / `--volume name:guest` via virtio-fs |
 | 🔑 | **Environment vars** | `-e KEY=VAL` (repeatable) |
 | 🔄 | **Smart output** | Auto-JSON when piped, human text on TTY |
 | 🧹 | **Self-cleaning** | Orphaned clones removed via signal handlers + `atexit` |
@@ -90,6 +95,96 @@ lumina run --mount ./src:/mnt/src "cat /mnt/src/README.md"
 lumina run "uname -a" | jq .stdout
 ```
 
+### Sessions (Persistent VMs)
+
+Boot a VM once, run commands instantly. No 2s boot per command.
+
+```bash
+# Start a persistent session
+SID=$(lumina session start | jq -r .sid)
+
+# Execute commands — ~0ms each (VM already running)
+lumina exec $SID "apk add python3"
+lumina exec $SID "python3 -c 'print(42)'"
+lumina exec $SID -e MY_VAR=hello "echo \$MY_VAR"
+
+# File transfers work too
+lumina exec $SID --copy ./script.py:/tmp/script.py "python3 /tmp/script.py"
+
+# List active sessions
+lumina session list
+
+# Stop when done
+lumina session stop $SID
+```
+
+Sessions with volumes — data persists across sessions and disposable runs:
+
+```bash
+lumina volume create workspace
+SID=$(lumina session start --volume workspace:/data | jq -r .sid)
+lumina exec $SID "echo 'cached result' > /data/output.txt"
+lumina session stop $SID
+
+# Data survives — read from a brand new VM
+lumina run --volume workspace:/data "cat /data/output.txt"
+```
+
+### Custom Images
+
+Pre-install packages so every run starts ready:
+
+```bash
+# Create a Python image (~17s to build, then ~2s to boot forever after)
+lumina images create python --from default --run "apk add --no-cache python3"
+
+# Use it — no install wait
+lumina run --image python "python3 -c 'import sys; print(sys.version)'"
+
+# Sessions with custom images
+SID=$(lumina session start --image python | jq -r .sid)
+lumina exec $SID "python3 script.py"   # instant, python pre-installed
+
+# Manage images
+lumina images list
+lumina images inspect python
+lumina images remove python
+```
+
+### Volumes
+
+Named persistent storage, mounted via virtio-fs:
+
+```bash
+lumina volume create mydata
+lumina run --volume mydata:/data "echo hello > /data/file.txt"
+lumina run --volume mydata:/data "cat /data/file.txt"   # still there
+
+lumina volume list
+lumina volume inspect mydata
+lumina volume remove mydata
+```
+
+### Networking (Multi-VM)
+
+Run interconnected VMs on a shared private network:
+
+```bash
+# Create a manifest
+cat > network.json << 'EOF'
+{
+  "sessions": [
+    {"name": "db", "image": "default"},
+    {"name": "api", "image": "default"}
+  ]
+}
+EOF
+
+# Boot all VMs on a shared ethernet switch
+lumina network run --file network.json
+# VMs can reach each other by name (db, api) via /etc/hosts
+```
+
 <details>
 <summary><strong>Full CLI Reference</strong></summary>
 
@@ -99,8 +194,12 @@ USAGE: lumina <subcommand>
 SUBCOMMANDS:
   run               Run a command in a disposable VM
   pull              Pull the default Alpine image from GitHub Releases
-  images            List cached images
+  images            Manage cached images (list, create, remove, inspect)
   clean             Remove orphaned COW clones and stale images
+  session           Manage persistent VM sessions (start, stop, list)
+  exec              Execute a command in a running session
+  volume            Manage persistent volumes (create, list, remove, inspect)
+  network           Run a group of VMs on a shared network
 ```
 
 **`lumina run`**
@@ -114,21 +213,58 @@ lumina run -e KEY=VAL <command>               # env vars (repeatable)
 lumina run --copy local:remote <command>      # upload file before exec
 lumina run --download remote:local <command>  # download file after exec
 lumina run --mount host:guest <command>       # virtio-fs directory sharing
+lumina run --volume name:guest <command>      # mount named volume
 lumina run --text <command>                   # force human-readable output
 LUMINA_FORMAT=json lumina run <command>       # force JSON output
 ```
 
-**`lumina pull`**
+**`lumina session`**
+
+```bash
+lumina session start                         # start with defaults
+lumina session start --image python           # use custom image
+lumina session start --memory 1GB --cpus 4    # configure resources
+lumina session start --volume data:/mnt       # mount volume at boot
+lumina session list                           # list active sessions
+lumina session list --text                    # human-readable output
+lumina session stop <sid>                     # stop and clean up
+```
+
+**`lumina exec`**
+
+```bash
+lumina exec <sid> <command>                   # execute in session
+lumina exec <sid> <command> --stream          # stream output live
+lumina exec <sid> <command> -e KEY=VAL        # env vars (repeatable)
+lumina exec <sid> <command> --copy l:r        # upload before exec
+lumina exec <sid> <command> --download r:l    # download after exec
+lumina exec <sid> <command> --timeout 2m      # timeout (default: 60s)
+lumina exec <sid> <command> --text            # human-readable output
+```
+
+**`lumina images`**
+
+```bash
+lumina images list                            # list cached images
+lumina images create NAME --from BASE --run CMD  # build custom image
+lumina images inspect NAME                    # show image details
+lumina images remove NAME                     # remove (checks deps)
+```
+
+**`lumina volume`**
+
+```bash
+lumina volume create NAME                     # create named volume
+lumina volume list                            # list all volumes
+lumina volume inspect NAME                    # show details + size
+lumina volume remove NAME                     # delete volume
+```
+
+**`lumina pull` / `lumina clean`**
 
 ```bash
 lumina pull                                   # download default image
 lumina pull --force                           # re-download even if exists
-```
-
-**`lumina images` / `lumina clean`**
-
-```bash
-lumina images                                 # list cached images
 lumina clean                                  # remove orphaned COW clones
 ```
 
@@ -161,10 +297,10 @@ for try await chunk in Lumina.stream("make build") {
 ```
 
 <details>
-<summary><strong>Advanced: File Transfers, Lifecycle API, NetworkProvider</strong></summary>
+<summary><strong>Advanced: Sessions, Custom Images, Volumes, Networking</strong></summary>
 
 ```swift
-// Upload files into the VM, download results after execution
+// File transfers — upload into VM, download results after execution
 let result = try await Lumina.run("python3 /tmp/process.py", options: RunOptions(
     uploads: [FileUpload(localPath: inputURL, remotePath: "/tmp/process.py")],
     downloads: [FileDownload(remotePath: "/tmp/out.json", localPath: outputURL)]
@@ -178,6 +314,18 @@ let r1 = try await vm.exec("chmod +x /tmp/run.sh && /tmp/run.sh")
 let r2 = try await vm.exec("cat /tmp/results.json")  // reuses same connection
 try vm.downloadFiles([FileDownload(remotePath: "/tmp/results.json", localPath: resultsURL)])
 await vm.shutdown()
+
+// Custom image creation — build once, boot fast forever
+try await Lumina.createImage(name: "python", from: "default", command: "apk add python3")
+
+// Private networking — VM-to-VM communication
+try await Lumina.withNetwork("mynet") { network in
+    let db  = try await network.session(name: "db",  image: "default")
+    let api = try await network.session(name: "api", image: "default")
+    // VMs share a private ethernet switch, can reach each other by name
+    let result = try await api.exec("ping -c1 db")
+    await network.shutdown()
+}
 
 // Custom networking — implement the NetworkProvider protocol
 struct TapProvider: NetworkProvider {
@@ -225,6 +373,39 @@ sequenceDiagram
 ```
 
 <details>
+<summary><strong>Session Architecture</strong></summary>
+
+```mermaid
+sequenceDiagram
+    participant CLI as lumina session start
+    participant SP as SessionProcess
+    participant SS as SessionServer
+    participant VM as VM Actor
+    participant EC as lumina exec
+
+    CLI->>SP: spawn background process
+    SP->>VM: boot VM
+    SP->>SS: bind Unix socket
+    SS-->>CLI: socket ready
+    CLI-->>CLI: return SID
+
+    EC->>SS: connect to socket
+    EC->>SS: {"type":"exec","cmd":"..."}
+    SS->>VM: exec(cmd)
+    VM-->>SS: RunResult
+    SS-->>EC: {"type":"output"} + {"type":"exit"}
+    Note over EC,VM: ~0ms per exec (VM already booted)
+
+    EC->>SS: {"type":"shutdown"}
+    SS->>VM: shutdown()
+    SS->>SP: cleanup session directory
+```
+
+Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts connections, and dispatches requests to the VM actor.
+
+</details>
+
+<details>
 <summary><strong>Guest Agent Protocol</strong></summary>
 
 Newline-delimited JSON over virtio-socket (port 1024, max 64KB per message):
@@ -261,12 +442,17 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 <details>
 <summary><strong>Architecture Deep Dive</strong></summary>
 
-### Two-Layer API
+### Three-Layer API
 
 ```
                          ┌─────────────────────────────────┐
   Convenience API        │  Lumina.run() / Lumina.stream()  │
   (one-shot)             │  withVM { boot → exec → shut }  │
+                         └──────────────┬──────────────────┘
+                                        │
+                         ┌──────────────▼──────────────────┐
+  Session API            │  session start / exec / stop     │
+  (persistent)           │  Unix socket IPC, ~0ms exec      │
                          └──────────────┬──────────────────┘
                                         │
                          ┌──────────────▼──────────────────┐
@@ -283,9 +469,14 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 |-----------|------|------------|
 | **VM** | Actor wrapping `VZVirtualMachine` | Custom `VMExecutor` (SerialExecutor) pins all VZ calls to a dedicated DispatchQueue |
 | **CommandRunner** | vsock protocol + state machine | `ConnectionState` enum with explicit transitions, NSLock for thread safety |
-| **InitrdPatcher** | Initramfs injection | Builds cpio newc archives, concatenates with base initrd — Linux extracts both |
-| **DiskClone** | Per-run ephemeral COW clones | PID file–based orphan detection; `cleanOrphans()` invoked by CLI via `atexit` + signal handlers |
-| **ImageStore** | Long-lived image cache | Resolves kernel + initrd + rootfs + optional agent + optional kernel modules |
+| **InitrdPatcher** | Initramfs injection | Builds cpio newc archives, concatenates with base initrd. Composable network overlay. |
+| **DiskClone** | Per-run ephemeral COW clones | PID file–based orphan detection; `cleanOrphans()` invoked via `atexit` + signal handlers |
+| **ImageStore** | Image cache + custom creation | Staging-dir atomicity for crash-safe image builds. Symlinks shared assets from base. |
+| **VolumeStore** | Named persistent volumes | Host directories at `~/.lumina/volumes/<name>/data/`, mounted via virtio-fs |
+| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, dispatches to VM actor |
+| **SessionClient** | Unix socket IPC client | Validates session liveness, sends requests, receives streamed responses |
+| **NetworkSwitch** | Ethernet frame relay | SOCK_DGRAM socketpairs, poll-based broadcast, dynamic port addition |
+| **Network** | VM group manager | Actor coordinating multiple VMs on a shared virtual switch with IP assignment |
 | **ImagePuller** | GitHub Releases downloader | SHA256 verification, auto-pull on first run from `abdul-abdi/lumina` releases |
 | **NetworkProvider** | Pluggable network backend | Default: `NATNetworkProvider` (VZ NAT). Protocol for custom implementations. |
 | **SerialConsole** | Serial output capture | Reads `hvc0` for crash diagnostics; surfaced in `LuminaError.guestCrashed` |
@@ -297,6 +488,8 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 - **All public types are `Sendable`** — safe to use across concurrency domains
 - **Guest agent uses raw `AF_VSOCK` syscalls** — Go's `net` package doesn't support vsock
 - **DHCP networking** — NAT provided by `VZNATNetworkDeviceAttachment`, DNS via gateway
+- **Session IPC** — NDJSON over Unix domain sockets, one client at a time per session
+- **Network relay** — reads ports under lock each iteration for dynamic VM join
 
 </details>
 
