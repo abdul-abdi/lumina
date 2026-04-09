@@ -10,7 +10,8 @@ struct LuminaCLI: AsyncParsableCommand {
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
         version: "0.2.2",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
-                      Session.self, Exec.self, SessionServe.self, Volume.self]
+                      Session.self, Exec.self, SessionServe.self,
+                      Volume.self, NetworkCmd.self]
     )
 }
 
@@ -821,6 +822,70 @@ struct VolumeInspect: ParsableCommand {
             print(str)
         }
     }
+}
+
+// MARK: - Network
+
+struct NetworkCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "network",
+        abstract: "Run a group of VMs on a shared network",
+        subcommands: [NetworkRun.self]
+    )
+}
+
+struct NetworkRun: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "run", abstract: "Run VMs from a manifest file")
+
+    @Option(name: .long, help: "Path to network manifest JSON file")
+    var file: String
+
+    func run() async throws {
+        installSignalHandlers()
+        atexit { DiskClone.cleanOrphans() }
+
+        let fileURL = URL(fileURLWithPath: file)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            FileHandle.standardError.write(Data("lumina: manifest file not found: \(file)\n".utf8))
+            throw ExitCode.failure
+        }
+
+        let data = try Data(contentsOf: fileURL)
+        let manifest: NetworkManifest
+        do {
+            manifest = try JSONDecoder().decode(NetworkManifest.self, from: data)
+        } catch {
+            FileHandle.standardError.write(Data("lumina: invalid manifest: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
+
+        FileHandle.standardError.write(Data("Starting \(manifest.sessions.count) sessions on shared network...\n".utf8))
+
+        try await Lumina.withNetwork("cli") { network in
+            for session in manifest.sessions {
+                FileHandle.standardError.write(Data("  Booting '\(session.name)' (image: \(session.image ?? "default"))...\n".utf8))
+                _ = try await network.session(
+                    name: session.name,
+                    image: session.image ?? "default"
+                )
+            }
+            FileHandle.standardError.write(Data("All sessions running. Press Ctrl-C to tear down.\n".utf8))
+
+            // Block main thread until signal — dispatchMain() never returns,
+            // signal handler triggers exit, withNetwork scope ensures shutdown
+            dispatchMain()
+        }
+    }
+}
+
+struct NetworkManifest: Codable {
+    let sessions: [NetworkSession]
+}
+
+struct NetworkSession: Codable {
+    let name: String
+    let image: String?
+    let volumes: [String]?
 }
 
 // Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift
