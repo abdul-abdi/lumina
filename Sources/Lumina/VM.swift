@@ -243,7 +243,7 @@ public actor VM {
     // custom-executor actor back to the caller. Catching inside the actor and
     // returning Result preserves the type as a value.
 
-    func bootResult() async -> Result<Void, LuminaError> {
+    public func bootResult() async -> Result<Void, LuminaError> {
         do {
             try await boot()
             return .success(())

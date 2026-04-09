@@ -1,63 +1,7 @@
-// Sources/lumina-cli/main.swift
+// Sources/lumina-cli/CLI.swift
 import ArgumentParser
 import Foundation
 import Lumina
-
-// Install signal handlers via sigaction. sigaction is stronger than signal() —
-// it can't be silently overridden. The handler cleans orphaned COW clones, then
-// re-raises the signal with default disposition so the parent process gets the
-// correct wait status (128 + signal).
-private func installSignalHandlers() {
-    for sig: Int32 in [SIGINT, SIGTERM] {
-        var action = sigaction()
-        action.__sigaction_u.__sa_handler = { signum in
-            let pid = "\(getpid())"
-            let runsDir = DiskClone.defaultRunsDir
-            if let entries = try? FileManager.default.contentsOfDirectory(
-                at: runsDir, includingPropertiesForKeys: nil
-            ) {
-                for entry in entries {
-                    let pidFile = entry.appendingPathComponent(".pid")
-                    if let content = try? String(contentsOf: pidFile, encoding: .utf8),
-                       content.trimmingCharacters(in: .whitespacesAndNewlines) == pid {
-                        try? FileManager.default.removeItem(at: entry)
-                    }
-                }
-            }
-            signal(signum, SIG_DFL)
-            raise(signum)
-        }
-        sigemptyset(&action.sa_mask)
-        action.sa_flags = 0
-        sigaction(sig, &action, nil)
-    }
-}
-
-// MARK: - Output Format
-
-/// Determine output format: JSON (for agents/pipes) or text (for humans/TTYs).
-/// Priority: LUMINA_FORMAT env > --text flag > isatty() auto-detection.
-private enum OutputFormat {
-    case json
-    case text
-}
-
-private func resolveOutputFormat(textFlag: Bool) -> OutputFormat {
-    // 1. LUMINA_FORMAT env var takes highest priority
-    if let envFormat = ProcessInfo.processInfo.environment["LUMINA_FORMAT"]?.lowercased() {
-        switch envFormat {
-        case "json": return .json
-        case "text", "human": return .text
-        default: break
-        }
-    }
-
-    // 2. --text flag explicitly requests human-readable
-    if textFlag { return .text }
-
-    // 3. Auto-detect: TTY → text, pipe → JSON
-    return isatty(STDOUT_FILENO) != 0 ? .text : .json
-}
 
 @main
 struct LuminaCLI: AsyncParsableCommand {
@@ -65,7 +9,8 @@ struct LuminaCLI: AsyncParsableCommand {
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
         version: "0.2.2",
-        subcommands: [Run.self, Pull.self, Images.self, Clean.self]
+        subcommands: [Run.self, Pull.self, Images.self, Clean.self,
+                      Session.self, Exec.self, SessionServe.self]
     )
 }
 
@@ -341,20 +286,6 @@ private func printErrorJSON(_ error: any Error, durationMs: Int) {
     encodeAndPrint(r)
 }
 
-/// Print an NDJSON line (used for streaming output).
-private func printNDJSON(_ dict: [String: Any]) {
-    // Use JSONSerialization for heterogeneous dicts, then ensure no literal newlines
-    guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .fragmentsAllowed]),
-          var str = String(data: data, encoding: .utf8) else { return }
-    // JSONSerialization doesn't escape newlines in string values — replace them
-    str = str.replacingOccurrences(of: "\n", with: "\\n")
-    str = str.replacingOccurrences(of: "\r", with: "\\r")
-    str = str.replacingOccurrences(of: "\t", with: "\\t")
-    print(str)
-    // Flush stdout for real-time streaming
-    fflush(stdout)
-}
-
 private func encodeAndPrint<T: Encodable>(_ value: T) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
@@ -428,6 +359,302 @@ struct Clean: ParsableCommand {
             print("Removed \(removed) orphaned clone(s).")
         } else {
             print("No orphaned clones found.")
+        }
+    }
+}
+
+// MARK: - Session
+
+struct Session: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Manage persistent VM sessions",
+        subcommands: [SessionStart.self, SessionStop.self, SessionList.self]
+    )
+}
+
+struct SessionStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "start", abstract: "Start a new persistent session")
+
+    @Option(name: .long, help: "Image to boot from")
+    var image: String = "default"
+
+    @Option(name: .long, help: "Number of CPU cores")
+    var cpus: Int = 2
+
+    @Option(name: .long, help: "Memory (e.g. 512MB, 1GB)")
+    var memory: String = "512MB"
+
+    @Option(name: .long, help: "Volume to mount (name:guest_path, repeatable)")
+    var volume: [String] = []
+
+    func run() async throws {
+        // Auto-pull image if not present
+        let puller = ImagePuller()
+        if !puller.imageExists() {
+            FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+            do {
+                try await puller.pull { msg in
+                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
+                }
+            } catch {
+                FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+                throw ExitCode.failure
+            }
+        }
+
+        guard let parsedMemory = parseMemory(memory) else {
+            FileHandle.standardError.write(Data("lumina: invalid memory '\(memory)'\n".utf8))
+            throw ExitCode.failure
+        }
+
+        var parsedVolumes: [VolumeMount] = []
+        for spec in volume {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use name:guest_path format\n".utf8))
+                throw ExitCode.failure
+            }
+            let name = String(spec[spec.startIndex..<colonIndex])
+            let guestPath = String(spec[spec.index(after: colonIndex)...])
+            parsedVolumes.append(VolumeMount(name: name, guestPath: guestPath))
+        }
+
+        let sid = UUID().uuidString
+        let execPath = ProcessInfo.processInfo.arguments[0]
+
+        // Spawn background session process
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: execPath)
+        process.arguments = [
+            "_session-serve",
+            "--sid", sid,
+            "--image", image,
+            "--cpus", String(cpus),
+            "--memory", String(parsedMemory),
+        ]
+        for v in parsedVolumes {
+            process.arguments! += ["--volume", "\(v.name):\(v.guestPath)"]
+        }
+
+        // Detach from terminal
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            FileHandle.standardError.write(Data("lumina: failed to start session: \(error)\n".utf8))
+            throw ExitCode.failure
+        }
+
+        // Wait for the socket to appear (session process boots VM)
+        let paths = SessionPaths(sid: sid)
+        let deadline = ContinuousClock.now + .seconds(30)
+        while ContinuousClock.now < deadline {
+            if FileManager.default.fileExists(atPath: paths.socket.path) {
+                break
+            }
+            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+
+        guard FileManager.default.fileExists(atPath: paths.socket.path) else {
+            FileHandle.standardError.write(Data("lumina: session failed to start within 30s\n".utf8))
+            throw ExitCode.failure
+        }
+
+        // Output session ID
+        let format = resolveOutputFormat(textFlag: false)
+        switch format {
+        case .json:
+            let output = try JSONSerialization.data(withJSONObject: ["sid": sid], options: [.sortedKeys])
+            print(String(data: output, encoding: .utf8)!)
+        case .text:
+            print(sid)
+        }
+    }
+}
+
+struct SessionStop: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "stop", abstract: "Stop a running session")
+
+    @Argument(help: "Session ID")
+    var sid: String
+
+    func run() async throws {
+        let client = SessionClient()
+        do {
+            try client.connect(sid: sid)
+            try client.send(.shutdown)
+            _ = try? client.receive()
+            client.disconnect()
+        } catch let error as LuminaError {
+            switch error {
+            case .sessionNotFound:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+            case .sessionDead:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+            default:
+                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+            }
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct SessionList: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "list", abstract: "List active sessions")
+
+    @Flag(name: .long, help: "Force human-readable text output")
+    var text = false
+
+    func run() throws {
+        let sessions = SessionPaths.listAll()
+        let format = resolveOutputFormat(textFlag: text)
+        switch format {
+        case .json:
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            encoder.dateEncodingStrategy = .iso8601
+            if let data = try? encoder.encode(sessions),
+               let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+        case .text:
+            if sessions.isEmpty {
+                print("No active sessions.")
+            } else {
+                for s in sessions {
+                    let status = s.status == .running ? "running" : "dead"
+                    print("\(s.sid)\t\(s.image)\t\(status)")
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Exec
+
+struct Exec: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Execute a command in a running session")
+
+    @Argument(help: "Session ID")
+    var sid: String
+
+    @Argument(help: "Command to run")
+    var command: String
+
+    @Flag(name: .long, help: "Stream output in real time")
+    var stream = false
+
+    @Flag(name: .long, help: "Force human-readable text output")
+    var text = false
+
+    @Option(name: .long, help: "Timeout (e.g. 30s, 5m)")
+    var timeout: String = "60s"
+
+    @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
+    var env: [String] = []
+
+    @Option(name: .long, help: "Copy file into VM (local:remote, repeatable)")
+    var copy: [String] = []
+
+    @Option(name: .long, help: "Download file from VM (remote:local, repeatable)")
+    var download: [String] = []
+
+    func run() async throws {
+        guard let parsedTimeout = parseDuration(timeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'\n".utf8))
+            throw ExitCode.failure
+        }
+        let timeoutSecs = Int(parsedTimeout.components.seconds)
+
+        var parsedEnv: [String: String] = [:]
+        for pair in env {
+            guard let eqIndex = pair.firstIndex(of: "=") else {
+                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL\n".utf8))
+                throw ExitCode.failure
+            }
+            parsedEnv[String(pair[..<eqIndex])] = String(pair[pair.index(after: eqIndex)...])
+        }
+
+        let client = SessionClient()
+        do {
+            try client.connect(sid: sid)
+        } catch let error as LuminaError {
+            switch error {
+            case .sessionNotFound:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+            case .sessionDead:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+            default:
+                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+            }
+            throw ExitCode.failure
+        }
+        defer { client.disconnect() }
+
+        // Handle file uploads before exec
+        for spec in copy {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'\n".utf8))
+                throw ExitCode.failure
+            }
+            let localStr = String(spec[..<colonIndex])
+            let remote = String(spec[spec.index(after: colonIndex)...])
+            try client.send(.upload(localPath: localStr, remotePath: remote))
+            let resp = try client.receive()
+            if case .error(let msg) = resp {
+                FileHandle.standardError.write(Data("lumina: upload failed: \(msg)\n".utf8))
+                throw ExitCode.failure
+            }
+        }
+
+        // Execute
+        let format = resolveOutputFormat(textFlag: text)
+        try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv))
+
+        while true {
+            let response = try client.receive()
+            switch response {
+            case .output(let outputStream, let data):
+                switch format {
+                case .json:
+                    printNDJSON(["stream": outputStream.rawValue, "data": data])
+                case .text:
+                    if outputStream == .stdout {
+                        print(data, terminator: "")
+                    } else {
+                        FileHandle.standardError.write(Data(data.utf8))
+                    }
+                }
+            case .exit(let code, let durationMs):
+                switch format {
+                case .json:
+                    printNDJSON(["exit_code": Int(code), "duration_ms": durationMs])
+                case .text:
+                    break
+                }
+
+                // Handle file downloads after exec
+                for spec in download {
+                    guard let colonIndex = spec.firstIndex(of: ":") else { continue }
+                    let remote = String(spec[..<colonIndex])
+                    let localStr = String(spec[spec.index(after: colonIndex)...])
+                    try client.send(.download(remotePath: remote, localPath: localStr))
+                    let dlResp = try client.receive()
+                    if case .error(let msg) = dlResp {
+                        FileHandle.standardError.write(Data("lumina: download failed: \(msg)\n".utf8))
+                    }
+                }
+
+                if code != 0 { throw ExitCode(code) }
+                return
+            case .error(let message):
+                FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
+                throw ExitCode.failure
+            default:
+                continue
+            }
         }
     }
 }
