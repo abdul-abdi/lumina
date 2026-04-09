@@ -88,11 +88,52 @@ public struct Lumina {
         }
     }
 
-    // MARK: - Private
+    /// Create a custom image by running a command in a disposable VM.
+    public static func createImage(
+        name: String,
+        from base: String = "default",
+        command: String,
+        options: RunOptions = .default
+    ) async throws {
+        var opts = options
+        opts.image = base
+        let resolvedOpts = opts
+        try await withVM(options: resolvedOpts) { vm in
+            try await vm.bootResult().get()
+            let result = try await vm.execResult(command, timeout: Int(resolvedOpts.timeout.components.seconds), env: resolvedOpts.env).get()
+            guard result.success else {
+                throw LuminaError.sessionFailed("Image build command failed with exit code \(result.exitCode): \(result.stderr)")
+            }
+            guard let clone = await vm.diskClone else {
+                throw LuminaError.sessionFailed("No disk clone available")
+            }
+            let store = ImageStore()
+            try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
+        }
+    }
+
+    /// Run a closure with a private network of VMs.
+    /// All VMs share a virtual switch for VM-to-VM communication.
+    public static func withNetwork<T: Sendable>(
+        _ name: String = "default",
+        body: @Sendable (Network) async throws -> T
+    ) async throws -> T {
+        let network = Network(name: name)
+        do {
+            let result = try await body(network)
+            await network.shutdown()
+            return result
+        } catch {
+            await network.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - Internal
 
     /// Lifecycle scope: creates a VM, runs the body, and always shuts down.
     /// One shutdown call site, guaranteed to run on every path.
-    private static func withVM<T: Sendable>(
+    static func withVM<T: Sendable>(
         options: RunOptions,
         body: @Sendable (VM) async throws -> T
     ) async throws -> T {

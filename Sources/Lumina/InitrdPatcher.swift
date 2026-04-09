@@ -208,6 +208,11 @@ enum InitrdPatcher {
             "  IFS=\"$OLD_IFS\"",
             "fi",
             "",
+            "# Source network init if present (injected by appendNetworkOverlay)",
+            "if [ -f /lumina-net-init ]; then",
+            "  . /lumina-net-init",
+            "fi",
+            "",
             "exec /usr/local/bin/lumina-agent",
             "INITEOF",
             "chmod 755 /sysroot/sbin/lumina-init",
@@ -217,6 +222,52 @@ enum InitrdPatcher {
         ]
 
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Append a network overlay to an existing combined initrd.
+    /// Adds /lumina-hosts file and eth1 configuration to the init script.
+    /// Called AFTER createCombinedInitrd, composes on top of it.
+    static func appendNetworkOverlay(
+        initrdURL: URL,
+        hosts: [String: String],
+        ip: String
+    ) throws(LuminaError) {
+        var cpio = Data()
+        cpio.append(cpioEntry(path: ".", mode: 0o40755, data: Data()))
+
+        // /lumina-hosts file
+        var hostsContent = "127.0.0.1 localhost\n"
+        for (name, addr) in hosts.sorted(by: { $0.key < $1.key }) {
+            hostsContent += "\(addr) \(name)\n"
+        }
+        cpio.append(cpioEntry(path: "lumina-hosts", mode: 0o100644, data: Data(hostsContent.utf8)))
+
+        // /lumina-net-init script (sourced by the main init if present)
+        let netInit = """
+        #!/bin/sh
+        # Configure eth1 for private networking
+        ip addr add "\(ip)/24" dev eth1 2>/dev/null
+        ip link set eth1 up 2>/dev/null
+        # Copy network hosts file
+        if [ -f /lumina-hosts ]; then
+            cp /lumina-hosts /etc/hosts
+        fi
+        """
+        cpio.append(cpioEntry(path: "lumina-net-init", mode: 0o100755, data: Data(netInit.utf8)))
+
+        cpio.append(cpioTrailer())
+
+        let compressedCpio = try gzipCompress(cpio, tempDir: initrdURL.deletingLastPathComponent())
+
+        // Append to existing initrd (Linux supports concatenated initramfs)
+        do {
+            let handle = try FileHandle(forWritingTo: initrdURL)
+            handle.seekToEndOfFile()
+            handle.write(compressedCpio)
+            try handle.close()
+        } catch {
+            throw .bootFailed(underlying: PatcherError.writeFailed("network overlay: \(error)"))
+        }
     }
 
     // MARK: - CPIO newc format

@@ -80,6 +80,9 @@ public struct VMOptions: Sendable {
     public var image: String
     public var networkProvider: any NetworkProvider
     public var mounts: [MountPoint]
+    public var privateNetworkFd: Int32?  // Raw fd, not FileHandle (FileHandle isn't Sendable)
+    public var networkHosts: [String: String]?
+    public var networkIP: String?
 
     public static let `default` = VMOptions()
 
@@ -88,13 +91,19 @@ public struct VMOptions: Sendable {
         cpuCount: Int = 2,
         image: String = "default",
         networkProvider: any NetworkProvider = NATNetworkProvider(),
-        mounts: [MountPoint] = []
+        mounts: [MountPoint] = [],
+        privateNetworkFd: Int32? = nil,
+        networkHosts: [String: String]? = nil,
+        networkIP: String? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
         self.image = image
         self.networkProvider = networkProvider
         self.mounts = mounts
+        self.privateNetworkFd = privateNetworkFd
+        self.networkHosts = networkHosts
+        self.networkIP = networkIP
     }
 
     public init(from runOptions: RunOptions) {
@@ -103,6 +112,9 @@ public struct VMOptions: Sendable {
         self.image = runOptions.image
         self.networkProvider = NATNetworkProvider()
         self.mounts = runOptions.mounts
+        self.privateNetworkFd = nil
+        self.networkHosts = nil
+        self.networkIP = nil
     }
 }
 
@@ -142,6 +154,98 @@ public enum VMState: Sendable, Equatable {
     case shutdown
 }
 
+// MARK: - Session Types
+
+public struct SessionOptions: Sendable {
+    public var cpuCount: Int
+    public var memory: UInt64
+    public var image: String
+    public var timeout: Duration
+    public var env: [String: String]
+    public var volumes: [VolumeMount]
+
+    public init(
+        cpuCount: Int = 2,
+        memory: UInt64 = 512 * 1024 * 1024,
+        image: String = "default",
+        timeout: Duration = .seconds(60),
+        env: [String: String] = [:],
+        volumes: [VolumeMount] = []
+    ) {
+        self.cpuCount = cpuCount
+        self.memory = memory
+        self.image = image
+        self.timeout = timeout
+        self.env = env
+        self.volumes = volumes
+    }
+}
+
+public struct SessionInfo: Sendable, Codable {
+    public let sid: String
+    public let pid: Int32
+    public let image: String
+    public let cpuCount: Int
+    public let memory: UInt64
+    public let created: Date
+    public var status: SessionState
+
+    public init(
+        sid: String,
+        pid: Int32,
+        image: String,
+        cpuCount: Int,
+        memory: UInt64,
+        created: Date,
+        status: SessionState
+    ) {
+        self.sid = sid
+        self.pid = pid
+        self.image = image
+        self.cpuCount = cpuCount
+        self.memory = memory
+        self.created = created
+        self.status = status
+    }
+}
+
+public enum SessionState: String, Sendable, Codable, Equatable {
+    case running
+    case dead
+}
+
+public struct VolumeMount: Sendable {
+    public let name: String
+    public let guestPath: String
+
+    public init(name: String, guestPath: String) {
+        self.name = name
+        self.guestPath = guestPath
+    }
+}
+
+// MARK: - Image Types
+
+public struct ImageInfo: Sendable {
+    public let name: String
+    public let base: String?
+    public let command: String?
+    public let created: Date
+    public let sizeBytes: UInt64
+}
+
+public struct ImageMeta: Sendable, Codable {
+    public let base: String?
+    public let command: String?
+    public let created: Date
+
+    public init(base: String?, command: String?, created: Date) {
+        self.base = base
+        self.command = command
+        self.created = created
+    }
+}
+
 // MARK: - Errors
 
 public enum LuminaError: Error, Sendable {
@@ -154,6 +258,9 @@ public enum LuminaError: Error, Sendable {
     case protocolError(String)
     case uploadFailed(path: String, reason: String)
     case downloadFailed(path: String, reason: String)
+    case sessionNotFound(String)
+    case sessionDead(String)
+    case sessionFailed(String)
 }
 
 // MARK: - Parsing Helpers
