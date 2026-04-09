@@ -313,29 +313,52 @@ func handleUpload(conn net.Conn, scanner *bufio.Scanner, first UploadMsg) {
 }
 
 func handleDownload(conn net.Conn, req DownloadReqMsg) {
-	data, err := os.ReadFile(req.Path)
+	f, err := os.Open(req.Path)
 	if err != nil {
 		sendJSON(conn, map[string]interface{}{
 			"type": "download_error", "path": req.Path, "error": err.Error(),
 		})
 		return
 	}
+	defer f.Close()
 
-	// Send in 48KB raw chunks (~64KB base64)
+	// Stream in 48KB raw chunks (~64KB base64) — never load entire file into memory.
+	// Go's Read can return (n>0, io.EOF) on the last read, or (n>0, nil) followed
+	// by (0, io.EOF). Handle both: set eof when readErr==io.EOF, and if we reach
+	// a zero-byte EOF without having sent eof yet, send a final empty chunk.
 	const chunkSize = 48 * 1024
+	buf := make([]byte, chunkSize)
 	seq := 0
-	for offset := 0; offset < len(data) || seq == 0; offset += chunkSize {
-		end := offset + chunkSize
-		if end > len(data) {
-			end = len(data)
+	sentEof := false
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			b64 := base64.StdEncoding.EncodeToString(buf[:n])
+			eof := readErr == io.EOF
+			sendJSON(conn, map[string]interface{}{
+				"type": "download_data", "path": req.Path, "data": b64, "seq": seq, "eof": eof,
+			})
+			seq++
+			if eof {
+				sentEof = true
+			}
 		}
-		chunk := data[offset:end]
-		b64 := base64.StdEncoding.EncodeToString(chunk)
-		eof := end >= len(data)
-		sendJSON(conn, map[string]interface{}{
-			"type": "download_data", "path": req.Path, "data": b64, "seq": seq, "eof": eof,
-		})
-		seq++
+		if readErr != nil {
+			if readErr == io.EOF {
+				if !sentEof {
+					// Either empty file or exact multiple of chunkSize —
+					// send final chunk so the host sees eof: true
+					sendJSON(conn, map[string]interface{}{
+						"type": "download_data", "path": req.Path, "data": "", "seq": seq, "eof": true,
+					})
+				}
+				return
+			}
+			sendJSON(conn, map[string]interface{}{
+				"type": "download_error", "path": req.Path, "error": readErr.Error(),
+			})
+			return
+		}
 	}
 }
 

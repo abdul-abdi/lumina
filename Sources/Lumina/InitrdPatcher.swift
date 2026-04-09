@@ -38,11 +38,15 @@ enum InitrdPatcher {
             throw .bootFailed(underlying: PatcherError.readFailed("agent binary: \(error)"))
         }
 
-        // Read kernel modules (vsock etc.) if available
+        // Read kernel modules (vsock etc.) if available.
+        // Resolve symlinks first — FileManager.contentsOfDirectory(at: URL) returns
+        // ENOTDIR for symlinked directories on macOS, even when the target is a real
+        // directory. This breaks custom images whose modules dir symlinks to the base.
         var moduleFiles: [(name: String, data: Data)] = []
         if let modulesDir = modulesDir {
+            let resolvedDir = modulesDir.resolvingSymlinksInPath()
             let fm = FileManager.default
-            if let entries = try? fm.contentsOfDirectory(at: modulesDir, includingPropertiesForKeys: nil) {
+            if let entries = try? fm.contentsOfDirectory(at: resolvedDir, includingPropertiesForKeys: nil) {
                 for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                     if entry.pathExtension == "gz" || entry.pathExtension == "ko" {
                         if let data = try? Data(contentsOf: entry) {

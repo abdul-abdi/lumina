@@ -380,6 +380,16 @@ public actor VM {
         await shutdownVM()
     }
 
+    /// Detach the disk clone from this VM. The caller takes ownership and is
+    /// responsible for cleanup. After detaching, shutdown() will NOT remove the
+    /// clone directory. Used by `createImage` to preserve the rootfs after a
+    /// clean VM shutdown.
+    public func detachClone() -> DiskClone? {
+        let c = clone
+        clone = nil
+        return c
+    }
+
     public var serialOutput: String {
         serialConsole.output
     }

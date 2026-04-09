@@ -159,7 +159,7 @@ public final class SessionServer: @unchecked Sendable {
     private func handleExec(cmd: String, timeout: Int, env: [String: String], vm: VM, handle: FileHandle) async {
         let start = ContinuousClock.now
         let result = await vm.execResult(cmd, timeout: timeout, env: env)
-        let ms = Int((ContinuousClock.now - start).components.seconds * 1000)
+        let ms = (ContinuousClock.now - start).totalMilliseconds
         switch result {
         case .success(let runResult):
             if !runResult.stdout.isEmpty {

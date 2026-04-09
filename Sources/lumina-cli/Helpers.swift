@@ -2,6 +2,28 @@
 import Foundation
 import Lumina
 
+// MARK: - Error Descriptions
+
+/// Return a human-friendly description for LuminaError, adding context where possible.
+func friendlyError(_ error: any Error) -> String {
+    guard let luminaError = error as? LuminaError else {
+        return String(describing: error)
+    }
+    switch luminaError {
+    case .bootFailed(let underlying):
+        // Match on structured NSError domain/code, not fragile string content.
+        // ENOTSUP (45) in NSPOSIXErrorDomain means the Virtualization framework
+        // rejected the VM — typically because macOS hit its concurrent VM limit.
+        let nsError = underlying as NSError
+        if nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOTSUP) {
+            return "bootFailed: VM limit reached — macOS restricts the number of concurrent VMs. Reduce parallel runs or use sessions."
+        }
+        return String(describing: luminaError)
+    default:
+        return String(describing: luminaError)
+    }
+}
+
 // MARK: - Signal Handlers (shared across CLI commands)
 
 /// Install signal handlers via sigaction. Cleans orphaned COW clones on
@@ -59,16 +81,34 @@ func resolveOutputFormat(textFlag: Bool) -> OutputFormat {
     return isatty(STDOUT_FILENO) != 0 ? .text : .json
 }
 
-/// Print an NDJSON line (used for streaming output).
-func printNDJSON(_ dict: [String: Any]) {
-    // Use JSONSerialization for heterogeneous dicts, then ensure no literal newlines
-    guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .fragmentsAllowed]),
-          var str = String(data: data, encoding: .utf8) else { return }
-    // JSONSerialization doesn't escape newlines in string values -- replace them
-    str = str.replacingOccurrences(of: "\n", with: "\\n")
-    str = str.replacingOccurrences(of: "\r", with: "\\r")
-    str = str.replacingOccurrences(of: "\t", with: "\\t")
-    print(str)
-    // Flush stdout for real-time streaming
-    fflush(stdout)
+// MARK: - NDJSON Output Types (streaming / session exec)
+
+/// Stream chunk: stdout or stderr data.
+struct StreamChunk: Encodable {
+    var stream: String
+    var data: String
+}
+
+/// Exit status for streaming / session exec.
+struct ExitChunk: Encodable {
+    var exit_code: Int
+    var duration_ms: Int
+}
+
+/// Error for streaming / session exec.
+struct ErrorChunk: Encodable {
+    var error: String
+    var duration_ms: Int
+}
+
+/// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.
+/// Uses JSONEncoder which always properly escapes control characters (\n, \r, \t, etc.).
+func printNDJSONLine<T: Encodable>(_ value: T) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    if let data = try? encoder.encode(value),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+        fflush(stdout)
+    }
 }
