@@ -276,7 +276,7 @@ extension Duration {
 
 // MARK: - Parsing Helpers
 
-/// Parse a human-readable duration string (e.g. "30s", "5m") into a Duration.
+/// Parse a human-readable duration string (e.g. "30s", "5m", "2h") into a Duration.
 /// Returns nil on invalid input. Bare numbers are treated as seconds.
 public func parseDuration(_ str: String) -> Duration? {
     let trimmed = str.trimmingCharacters(in: .whitespaces).lowercased()
@@ -286,6 +286,9 @@ public func parseDuration(_ str: String) -> Duration? {
     } else if trimmed.hasSuffix("m") {
         guard let num = Int(trimmed.dropLast()) else { return nil }
         return .seconds(num * 60)
+    } else if trimmed.hasSuffix("h") {
+        guard let num = Int(trimmed.dropLast()) else { return nil }
+        return .seconds(num * 3600)
     }
     guard let num = Int(trimmed) else { return nil }
     return .seconds(num)

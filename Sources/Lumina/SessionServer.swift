@@ -158,18 +158,22 @@ public final class SessionServer: @unchecked Sendable {
 
     private func handleExec(cmd: String, timeout: Int, env: [String: String], vm: VM, handle: FileHandle) async {
         let start = ContinuousClock.now
-        let result = await vm.execResult(cmd, timeout: timeout, env: env)
-        let ms = (ContinuousClock.now - start).totalMilliseconds
-        switch result {
-        case .success(let runResult):
-            if !runResult.stdout.isEmpty {
-                try? writeResponse(.output(stream: .stdout, data: runResult.stdout), to: handle)
+        do {
+            // Stream output in real time — each chunk is sent to the client as it arrives
+            // from the guest agent, rather than buffering the entire result.
+            let chunks = try await vm.stream(cmd, timeout: timeout, env: env)
+            for try await chunk in chunks {
+                switch chunk {
+                case .stdout(let data):
+                    try? writeResponse(.output(stream: .stdout, data: data), to: handle)
+                case .stderr(let data):
+                    try? writeResponse(.output(stream: .stderr, data: data), to: handle)
+                case .exit(let code):
+                    let ms = (ContinuousClock.now - start).totalMilliseconds
+                    try? writeResponse(.exit(code: code, durationMs: ms), to: handle)
+                }
             }
-            if !runResult.stderr.isEmpty {
-                try? writeResponse(.output(stream: .stderr, data: runResult.stderr), to: handle)
-            }
-            try? writeResponse(.exit(code: runResult.exitCode, durationMs: ms), to: handle)
-        case .failure(let error):
+        } catch {
             try? writeResponse(.error(message: String(describing: error)), to: handle)
         }
     }

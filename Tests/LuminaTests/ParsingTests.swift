@@ -13,6 +13,12 @@ import Testing
     #expect(parseDuration("1m") == .seconds(60))
 }
 
+@Test func parseDurationHours() {
+    #expect(parseDuration("1h") == .seconds(3600))
+    #expect(parseDuration("2h") == .seconds(7200))
+    #expect(parseDuration("24h") == .seconds(86400))
+}
+
 @Test func parseDurationBareNumber() {
     #expect(parseDuration("30") == .seconds(30))
     #expect(parseDuration("0") == .seconds(0))
@@ -23,6 +29,7 @@ import Testing
     #expect(parseDuration("") == nil)
     #expect(parseDuration("s") == nil)
     #expect(parseDuration("m") == nil)
+    #expect(parseDuration("h") == nil)
     #expect(parseDuration("12x") == nil)
 }
 
