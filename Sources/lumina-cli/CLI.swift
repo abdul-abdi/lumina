@@ -10,7 +10,7 @@ struct LuminaCLI: AsyncParsableCommand {
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
         version: "0.2.2",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
-                      Session.self, Exec.self, SessionServe.self]
+                      Session.self, Exec.self, SessionServe.self, Volume.self]
     )
 }
 
@@ -48,6 +48,9 @@ struct Run: AsyncParsableCommand {
 
     @Option(name: .long, help: "Mount host directory into VM (host:guest, repeatable)")
     var mount: [String] = []
+
+    @Option(name: .long, help: "Mount named volume (name:guest_path, repeatable)")
+    var volume: [String] = []
 
     func run() async throws {
         installSignalHandlers()
@@ -139,6 +142,23 @@ struct Run: AsyncParsableCommand {
                 throw ExitCode.failure
             }
             parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guest))
+        }
+
+        // Resolve --volume flags (name:guest_path -> host_path:guest_path)
+        let volumeStore = VolumeStore()
+        for spec in volume {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use name:guest_path\n".utf8))
+                throw ExitCode.failure
+            }
+            let name = String(spec[..<colonIndex])
+            let guestPath = String(spec[spec.index(after: colonIndex)...])
+            guard let hostDir = volumeStore.resolve(name: name) else {
+                FileHandle.standardError.write(Data("lumina: volume '\(name)' not found\n".utf8))
+                throw ExitCode.failure
+            }
+            volumeStore.touch(name: name)
+            parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
         }
 
         let options = RunOptions(
@@ -728,6 +748,77 @@ struct Exec: AsyncParsableCommand {
             default:
                 continue
             }
+        }
+    }
+}
+
+// MARK: - Volume
+
+struct Volume: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Manage persistent volumes",
+        subcommands: [VolumeCreate.self, VolumeList.self, VolumeRemove.self, VolumeInspect.self]
+    )
+}
+
+struct VolumeCreate: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "create", abstract: "Create a named volume")
+
+    @Argument(help: "Volume name")
+    var name: String
+
+    func run() throws {
+        let store = VolumeStore()
+        try store.create(name: name)
+        print("Volume '\(name)' created.")
+    }
+}
+
+struct VolumeList: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "list", abstract: "List volumes")
+
+    func run() throws {
+        let store = VolumeStore()
+        let names = store.list()
+        if names.isEmpty {
+            print("No volumes.")
+        } else {
+            for name in names { print(name) }
+        }
+    }
+}
+
+struct VolumeRemove: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "remove", abstract: "Remove a volume")
+
+    @Argument(help: "Volume name")
+    var name: String
+
+    func run() throws {
+        let store = VolumeStore()
+        try store.remove(name: name)
+        print("Volume '\(name)' removed.")
+    }
+}
+
+struct VolumeInspect: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "inspect", abstract: "Show volume details")
+
+    @Argument(help: "Volume name")
+    var name: String
+
+    func run() throws {
+        let store = VolumeStore()
+        let info = try store.inspect(name: name)
+        let dict: [String: Any] = [
+            "name": info.name,
+            "size_bytes": info.sizeBytes,
+            "created": ISO8601DateFormatter().string(from: info.created),
+            "last_used": ISO8601DateFormatter().string(from: info.lastUsed)
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .prettyPrinted]),
+           let str = String(data: data, encoding: .utf8) {
+            print(str)
         }
     }
 }
