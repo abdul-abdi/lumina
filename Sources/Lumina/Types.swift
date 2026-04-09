@@ -263,6 +263,17 @@ public enum LuminaError: Error, Sendable {
     case sessionFailed(String)
 }
 
+// MARK: - Duration Helpers
+
+extension Duration {
+    /// Total milliseconds from both seconds and attoseconds components.
+    /// Single definition to avoid fat-fingering the attosecond divisor.
+    /// Named `totalMilliseconds` to avoid conflict with `Duration.milliseconds(_:)`.
+    public var totalMilliseconds: Int {
+        Int(components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000)
+    }
+}
+
 // MARK: - Parsing Helpers
 
 /// Parse a human-readable duration string (e.g. "30s", "5m") into a Duration.

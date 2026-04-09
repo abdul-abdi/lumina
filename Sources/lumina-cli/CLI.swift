@@ -23,13 +23,16 @@ struct Run: AsyncParsableCommand {
     @Argument(help: "Command to run in the VM")
     var command: String
 
+    @Option(name: .long, help: "Image to boot from")
+    var image: String = "default"
+
     @Flag(name: .long, help: "Stream output in real time (NDJSON when piped, raw when TTY)")
     var stream = false
 
     @Flag(name: .long, help: "Force human-readable text output (default when TTY)")
     var text = false
 
-    @Option(name: .long, help: "Timeout (e.g. 30s, 5m)")
+    @Option(name: .long, help: "Command timeout, excludes ~2s boot time (e.g. 30s, 5m)")
     var timeout: String = "60s"
 
     @Option(name: .long, help: "Memory (e.g. 512MB, 1GB)")
@@ -166,6 +169,7 @@ struct Run: AsyncParsableCommand {
             timeout: parsedTimeout,
             memory: parsedMemory,
             cpuCount: cpus,
+            image: image,
             env: parsedEnv,
             uploads: parsedUploads,
             downloads: parsedDownloads,
@@ -206,7 +210,7 @@ struct Run: AsyncParsableCommand {
             let ms = millisSince(start)
             switch format {
             case .json:
-                printErrorJSON(error, durationMs: ms)
+                printErrorJSON(error, durationMs: ms, friendly: true)
             case .text:
                 try handleTextError(error, timeout: timeout)
             }
@@ -226,11 +230,11 @@ struct Run: AsyncParsableCommand {
                     // NDJSON: one JSON object per line
                     switch chunk {
                     case .stdout(let data):
-                        printNDJSON(["stream": "stdout", "data": data])
+                        printNDJSONLine(StreamChunk(stream: "stdout", data: data))
                     case .stderr(let data):
-                        printNDJSON(["stream": "stderr", "data": data])
+                        printNDJSONLine(StreamChunk(stream: "stderr", data: data))
                     case .exit(let code):
-                        printNDJSON(["exit_code": Int(code), "duration_ms": millisSince(start)])
+                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: millisSince(start)))
                         if code != 0 { throw ExitCode(code) }
                     }
                 case .text:
@@ -249,7 +253,7 @@ struct Run: AsyncParsableCommand {
         } catch {
             switch format {
             case .json:
-                printNDJSON(["error": String(describing: error), "duration_ms": millisSince(start)])
+                printNDJSONLine(ErrorChunk(error: friendlyError(error), duration_ms: millisSince(start)))
             case .text:
                 try handleTextError(error, timeout: timeout)
             }
@@ -302,8 +306,9 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
     encodeAndPrint(r)
 }
 
-private func printErrorJSON(_ error: any Error, durationMs: Int) {
-    let r = ResultJSON(error: String(describing: error), duration_ms: durationMs)
+private func printErrorJSON(_ error: any Error, durationMs: Int, friendly: Bool = false) {
+    let msg = friendly ? friendlyError(error) : String(describing: error)
+    let r = ResultJSON(error: msg, duration_ms: durationMs)
     encodeAndPrint(r)
 }
 
@@ -317,8 +322,7 @@ private func encodeAndPrint<T: Encodable>(_ value: T) {
 }
 
 private func millisSince(_ start: ContinuousClock.Instant) -> Int {
-    let elapsed = ContinuousClock.now - start
-    return Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
+    (ContinuousClock.now - start).totalMilliseconds
 }
 
 // MARK: - Pull
@@ -389,10 +393,20 @@ struct ImageCreate: AsyncParsableCommand {
     @Option(name: [.customLong("run")], help: "Command to run for setup")
     var buildCommand: String
 
+    @Option(name: .long, help: "Timeout for build command (e.g. 60s, 5m)")
+    var timeout: String = "5m"
+
     func run() async throws {
+        guard let parsedTimeout = parseDuration(timeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 60s, 5m\n".utf8))
+            throw ExitCode.failure
+        }
+
         FileHandle.standardError.write(Data("Creating image '\(name)' from '\(from)'...\n".utf8))
         do {
-            try await Lumina.createImage(name: name, from: from, command: buildCommand)
+            var opts = RunOptions()
+            opts.timeout = parsedTimeout
+            try await Lumina.createImage(name: name, from: from, command: buildCommand, options: opts)
             print("Image '\(name)' created successfully.")
         } catch {
             FileHandle.standardError.write(Data("lumina: image create failed: \(error)\n".utf8))
@@ -428,14 +442,23 @@ struct ImageInspect: ParsableCommand {
     func run() throws {
         let store = ImageStore()
         let info = try store.inspect(name: name)
-        let dict: [String: Any] = [
-            "name": info.name,
-            "base": info.base ?? "none",
-            "command": info.command ?? "none",
-            "size_bytes": info.sizeBytes,
-            "created": ISO8601DateFormatter().string(from: info.created)
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .prettyPrinted]),
+        struct ImageInspectOutput: Encodable {
+            var name: String
+            var base: String
+            var command: String
+            var size_bytes: UInt64
+            var created: String
+        }
+        let output = ImageInspectOutput(
+            name: info.name,
+            base: info.base ?? "none",
+            command: info.command ?? "none",
+            size_bytes: info.sizeBytes,
+            created: ISO8601DateFormatter().string(from: info.created)
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        if let data = try? encoder.encode(output),
            let str = String(data: data, encoding: .utf8) {
             print(str)
         }
@@ -481,6 +504,9 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Volume to mount (name:guest_path, repeatable)")
     var volume: [String] = []
 
+    @Option(name: .long, help: "Max time to wait for VM to boot (e.g. 30s, 2m)")
+    var bootTimeout: String = "60s"
+
     func run() async throws {
         // Auto-pull image if not present
         let puller = ImagePuller()
@@ -500,6 +526,12 @@ struct SessionStart: AsyncParsableCommand {
             FileHandle.standardError.write(Data("lumina: invalid memory '\(memory)'\n".utf8))
             throw ExitCode.failure
         }
+
+        guard let parsedBootTimeout = parseDuration(bootTimeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid boot-timeout '\(bootTimeout)'. Use e.g. 30s, 2m\n".utf8))
+            throw ExitCode.failure
+        }
+        let bootTimeoutSecs = Int(parsedBootTimeout.components.seconds)
 
         var parsedVolumes: [VolumeMount] = []
         for spec in volume {
@@ -543,7 +575,7 @@ struct SessionStart: AsyncParsableCommand {
 
         // Wait for the socket to appear (session process boots VM)
         let paths = SessionPaths(sid: sid)
-        let deadline = ContinuousClock.now + .seconds(30)
+        let deadline = ContinuousClock.now + .seconds(bootTimeoutSecs)
         while ContinuousClock.now < deadline {
             if FileManager.default.fileExists(atPath: paths.socket.path) {
                 break
@@ -552,7 +584,7 @@ struct SessionStart: AsyncParsableCommand {
         }
 
         guard FileManager.default.fileExists(atPath: paths.socket.path) else {
-            FileHandle.standardError.write(Data("lumina: session failed to start within 30s\n".utf8))
+            FileHandle.standardError.write(Data("lumina: session failed to start within \(bootTimeout)\n".utf8))
             throw ExitCode.failure
         }
 
@@ -574,13 +606,37 @@ struct SessionStop: AsyncParsableCommand {
     @Argument(help: "Session ID")
     var sid: String
 
+    @Flag(name: .long, help: "Force human-readable text output")
+    var text = false
+
     func run() async throws {
         let client = SessionClient()
         do {
             try client.connect(sid: sid)
             try client.send(.shutdown)
-            _ = try? client.receive()
+            // Verify the server acknowledged the shutdown
+            let response = try? client.receive()
             client.disconnect()
+
+            let confirmed: Bool
+            if let response = response {
+                switch response {
+                case .exit: confirmed = true
+                default: confirmed = false
+                }
+            } else {
+                // Connection closed — server shut down (success)
+                confirmed = true
+            }
+
+            let format = resolveOutputFormat(textFlag: text)
+            switch format {
+            case .json:
+                struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
+                encodeAndPrint(StopResult(stopped: sid, confirmed: confirmed))
+            case .text:
+                print("Session '\(sid)' stopped.")
+            }
         } catch let error as LuminaError {
             switch error {
             case .sessionNotFound:
@@ -713,7 +769,7 @@ struct Exec: AsyncParsableCommand {
             case .output(let outputStream, let data):
                 switch format {
                 case .json:
-                    printNDJSON(["stream": outputStream.rawValue, "data": data])
+                    printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
                 case .text:
                     if outputStream == .stdout {
                         print(data, terminator: "")
@@ -724,7 +780,7 @@ struct Exec: AsyncParsableCommand {
             case .exit(let code, let durationMs):
                 switch format {
                 case .json:
-                    printNDJSON(["exit_code": Int(code), "duration_ms": durationMs])
+                    printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
                 case .text:
                     break
                 }
@@ -811,13 +867,21 @@ struct VolumeInspect: ParsableCommand {
     func run() throws {
         let store = VolumeStore()
         let info = try store.inspect(name: name)
-        let dict: [String: Any] = [
-            "name": info.name,
-            "size_bytes": info.sizeBytes,
-            "created": ISO8601DateFormatter().string(from: info.created),
-            "last_used": ISO8601DateFormatter().string(from: info.lastUsed)
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys, .prettyPrinted]),
+        struct VolumeInspectOutput: Encodable {
+            var name: String
+            var size_bytes: UInt64
+            var created: String
+            var last_used: String
+        }
+        let output = VolumeInspectOutput(
+            name: info.name,
+            size_bytes: info.sizeBytes,
+            created: ISO8601DateFormatter().string(from: info.created),
+            last_used: ISO8601DateFormatter().string(from: info.lastUsed)
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        if let data = try? encoder.encode(output),
            let str = String(data: data, encoding: .utf8) {
             print(str)
         }

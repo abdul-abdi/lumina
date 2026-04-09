@@ -89,6 +89,11 @@ public struct Lumina {
     }
 
     /// Create a custom image by running a command in a disposable VM.
+    /// Set `options.timeout` to control how long the build command can run (default 60s).
+    ///
+    /// Unlike `run`, this manages the VM lifecycle manually: after the build
+    /// command completes, the clone is detached, the VM is shut down cleanly
+    /// (flushing the ext4 journal), and then the rootfs is copied to the image store.
     public static func createImage(
         name: String,
         from base: String = "default",
@@ -97,19 +102,36 @@ public struct Lumina {
     ) async throws {
         var opts = options
         opts.image = base
-        let resolvedOpts = opts
-        try await withVM(options: resolvedOpts) { vm in
+        let vmOptions = VMOptions(from: opts)
+        let vm = VM(options: vmOptions)
+
+        // Phase 1: Run command (VM owns everything — shutdown handles cleanup on failure)
+        do {
             try await vm.bootResult().get()
-            let result = try await vm.execResult(command, timeout: Int(resolvedOpts.timeout.components.seconds), env: resolvedOpts.env).get()
-            guard result.success else {
-                throw LuminaError.sessionFailed("Image build command failed with exit code \(result.exitCode): \(result.stderr)")
-            }
-            guard let clone = await vm.diskClone else {
-                throw LuminaError.sessionFailed("No disk clone available")
-            }
-            let store = ImageStore()
-            try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
+        } catch {
+            await vm.shutdown()
+            throw error
         }
+        let result = try await vm.execResult(command, timeout: max(Int(opts.timeout.components.seconds), 1), env: opts.env).get()
+        guard result.success else {
+            await vm.shutdown()
+            throw LuminaError.sessionFailed("Image build command failed with exit code \(result.exitCode): \(result.stderr)")
+        }
+
+        // Phase 2: Transfer ownership — clone detached, VM shut down cleanly.
+        // After this point, WE own the clone and must clean it up.
+        guard let clone = await vm.detachClone() else {
+            await vm.shutdown()
+            throw LuminaError.sessionFailed("No disk clone available")
+        }
+        // Clean shutdown flushes the Virtualization framework's disk cache
+        // and the guest kernel's ext4 journal, producing a consistent rootfs.
+        await vm.shutdown()
+
+        // Phase 3: Copy rootfs into image store (caller owns clone)
+        defer { clone.remove() }
+        let store = ImageStore()
+        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
     }
 
     /// Run a closure with a private network of VMs.
