@@ -206,8 +206,9 @@ SUBCOMMANDS:
 
 ```bash
 lumina run <command>                          # run, print stdout
+lumina run --image python <command>           # use a custom image
 lumina run --stream <command>                 # stream output live
-lumina run --timeout 30s <command>            # timeout (default: 60s)
+lumina run --timeout 30s <command>            # command timeout (default: 60s, excludes ~2s boot)
 lumina run --memory 1GB --cpus 4 <command>    # resources (default: 512MB, 2 CPUs)
 lumina run -e KEY=VAL <command>               # env vars (repeatable)
 lumina run --copy local:remote <command>      # upload file before exec
@@ -225,9 +226,11 @@ lumina session start                         # start with defaults
 lumina session start --image python           # use custom image
 lumina session start --memory 1GB --cpus 4    # configure resources
 lumina session start --volume data:/mnt       # mount volume at boot
+lumina session start --boot-timeout 2m        # boot timeout (default: 60s)
 lumina session list                           # list active sessions
 lumina session list --text                    # human-readable output
-lumina session stop <sid>                     # stop and clean up
+lumina session stop <sid>                     # stop and confirm
+# → {"confirmed":true,"stopped":"<sid>"}
 ```
 
 **`lumina exec`**
@@ -247,6 +250,7 @@ lumina exec <sid> <command> --text            # human-readable output
 ```bash
 lumina images list                            # list cached images
 lumina images create NAME --from BASE --run CMD  # build custom image
+lumina images create NAME --run CMD --timeout 5m # with build timeout (default: 5m)
 lumina images inspect NAME                    # show image details
 lumina images remove NAME                     # remove (checks deps)
 ```
