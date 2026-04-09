@@ -2,6 +2,7 @@
 
 > Sessions, Custom Images, Persistent Volumes, VM-to-VM Networking.
 > Informed by roundtable debate (Carmack, Hickey, PG) on 2026-04-09.
+> Revised after roundtable spec review — fixes for IPC protocol, DiskClone, volumes, networking.
 
 ---
 
@@ -33,22 +34,34 @@ Per-session background process + Unix domain socket. No daemon. Each session is 
 
 ### IPC protocol (over Unix socket)
 
-NDJSON, same shape as vsock protocol. Agent-consumer-first design.
+NDJSON over Unix domain socket. **This is a separate protocol from the vsock guest protocol** — different senders, different semantics. Defined as `SessionMessage` types in `SessionProtocol.swift`, distinct from `HostMessage`/`GuestMessage` in `Protocol.swift`.
 
+The session server translates between the two: it receives `SessionMessage` from the CLI client, dispatches to the VM actor via the existing `CommandRunner` vsock protocol, and relays results back as `SessionMessage` responses.
+
+**Client → Server messages (`SessionRequest`):**
 ```
-Client → Server: {"type":"exec","cmd":"...","timeout":30,"env":{},"volumes":[{"name":"x","guest_path":"/mnt/x"}]}
-Server → Client: {"type":"output","stream":"stdout","data":"..."}
-Server → Client: {"type":"exit","code":0,"duration_ms":150}
-Client → Server: {"type":"shutdown"}
+{"type":"exec","cmd":"...","timeout":30,"env":{}}
+{"type":"upload","local_path":"/host/file","remote_path":"/guest/file"}
+{"type":"download","remote_path":"/guest/file","local_path":"/host/file"}
+{"type":"shutdown"}
 ```
 
-Additional messages for file operations:
+**Server → Client messages (`SessionResponse`):**
 ```
-Client → Server: {"type":"upload","path":"/guest/path","data":"<base64>","seq":0}
-Server → Client: {"type":"upload_ack","seq":0}
-Client → Server: {"type":"download_req","path":"/guest/path"}
-Server → Client: {"type":"download_data","path":"/guest/path","data":"<base64>"}
+{"type":"output","stream":"stdout","data":"..."}
+{"type":"exit","code":0,"duration_ms":150}
+{"type":"error","message":"session_dead"}
+{"type":"upload_done","path":"/guest/file"}
+{"type":"download_done","path":"/host/file"}
 ```
+
+### Session crash recovery
+
+**VM crash during exec:** The session server detects EOF on the vsock connection (CommandRunner returns `.connectionFailed`). It returns `{"type":"error","message":"vm_crashed","serial_log_tail":"..."}` to the client. The session enters a terminal `dead` state — no restart, no implicit recovery. The client must start a new session.
+
+**Session process crash (SIGKILL/OOM):** The Unix socket disappears. Next `lumina exec` or `lumina session list` detects stale PID via `kill(pid, 0)`, cleans up the session directory and COW clone, returns `{"error":"session_dead","sid":"..."}`.
+
+**SIGTERM/SIGINT on session process:** Graceful VM shutdown + COW clone removal (reuses existing signal handling).
 
 ### CLI interface
 
@@ -64,19 +77,15 @@ lumina session list                    # JSON array of session metadata
 lumina session list --text             # human-readable table
 ```
 
-### Failure recovery
-
-- **Stale session detection:** On connect, if socket fails, check PID via `kill(pid, 0)`. If dead: remove session directory, clean COW clone via existing `DiskClone` orphan logic, return `{"error":"session_dead","sid":"..."}`.
-- **`lumina session list`:** Marks dead sessions with `"status":"dead"`. `lumina clean` garbage-collects them.
-- **SIGTERM/SIGINT on session process:** Graceful VM shutdown + COW clone removal (reuses existing signal handling).
-- **Hard crash (SIGKILL/OOM):** Next `exec` or `list` detects stale PID, triggers cleanup.
+**Note:** `--volume` is only valid on `session start`, not on `exec`. VirtioFS shares are boot-time configuration — they cannot be added to a running VM. Volumes must be declared when the session is created.
 
 ### What changes in existing code
 
 | File | Change |
 |------|--------|
-| `Sources/Lumina/SessionServer.swift` | **New.** Unix socket listener, accepts IPC connections, dispatches to VM actor |
-| `Sources/Lumina/SessionClient.swift` | **New.** Connects to session socket, sends commands, receives output stream |
+| `Sources/Lumina/SessionProtocol.swift` | **New.** `SessionRequest`/`SessionResponse` enums + NDJSON encode/decode (separate from vsock `Protocol.swift`) |
+| `Sources/Lumina/SessionServer.swift` | **New.** Unix socket listener, accepts IPC connections, translates SessionMessages to CommandRunner calls |
+| `Sources/Lumina/SessionClient.swift` | **New.** Connects to session socket, sends SessionRequest, receives SessionResponse stream |
 | `Sources/Lumina/Session.swift` | **New.** Session metadata, filesystem paths, PID management |
 | `Sources/Lumina/Lumina.swift` | Add `Lumina.session(start:)`, `Lumina.exec(sid:)`, `Lumina.sessionStop(sid:)` |
 | `Sources/Lumina/Types.swift` | Add `SessionOptions`, `SessionInfo`, `SessionState` types |
@@ -96,17 +105,23 @@ lumina session list --text             # human-readable table
 
 ### Mechanism
 
-Boot a VM from base image, run setup command, save modified rootfs as new named image. The DiskClone COW copy is promoted to ImageStore instead of deleted.
+Boot a VM from base image, run setup command, save modified rootfs as new named image. `ImageStore.create()` handles the entire image creation lifecycle — DiskClone stays purely ephemeral.
 
 ### Image creation flow
 
 1. Resolve base image via `ImageStore.resolve(name:)`
 2. Create COW clone via `DiskClone.create()`
 3. Boot VM, exec the setup command, wait for exit code 0
-4. On success: copy COW clone's `rootfs.img` to `~/.lumina/images/<new_name>/`
-5. Symlink shared assets from base: `vmlinuz`, `initrd`, `modules/`, `lumina-agent`
-6. Write `meta.json` with lineage info
-7. On failure: delete COW clone, report error
+4. On success: `ImageStore.create(name:from:rootfsSource:command:)` does:
+   a. Create staging dir at `~/.lumina/images/.tmp-<uuid>/`
+   b. Copy COW clone's `rootfs.img` (via `DiskClone.rootfs` public property) into staging dir
+   c. Create symlinks to base image's `vmlinuz`, `initrd`, `modules/`, `lumina-agent`
+   d. Write `meta.json` with lineage info
+   e. Atomic `rename()` staging dir to `~/.lumina/images/<new_name>/`
+5. DiskClone gets normal `remove()` — it stays ephemeral, no `promote()` method
+6. On failure: delete COW clone, clean up staging dir if it exists, report error
+
+**Atomicity:** The staging-dir + `rename()` pattern ensures no partial images. If the process crashes mid-creation, the `.tmp-*` dir is cleaned up on next `ImageStore` operation (same pattern as `DiskClone.cleanOrphans()`).
 
 ### Filesystem layout
 
@@ -134,8 +149,7 @@ lumina image inspect python               # full metadata
 
 | File | Change |
 |------|--------|
-| `Sources/Lumina/ImageStore.swift` | Add `create(name:from:command:)`, `remove(name:)`, `inspect(name:)`, dependency checking |
-| `Sources/Lumina/DiskClone.swift` | Add `promote(to:)` — moves COW clone rootfs to target path instead of deleting |
+| `Sources/Lumina/ImageStore.swift` | Add `create(name:from:rootfsSource:command:)` with staging-dir atomicity, `remove(name:)` with dependency checking, `inspect(name:)` |
 | `Sources/Lumina/Lumina.swift` | Add `Lumina.createImage(name:from:command:)` convenience |
 | `Sources/Lumina/Types.swift` | Add `ImageInfo` type (name, base, size, created, command) |
 | `Sources/lumina-cli/main.swift` | Add `image create`, `image remove`, `image inspect` subcommands |
@@ -174,9 +188,9 @@ lumina volume inspect pycache                         # size, last_used, created
 # Use with one-shot runs
 lumina run --volume pycache:/root/.cache/pip "pip install pandas"
 
-# Use with sessions
-lumina session start --volume cache:/root/.cache
-lumina exec $sid --volume data:/mnt/data "python3 train.py"
+# Use with sessions (volumes declared at session start, not exec — VirtioFS is boot-time only)
+lumina session start --volume cache:/root/.cache --volume data:/mnt/data
+lumina exec $sid "python3 train.py"
 ```
 
 ### Concurrency semantics
@@ -208,17 +222,41 @@ Multiple VMs can mount the same volume simultaneously. VirtioFS is a passthrough
 
 ### Mechanism
 
-`VZFileHandleNetworkDeviceAttachment` provides file descriptors for raw ethernet frame I/O. A userspace `NetworkSwitch` relays frames between connected VMs via socketpairs.
+`VZFileHandleNetworkDeviceAttachment` provides file descriptors for raw ethernet frame I/O. VZ emulates an Ethernet device — frames, not streams — so the file descriptors **must be datagram sockets**. Each VM-to-switch connection uses:
 
-Each networked VM gets two interfaces:
+```swift
+var fds: [Int32] = [0, 0]
+socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds)
+// fds[0] → given to VZFileHandleNetworkDeviceAttachment (VM side)
+// fds[1] → owned by NetworkSwitch (relay side)
+```
+
+**Critical:** `SOCK_DGRAM` is required, not `SOCK_STREAM`. VZ writes complete Ethernet frames as individual datagrams. Stream sockets lose frame boundaries and silently corrupt the network — the VM's network stack hangs with no useful error.
+
+A userspace `NetworkSwitch` reads datagrams from each VM's relay fd and writes them to all other VMs' relay fds (simple hub/broadcast model). Each networked VM gets two interfaces:
 - `eth0` — NAT (existing `VZNATNetworkDeviceAttachment`) for internet access
 - `eth1` — Private network via `VZFileHandleNetworkDeviceAttachment` for VM-to-VM
+
+### VMOptions wiring
+
+`VMOptions` gains an optional `privateNetworkFd: FileHandle?` field. When set, `VM.boot()` creates a second `VZVirtioNetworkDeviceConfiguration` with `VZFileHandleNetworkDeviceAttachment(fileHandle: privateNetworkFd)` and appends it to `config.networkDevices`. The existing NAT device remains at index 0 (eth0); the private network becomes index 1 (eth1).
 
 ### IP assignment and DNS
 
 - IPs assigned deterministically from `192.168.100.0/24` by session index (`.2`, `.3`, `.4`, ...)
-- DNS via `/etc/hosts` injection: `InitrdPatcher` writes host entries for all peers before boot
-- No dnsmasq, no dynamic DNS. Static hosts file is sufficient for group-based networks.
+- DNS via `/etc/hosts` injection into the initrd overlay
+
+### InitrdPatcher changes
+
+`InitrdPatcher.createCombinedInitrd` gains a new parameter: `networkHosts: [String: String]?` — a hostname-to-IP mapping (e.g., `["db": "192.168.100.2", "api": "192.168.100.3"]`). When non-nil:
+
+1. A `/lumina-hosts` file is added as a cpio entry containing the hosts file content
+2. The `customInitScript()` inner init (`/sysroot/sbin/lumina-init`) gains lines to:
+   - Copy `/lumina-hosts` to `/sysroot/etc/hosts` (alongside the rootfs mount)
+   - Configure `eth1` with the assigned static IP via `ip addr add <ip>/24 dev eth1 && ip link set eth1 up`
+3. The assigned IP is passed via kernel cmdline: `lumina_ip=192.168.100.2`
+
+This is a non-trivial addition to `InitrdPatcher` — estimated ~40 lines of init script changes and ~15 lines of cpio generation.
 
 ### Library API
 
@@ -252,12 +290,12 @@ lumina network run --file stack.json
 
 | File | Change |
 |------|--------|
-| `Sources/Lumina/NetworkSwitch.swift` | **New.** ~200 lines. Userspace ethernet frame relay between file handle pairs |
+| `Sources/Lumina/NetworkSwitch.swift` | **New.** ~200 lines. Userspace SOCK_DGRAM relay between VM file handle pairs (hub model) |
 | `Sources/Lumina/Network.swift` | **New.** Network actor: manages switch + session registry + IP assignment + hosts generation |
 | `Sources/Lumina/Lumina.swift` | Add `Lumina.withNetwork()` convenience |
-| `Sources/Lumina/VM.swift` | Support optional second network interface via `VZFileHandleNetworkDeviceAttachment` |
-| `Sources/Lumina/InitrdPatcher.swift` | Inject `/etc/hosts` entries for network peers |
-| `Guest/lumina-agent/main.go` | Configure `eth1` with static IP if network config present (or handle in init script) |
+| `Sources/Lumina/VM.swift` | Support optional `privateNetworkFd` — creates second `VZVirtioNetworkDeviceConfiguration` with `VZFileHandleNetworkDeviceAttachment` |
+| `Sources/Lumina/Types.swift` | Add `privateNetworkFd: FileHandle?` to `VMOptions` |
+| `Sources/Lumina/InitrdPatcher.swift` | Add `networkHosts: [String: String]?` param to `createCombinedInitrd`. New cpio entry for `/lumina-hosts`. Init script changes: copy hosts file, configure eth1 with static IP from `lumina_ip` cmdline param (~55 new lines) |
 | `Sources/lumina-cli/main.swift` | Add `network run` subcommand |
 
 ### What's explicitly deferred
@@ -282,11 +320,12 @@ lumina network run --file stack.json
 
 | Module | Lines (est.) | Purpose |
 |--------|-------------|---------|
-| `SessionServer.swift` | ~250 | Unix socket listener + IPC dispatch |
-| `SessionClient.swift` | ~150 | Connect to session, send/receive |
+| `SessionProtocol.swift` | ~120 | `SessionRequest`/`SessionResponse` enums + NDJSON codec |
+| `SessionServer.swift` | ~250 | Unix socket listener, translates SessionMessages → CommandRunner |
+| `SessionClient.swift` | ~150 | Connect to session, send SessionRequest, receive SessionResponse |
 | `Session.swift` | ~100 | Metadata, paths, PID management |
 | `VolumeStore.swift` | ~100 | Named volume CRUD |
-| `NetworkSwitch.swift` | ~200 | Userspace ethernet relay |
+| `NetworkSwitch.swift` | ~200 | Userspace SOCK_DGRAM ethernet relay |
 | `Network.swift` | ~200 | Network actor, IP assignment, hosts |
 
 ### Types additions (Types.swift)
@@ -325,8 +364,14 @@ public struct NetworkConfig: Sendable { ... }
      │                  │                  │               │
      │                  │                  │               └─ NetworkSwitch + Network actor + dual-interface VM
      │                  │                  └─ VolumeStore + --volume flag + VirtioFS wiring
-     │                  └─ ImageStore.create + DiskClone.promote + image CLI
+     │                  └─ ImageStore.create (staging dir atomicity) + image CLI
      └─ SessionServer + SessionClient + session CLI + exec subcommand
 ```
 
 Each step builds on the last. Sessions are the foundation — custom images, volumes, and networking all integrate with sessions.
+
+### Concurrency notes
+
+**ImageStore concurrent access:** Two concurrent `image create` calls could race on the same image name. The staging-dir + atomic `rename()` pattern handles this — last writer wins, no partial images. Two concurrent `Lumina.run()` calls resolving the same image for read is safe (APFS COW clone from a read-only source).
+
+**Guest agent lifespan:** The existing guest agent (`Guest/lumina-agent/main.go`) already supports multiple exec requests per connection via its `for scanner.Scan()` command loop. No guest agent changes are needed for sessions — the agent stays connected and accepts sequential exec messages. The heartbeat mechanism (5s keepalive when idle) keeps the vsock connection alive between execs.
