@@ -311,6 +311,98 @@ public actor VM {
         }
     }
 
+    // MARK: - Directory Transfer
+
+    /// Upload a local directory to the guest by creating a tarball, uploading it,
+    /// and extracting on the guest side. Requires the VM to be in `ready` state.
+    public func uploadDirectory(localPath: URL, remotePath: String) async throws(LuminaError) {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot upload from state: \(_state)"))
+        }
+
+        // Create a temporary tarball of the local directory
+        let tarName = ".lumina-upload-\(UUID().uuidString).tar.gz"
+        let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
+        defer { try? FileManager.default.removeItem(at: tarLocal) }
+
+        let tarProcess = Process()
+        tarProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tarProcess.arguments = ["czf", tarLocal.path, "-C", localPath.path, "."]
+        tarProcess.standardOutput = FileHandle.nullDevice
+        tarProcess.standardError = FileHandle.nullDevice
+        do {
+            try tarProcess.run()
+            tarProcess.waitUntilExit()
+        } catch {
+            throw .uploadFailed(path: localPath.path, reason: "Failed to create tarball: \(error)")
+        }
+        guard tarProcess.terminationStatus == 0 else {
+            throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tarProcess.terminationStatus)")
+        }
+
+        // Upload the tarball to a temp path on the guest
+        let guestTar = "/tmp/\(tarName)"
+        try runner.upload(FileUpload(localPath: tarLocal, remotePath: guestTar))
+
+        // Create the target directory and extract
+        let mkdirResult = try await exec("mkdir -p '\(remotePath)'", timeout: 10)
+        guard mkdirResult.success else {
+            throw .uploadFailed(path: localPath.path, reason: "mkdir failed: \(mkdirResult.stderr)")
+        }
+
+        let extractResult = try await exec("tar xzf '\(guestTar)' -C '\(remotePath)' && rm -f '\(guestTar)'", timeout: 60)
+        guard extractResult.success else {
+            throw .uploadFailed(path: localPath.path, reason: "extract failed: \(extractResult.stderr)")
+        }
+    }
+
+    /// Download a remote directory from the guest by tarring on the guest,
+    /// downloading the tarball, and extracting locally.
+    public func downloadDirectory(remotePath: String, localPath: URL) async throws(LuminaError) {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
+        }
+
+        // Tar the remote directory on the guest
+        let tarName = ".lumina-download-\(UUID().uuidString).tar.gz"
+        let guestTar = "/tmp/\(tarName)"
+        let tarResult = try await exec("tar czf '\(guestTar)' -C '\(remotePath)' .", timeout: 60)
+        guard tarResult.success else {
+            throw .downloadFailed(path: remotePath, reason: "tar failed: \(tarResult.stderr)")
+        }
+
+        // Download the tarball
+        let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
+        defer { try? FileManager.default.removeItem(at: tarLocal) }
+
+        try runner.download(FileDownload(remotePath: guestTar, localPath: tarLocal))
+
+        // Clean up on guest (best effort)
+        _ = try? await exec("rm -f '\(guestTar)'", timeout: 10)
+
+        // Create local directory and extract
+        do {
+            try FileManager.default.createDirectory(at: localPath, withIntermediateDirectories: true)
+        } catch {
+            throw .downloadFailed(path: remotePath, reason: "Failed to create local directory: \(error)")
+        }
+
+        let extractProcess = Process()
+        extractProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        extractProcess.arguments = ["xzf", tarLocal.path, "-C", localPath.path]
+        extractProcess.standardOutput = FileHandle.nullDevice
+        extractProcess.standardError = FileHandle.nullDevice
+        do {
+            try extractProcess.run()
+            extractProcess.waitUntilExit()
+        } catch {
+            throw .downloadFailed(path: remotePath, reason: "Failed to extract tarball: \(error)")
+        }
+        guard extractProcess.terminationStatus == 0 else {
+            throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(extractProcess.terminationStatus)")
+        }
+    }
+
     func uploadFilesResult(_ uploads: [FileUpload]) -> Result<Void, LuminaError> {
         do {
             try uploadFiles(uploads)
@@ -337,6 +429,14 @@ public actor VM {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot exec from state: \(_state)"))
         }
+
+        // If the CommandRunner lost its connection (failed timeout, cancelled
+        // stream, or a proactive reconnect that didn't succeed), reconnect
+        // before starting a new exec.
+        if runner.state == .failed || runner.state == .disconnected {
+            try await runner.reconnect()
+        }
+
         _state = .executing
 
         let start = ContinuousClock.now
@@ -361,17 +461,75 @@ public actor VM {
 
     /// Stream output chunks from a command in real time.
     /// Each output message from the guest agent is yielded as it arrives.
-    /// Returns the stream directly from CommandRunner — no intermediate wrapping.
+    /// The returned stream wraps CommandRunner's stream and resets the VM
+    /// state to `.ready` when the stream finishes (success, error, or cancel).
     public func stream(
         _ command: String,
         timeout: Int = 60,
         env: [String: String] = [:]
-    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
+    ) async throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
         }
+
+        // If the CommandRunner lost its connection (failed timeout, cancelled
+        // stream, or a proactive reconnect that didn't succeed), reconnect
+        // before starting a new exec.
+        if runner.state == .failed || runner.state == .disconnected {
+            try await runner.reconnect()
+        }
+
         _state = .executing
-        return try runner.execStream(command: command, timeout: timeout, env: env)
+        let innerStream = try runner.execStream(command: command, timeout: timeout, env: env)
+
+        // Wrap the inner stream so we can reset VM state on completion.
+        // Task inherits actor isolation, so `self.streamDidFinish()` is safe.
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await chunk in innerStream {
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+                self.streamDidFinish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+
+    /// Reset state after a streamed exec completes.
+    /// The CommandRunner may be in .failed state (timeout, connection drop,
+    /// cancelled stream). We leave it in that state — the next exec/stream
+    /// call detects it and drives the reconnect synchronously, avoiding
+    /// races between a proactive reconnect and a concurrent exec.
+    private func streamDidFinish() {
+        if _state == .executing {
+            _state = .ready
+        }
+    }
+
+    /// Attempt to reconnect to the guest agent after a connection drop.
+    /// The guest agent accepts new connections, so this works without rebooting.
+    public func reconnect() async throws(LuminaError) {
+        guard let runner = commandRunner else {
+            throw .connectionFailed
+        }
+        _state = .ready
+        try await runner.reconnect()
+    }
+
+    /// Send a signal to the currently executing guest command.
+    /// The guest agent forwards the signal to the process group, then
+    /// sends SIGKILL after `gracePeriod` seconds if the process hasn't exited.
+    /// No-op if no command is executing.
+    public func cancel(signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
+        guard let runner = commandRunner else { return }
+        try runner.cancel(signal: signal, gracePeriod: gracePeriod)
     }
 
     public func shutdown() async {

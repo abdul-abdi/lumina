@@ -25,6 +25,10 @@ final class CommandRunner: @unchecked Sendable {
     private var _outputHandle: FileHandle?
     private var _state: ConnectionState = .disconnected
 
+    /// The guest-side timeout (seconds) from the most recent exec. Used by
+    /// reconnect to know how long the guest agent may be busy.
+    private var _lastGuestTimeout: Int = 0
+
     // Read buffer for the buffered line reader. Only accessed from the active
     // read path (exec or execStream) — never concurrent because the state
     // machine prevents overlapping executions.
@@ -47,10 +51,10 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Connect
 
-    func connect() async throws(LuminaError) {
+    func connect(maxRetries: Int = maxRetries) async throws(LuminaError) {
         setState(.connecting)
 
-        for _ in 0..<Self.maxRetries {
+        for _ in 0..<maxRetries {
             do {
                 let conn: VZVirtioSocketConnection = try await withCheckedThrowingContinuation { cont in
                     queue.async { [socketDevice] in
@@ -160,7 +164,7 @@ final class CommandRunner: @unchecked Sendable {
                 do {
                     while ContinuousClock.now < deadline {
                         if cancelled.withLock({ $0 }) {
-                            runner.setState(.ready)
+                            runner.setState(.failed)
                             continuation.finish()
                             return
                         }
@@ -168,7 +172,7 @@ final class CommandRunner: @unchecked Sendable {
                         let guestMsg = try runner.readGuestMessage(from: input)
 
                         if cancelled.withLock({ $0 }) {
-                            runner.setState(.ready)
+                            runner.setState(.failed)
                             continuation.finish()
                             return
                         }
@@ -207,6 +211,96 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
+    // MARK: - Reconnect
+
+    /// Attempt to reconnect after a connection drop.
+    /// Resets internal state and establishes a fresh vsock connection.
+    /// The guest agent accepts new connections after a drop, so reconnect
+    /// works without rebooting the VM.
+    /// Reconnect after a connection drop or timeout.
+    /// Uses the last known guest timeout to determine how long to wait for
+    /// the guest agent to finish its current command and accept a new connection.
+    func reconnect() async throws(LuminaError) {
+        let guestTimeout = lastGuestTimeout
+
+        resetForReconnect()
+
+        // The guest agent is single-threaded: it won't accept a new connection
+        // until the current command finishes (at guestTimeout + 5s SIGKILL grace).
+        // Retry long enough to cover that, with 10s extra margin.
+        let retries = guestTimeout > 0
+            ? max(Self.maxRetries, (guestTimeout + 15) * 10)
+            : Self.maxRetries
+        try await connect(maxRetries: retries)
+    }
+
+    private var lastGuestTimeout: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastGuestTimeout
+    }
+
+    /// Reset all connection state synchronously (safe for pre-async context).
+    /// Sends a cancel to kill any running guest command, then closes the vsock
+    /// fd so the guest agent's serveConnection() sees EOF and returns quickly,
+    /// making it ready to accept a new connection.
+    private func resetForReconnect() {
+        lock.lock()
+        let fd = _connection?.fileDescriptor
+        let output = _outputHandle
+        _connection = nil
+        _inputHandle = nil
+        _outputHandle = nil
+        _state = .disconnected
+        readBuffer = Data()
+        lock.unlock()
+
+        // Best-effort cancel: tell the guest agent to kill the running command
+        // so it returns to the accept loop quickly. Without this, reconnect
+        // blocks until the guest command's (3x) timeout expires.
+        // Uses POSIX write() to avoid NSFileHandle Obj-C exceptions on EPIPE.
+        if let fd = fd {
+            let msg = HostMessage.cancel(signal: 9, gracePeriod: 0) // SIGKILL, immediate
+            if let data = try? LuminaProtocol.encode(msg) {
+                data.withUnsafeBytes { buffer in
+                    if let base = buffer.baseAddress {
+                        _ = Darwin.write(fd, base, buffer.count)
+                    }
+                }
+            }
+        }
+
+        // Close the fd explicitly — VZVirtioSocketConnection may not close it
+        // on dealloc, and the guest agent blocks on the old connection until it
+        // sees EOF.
+        if let fd = fd {
+            Darwin.close(fd)
+        }
+    }
+
+    // MARK: - Cancel
+
+    /// Send a cancel message to the guest agent, requesting it to signal
+    /// the currently executing command. The guest sends `signal` to the
+    /// process group, then SIGKILL after `gracePeriod` seconds if it hasn't exited.
+    func cancel(signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
+        lock.lock()
+        guard _state == .executing, let output = _outputHandle else {
+            lock.unlock()
+            return // No command running — nothing to cancel
+        }
+        lock.unlock()
+
+        let msg = HostMessage.cancel(signal: signal, gracePeriod: gracePeriod)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode cancel message: \(error)")
+        }
+        output.write(msgData)
+    }
+
     // MARK: - File Upload
 
     /// Upload a file to the guest via the vsock protocol.
@@ -222,8 +316,9 @@ final class CommandRunner: @unchecked Sendable {
             throw .uploadFailed(path: file.remotePath, reason: "Cannot read local file: \(error)")
         }
 
-        // 48KB raw → ~64KB base64 encoded, fits within the 64KB message limit
-        let chunkSize = 48 * 1024
+        // 45KB raw → ~60KB base64 + ~200B JSON envelope = well within 64KB limit.
+        // Previous 48KB overflowed: 48*4/3=64KB base64 + envelope > 64KB.
+        let chunkSize = 45 * 1024
         let totalChunks = max(1, (fileData.count + chunkSize - 1) / chunkSize)
 
         for seq in 0..<totalChunks {
@@ -395,12 +490,13 @@ final class CommandRunner: @unchecked Sendable {
         }
         _state = .executing
         readBuffer = Data()
-        lock.unlock()
 
         // Safety net: guest timeout must be well beyond host deadline + heartbeat interval
         // so the host always detects the timeout first. Minimum 30s to handle short timeouts
         // where 2x would still race with the 5s heartbeat cadence.
         let guestTimeout = max(timeout * 3, 30)
+        _lastGuestTimeout = guestTimeout
+        lock.unlock()
         let execMsg = HostMessage.exec(cmd: command, timeout: guestTimeout, env: env)
         let msgData: Data
         do {

@@ -23,7 +23,7 @@ import (
 const (
 	vsockPort         = 1024
 	maxChunkSize      = 65536 // 64KB
-	heartbeatInterval = 5 * time.Second
+	heartbeatInterval = 2 * time.Second
 	agentStartMsg     = "lumina-agent starting"
 )
 
@@ -31,6 +31,13 @@ const (
 // Required because heartbeat goroutine and command execution
 // goroutines may write concurrently.
 var writeMu sync.Mutex
+
+// cmdMu protects currentCmd — the currently executing command.
+// Used by the cancel handler to send signals to the active process group.
+var (
+	cmdMu      sync.Mutex
+	currentCmd *exec.Cmd
+)
 
 // Protocol messages
 
@@ -74,6 +81,12 @@ type HeartbeatMsg struct {
 	Type string `json:"type"`
 }
 
+type CancelMsg struct {
+	Type        string `json:"type"`
+	Signal      int    `json:"signal"`
+	GracePeriod int    `json:"grace_period"`
+}
+
 func main() {
 	// Log to serial console (stderr goes to serial on most VM setups)
 	fmt.Fprintln(os.Stderr, agentStartMsg)
@@ -86,20 +99,29 @@ func main() {
 	}
 	defer ln.Close()
 
-	// Accept one connection
-	conn, err := ln.Accept()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "accept failed: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
+	// Accept connections in a loop — if a connection drops (host crash, vsock
+	// reset), accept a new one so the session can reconnect without rebooting.
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "accept failed: %v\n", err)
+			continue
+		}
 
+		serveConnection(conn)
+		conn.Close()
+		fmt.Fprintln(os.Stderr, "connection closed, waiting for reconnect...")
+	}
+}
+
+func serveConnection(conn net.Conn) {
 	// Send ready message
 	sendJSON(conn, ReadyMsg{Type: "ready"})
 
 	// Start heartbeat — runs continuously, including during command execution,
 	// so the host can check its deadline between heartbeats.
 	ctx, cancelHeartbeat := context.WithCancel(context.Background())
+	defer cancelHeartbeat()
 	go heartbeat(ctx, conn)
 
 	// Command loop — accept multiple exec requests on the same connection
@@ -146,15 +168,21 @@ func main() {
 			}
 			handleDownload(conn, msg)
 
+		case "cancel":
+			var msg CancelMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid cancel request: %v\n", err)
+				continue
+			}
+			handleCancel(msg)
+
 		default:
 			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", header.Type)
 		}
 	}
 
-	cancelHeartbeat()
-
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "scanner error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "connection error: %v\n", err)
 	}
 }
 
@@ -166,7 +194,18 @@ func heartbeat(ctx context.Context, conn net.Conn) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sendJSON(conn, HeartbeatMsg{Type: "heartbeat"})
+			if err := writeJSON(conn, HeartbeatMsg{Type: "heartbeat"}); err != nil {
+				// Connection lost — kill the running command so
+				// serveConnection returns and we get back to Accept() quickly.
+				// Without this, the guest blocks until its own timeout expires.
+				cmdMu.Lock()
+				cmd := currentCmd
+				cmdMu.Unlock()
+				if cmd != nil && cmd.Process != nil {
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				return
+			}
 		}
 	}
 }
@@ -191,13 +230,23 @@ func executeCommand(conn net.Conn, req ExecRequest) int {
 		return 127
 	}
 
+	// Track current command so the cancel handler can signal it
+	cmdMu.Lock()
+	currentCmd = cmd
+	cmdMu.Unlock()
+	defer func() {
+		cmdMu.Lock()
+		currentCmd = nil
+		cmdMu.Unlock()
+	}()
+
 	// Stream stdout and stderr concurrently
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); streamPipe(conn, "stdout", stdoutPipe) }()
 	go func() { defer wg.Done(); streamPipe(conn, "stderr", stderrPipe) }()
 
-	// Timeout handling
+	// Timeout handling: SIGTERM first, then SIGKILL after 5s grace period
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
@@ -208,11 +257,7 @@ func executeCommand(conn net.Conn, req ExecRequest) int {
 		select {
 		case cmdErr = <-done:
 		case <-timer.C:
-			// Kill the process group
-			if cmd.Process != nil {
-				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-			cmdErr = <-done
+			cmdErr = gracefulKill(cmd, done, 5*time.Second)
 		}
 	} else {
 		cmdErr = <-done
@@ -227,6 +272,59 @@ func executeCommand(conn net.Conn, req ExecRequest) int {
 		return 1
 	}
 	return 0
+}
+
+// gracefulKill sends SIGTERM to the process group, waits for the grace period,
+// then sends SIGKILL if the process hasn't exited.
+func gracefulKill(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
+	if cmd.Process == nil {
+		return <-done
+	}
+	pgid := -cmd.Process.Pid
+	syscall.Kill(pgid, syscall.SIGTERM)
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		syscall.Kill(pgid, syscall.SIGKILL)
+		return <-done
+	}
+}
+
+// handleCancel sends a signal to the currently executing command's process group.
+// If the process doesn't exit within the grace period, it sends SIGKILL.
+func handleCancel(msg CancelMsg) {
+	cmdMu.Lock()
+	cmd := currentCmd
+	cmdMu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	sig := syscall.Signal(msg.Signal)
+	if sig == 0 {
+		sig = syscall.SIGTERM
+	}
+	pgid := -cmd.Process.Pid
+
+	syscall.Kill(pgid, sig)
+
+	// If the requested signal isn't SIGKILL, schedule a SIGKILL after grace period
+	if sig != syscall.SIGKILL && msg.GracePeriod > 0 {
+		go func() {
+			time.Sleep(time.Duration(msg.GracePeriod) * time.Second)
+			cmdMu.Lock()
+			stillRunning := currentCmd == cmd
+			cmdMu.Unlock()
+			if stillRunning && cmd.Process != nil {
+				syscall.Kill(pgid, syscall.SIGKILL)
+			}
+		}()
+	}
 }
 
 func handleUpload(conn net.Conn, scanner *bufio.Scanner, first UploadMsg) {
@@ -326,7 +424,7 @@ func handleDownload(conn net.Conn, req DownloadReqMsg) {
 	// Go's Read can return (n>0, io.EOF) on the last read, or (n>0, nil) followed
 	// by (0, io.EOF). Handle both: set eof when readErr==io.EOF, and if we reach
 	// a zero-byte EOF without having sent eof yet, send a final empty chunk.
-	const chunkSize = 48 * 1024
+	const chunkSize = 45 * 1024 // 45KB raw → ~60KB base64 + JSON envelope < 64KB limit
 	buf := make([]byte, chunkSize)
 	seq := 0
 	sentEof := false
@@ -388,14 +486,21 @@ func sendOutput(conn net.Conn, stream string, data string) {
 }
 
 func sendJSON(conn net.Conn, v interface{}) {
+	writeJSON(conn, v)
+}
+
+// writeJSON serializes v as NDJSON and writes to conn. Returns the write error
+// (nil on success). Used by heartbeat to detect connection loss.
+func writeJSON(conn net.Conn, v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return
+		return err
 	}
 	data = append(data, '\n')
 	writeMu.Lock()
-	conn.Write(data)
+	_, err = conn.Write(data)
 	writeMu.Unlock()
+	return err
 }
 
 // vsockListener implements net.Listener using raw syscalls.
