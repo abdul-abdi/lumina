@@ -69,28 +69,57 @@ public final class SessionServer: @unchecked Sendable {
     }
 
     /// Read one NDJSON line from a file handle.
-    public func readMessage(from handle: FileHandle) throws -> Data {
-        var buffer = Data()
+    /// Uses the caller-provided buffer to retain leftover bytes when multiple
+    /// frames arrive in a single read (coalesced NDJSON).
+    public func readMessage(from handle: FileHandle, buffer: inout Data) throws -> Data {
         while true {
+            // Check if buffer already has a complete line
+            if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let lineEnd = buffer.index(after: newlineIndex)
+                let line = Data(buffer[buffer.startIndex..<lineEnd])
+                buffer.removeSubrange(buffer.startIndex..<lineEnd)
+                return line
+            }
+
             let chunk = handle.availableData
             if chunk.isEmpty {
                 if buffer.isEmpty { throw LuminaError.connectionFailed }
-                return buffer
+                let remaining = buffer
+                buffer = Data()
+                return remaining
             }
             buffer.append(chunk)
             if buffer.count > SessionProtocol.maxMessageSize {
+                buffer = Data()
                 throw LuminaError.protocolError("Session message exceeds 64KB")
-            }
-            if buffer.firstIndex(of: UInt8(ascii: "\n")) != nil {
-                return buffer
             }
         }
     }
 
     /// Write a SessionResponse to the client.
+    ///
+    /// Uses POSIX `write()` instead of `FileHandle.write(_:)` because
+    /// NSFileHandle raises an Obj-C exception (NSFileHandleOperationException)
+    /// on EPIPE, which is NOT caught by Swift's `try?`. When a client
+    /// disconnects mid-stream, the broken socket triggers EPIPE on the next
+    /// write. With NSFileHandle this crashes the server; with POSIX write()
+    /// the error is returned as a Swift error that `try?` can suppress.
     public func writeResponse(_ response: SessionResponse, to handle: FileHandle) throws {
         let data = try SessionProtocol.encode(response)
-        handle.write(data)
+        let fd = handle.fileDescriptor
+        try data.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var remaining = buffer.count
+            var offset = 0
+            while remaining > 0 {
+                let written = Darwin.write(fd, base + offset, remaining)
+                if written < 0 {
+                    throw LuminaError.sessionFailed("Write failed: \(errno)")
+                }
+                offset += written
+                remaining -= written
+            }
+        }
     }
 
     /// Close the server socket.
@@ -117,11 +146,14 @@ public final class SessionServer: @unchecked Sendable {
             let clientFd = handles.read.fileDescriptor
             defer { Darwin.close(clientFd) }
 
-            // Read and dispatch messages until client disconnects
+            // Read and dispatch messages until client disconnects.
+            // The buffer persists across reads for this connection to
+            // handle coalesced NDJSON frames.
+            var readBuf = Data()
             while true {
                 let msgData: Data
                 do {
-                    msgData = try readMessage(from: handles.read)
+                    msgData = try readMessage(from: handles.read, buffer: &readBuf)
                 } catch {
                     break // client disconnected
                 }
@@ -143,6 +175,13 @@ public final class SessionServer: @unchecked Sendable {
 
                 case .download(let remotePath, let localPath):
                     await handleDownload(remotePath: remotePath, localPath: localPath, vm: vm, handle: handles.write)
+
+                case .cancel(let signal, let gracePeriod):
+                    do {
+                        try await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+                    } catch {
+                        try? writeResponse(.error(message: "Cancel failed: \(error)"), to: handles.write)
+                    }
 
                 case .shutdown:
                     await vm.shutdown()

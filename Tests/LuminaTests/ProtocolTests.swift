@@ -142,6 +142,27 @@ import Testing
     #expect(msg == .downloadError(path: "/tmp/missing", error: "no such file"))
 }
 
+// MARK: - Cancel Protocol Tests
+
+@Test func encodeCancelMessage() throws {
+    let msg = HostMessage.cancel(signal: 15, gracePeriod: 5)
+    let data = try Protocol.encode(msg)
+    let str = String(data: data, encoding: .utf8)!
+    #expect(str.hasSuffix("\n"))
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "cancel")
+    #expect(json["signal"] as? Int == 15)
+    #expect(json["grace_period"] as? Int == 5)
+}
+
+@Test func encodeCancelSIGKILL() throws {
+    let msg = HostMessage.cancel(signal: 9, gracePeriod: 0)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["signal"] as? Int == 9)
+    #expect(json["grace_period"] as? Int == 0)
+}
+
 // MARK: - Type Default Tests
 
 @Test func fileUploadDefaults() {

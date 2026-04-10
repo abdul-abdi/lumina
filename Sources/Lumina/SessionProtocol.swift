@@ -7,6 +7,7 @@ public enum SessionRequest: Sendable, Equatable {
     case exec(cmd: String, timeout: Int, env: [String: String])
     case upload(localPath: String, remotePath: String)
     case download(remotePath: String, localPath: String)
+    case cancel(signal: Int32, gracePeriod: Int)
     case shutdown
 }
 
@@ -34,6 +35,8 @@ public enum SessionProtocol {
             dict = ["type": "upload", "local_path": localPath, "remote_path": remotePath]
         case .download(let remotePath, let localPath):
             dict = ["type": "download", "remote_path": remotePath, "local_path": localPath]
+        case .cancel(let signal, let gracePeriod):
+            dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
         case .shutdown:
             dict = ["type": "shutdown"]
         }
@@ -89,6 +92,10 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed download request")
             }
             return .download(remotePath: remotePath, localPath: localPath)
+        case "cancel":
+            let signal = (json["signal"] as? Int).map { Int32($0) } ?? Int32(SIGTERM)
+            let gracePeriod = json["grace_period"] as? Int ?? 5
+            return .cancel(signal: signal, gracePeriod: gracePeriod)
         case "shutdown":
             return .shutdown
         default:

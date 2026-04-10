@@ -24,23 +24,19 @@ sign:
 test:
 	swift test
 
-# Run e2e integration tests via the actual CLI (requires VM image + jq)
+# Run comprehensive e2e test suite via the actual CLI (requires VM image + jq)
 test-integration: build
-	@echo "=== e2e: echo hello ==="
+	@bash tests/e2e.sh $(BINARY_DEBUG)
+
+# Run quick smoke tests only (subset of e2e, faster)
+test-smoke: build
+	@echo "=== smoke: echo hello ==="
 	@$(BINARY_DEBUG) run "echo hello" | jq -e '.stdout == "hello\n"' >/dev/null && echo "PASS" || (echo "FAIL"; exit 1)
-	@echo "=== e2e: exit code ==="
+	@echo "=== smoke: exit code ==="
 	@$(BINARY_DEBUG) run "exit 42" 2>/dev/null; test $$? -eq 42 && echo "PASS" || (echo "FAIL: expected exit 42"; exit 1)
-	@echo "=== e2e: stderr ==="
+	@echo "=== smoke: stderr ==="
 	@$(BINARY_DEBUG) run "echo err >&2" | jq -e '.stderr | test("err")' >/dev/null && echo "PASS" || (echo "FAIL: stderr not captured"; exit 1)
-	@echo "=== e2e: uname ==="
-	@$(BINARY_DEBUG) run "uname -m" | jq -e '.stdout == "aarch64\n"' >/dev/null && echo "PASS" || (echo "FAIL"; exit 1)
-	@echo "=== e2e: upload + read ==="
-	@echo "upload-test" > /tmp/lumina-e2e-upload.txt
-	@$(BINARY_DEBUG) run --copy "/tmp/lumina-e2e-upload.txt:/tmp/test.txt" "cat /tmp/test.txt" | jq -e '.stdout == "upload-test\n"' >/dev/null && echo "PASS" || (echo "FAIL"; exit 1)
-	@echo "=== e2e: download ==="
-	@rm -f /tmp/lumina-e2e-download.txt
-	@$(BINARY_DEBUG) run --download "/etc/hostname:/tmp/lumina-e2e-download.txt" "true" >/dev/null 2>&1 && test -f /tmp/lumina-e2e-download.txt && echo "PASS" || (echo "FAIL: download file not created"; exit 1)
-	@echo "All integration tests passed."
+	@echo "All smoke tests passed."
 
 # Build, sign, and run with arguments: make run ARGS="echo hello"
 run: build

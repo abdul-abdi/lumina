@@ -47,8 +47,14 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Copy file into VM (local:remote, repeatable)")
     var copy: [String] = []
 
+    @Option(name: .long, help: "Copy directory into VM (local:remote, repeatable)")
+    var copyDir: [String] = []
+
     @Option(name: .long, help: "Download file from VM after command (remote:local, repeatable)")
     var download: [String] = []
+
+    @Option(name: .long, help: "Download directory from VM after command (remote:local, repeatable)")
+    var downloadDir: [String] = []
 
     @Option(name: .long, help: "Mount host directory into VM (host:guest, repeatable)")
     var mount: [String] = []
@@ -131,6 +137,35 @@ struct Run: AsyncParsableCommand {
             parsedDownloads.append(FileDownload(remotePath: remote, localPath: localURL))
         }
 
+        var parsedDirUploads: [DirectoryUpload] = []
+        for spec in copyDir {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --copy-dir '\(spec)'. Use local:remote format\n".utf8))
+                throw ExitCode.failure
+            }
+            let localStr = String(spec[spec.startIndex..<colonIndex])
+            let remote = String(spec[spec.index(after: colonIndex)...])
+            let localURL = URL(fileURLWithPath: localStr)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir), isDir.boolValue else {
+                FileHandle.standardError.write(Data("lumina: not a directory: \(localStr)\n".utf8))
+                throw ExitCode.failure
+            }
+            parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
+        }
+
+        var parsedDirDownloads: [DirectoryDownload] = []
+        for spec in downloadDir {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --download-dir '\(spec)'. Use remote:local format\n".utf8))
+                throw ExitCode.failure
+            }
+            let remote = String(spec[spec.startIndex..<colonIndex])
+            let localStr = String(spec[spec.index(after: colonIndex)...])
+            let localURL = URL(fileURLWithPath: localStr)
+            parsedDirDownloads.append(DirectoryDownload(remotePath: remote, localPath: localURL))
+        }
+
         var parsedMounts: [MountPoint] = []
         for spec in mount {
             guard let colonIndex = spec.firstIndex(of: ":") else {
@@ -173,6 +208,8 @@ struct Run: AsyncParsableCommand {
             env: parsedEnv,
             uploads: parsedUploads,
             downloads: parsedDownloads,
+            directoryUploads: parsedDirUploads,
+            directoryDownloads: parsedDirDownloads,
             mounts: parsedMounts
         )
 
@@ -508,16 +545,21 @@ struct SessionStart: AsyncParsableCommand {
     var bootTimeout: String = "60s"
 
     func run() async throws {
-        // Auto-pull image if not present
+        // Check if requested image exists before spawning background process
         let puller = ImagePuller()
-        if !puller.imageExists() {
-            FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
-            do {
-                try await puller.pull { msg in
-                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
+        if !puller.imageExists(name: image) {
+            if image == "default" {
+                FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+                do {
+                    try await puller.pull { msg in
+                        FileHandle.standardError.write(Data("\(msg)\n".utf8))
+                    }
+                } catch {
+                    FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+                    throw ExitCode.failure
                 }
-            } catch {
-                FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+            } else {
+                FileHandle.standardError.write(Data("lumina: image '\(image)' not found. Use 'lumina images list' to see available images.\n".utf8))
                 throw ExitCode.failure
             }
         }
@@ -561,10 +603,12 @@ struct SessionStart: AsyncParsableCommand {
             process.arguments! += ["--volume", "\(v.name):\(v.guestPath)"]
         }
 
-        // Detach from terminal
+        // Capture stderr from child process so boot failures are surfaced
+        // instead of hidden behind a generic timeout message.
+        let stderrPipe = Pipe()
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrPipe
 
         do {
             try process.run()
@@ -580,11 +624,22 @@ struct SessionStart: AsyncParsableCommand {
             if FileManager.default.fileExists(atPath: paths.socket.path) {
                 break
             }
+            // Check if child exited early (boot failure)
+            if !process.isRunning {
+                break
+            }
             try await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
         guard FileManager.default.fileExists(atPath: paths.socket.path) else {
-            FileHandle.standardError.write(Data("lumina: session failed to start within \(bootTimeout)\n".utf8))
+            // Read child stderr to surface the real error
+            let stderrData = stderrPipe.fileHandleForReading.availableData
+            let stderrStr = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !process.isRunning && !stderrStr.isEmpty {
+                FileHandle.standardError.write(Data("lumina: session failed to start: \(stderrStr)\n".utf8))
+            } else {
+                FileHandle.standardError.write(Data("lumina: session failed to start within \(bootTimeout)\n".utf8))
+            }
             throw ExitCode.failure
         }
 
@@ -758,6 +813,10 @@ struct Exec: AsyncParsableCommand {
                 throw ExitCode.failure
             }
         }
+
+        // Forward SIGINT/SIGTERM to the guest command via cancel message
+        let cleanupSignals = installSignalForwarding(client: client)
+        defer { cleanupSignals() }
 
         // Execute
         let format = resolveOutputFormat(textFlag: text)

@@ -14,6 +14,8 @@ public actor Network {
     }
 
     /// Boot a new VM on the network.
+    /// After booting, updates `/etc/hosts` on all previously booted VMs so they
+    /// can resolve the new peer by name (bidirectional discovery).
     public func session(
         name sessionName: String,
         image: String = "default",
@@ -41,6 +43,17 @@ public actor Network {
 
         if sessions.count == 2 {
             networkSwitch.startRelay()
+        }
+
+        // Update /etc/hosts on all previously booted VMs with the full peer list.
+        // This ensures earlier VMs can resolve later peers by name.
+        if sessions.count > 1 {
+            let hostsContent = NetworkSwitch.generateHosts(peers: allPeers)
+            let escaped = hostsContent.replacingOccurrences(of: "'", with: "'\\''")
+            let cmd = "printf '%s' '\(escaped)' > /etc/hosts"
+            for i in 0..<(sessions.count - 1) {
+                _ = try? await sessions[i].vm.exec(cmd, timeout: 10)
+            }
         }
 
         return vm
