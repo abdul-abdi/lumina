@@ -12,8 +12,8 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-333)](https://support.apple.com/en-us/116943)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Boot a disposable Linux VM, run a command, get the output.<br>
-One function call. ~2s cold start. Zero host access.
+Boot a Linux VM, run a command, get the output.<br>
+One function call. ~1.6s cold start. ~30ms warm exec. Zero host access.
 
 ![demo](demo.gif)
 
@@ -40,24 +40,25 @@ AI agents need to run untrusted code. The question is where.
 
 | | Lumina | Docker | SSH to cloud VM |
 |---|--------|--------|-----------------|
-| **Boot time** | ~2s | ~3-5s | 30-60s |
+| **Cold start** | ~1.6s | ~3-5s | 30-60s |
+| **Exec after boot** | ~30ms (CLI) · ~2ms (library) | ~50-100ms | ~20-50ms (RTT) |
 | **Isolation** | Hardware (Virtualization.framework) | Kernel namespaces (shared kernel) | Full VM |
 | **Host exposure** | None — no mounted filesystem, no Docker socket | Container escape risk, daemon access | Network-exposed |
 | **Cleanup** | Automatic — COW clone deleted on exit | Manual — images/volumes linger | Manual — VM persists |
 | **Dependencies** | Zero — ships as one binary | Docker daemon | Cloud account + SSH keys |
 | **macOS native** | Yes — `VZVirtualMachine` | Linux-first (Docker Desktop is a VM) | N/A |
 | **Agent-friendly output** | JSON by default when piped | Text only (needs parsing) | Text only |
-| **Persistent sessions** | Built-in — ~0ms exec after first boot | N/A | SSH sessions |
+| **Persistent sessions** | Built-in | N/A | SSH sessions |
 
-Lumina is purpose-built for the pattern: *boot, run, destroy*. No daemon, no container registry, no cloud credentials. Just a function call.
+For agents, boot time is paid once. Exec latency is paid every iteration. Lumina sessions give you both: hardware-isolated VMs with subprocess-fast execution. No daemon, no container registry, no cloud credentials.
 
 ## Features
 
 | | Feature | Detail |
 |---|---------|--------|
-| ⚡ | **Instant VMs** | ~2s cold start, APFS copy-on-write clones |
+| ⚡ | **Instant VMs** | ~1.6s cold start, APFS copy-on-write clones |
 | 🔒 | **Full isolation** | No host filesystem, credentials, or process access |
-| 🔄 | **Persistent sessions** | Boot once, exec many — ~0ms per command |
+| 🔄 | **Persistent sessions** | Boot once, exec many — ~30ms per command (CLI), ~2ms (library) |
 | 🐍 | **Custom images** | `images create python --run "apk add python3"` |
 | 💾 | **Named volumes** | Persistent storage across VMs and sessions |
 | 🌐 | **VM-to-VM networking** | Private ethernet switch for multi-VM setups |
@@ -97,13 +98,13 @@ lumina run "uname -a" | jq .stdout
 
 ### Sessions (Persistent VMs)
 
-Boot a VM once, run commands instantly. No 2s boot per command.
+Boot once, exec many. The right abstraction for agents — pay the ~1.6s boot once, then run commands at ~30ms each.
 
 ```bash
-# Start a persistent session
+# Start a persistent session (~1.6s boot)
 SID=$(lumina session start | jq -r .sid)
 
-# Execute commands — ~0ms each (VM already running)
+# Execute commands — ~30ms each (VM already running)
 lumina exec $SID "apk add python3"
 lumina exec $SID "python3 -c 'print(42)'"
 lumina exec $SID -e MY_VAR=hello "echo \$MY_VAR"
@@ -135,7 +136,7 @@ lumina run --volume workspace:/data "cat /data/output.txt"
 Pre-install packages so every run starts ready:
 
 ```bash
-# Create a Python image (~17s to build, then ~2s to boot forever after)
+# Create a Python image (~17s to build, then ~1.6s to boot forever after)
 lumina images create python --from default --run "apk add --no-cache python3"
 
 # Use it — no install wait
@@ -208,7 +209,7 @@ SUBCOMMANDS:
 lumina run <command>                          # run, print stdout
 lumina run --image python <command>           # use a custom image
 lumina run --stream <command>                 # stream output live
-lumina run --timeout 30s <command>            # command timeout (default: 60s, excludes ~2s boot)
+lumina run --timeout 30s <command>            # command timeout (default: 60s, excludes boot)
 lumina run --memory 1GB --cpus 4 <command>    # resources (default: 512MB, 2 CPUs)
 lumina run -e KEY=VAL <command>               # env vars (repeatable)
 lumina run --copy local:remote <command>      # upload file before exec
@@ -398,7 +399,7 @@ sequenceDiagram
     SS->>VM: exec(cmd)
     VM-->>SS: RunResult
     SS-->>EC: {"type":"output"} + {"type":"exit"}
-    Note over EC,VM: ~0ms per exec (VM already booted)
+    Note over EC,VM: ~30ms per exec (VM already booted)
 
     EC->>SS: {"type":"shutdown"}
     SS->>VM: shutdown()
@@ -456,7 +457,7 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
                                         │
                          ┌──────────────▼──────────────────┐
   Session API            │  session start / exec / stop     │
-  (persistent)           │  Unix socket IPC, ~0ms exec      │
+  (persistent)           │  Unix socket IPC, ~30ms exec     │
                          └──────────────┬──────────────────┘
                                         │
                          ┌──────────────▼──────────────────┐
@@ -491,7 +492,7 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 - **Zero external Swift dependencies** — library target links only `Virtualization.framework`
 - **All public types are `Sendable`** — safe to use across concurrency domains
 - **Guest agent uses raw `AF_VSOCK` syscalls** — Go's `net` package doesn't support vsock
-- **DHCP networking** — NAT provided by `VZNATNetworkDeviceAttachment`, DNS via gateway
+- **Static IP networking** — NAT via `VZNATNetworkDeviceAttachment`, IP derived from MAC, DNS via gateway. DHCP fallback for edge cases.
 - **Session IPC** — NDJSON over Unix domain sockets, one client at a time per session
 - **Network relay** — reads ports under lock each iteration for dynamic VM join
 
