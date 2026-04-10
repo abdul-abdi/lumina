@@ -58,16 +58,23 @@ jobs:
           cp "$AGENT_BIN" release-artifacts/lumina-agent
 
       # ── Create GitHub Release ─────────────────────────────────
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            --latest \
-            release-artifacts/lumina \
-            release-artifacts/lumina-agent
+          TAG="${{ github.ref_name }}"
+          if gh release view "$TAG" &>/dev/null; then
+            # Release already exists (created by build-image workflow) — upload artifacts
+            gh release upload "$TAG" release-artifacts/lumina release-artifacts/lumina-agent --clobber
+            gh release edit "$TAG" --title "$TAG" --latest
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --latest \
+              release-artifacts/lumina \
+              release-artifacts/lumina-agent
+          fi
 
       # ── Homebrew tap (future) ─────────────────────────────────
       # - name: Update Homebrew tap
