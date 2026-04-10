@@ -9,18 +9,13 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & Release
-    runs-on: macos-15  # Apple Silicon runner with Swift 6
+  # ── Job 1: Build Swift CLI binary (requires macOS) ──────────
+  build-cli:
+    name: Build CLI (macOS)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for release notes generation
 
-      - name: Swift version
-        run: swift --version
-
-      # ── Build release binary ──────────────────────────────────
       - name: Build release binary
         run: swift build -c release
 
@@ -28,61 +23,86 @@ jobs:
         run: |
           BIN_PATH=$(swift build -c release --show-bin-path)/lumina
           codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
-          echo "LUMINA_BIN=$BIN_PATH" >> "$GITHUB_ENV"
+          cp "$BIN_PATH" lumina
 
-      - name: Verify binary
-        run: |
-          "$LUMINA_BIN" --help
+      - name: Smoke test
+        run: ./lumina --help
 
-      # ── Build guest agent (Go cross-compile) ─────────────────
+      - name: Run unit tests
+        run: swift test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumina-cli
+          path: lumina
+
+  # ── Job 2: Build VM image (requires Linux ARM) ──────────────
+  build-image:
+    name: Build VM Image (Linux ARM)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
           cache-dependency-path: Guest/lumina-agent/go.sum
 
-      - name: Build guest agent (linux/arm64)
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Build guest agent
         run: |
           cd Guest/lumina-agent
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent
-          echo "AGENT_BIN=$(pwd)/lumina-agent" >> "$GITHUB_ENV"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
-      # ── Run unit tests ────────────────────────────────────────
-      - name: Run all unit tests
-        run: swift test
+      - name: Build VM image
+        run: sudo bash Guest/build-image.sh /tmp/lumina-image
 
-      # ── Stage release artifacts ───────────────────────────────
-      - name: Stage artifacts
+      - name: Package image
         run: |
-          mkdir -p release-artifacts
-          cp "$LUMINA_BIN" release-artifacts/lumina
-          cp "$AGENT_BIN" release-artifacts/lumina-agent
+          cd /tmp/lumina-image
+          sudo chmod 644 vmlinuz initrd rootfs.img
+          [ -f lumina-agent ] && sudo chmod 755 lumina-agent
+          [ -d modules ] && sudo chmod 644 modules/*
+          tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img \
+            $([ -f lumina-agent ] && echo lumina-agent) \
+            $([ -d modules ] && echo modules/)
 
-      # ── Create GitHub Release ─────────────────────────────────
-      - name: Create or update GitHub Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumina-image-default
+          path: /tmp/lumina-image-default.tar.gz
+
+  # ── Job 3: Create release (waits for both builds) ───────────
+  publish:
+    name: Publish Release
+    needs: [build-cli, build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumina-cli
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumina-image-default
+          path: artifacts/
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.ref_name }}"
-          if gh release view "$TAG" &>/dev/null; then
-            # Release already exists (created by build-image workflow) — upload artifacts
-            gh release upload "$TAG" release-artifacts/lumina release-artifacts/lumina-agent --clobber
-            gh release edit "$TAG" --title "$TAG" --latest
-          else
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --generate-notes \
-              --latest \
-              release-artifacts/lumina \
-              release-artifacts/lumina-agent
-          fi
-
-      # ── Homebrew tap (future) ─────────────────────────────────
-      # - name: Update Homebrew tap
-      #   env:
-      #     HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      #   run: |
-      #     # TODO: Update formula in homebrew-tap repo
-      #     # 1. Calculate sha256 of the release binary
-      #     # 2. Update the formula with new version + sha256
-      #     # 3. Push to the tap repo
-      #     echo "Homebrew tap update not yet configured"
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --latest \
+            artifacts/lumina \
+            artifacts/lumina-image-default.tar.gz
