@@ -429,7 +429,7 @@ sequenceDiagram
     G->>H: {"type":"exit","code":0}
     Note over G,H: Connection supports reuse — send another exec
     loop idle
-        G-->>H: {"type":"heartbeat"} (every 5s)
+        G-->>H: {"type":"heartbeat"} (every 2s)
     end
 ```
 
