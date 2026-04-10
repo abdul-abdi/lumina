@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    name: Build & Smoke Test
     runs-on: macos-15  # Apple Silicon runner with Swift 6
     permissions:
       contents: read
@@ -20,5 +21,24 @@ jobs:
       - name: Build
         run: swift build
 
-      - name: Unit Tests
-        run: swift test --filter "TypesTests|ParsingTests|ProtocolTests|DiskCloneTests|ImageStoreTests|SerialConsoleTests|SessionTests|SessionProtocolTests|SessionServerTests|SessionClientTests|VolumeStoreTests|NetworkSwitchTests|NetworkTests"
+      - name: Codesign with entitlements
+        run: |
+          BIN_PATH=$(swift build --show-bin-path)/lumina
+          codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
+
+      - name: Smoke test (--help)
+        run: |
+          BIN_PATH=$(swift build --show-bin-path)/lumina
+          "$BIN_PATH" --help
+
+  test:
+    name: Unit Tests
+    runs-on: macos-15
+    permissions:
+      contents: read
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run all unit tests
+        run: swift test

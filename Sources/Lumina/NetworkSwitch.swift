@@ -97,7 +97,7 @@ public final class NetworkSwitch: @unchecked Sendable {
             // Set any new fds to non-blocking
             for port in currentPorts where !knownFds.contains(port.switchFd) {
                 let flags = fcntl(port.switchFd, F_GETFL)
-                fcntl(port.switchFd, F_SETFL, flags | O_NONBLOCK)
+                _ = fcntl(port.switchFd, F_SETFL, flags | O_NONBLOCK)
                 knownFds.insert(port.switchFd)
             }
 

@@ -182,16 +182,28 @@ enum InitrdPatcher {
             "# multi-second delays before IPv4 fallback.",
             "echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null",
             "",
-            "# DHCP — vmnet NAT only routes for IPs it assigns via DHCP.",
-            "# af_packet.ko is loaded in the initramfs init so udhcpc works.",
-            "udhcpc -i eth0 -n -q -s /usr/share/udhcpc/default.script 2>/dev/null",
+            "# Network: static IP derived from MAC, with DHCP fallback.",
+            "# vmnet NAT routes traffic for any IP on the bridge subnet — DHCP is",
+            "# not required for routing. We use static IP as primary because macOS",
+            "# vmnet's bootpd becomes unreliable after ~5 VM lifecycles (radar://FB...).",
+            "# Derive IP from last octet of MAC to avoid collisions between concurrent VMs.",
+            "LUMINA_MAC=$(ip link show eth0 2>/dev/null | awk '/ether/{print $2}')",
+            "if [ -n \"$LUMINA_MAC\" ]; then",
+            "  LUMINA_LAST=$(printf '%d' \"0x$(echo $LUMINA_MAC | cut -d: -f6)\")",
+            "  LUMINA_IP=\"192.168.64.$(( (LUMINA_LAST % 253) + 2 ))\"",
+            "  ip addr add \"${LUMINA_IP}/24\" dev eth0 2>/dev/null",
+            "  ip route add default via 192.168.64.1 2>/dev/null",
+            "fi",
+            "# Fallback: try DHCP if static assignment failed (e.g. IP collision)",
+            "if ! ip addr show eth0 2>/dev/null | grep -q 'inet '; then",
+            "  udhcpc -i eth0 -t 1 -T 1 -n -q -s /usr/share/udhcpc/default.script 2>/dev/null",
+            "fi",
             "",
             "# DNS — force gateway as sole nameserver. vmnet runs named(8) on the",
             "# gateway in caching-only mode; external resolvers (8.8.8.8, 1.1.1.1)",
             "# are unreachable through the NAT.",
-            "LUMINA_GW=$(ip route | awk '/default/{print $3}')",
             "mkdir -p /etc",
-            "echo \"nameserver ${LUMINA_GW:-192.168.64.1}\" > /etc/resolv.conf",
+            "echo \"nameserver 192.168.64.1\" > /etc/resolv.conf",
             "",
             "# Mount virtio-fs shares (lumina_mounts=tag:path,tag:path from cmdline)",
             "LUMINA_MOUNTS=",
@@ -338,7 +350,9 @@ enum InitrdPatcher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-        process.arguments = ["-f", "-9", inputFile.path]
+        // -1 (fastest): 27ms vs -9 (slowest): 277ms on a 2.4MB agent binary.
+        // Size difference is ~130KB — decompressed once during kernel boot.
+        process.arguments = ["-f", "-1", inputFile.path]
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
         do {

@@ -60,3 +60,19 @@ import Testing
     let decoded = try SessionProtocol.decodeRequest(data)
     #expect(decoded == req)
 }
+
+@Test func encodeCancelRequest() throws {
+    let req = SessionRequest.cancel(signal: 15, gracePeriod: 5)
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "cancel")
+    #expect(json["signal"] as? Int == 15)
+    #expect(json["grace_period"] as? Int == 5)
+}
+
+@Test func decodeCancelRequestRoundtrip() throws {
+    let req = SessionRequest.cancel(signal: 2, gracePeriod: 10)
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}

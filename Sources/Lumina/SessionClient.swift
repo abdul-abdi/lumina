@@ -8,6 +8,9 @@ public final class SessionClient: @unchecked Sendable {
     private var clientFd: Int32 = -1
     private var readHandle: FileHandle?
     private var writeHandle: FileHandle?
+    /// Persistent read buffer that retains leftover bytes between `receive()` calls.
+    /// Prevents data loss when multiple NDJSON frames arrive in a single read.
+    private var readBuffer = Data()
 
     public init(sessionsDir: URL = SessionPaths.defaultSessionsDir) {
         self.sessionsDir = sessionsDir
@@ -77,22 +80,30 @@ public final class SessionClient: @unchecked Sendable {
     }
 
     /// Read one response from the session server.
+    /// Uses a persistent buffer to handle coalesced NDJSON frames — if a
+    /// single read returns multiple newline-delimited messages, the leftover
+    /// bytes are retained for the next call.
     public func receive() throws -> SessionResponse {
         guard let handle = readHandle else {
             throw LuminaError.connectionFailed
         }
-        var buffer = Data()
         while true {
+            // Check if there's already a complete line in the buffer
+            if let newlineIndex = readBuffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let lineEnd = readBuffer.index(after: newlineIndex)
+                let lineData = Data(readBuffer[readBuffer.startIndex..<lineEnd])
+                readBuffer.removeSubrange(readBuffer.startIndex..<lineEnd)
+                return try SessionProtocol.decodeResponse(lineData)
+            }
+
             let chunk = handle.availableData
             if chunk.isEmpty {
                 throw LuminaError.connectionFailed
             }
-            buffer.append(chunk)
-            if buffer.count > SessionProtocol.maxMessageSize {
+            readBuffer.append(chunk)
+            if readBuffer.count > SessionProtocol.maxMessageSize {
+                readBuffer = Data()
                 throw LuminaError.protocolError("Session response exceeds 64KB")
-            }
-            if buffer.firstIndex(of: UInt8(ascii: "\n")) != nil {
-                return try SessionProtocol.decodeResponse(buffer)
             }
         }
     }
@@ -117,6 +128,15 @@ public final class SessionClient: @unchecked Sendable {
         }
     }
 
+    /// Inject pre-connected file descriptors for testing.
+    /// Bypasses the Unix socket connect flow.
+    internal func injectTestSocket(readFd: Int32, writeFd: Int32) {
+        clientFd = readFd
+        readHandle = FileHandle(fileDescriptor: readFd, closeOnDealloc: false)
+        writeHandle = FileHandle(fileDescriptor: writeFd, closeOnDealloc: false)
+        readBuffer = Data()
+    }
+
     /// Disconnect from the session.
     public func disconnect() {
         if clientFd >= 0 {
@@ -125,6 +145,7 @@ public final class SessionClient: @unchecked Sendable {
         }
         readHandle = nil
         writeHandle = nil
+        readBuffer = Data()
     }
 
     deinit {

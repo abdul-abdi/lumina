@@ -55,6 +55,40 @@ func installSignalHandlers() {
     }
 }
 
+// MARK: - Signal Forwarding (for session exec)
+
+/// Install signal forwarding that sends a cancel message to the session client
+/// on SIGINT/SIGTERM. Returns a cleanup closure that removes the signal sources.
+func installSignalForwarding(client: SessionClient) -> () -> Void {
+    // Ignore default signal handling — we'll handle it ourselves
+    signal(SIGINT, SIG_IGN)
+    signal(SIGTERM, SIG_IGN)
+
+    let queue = DispatchQueue(label: "com.lumina.signal")
+    let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+        source.setEventHandler {
+            // Send cancel to guest via session IPC
+            try? client.send(.cancel(signal: Int32(sig), gracePeriod: 5))
+
+            // After sending cancel, restore default handler and re-raise
+            // so the process eventually exits with the correct signal status.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                Foundation.signal(sig, SIG_DFL)
+                raise(sig)
+            }
+        }
+        source.resume()
+        return source
+    }
+
+    return {
+        for source in sources { source.cancel() }
+        signal(SIGINT, SIG_DFL)
+        signal(SIGTERM, SIG_DFL)
+    }
+}
+
 // MARK: - Output Format (shared across CLI commands)
 
 enum OutputFormat {

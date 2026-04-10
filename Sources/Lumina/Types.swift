@@ -25,6 +25,26 @@ public struct FileDownload: Sendable {
     }
 }
 
+public struct DirectoryUpload: Sendable {
+    public let localPath: URL
+    public let remotePath: String
+
+    public init(localPath: URL, remotePath: String) {
+        self.localPath = localPath
+        self.remotePath = remotePath
+    }
+}
+
+public struct DirectoryDownload: Sendable {
+    public let remotePath: String
+    public let localPath: URL
+
+    public init(remotePath: String, localPath: URL) {
+        self.remotePath = remotePath
+        self.localPath = localPath
+    }
+}
+
 public struct MountPoint: Sendable {
     public let hostPath: URL
     public let guestPath: String
@@ -47,6 +67,8 @@ public struct RunOptions: Sendable {
     public var env: [String: String]
     public var uploads: [FileUpload]
     public var downloads: [FileDownload]
+    public var directoryUploads: [DirectoryUpload]
+    public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
 
     public static let `default` = RunOptions()
@@ -59,6 +81,8 @@ public struct RunOptions: Sendable {
         env: [String: String] = [:],
         uploads: [FileUpload] = [],
         downloads: [FileDownload] = [],
+        directoryUploads: [DirectoryUpload] = [],
+        directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = []
     ) {
         self.timeout = timeout
@@ -68,6 +92,8 @@ public struct RunOptions: Sendable {
         self.env = env
         self.uploads = uploads
         self.downloads = downloads
+        self.directoryUploads = directoryUploads
+        self.directoryDownloads = directoryDownloads
         self.mounts = mounts
     }
 }

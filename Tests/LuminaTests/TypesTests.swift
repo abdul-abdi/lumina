@@ -1,4 +1,5 @@
 // Tests/LuminaTests/TypesTests.swift
+import Foundation
 import Testing
 @testable import Lumina
 
@@ -8,6 +9,20 @@ import Testing
     #expect(opts.memory == 512 * 1024 * 1024)
     #expect(opts.cpuCount == 2)
     #expect(opts.image == "default")
+    #expect(opts.directoryUploads.isEmpty)
+    #expect(opts.directoryDownloads.isEmpty)
+}
+
+@Test func directoryUploadInit() {
+    let upload = DirectoryUpload(localPath: URL(fileURLWithPath: "/tmp/mydir"), remotePath: "/data")
+    #expect(upload.localPath.path == "/tmp/mydir")
+    #expect(upload.remotePath == "/data")
+}
+
+@Test func directoryDownloadInit() {
+    let download = DirectoryDownload(remotePath: "/app/dist", localPath: URL(fileURLWithPath: "/tmp/output"))
+    #expect(download.remotePath == "/app/dist")
+    #expect(download.localPath.path == "/tmp/output")
 }
 
 @Test func vmOptionsFromRunOptions() {
@@ -37,6 +52,9 @@ import Testing
     #expect(ConnectionState.disconnected == ConnectionState.disconnected)
     #expect(ConnectionState.ready != ConnectionState.executing)
     #expect(ConnectionState.connecting != ConnectionState.waitingForReady)
+    #expect(ConnectionState.failed != ConnectionState.ready)
+    #expect(ConnectionState.failed != ConnectionState.disconnected)
+    #expect(ConnectionState.failed == ConnectionState.failed)
 }
 
 @Test func guestMessageHeartbeatEquality() {

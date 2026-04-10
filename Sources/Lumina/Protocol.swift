@@ -7,6 +7,9 @@ public enum HostMessage: Sendable {
     case exec(cmd: String, timeout: Int, env: [String: String])
     case upload(path: String, data: String, mode: String, seq: Int, eof: Bool)
     case downloadReq(path: String)
+    /// Send a signal to the currently executing command's process group.
+    /// The guest sends SIGTERM first, waits `gracePeriod` seconds, then SIGKILL.
+    case cancel(signal: Int32, gracePeriod: Int)
 }
 
 // MARK: - Guest Messages (received from guest)
@@ -31,7 +34,9 @@ public enum OutputStream: String, Sendable, Equatable, Codable {
 // MARK: - Wire Format
 
 enum LuminaProtocol {
-    static let maxMessageSize = 65_536 // 64KB
+    // 128KB — must accommodate 48KB raw chunks from guest agent (48*4/3 ≈ 64KB base64 + JSON envelope).
+    // Previous 64KB limit caused "Message exceeds limit" on file transfers.
+    static let maxMessageSize = 131_072
 
     static func encode(_ message: HostMessage) throws -> Data {
         let dict: [String: Any]
@@ -42,6 +47,8 @@ enum LuminaProtocol {
             dict = ["type": "upload", "path": path, "data": dataStr, "mode": mode, "seq": seq, "eof": eof]
         case .downloadReq(let path):
             dict = ["type": "download_req", "path": path]
+        case .cancel(let signal, let gracePeriod):
+            dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])

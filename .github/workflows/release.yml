@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: macos-15  # Apple Silicon runner with Swift 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for release notes generation
+
+      - name: Swift version
+        run: swift --version
+
+      # ── Build release binary ──────────────────────────────────
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Codesign with entitlements
+        run: |
+          BIN_PATH=$(swift build -c release --show-bin-path)/lumina
+          codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
+          echo "LUMINA_BIN=$BIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify binary
+        run: |
+          "$LUMINA_BIN" --help
+
+      # ── Build guest agent (Go cross-compile) ─────────────────
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache-dependency-path: Guest/lumina-agent/go.sum
+
+      - name: Build guest agent (linux/arm64)
+        run: |
+          cd Guest/lumina-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent
+          echo "AGENT_BIN=$(pwd)/lumina-agent" >> "$GITHUB_ENV"
+
+      # ── Run unit tests ────────────────────────────────────────
+      - name: Run all unit tests
+        run: swift test
+
+      # ── Stage release artifacts ───────────────────────────────
+      - name: Stage artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp "$LUMINA_BIN" release-artifacts/lumina
+          cp "$AGENT_BIN" release-artifacts/lumina-agent
+
+      # ── Create GitHub Release ─────────────────────────────────
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --latest \
+            release-artifacts/lumina \
+            release-artifacts/lumina-agent
+
+      # ── Homebrew tap (future) ─────────────────────────────────
+      # - name: Update Homebrew tap
+      #   env:
+      #     HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      #   run: |
+      #     # TODO: Update formula in homebrew-tap repo
+      #     # 1. Calculate sha256 of the release binary
+      #     # 2. Update the formula with new version + sha256
+      #     # 3. Push to the tap repo
+      #     echo "Homebrew tap update not yet configured"

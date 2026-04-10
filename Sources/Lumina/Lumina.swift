@@ -23,6 +23,10 @@ public struct Lumina {
             if !options.uploads.isEmpty {
                 try await vm.uploadFilesResult(options.uploads).get()
             }
+            // Upload directories before exec
+            for dir in options.directoryUploads {
+                try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
+            }
 
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
@@ -31,6 +35,10 @@ public struct Lumina {
             // Download files after exec
             if !options.downloads.isEmpty {
                 try await vm.downloadFilesResult(options.downloads).get()
+            }
+            // Download directories after exec
+            for dir in options.directoryDownloads {
+                try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
             }
 
             let totalWallTime = ContinuousClock.now - start
@@ -65,6 +73,9 @@ public struct Lumina {
                         if !options.uploads.isEmpty {
                             try await vm.uploadFilesResult(options.uploads).get()
                         }
+                        for dir in options.directoryUploads {
+                            try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
+                        }
 
                         let remaining = options.timeout - elapsed
                         let remainingSeconds = max(Int(remaining.components.seconds), 1)
@@ -77,6 +88,9 @@ public struct Lumina {
                         // Download files after stream completes
                         if !options.downloads.isEmpty {
                             try await vm.downloadFilesResult(options.downloads).get()
+                        }
+                        for dir in options.directoryDownloads {
+                            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
                         }
 
                         continuation.finish()

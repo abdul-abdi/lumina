@@ -28,6 +28,9 @@ struct SessionServe: AsyncParsableCommand {
     var volume: [String] = []
 
     func run() async throws {
+        // Ignore SIGPIPE — when a client disconnects mid-exec, writing to
+        // the broken socket must not kill the server process.
+        signal(SIGPIPE, SIG_IGN)
         installSignalHandlers()
 
         let paths = SessionPaths(sid: sid)

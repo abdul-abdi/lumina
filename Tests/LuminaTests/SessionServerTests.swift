@@ -51,3 +51,50 @@ import Testing
     }
     #expect(connectResult == 0)
 }
+
+// MARK: - Buffered Read Tests
+
+/// Verify that readMessage correctly handles coalesced NDJSON frames
+/// by splitting on newlines and retaining leftover bytes in the buffer.
+@Test func serverReadMessageHandlesCoalescedFrames() throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let socketPath = tmpDir.appendingPathComponent("control.sock")
+    let server = SessionServer(socketPath: socketPath)
+
+    // Use a pipe to simulate the read side
+    var fds: [Int32] = [0, 0]
+    guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+        throw LuminaError.sessionFailed("socketpair failed")
+    }
+    defer {
+        close(fds[0])
+        close(fds[1])
+    }
+
+    // Write two coalesced NDJSON requests in one write
+    let req1 = try SessionProtocol.encode(SessionRequest.exec(cmd: "echo hello", timeout: 30, env: [:]))
+    let req2 = try SessionProtocol.encode(SessionRequest.shutdown)
+    var combined = Data()
+    combined.append(req1)
+    combined.append(req2)
+    let writer = FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
+    writer.write(combined)
+
+    let reader = FileHandle(fileDescriptor: fds[0], closeOnDealloc: false)
+    var buffer = Data()
+
+    // First read should return the exec request
+    let msg1Data = try server.readMessage(from: reader, buffer: &buffer)
+    let decoded1 = try SessionProtocol.decodeRequest(msg1Data)
+    #expect(decoded1 == .exec(cmd: "echo hello", timeout: 30, env: [:]))
+
+    // Second read should return the shutdown request (from leftover buffer)
+    let msg2Data = try server.readMessage(from: reader, buffer: &buffer)
+    let decoded2 = try SessionProtocol.decodeRequest(msg2Data)
+    #expect(decoded2 == .shutdown)
+
+    _ = server // keep server alive
+}
