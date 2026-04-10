@@ -247,7 +247,6 @@ final class CommandRunner: @unchecked Sendable {
     private func resetForReconnect() {
         lock.lock()
         let fd = _connection?.fileDescriptor
-        let output = _outputHandle
         _connection = nil
         _inputHandle = nil
         _outputHandle = nil
