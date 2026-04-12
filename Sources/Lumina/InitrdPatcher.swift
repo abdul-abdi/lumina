@@ -95,6 +95,11 @@ enum InitrdPatcher {
     // MARK: - Custom Init Script
 
     private static func customInitScript() -> String {
+        // SYNC WARNING: The baked rootfs init script at Guest/build-image.sh (/sbin/init)
+        // shares network config logic with the lumina-init generated here.
+        // If you change network, virtiofs, or agent startup behavior below,
+        // check Guest/build-image.sh for the corresponding baked version.
+        //
         // No leading whitespace — this script is written verbatim into the cpio.
         // Each line must start at column 0 for the shell to parse correctly.
         var lines: [String] = [
@@ -186,6 +191,22 @@ enum InitrdPatcher {
             "    mount -t virtiofs \"$tag\" \"$mpath\" 2>/dev/null",
             "  done",
             "  IFS=\"$OLD_IFS\"",
+            "fi",
+            "",
+            "# Rosetta (x86_64 binary translation)",
+            "LUMINA_ROSETTA=",
+            "for param in $(cat /proc/cmdline); do",
+            "  case \"$param\" in",
+            "    lumina_rosetta=*) LUMINA_ROSETTA=\"${param#lumina_rosetta=}\" ;;",
+            "  esac",
+            "done",
+            "if [ \"$LUMINA_ROSETTA\" = \"1\" ]; then",
+            "  mkdir -p /mnt/rosetta",
+            "  mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null",
+            "  if [ -f /mnt/rosetta/rosetta ]; then",
+            "    mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null",
+            "    echo ':rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/mnt/rosetta/rosetta:F' > /proc/sys/fs/binfmt_misc/register 2>/dev/null",
+            "  fi",
             "fi",
             "",
             "# Background network config — off the critical path.",

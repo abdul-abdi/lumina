@@ -27,6 +27,9 @@ struct SessionServe: AsyncParsableCommand {
     @Option(help: "Volume mount (name:guest_path, repeatable)")
     var volume: [String] = []
 
+    @Flag(help: "Enable Rosetta")
+    var rosetta = false
+
     func run() async throws {
         // Ignore SIGPIPE — when a client disconnects mid-exec, writing to
         // the broken socket must not kill the server process.
@@ -54,7 +57,8 @@ struct SessionServe: AsyncParsableCommand {
             memory: memory,
             cpuCount: cpus,
             image: image,
-            mounts: mounts
+            mounts: mounts,
+            rosetta: rosetta
         )
         let vm = VM(options: vmOptions)
 

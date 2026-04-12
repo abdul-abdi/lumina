@@ -123,18 +123,6 @@ public actor VM {
             cmdLine += " lumina_hosts=\(Self.encodeHosts(hosts))"
         }
 
-        // ARM64 COMMAND_LINE_SIZE is 2048. Guard against silent truncation
-        // from large host maps or many mounts.
-        if cmdLine.utf8.count > 2048 {
-            clone?.remove()
-            _state = .idle
-            throw .bootFailed(underlying: VMError.invalidState(
-                "Kernel cmdline exceeds 2048 bytes (\(cmdLine.utf8.count)). "
-                + "Reduce the number of network hosts or mounts."
-            ))
-        }
-
-        bootLoader.commandLine = cmdLine
         config.bootLoader = bootLoader
 
         // Disk
@@ -209,6 +197,58 @@ public actor VM {
             }
             config.directorySharingDevices = sharingDevices
         }
+
+        // Rosetta for x86_64 binary translation in Linux guests
+        if options.rosetta {
+            if #available(macOS 13.0, *) {
+                let availability = VZLinuxRosettaDirectoryShare.availability
+                switch availability {
+                case .installed:
+                    do {
+                        let rosettaShare = try VZLinuxRosettaDirectoryShare()
+                        let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                        rosettaDevice.share = rosettaShare
+                        var sharingDevices = config.directorySharingDevices
+                        sharingDevices.append(rosettaDevice)
+                        config.directorySharingDevices = sharingDevices
+                        cmdLine += " lumina_rosetta=1"
+                    } catch {
+                        clone?.remove()
+                        _state = .idle
+                        throw .bootFailed(underlying: error)
+                    }
+                case .notSupported:
+                    clone?.remove()
+                    _state = .idle
+                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not supported on this Mac"))
+                case .notInstalled:
+                    clone?.remove()
+                    _state = .idle
+                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not installed. Run: softwareupdate --install-rosetta"))
+                @unknown default:
+                    clone?.remove()
+                    _state = .idle
+                    throw .bootFailed(underlying: VMError.invalidState("Unknown Rosetta availability status"))
+                }
+            } else {
+                clone?.remove()
+                _state = .idle
+                throw .bootFailed(underlying: VMError.invalidState("Rosetta requires macOS 13.0 or later"))
+            }
+        }
+
+        // ARM64 COMMAND_LINE_SIZE is 2048. Guard against silent truncation
+        // from large host maps, many mounts, or rosetta param.
+        if cmdLine.utf8.count > 2048 {
+            clone?.remove()
+            _state = .idle
+            throw .bootFailed(underlying: VMError.invalidState(
+                "Kernel cmdline exceeds 2048 bytes (\(cmdLine.utf8.count)). "
+                + "Reduce the number of network hosts or mounts."
+            ))
+        }
+
+        bootLoader.commandLine = cmdLine
 
         // Entropy
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

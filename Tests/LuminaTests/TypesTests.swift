@@ -66,3 +66,13 @@ import Testing
     let opts = RunOptions()
     #expect(opts.workingDirectory == nil)
 }
+
+@Test func vmOptionsRosettaDefaultFalse() {
+    let opts = VMOptions()
+    #expect(opts.rosetta == false)
+}
+
+@Test func runOptionsRosettaDefaultFalse() {
+    let opts = RunOptions()
+    #expect(opts.rosetta == false)
+}

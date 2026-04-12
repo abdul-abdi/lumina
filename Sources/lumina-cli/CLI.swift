@@ -65,6 +65,9 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
 
+    @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
+    var rosetta = false
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -214,7 +217,8 @@ struct Run: AsyncParsableCommand {
             directoryUploads: parsedDirUploads,
             directoryDownloads: parsedDirDownloads,
             mounts: parsedMounts,
-            workingDirectory: workdir
+            workingDirectory: workdir,
+            rosetta: rosetta
         )
 
         let format = resolveOutputFormat(textFlag: text)
@@ -558,6 +562,9 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Max time to wait for VM to boot (e.g. 30s, 2m)")
     var bootTimeout: String = "60s"
 
+    @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
+    var rosetta = false
+
     func run() async throws {
         // Check if requested image exists before spawning background process
         let puller = ImagePuller()
@@ -615,6 +622,9 @@ struct SessionStart: AsyncParsableCommand {
         ]
         for v in parsedVolumes {
             process.arguments! += ["--volume", "\(v.name):\(v.guestPath)"]
+        }
+        if rosetta {
+            process.arguments! += ["--rosetta"]
         }
 
         // Capture stderr from child process so boot failures are surfaced

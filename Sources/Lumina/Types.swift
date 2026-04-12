@@ -71,6 +71,7 @@ public struct RunOptions: Sendable {
     public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
     public var workingDirectory: String?
+    public var rosetta: Bool
 
     public static let `default` = RunOptions()
 
@@ -85,7 +86,8 @@ public struct RunOptions: Sendable {
         directoryUploads: [DirectoryUpload] = [],
         directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        rosetta: Bool = false
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -98,6 +100,7 @@ public struct RunOptions: Sendable {
         self.directoryDownloads = directoryDownloads
         self.mounts = mounts
         self.workingDirectory = workingDirectory
+        self.rosetta = rosetta
     }
 }
 
@@ -112,6 +115,7 @@ public struct VMOptions: Sendable {
     public var privateNetworkFd: Int32?  // Raw fd, not FileHandle (FileHandle isn't Sendable)
     public var networkHosts: [String: String]?
     public var networkIP: String?
+    public var rosetta: Bool
 
     public static let `default` = VMOptions()
 
@@ -123,7 +127,8 @@ public struct VMOptions: Sendable {
         mounts: [MountPoint] = [],
         privateNetworkFd: Int32? = nil,
         networkHosts: [String: String]? = nil,
-        networkIP: String? = nil
+        networkIP: String? = nil,
+        rosetta: Bool = false
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -133,6 +138,7 @@ public struct VMOptions: Sendable {
         self.privateNetworkFd = privateNetworkFd
         self.networkHosts = networkHosts
         self.networkIP = networkIP
+        self.rosetta = rosetta
     }
 
     public init(from runOptions: RunOptions) {
@@ -144,6 +150,7 @@ public struct VMOptions: Sendable {
         self.privateNetworkFd = nil
         self.networkHosts = nil
         self.networkIP = nil
+        self.rosetta = runOptions.rosetta
     }
 }
 
