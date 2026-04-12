@@ -61,3 +61,8 @@ import Testing
     #expect(GuestMessage.heartbeat == GuestMessage.heartbeat)
     #expect(GuestMessage.heartbeat != GuestMessage.ready)
 }
+
+@Test func runOptionsWorkingDirectoryDefaultNil() {
+    let opts = RunOptions()
+    #expect(opts.workingDirectory == nil)
+}

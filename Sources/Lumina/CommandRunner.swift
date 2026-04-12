@@ -125,12 +125,12 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Concurrent Exec (returns complete result)
 
-    func exec(id: String, command: String, timeout: Int, env: [String: String] = [:]) async throws(LuminaError) -> RunResult {
+    func exec(id: String, command: String, timeout: Int, env: [String: String] = [:], cwd: String? = nil) async throws(LuminaError) -> RunResult {
         let guestTimeout = max(timeout * 3, 30)
         let stream = registerExecHandler(id, guestTimeout: guestTimeout)
         defer { unregisterExecHandler(id) }
 
-        try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env)
+        try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
 
         var stdout = ""
         var stderr = ""
@@ -165,12 +165,13 @@ final class CommandRunner: @unchecked Sendable {
         id: String,
         command: String,
         timeout: Int,
-        env: [String: String] = [:]
+        env: [String: String] = [:],
+        cwd: String? = nil
     ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
         let guestTimeout = max(timeout * 3, 30)
         let msgStream = registerExecHandler(id, guestTimeout: guestTimeout)
 
-        try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env)
+        try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
 
         let runner = self
         let execId = id
@@ -574,7 +575,7 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Private: Message Sending
 
-    private func sendExecMessage(id: String, command: String, guestTimeout: Int, env: [String: String]) throws(LuminaError) {
+    private func sendExecMessage(id: String, command: String, guestTimeout: Int, env: [String: String], cwd: String? = nil) throws(LuminaError) {
         lock.lock()
         guard _state == .ready else {
             lock.unlock()
@@ -582,7 +583,7 @@ final class CommandRunner: @unchecked Sendable {
         }
         lock.unlock()
 
-        let execMsg = HostMessage.exec(id: id, cmd: command, timeout: guestTimeout, env: env)
+        let execMsg = HostMessage.exec(id: id, cmd: command, timeout: guestTimeout, env: env, cwd: cwd)
         let msgData: Data
         do {
             msgData = try LuminaProtocol.encode(execMsg)

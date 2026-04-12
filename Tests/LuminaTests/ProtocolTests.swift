@@ -26,6 +26,22 @@ import Testing
     #expect(env?["FOO"] == "bar")
 }
 
+@Test func encodeExecMessageWithCwd() throws {
+    let msg = HostMessage.exec(id: "cwd-1", cmd: "pwd", timeout: 30, env: [:], cwd: "/code")
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "exec")
+    #expect(json["cwd"] as? String == "/code")
+}
+
+@Test func encodeExecMessageWithoutCwd() throws {
+    let msg = HostMessage.exec(id: "cwd-2", cmd: "pwd", timeout: 30, env: [:], cwd: nil)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "exec")
+    #expect(json["cwd"] == nil)
+}
+
 // MARK: - Guest Message Tests
 
 @Test func decodeReadyMessage() throws {

@@ -167,8 +167,8 @@ public final class SessionServer: @unchecked Sendable {
                 }
 
                 switch request {
-                case .exec(let cmd, let timeout, let env):
-                    await handleExec(cmd: cmd, timeout: timeout, env: env, vm: vm, handle: handles.write)
+                case .exec(let cmd, let timeout, let env, let cwd):
+                    await handleExec(cmd: cmd, timeout: timeout, env: env, cwd: cwd, vm: vm, handle: handles.write)
 
                 case .upload(let localPath, let remotePath):
                     await handleUpload(localPath: localPath, remotePath: remotePath, vm: vm, handle: handles.write)
@@ -200,12 +200,12 @@ public final class SessionServer: @unchecked Sendable {
 
     // MARK: - Request Handlers
 
-    private func handleExec(cmd: String, timeout: Int, env: [String: String], vm: VM, handle: FileHandle) async {
+    private func handleExec(cmd: String, timeout: Int, env: [String: String], cwd: String?, vm: VM, handle: FileHandle) async {
         let start = ContinuousClock.now
         do {
             // Stream output in real time — each chunk is sent to the client as it arrives
             // from the guest agent, rather than buffering the entire result.
-            let chunks = try await vm.stream(cmd, timeout: timeout, env: env)
+            let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd)
             for try await chunk in chunks {
                 switch chunk {
                 case .stdout(let data):

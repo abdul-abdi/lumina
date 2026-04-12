@@ -91,3 +91,23 @@ import Testing
     let decoded = try SessionProtocol.decodeRequest(data)
     #expect(decoded == req)
 }
+
+@Test func encodeExecRequestWithCwd() throws {
+    let req = SessionRequest.exec(cmd: "pwd", timeout: 30, env: [:], cwd: "/code")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["cmd"] as? String == "pwd")
+    #expect(json["cwd"] as? String == "/code")
+}
+
+@Test func decodeExecRequestWithCwd() throws {
+    let json = "{\"type\":\"exec\",\"cmd\":\"pwd\",\"timeout\":30,\"env\":{},\"cwd\":\"/code\"}\n"
+    let req = try SessionProtocol.decodeRequest(Data(json.utf8))
+    #expect(req == .exec(cmd: "pwd", timeout: 30, env: [:], cwd: "/code"))
+}
+
+@Test func decodeExecRequestWithoutCwd() throws {
+    let json = "{\"type\":\"exec\",\"cmd\":\"pwd\",\"timeout\":30,\"env\":{}}\n"
+    let req = try SessionProtocol.decodeRequest(Data(json.utf8))
+    #expect(req == .exec(cmd: "pwd", timeout: 30, env: [:], cwd: nil))
+}

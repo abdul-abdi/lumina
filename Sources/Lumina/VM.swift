@@ -80,35 +80,38 @@ public actor VM {
         config.memorySize = options.memory
 
         // Boot loader
+        // ── Boot loader: initrd setup ──
         let bootLoader = VZLinuxBootLoader(kernelURL: imagePaths.kernel)
 
-        // If the image includes a guest agent binary, create a combined initrd
-        // that injects the agent + custom init into the Alpine initramfs.
-        if let agentURL = imagePaths.agent {
-            let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
-            try InitrdPatcher.createCombinedInitrd(
-                baseInitrd: imagePaths.initrd,
-                agentBinary: agentURL,
-                modulesDir: imagePaths.modulesDir,
-                outputURL: combinedInitrd
-            )
-            // Append network overlay if private networking is configured
-            if let hosts = options.networkHosts, let ip = options.networkIP {
-                try InitrdPatcher.appendNetworkOverlay(
-                    initrdURL: combinedInitrd,
-                    hosts: hosts,
-                    ip: ip
+        if let baseInitrd = imagePaths.initrd {
+            // Legacy image: has initrd (Alpine kernel with modules)
+            if let agentURL = imagePaths.agent {
+                let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
+                try InitrdPatcher.createCombinedInitrd(
+                    baseInitrd: baseInitrd,
+                    agentBinary: agentURL,
+                    modulesDir: imagePaths.modulesDir,
+                    outputURL: combinedInitrd
                 )
+                if let hosts = options.networkHosts, let ip = options.networkIP {
+                    try InitrdPatcher.appendNetworkOverlay(
+                        initrdURL: combinedInitrd,
+                        hosts: hosts,
+                        ip: ip
+                    )
+                }
+                bootLoader.initialRamdiskURL = combinedInitrd
+            } else {
+                bootLoader.initialRamdiskURL = baseInitrd
             }
-
-            bootLoader.initialRamdiskURL = combinedInitrd
-        } else {
-            bootLoader.initialRamdiskURL = imagePaths.initrd
         }
+        // else: baked image — no initrd, kernel boots directly to rootfs
 
+        // ── Kernel command line ──
+        // All cmdline params built in one block. Both paths share mounts and IP;
+        // baked images additionally pass hosts via cmdline (legacy uses initrd overlay).
         var cmdLine = "console=hvc0 root=/dev/vda rw"
 
-        // Encode mount specs as kernel param so the init script can mount them.
         if !options.mounts.isEmpty {
             let specs = options.mounts.enumerated().map { "lumina\($0.offset):\($0.element.guestPath)" }
             cmdLine += " lumina_mounts=\(specs.joined(separator: ","))"
@@ -116,6 +119,21 @@ public actor VM {
         if let ip = options.networkIP {
             cmdLine += " lumina_ip=\(ip)"
         }
+        if imagePaths.isBaked, let hosts = options.networkHosts {
+            cmdLine += " lumina_hosts=\(Self.encodeHosts(hosts))"
+        }
+
+        // ARM64 COMMAND_LINE_SIZE is 2048. Guard against silent truncation
+        // from large host maps or many mounts.
+        if cmdLine.utf8.count > 2048 {
+            clone?.remove()
+            _state = .idle
+            throw .bootFailed(underlying: VMError.invalidState(
+                "Kernel cmdline exceeds 2048 bytes (\(cmdLine.utf8.count)). "
+                + "Reduce the number of network hosts or mounts."
+            ))
+        }
+
         bootLoader.commandLine = cmdLine
         config.bootLoader = bootLoader
 
@@ -268,10 +286,11 @@ public actor VM {
     func execResult(
         _ command: String,
         timeout: Int = 60,
-        env: [String: String] = [:]
+        env: [String: String] = [:],
+        cwd: String? = nil
     ) async -> Result<RunResult, LuminaError> {
         do {
-            return .success(try await exec(command, timeout: timeout, env: env))
+            return .success(try await exec(command, timeout: timeout, env: env, cwd: cwd))
         } catch {
             return .failure(error)
         }
@@ -406,7 +425,8 @@ public actor VM {
     public func exec(
         _ command: String,
         timeout: Int = 60,
-        env: [String: String] = [:]
+        env: [String: String] = [:],
+        cwd: String? = nil
     ) async throws(LuminaError) -> RunResult {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot exec from state: \(_state)"))
@@ -419,7 +439,7 @@ public actor VM {
 
         let id = UUID().uuidString
         let start = ContinuousClock.now
-        let result = try await runner.exec(id: id, command: command, timeout: timeout, env: env)
+        let result = try await runner.exec(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
         let wallTime = ContinuousClock.now - start
         return RunResult(
             stdout: result.stdout,
@@ -434,7 +454,8 @@ public actor VM {
     public func stream(
         _ command: String,
         timeout: Int = 60,
-        env: [String: String] = [:]
+        env: [String: String] = [:],
+        cwd: String? = nil
     ) async throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
@@ -445,7 +466,7 @@ public actor VM {
         }
 
         let id = UUID().uuidString
-        return try runner.execStream(id: id, command: command, timeout: timeout, env: env)
+        return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
     }
 
     // MARK: - Stdin
@@ -535,6 +556,23 @@ public actor VM {
             throw .bootFailed(underlying: VMError.pipeFailed)
         }
         return (FileHandle(fileDescriptor: fds[0]), FileHandle(fileDescriptor: fds[1]))
+    }
+
+    /// Encode network hosts map as a kernel cmdline param value.
+    /// Sanitizes hostnames to DNS-safe characters (alphanumeric + hyphens)
+    /// to prevent shell injection via the init script's cmdline parsing.
+    private static func encodeHosts(_ hosts: [String: String]) -> String {
+        hosts.sorted(by: { $0.key < $1.key })
+            .map { (name, addr) in
+                let safeName = String(name.unicodeScalars.filter {
+                    CharacterSet.alphanumerics.contains($0) || $0 == "-"
+                })
+                let safeAddr = String(addr.unicodeScalars.filter {
+                    CharacterSet.decimalDigits.contains($0) || $0 == "."
+                })
+                return "\(safeName):\(safeAddr)"
+            }
+            .joined(separator: ",")
     }
 }
 

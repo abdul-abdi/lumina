@@ -30,7 +30,7 @@ public struct Lumina {
 
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env).get()
+            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory).get()
 
             // Download files after exec
             if !options.downloads.isEmpty {
@@ -80,7 +80,7 @@ public struct Lumina {
                         let remaining = options.timeout - elapsed
                         let remainingSeconds = max(Int(remaining.components.seconds), 1)
 
-                        let chunks = try await vm.stream(command, timeout: remainingSeconds, env: options.env)
+                        let chunks = try await vm.stream(command, timeout: remainingSeconds, env: options.env, cwd: options.workingDirectory)
                         for try await chunk in chunks {
                             continuation.yield(chunk)
                         }

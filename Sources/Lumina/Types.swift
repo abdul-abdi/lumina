@@ -70,6 +70,7 @@ public struct RunOptions: Sendable {
     public var directoryUploads: [DirectoryUpload]
     public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
+    public var workingDirectory: String?
 
     public static let `default` = RunOptions()
 
@@ -83,7 +84,8 @@ public struct RunOptions: Sendable {
         downloads: [FileDownload] = [],
         directoryUploads: [DirectoryUpload] = [],
         directoryDownloads: [DirectoryDownload] = [],
-        mounts: [MountPoint] = []
+        mounts: [MountPoint] = [],
+        workingDirectory: String? = nil
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -95,6 +97,7 @@ public struct RunOptions: Sendable {
         self.directoryUploads = directoryUploads
         self.directoryDownloads = directoryDownloads
         self.mounts = mounts
+        self.workingDirectory = workingDirectory
     }
 }
 

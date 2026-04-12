@@ -4,7 +4,7 @@ import Foundation
 // MARK: - Session Request (host → session server)
 
 public enum SessionRequest: Sendable, Equatable {
-    case exec(cmd: String, timeout: Int, env: [String: String])
+    case exec(cmd: String, timeout: Int, env: [String: String], cwd: String? = nil)
     case upload(localPath: String, remotePath: String)
     case download(remotePath: String, localPath: String)
     case cancel(signal: Int32, gracePeriod: Int)
@@ -30,8 +30,10 @@ public enum SessionProtocol {
     public static func encode(_ request: SessionRequest) throws -> Data {
         let dict: [String: Any]
         switch request {
-        case .exec(let cmd, let timeout, let env):
-            dict = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+        case .exec(let cmd, let timeout, let env, let cwd):
+            var d: [String: Any] = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+            if let cwd = cwd { d["cwd"] = cwd }
+            dict = d
         case .upload(let localPath, let remotePath):
             dict = ["type": "upload", "local_path": localPath, "remote_path": remotePath]
         case .download(let remotePath, let localPath):
@@ -82,7 +84,8 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed exec request")
             }
             let env = json["env"] as? [String: String] ?? [:]
-            return .exec(cmd: cmd, timeout: timeout, env: env)
+            let cwd = json["cwd"] as? String
+            return .exec(cmd: cmd, timeout: timeout, env: env, cwd: cwd)
         case "upload":
             guard let localPath = json["local_path"] as? String,
                   let remotePath = json["remote_path"] as? String else {

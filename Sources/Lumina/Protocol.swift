@@ -4,7 +4,7 @@ import Foundation
 // MARK: - Host Messages (sent to guest)
 
 public enum HostMessage: Sendable {
-    case exec(id: String, cmd: String, timeout: Int, env: [String: String])
+    case exec(id: String, cmd: String, timeout: Int, env: [String: String], cwd: String? = nil)
     case upload(path: String, data: String, mode: String, seq: Int, eof: Bool)
     case downloadReq(path: String)
     /// Send a signal to a running command (by id) or all commands (id nil).
@@ -44,8 +44,10 @@ enum LuminaProtocol {
     static func encode(_ message: HostMessage) throws -> Data {
         let dict: [String: Any]
         switch message {
-        case .exec(let id, let cmd, let timeout, let env):
-            dict = ["type": "exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env]
+        case .exec(let id, let cmd, let timeout, let env, let cwd):
+            var d: [String: Any] = ["type": "exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env]
+            if let cwd = cwd { d["cwd"] = cwd }
+            dict = d
         case .upload(let path, let dataStr, let mode, let seq, let eof):
             dict = ["type": "upload", "path": path, "data": dataStr, "mode": mode, "seq": seq, "eof": eof]
         case .downloadReq(let path):

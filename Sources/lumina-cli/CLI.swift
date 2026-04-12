@@ -62,6 +62,9 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Mount named volume (name:guest_path, repeatable)")
     var volume: [String] = []
 
+    @Option(name: .long, help: "Working directory inside the VM")
+    var workdir: String? = nil
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -210,7 +213,8 @@ struct Run: AsyncParsableCommand {
             downloads: parsedDownloads,
             directoryUploads: parsedDirUploads,
             directoryDownloads: parsedDirDownloads,
-            mounts: parsedMounts
+            mounts: parsedMounts,
+            workingDirectory: workdir
         )
 
         let format = resolveOutputFormat(textFlag: text)
@@ -766,6 +770,9 @@ struct Exec: AsyncParsableCommand {
     @Option(name: .long, help: "Download file from VM (remote:local, repeatable)")
     var download: [String] = []
 
+    @Option(name: .long, help: "Working directory inside the VM")
+    var workdir: String? = nil
+
     func run() async throws {
         guard let parsedTimeout = parseDuration(timeout) else {
             FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'\n".utf8))
@@ -820,7 +827,7 @@ struct Exec: AsyncParsableCommand {
 
         // Execute
         let format = resolveOutputFormat(textFlag: text)
-        try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv))
+        try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv, cwd: workdir))
 
         while true {
             let response = try client.receive()
