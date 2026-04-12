@@ -71,7 +71,6 @@ public struct RunOptions: Sendable {
     public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
     public var workingDirectory: String?
-    public var rosetta: Bool
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
     /// is resized before boot. Nil means use the image's original size.
     public var diskSize: UInt64?
@@ -80,7 +79,7 @@ public struct RunOptions: Sendable {
 
     public init(
         timeout: Duration = .seconds(60),
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
         env: [String: String] = [:],
@@ -90,7 +89,6 @@ public struct RunOptions: Sendable {
         directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
-        rosetta: Bool = false,
         diskSize: UInt64? = nil
     ) {
         self.timeout = timeout
@@ -104,7 +102,6 @@ public struct RunOptions: Sendable {
         self.directoryDownloads = directoryDownloads
         self.mounts = mounts
         self.workingDirectory = workingDirectory
-        self.rosetta = rosetta
         self.diskSize = diskSize
     }
 }
@@ -126,7 +123,7 @@ public struct VMOptions: Sendable {
     public static let `default` = VMOptions()
 
     public init(
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
         networkProvider: any NetworkProvider = NATNetworkProvider(),
@@ -158,8 +155,9 @@ public struct VMOptions: Sendable {
         self.privateNetworkFd = nil
         self.networkHosts = nil
         self.networkIP = nil
-        self.rosetta = runOptions.rosetta
         self.diskSize = runOptions.diskSize
+        // Auto-detect rosetta from image metadata
+        self.rosetta = ImageStore().readMeta(name: runOptions.image)?.rosetta ?? false
     }
 }
 
@@ -210,7 +208,7 @@ public struct SessionOptions: Sendable {
 
     public init(
         cpuCount: Int = 2,
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         image: String = "default",
         timeout: Duration = .seconds(60),
         env: [String: String] = [:],
@@ -274,6 +272,7 @@ public struct ImageInfo: Sendable {
     public let name: String
     public let base: String?
     public let command: String?
+    public let rosetta: Bool
     public let created: Date
     public let sizeBytes: UInt64
 }
@@ -282,11 +281,26 @@ public struct ImageMeta: Sendable, Codable {
     public let base: String?
     public let command: String?
     public let created: Date
+    public let rosetta: Bool
 
-    public init(base: String?, command: String?, created: Date) {
+    public init(base: String?, command: String?, created: Date, rosetta: Bool = false) {
         self.base = base
         self.command = command
         self.created = created
+        self.rosetta = rosetta
+    }
+
+    // Backward-compatible decoding: old images lack the rosetta field
+    private enum CodingKeys: String, CodingKey {
+        case base, command, created, rosetta
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        base = try container.decodeIfPresent(String.self, forKey: .base)
+        command = try container.decodeIfPresent(String.self, forKey: .command)
+        created = try container.decode(Date.self, forKey: .created)
+        rosetta = try container.decodeIfPresent(Bool.self, forKey: .rosetta) ?? false
     }
 }
 

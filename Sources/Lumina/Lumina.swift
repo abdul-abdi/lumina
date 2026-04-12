@@ -35,11 +35,17 @@ public struct Lumina {
             let remainingSeconds = Int(remaining.components.seconds)
             let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory).get()
 
-            // Download files after exec
-            if !options.downloads.isEmpty {
-                try await vm.downloadFilesResult(options.downloads).get()
+            // Download after exec — auto-detect file vs directory on guest
+            for dl in options.downloads {
+                let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+                let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
+                if check.exitCode == 0 {
+                    try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+                } else {
+                    try await vm.downloadFiles([dl])
+                }
             }
-            // Download directories after exec
+            // Explicit directory downloads (library API)
             for dir in options.directoryDownloads {
                 try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
             }
@@ -90,9 +96,15 @@ public struct Lumina {
                             continuation.yield(chunk)
                         }
 
-                        // Download files after stream completes
-                        if !options.downloads.isEmpty {
-                            try await vm.downloadFilesResult(options.downloads).get()
+                        // Download after stream — auto-detect file vs directory on guest
+                        for dl in options.downloads {
+                            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+                            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
+                            if check.exitCode == 0 {
+                                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+                            } else {
+                                try await vm.downloadFiles([dl])
+                            }
                         }
                         for dir in options.directoryDownloads {
                             try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
@@ -117,11 +129,13 @@ public struct Lumina {
         name: String,
         from base: String = "default",
         command: String,
-        options: RunOptions = .default
+        options: RunOptions = .default,
+        rosetta: Bool = false
     ) async throws {
         var opts = options
         opts.image = base
-        let vmOptions = VMOptions(from: opts)
+        var vmOptions = VMOptions(from: opts)
+        if rosetta { vmOptions.rosetta = true }
         let vm = VM(options: vmOptions)
 
         // Phase 1: Run command (VM owns everything — shutdown handles cleanup on failure)
@@ -152,7 +166,7 @@ public struct Lumina {
         // Phase 3: Copy rootfs into image store (caller owns clone)
         defer { clone.remove() }
         let store = ImageStore()
-        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
+        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command, rosetta: rosetta)
     }
 
     /// Create a custom image by running multiple commands sequentially.
@@ -161,7 +175,8 @@ public struct Lumina {
         name: String,
         from base: String = "default",
         commands: [String],
-        options: RunOptions = .default
+        options: RunOptions = .default,
+        rosetta: Bool = false
     ) async throws {
         guard !commands.isEmpty else {
             throw LuminaError.sessionFailed("No build commands provided")
@@ -169,7 +184,8 @@ public struct Lumina {
 
         var opts = options
         opts.image = base
-        let vmOptions = VMOptions(from: opts)
+        var vmOptions = VMOptions(from: opts)
+        if rosetta { vmOptions.rosetta = true }
         let vm = VM(options: vmOptions)
 
         do {
@@ -199,7 +215,7 @@ public struct Lumina {
 
         defer { clone.remove() }
         let store = ImageStore()
-        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "))
+        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "), rosetta: rosetta)
     }
 
     /// Run a closure with a private network of VMs.

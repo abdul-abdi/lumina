@@ -97,8 +97,8 @@ enum OutputFormat {
 }
 
 /// Determine output format: JSON (for agents/pipes) or text (for humans/TTYs).
-/// Priority: LUMINA_FORMAT env > --text flag > isatty() auto-detection.
-func resolveOutputFormat(textFlag: Bool) -> OutputFormat {
+/// Priority: LUMINA_FORMAT env > isatty() auto-detection.
+func resolveOutputFormat() -> OutputFormat {
     // 1. LUMINA_FORMAT env var takes highest priority
     if let envFormat = ProcessInfo.processInfo.environment["LUMINA_FORMAT"]?.lowercased() {
         switch envFormat {
@@ -108,11 +108,58 @@ func resolveOutputFormat(textFlag: Bool) -> OutputFormat {
         }
     }
 
-    // 2. --text flag explicitly requests human-readable
-    if textFlag { return .text }
-
-    // 3. Auto-detect: TTY -> text, pipe -> JSON
+    // 2. Auto-detect: TTY -> text, pipe -> JSON
     return isatty(STDOUT_FILENO) != 0 ? .text : .json
+}
+
+// MARK: - Env Var Defaults
+//
+// Priority: CLI flag > env var > built-in default.
+// Env vars: LUMINA_MEMORY, LUMINA_CPUS, LUMINA_TIMEOUT, LUMINA_DISK_SIZE
+
+import Lumina
+
+/// Resolve memory: CLI flag (if changed from default) > LUMINA_MEMORY env > built-in 1GB.
+func resolveMemory(flag: String) -> String {
+    if flag != "1GB" { return flag }
+    return ProcessInfo.processInfo.environment["LUMINA_MEMORY"] ?? flag
+}
+
+/// Resolve CPU count: CLI flag (if changed from default) > LUMINA_CPUS env > built-in 2.
+func resolveCpus(flag: Int) -> Int {
+    if flag != 2 { return flag }
+    if let envStr = ProcessInfo.processInfo.environment["LUMINA_CPUS"],
+       let envVal = Int(envStr), envVal > 0 {
+        return envVal
+    }
+    return flag
+}
+
+/// Resolve timeout: CLI flag (if changed from default) > LUMINA_TIMEOUT env > built-in default.
+func resolveTimeout(flag: String, defaultValue: String) -> String {
+    if flag != defaultValue { return flag }
+    return ProcessInfo.processInfo.environment["LUMINA_TIMEOUT"] ?? flag
+}
+
+/// Resolve disk size: CLI flag > LUMINA_DISK_SIZE env > nil (use image default).
+func resolveDiskSize(flag: String?) -> String? {
+    if let flag { return flag }
+    return ProcessInfo.processInfo.environment["LUMINA_DISK_SIZE"]
+}
+
+// MARK: - Streaming Mode
+//
+// Default: TTY = stream (humans want real-time), pipe = buffer (agents want complete JSON).
+// Override: LUMINA_STREAM=0|1 env var.
+
+/// Resolve streaming mode: LUMINA_STREAM env > isatty auto-detect.
+func resolveStreaming() -> Bool {
+    // 1. LUMINA_STREAM env var
+    if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
+        return envVal == "1" || envVal == "true"
+    }
+    // 3. Auto-detect: TTY = stream, pipe = buffer
+    return isatty(STDOUT_FILENO) != 0
 }
 
 // MARK: - NDJSON Output Types (streaming / session exec)

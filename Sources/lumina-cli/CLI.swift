@@ -10,7 +10,7 @@ struct LuminaCLI: AsyncParsableCommand {
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
         version: "0.5.0",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
-                      Session.self, Exec.self, SessionServe.self,
+                      Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self]
     )
 }
@@ -26,50 +26,23 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Image to boot from")
     var image: String = "default"
 
-    @Flag(name: .long, help: "Stream output in real time (NDJSON when piped, raw when TTY)")
-    var stream = false
-
-    @Flag(name: .long, help: "Force human-readable text output (default when TTY)")
-    var text = false
-
-    @Option(name: .long, help: "Command timeout, excludes ~2s boot time (e.g. 30s, 5m)")
+    @Option(name: .long, help: "Command timeout, excludes ~2s boot time (e.g. 30s, 5m). Env: LUMINA_TIMEOUT")
     var timeout: String = "60s"
-
-    @Option(name: .long, help: "Memory (e.g. 512MB, 1GB)")
-    var memory: String = "512MB"
-
-    @Option(name: .long, help: "Number of CPU cores")
-    var cpus: Int = 2
 
     @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
     var env: [String] = []
 
-    @Option(name: .long, help: "Copy file into VM (local:remote, repeatable)")
+    @Option(name: .long, help: "Copy file or directory into VM (local:remote, repeatable)")
     var copy: [String] = []
 
-    @Option(name: .long, help: "Copy directory into VM (local:remote, repeatable)")
-    var copyDir: [String] = []
-
-    @Option(name: .long, help: "Download file from VM after command (remote:local, repeatable)")
+    @Option(name: .long, help: "Download from VM after command (remote:local, repeatable)")
     var download: [String] = []
 
-    @Option(name: .long, help: "Download directory from VM after command (remote:local, repeatable)")
-    var downloadDir: [String] = []
-
-    @Option(name: .long, help: "Mount host directory into VM (host:guest, repeatable)")
-    var mount: [String] = []
-
-    @Option(name: .long, help: "Mount named volume (name:guest_path, repeatable)")
+    @Option(name: .long, help: "Mount host dir or named volume into VM (path_or_name:guest, repeatable)")
     var volume: [String] = []
 
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
-
-    @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
-    var rosetta = false
-
-    @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default.")
-    var diskSize: String? = nil
 
     func run() async throws {
         installSignalHandlers()
@@ -95,13 +68,19 @@ struct Run: AsyncParsableCommand {
             }
         }
 
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 30s, 5m\n".utf8))
+        // Resolve from env vars with built-in defaults
+        let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
+        let resolvedMemory = resolveMemory(flag: "1GB")
+        let resolvedCpus = resolveCpus(flag: 2)
+        let resolvedDiskSize = resolveDiskSize(flag: nil)
+
+        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'. Use e.g. 30s, 5m\n".utf8))
             throw ExitCode.failure
         }
 
-        guard let parsedMemory = parseMemory(memory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(memory)'. Use e.g. 512MB, 1GB\n".utf8))
+        guard let parsedMemory = parseMemory(resolvedMemory) else {
+            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'. Use e.g. 512MB, 1GB\n".utf8))
             throw ExitCode.failure
         }
 
@@ -116,7 +95,9 @@ struct Run: AsyncParsableCommand {
             parsedEnv[key] = value
         }
 
+        // Parse --copy: auto-detect file vs directory from local path
         var parsedUploads: [FileUpload] = []
+        var parsedDirUploads: [DirectoryUpload] = []
         for spec in copy {
             guard let colonIndex = spec.firstIndex(of: ":") else {
                 FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'. Use local:remote format\n".utf8))
@@ -125,15 +106,20 @@ struct Run: AsyncParsableCommand {
             let localStr = String(spec[spec.startIndex..<colonIndex])
             let remote = String(spec[spec.index(after: colonIndex)...])
             let localURL = URL(fileURLWithPath: localStr)
-            guard FileManager.default.fileExists(atPath: localURL.path) else {
-                FileHandle.standardError.write(Data("lumina: file not found: \(localStr)\n".utf8))
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir) else {
+                FileHandle.standardError.write(Data("lumina: not found: \(localStr)\n".utf8))
                 throw ExitCode.failure
             }
-            // Detect executable files and set mode accordingly
-            let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
-            parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
+            if isDir.boolValue {
+                parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
+            } else {
+                let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
+                parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
+            }
         }
 
+        // Parse --download: auto-detected as file vs directory at runtime on guest
         var parsedDownloads: [FileDownload] = []
         for spec in download {
             guard let colonIndex = spec.firstIndex(of: ":") else {
@@ -146,73 +132,41 @@ struct Run: AsyncParsableCommand {
             parsedDownloads.append(FileDownload(remotePath: remote, localPath: localURL))
         }
 
-        var parsedDirUploads: [DirectoryUpload] = []
-        for spec in copyDir {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --copy-dir '\(spec)'. Use local:remote format\n".utf8))
-                throw ExitCode.failure
-            }
-            let localStr = String(spec[spec.startIndex..<colonIndex])
-            let remote = String(spec[spec.index(after: colonIndex)...])
-            let localURL = URL(fileURLWithPath: localStr)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir), isDir.boolValue else {
-                FileHandle.standardError.write(Data("lumina: not a directory: \(localStr)\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
-        }
-
-        var parsedDirDownloads: [DirectoryDownload] = []
-        for spec in downloadDir {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --download-dir '\(spec)'. Use remote:local format\n".utf8))
-                throw ExitCode.failure
-            }
-            let remote = String(spec[spec.startIndex..<colonIndex])
-            let localStr = String(spec[spec.index(after: colonIndex)...])
-            let localURL = URL(fileURLWithPath: localStr)
-            parsedDirDownloads.append(DirectoryDownload(remotePath: remote, localPath: localURL))
-        }
-
+        // Parse --volume: host path (starts with / or .) = mount, otherwise = named volume
         var parsedMounts: [MountPoint] = []
-        for spec in mount {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --mount '\(spec)'. Use host:guest format\n".utf8))
-                throw ExitCode.failure
-            }
-            let hostStr = String(spec[spec.startIndex..<colonIndex])
-            let guest = String(spec[spec.index(after: colonIndex)...])
-            let hostURL = URL(fileURLWithPath: hostStr)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
-                FileHandle.standardError.write(Data("lumina: not a directory: \(hostStr)\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guest))
-        }
-
-        // Resolve --volume flags (name:guest_path -> host_path:guest_path)
         let volumeStore = VolumeStore()
         for spec in volume {
             guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use name:guest_path\n".utf8))
+                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
                 throw ExitCode.failure
             }
-            let name = String(spec[..<colonIndex])
+            let left = String(spec[spec.startIndex..<colonIndex])
             let guestPath = String(spec[spec.index(after: colonIndex)...])
-            guard let hostDir = volumeStore.resolve(name: name) else {
-                FileHandle.standardError.write(Data("lumina: volume '\(name)' not found\n".utf8))
-                throw ExitCode.failure
+
+            if left.hasPrefix("/") || left.hasPrefix(".") {
+                // Host directory mount
+                let hostURL = URL(fileURLWithPath: left)
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
+                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
+                    throw ExitCode.failure
+                }
+                parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
+            } else {
+                // Named volume
+                guard let hostDir = volumeStore.resolve(name: left) else {
+                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
+                    throw ExitCode.failure
+                }
+                volumeStore.touch(name: left)
+                parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
             }
-            volumeStore.touch(name: name)
-            parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
         }
 
         var parsedDiskSize: UInt64? = nil
-        if let diskSize {
-            guard let size = parseMemory(diskSize) else {
-                FileHandle.standardError.write(Data("lumina: invalid --disk-size '\(diskSize)'. Use e.g. 2GB, 4GB\n".utf8))
+        if let ds = resolvedDiskSize {
+            guard let size = parseMemory(ds) else {
+                FileHandle.standardError.write(Data("lumina: invalid disk-size '\(ds)'. Use e.g. 2GB, 4GB\n".utf8))
                 throw ExitCode.failure
             }
             parsedDiskSize = size
@@ -221,22 +175,21 @@ struct Run: AsyncParsableCommand {
         let options = RunOptions(
             timeout: parsedTimeout,
             memory: parsedMemory,
-            cpuCount: cpus,
+            cpuCount: resolvedCpus,
             image: image,
             env: parsedEnv,
             uploads: parsedUploads,
             downloads: parsedDownloads,
             directoryUploads: parsedDirUploads,
-            directoryDownloads: parsedDirDownloads,
             mounts: parsedMounts,
             workingDirectory: workdir,
-            rosetta: rosetta,
             diskSize: parsedDiskSize
         )
 
-        let format = resolveOutputFormat(textFlag: text)
+        let format = resolveOutputFormat()
+        let shouldStream = resolveStreaming()
 
-        if stream {
+        if shouldStream {
             try await runStreaming(options: options, format: format)
         } else {
             try await runBuffered(options: options, format: format)
@@ -454,6 +407,9 @@ struct ImageCreate: AsyncParsableCommand {
     @Option(name: .long, help: "Timeout for build command (e.g. 60s, 5m)")
     var timeout: String = "5m"
 
+    @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation (stored in image metadata)")
+    var rosetta = false
+
     func run() async throws {
         guard let parsedTimeout = parseDuration(timeout) else {
             FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 60s, 5m\n".utf8))
@@ -471,9 +427,9 @@ struct ImageCreate: AsyncParsableCommand {
             var opts = RunOptions()
             opts.timeout = parsedTimeout
             if buildCommands.count == 1 {
-                try await Lumina.createImage(name: name, from: from, command: buildCommands[0], options: opts)
+                try await Lumina.createImage(name: name, from: from, command: buildCommands[0], options: opts, rosetta: rosetta)
             } else {
-                try await Lumina.createImage(name: name, from: from, commands: buildCommands, options: opts)
+                try await Lumina.createImage(name: name, from: from, commands: buildCommands, options: opts, rosetta: rosetta)
             }
             print("Image '\(name)' created successfully.")
         } catch {
@@ -514,6 +470,7 @@ struct ImageInspect: ParsableCommand {
             var name: String
             var base: String
             var command: String
+            var rosetta: Bool
             var size_bytes: UInt64
             var created: String
         }
@@ -521,6 +478,7 @@ struct ImageInspect: ParsableCommand {
             name: info.name,
             base: info.base ?? "none",
             command: info.command ?? "none",
+            rosetta: info.rosetta,
             size_bytes: info.sizeBytes,
             created: ISO8601DateFormatter().string(from: info.created)
         )
@@ -563,20 +521,17 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Image to boot from")
     var image: String = "default"
 
-    @Option(name: .long, help: "Number of CPU cores")
+    @Option(name: .long, help: "Number of CPU cores. Env: LUMINA_CPUS")
     var cpus: Int = 2
 
-    @Option(name: .long, help: "Memory (e.g. 512MB, 1GB)")
-    var memory: String = "512MB"
+    @Option(name: .long, help: "Memory (e.g. 512MB, 1GB). Env: LUMINA_MEMORY")
+    var memory: String = "1GB"
 
-    @Option(name: .long, help: "Volume to mount (name:guest_path, repeatable)")
+    @Option(name: .long, help: "Mount host dir or named volume (path_or_name:guest, repeatable)")
     var volume: [String] = []
 
-    @Option(name: .long, help: "Max time to wait for VM to boot (e.g. 30s, 2m)")
-    var bootTimeout: String = "60s"
-
-    @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
-    var rosetta = false
+    @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default. Env: LUMINA_DISK_SIZE")
+    var diskSize: String? = nil
 
     func run() async throws {
         // Check if requested image exists before spawning background process
@@ -598,26 +553,45 @@ struct SessionStart: AsyncParsableCommand {
             }
         }
 
-        guard let parsedMemory = parseMemory(memory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(memory)'\n".utf8))
+        let resolvedMemory = resolveMemory(flag: memory)
+        let resolvedCpus = resolveCpus(flag: cpus)
+
+        guard let parsedMemory = parseMemory(resolvedMemory) else {
+            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'\n".utf8))
             throw ExitCode.failure
         }
 
-        guard let parsedBootTimeout = parseDuration(bootTimeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid boot-timeout '\(bootTimeout)'. Use e.g. 30s, 2m\n".utf8))
-            throw ExitCode.failure
-        }
-        let bootTimeoutSecs = Int(parsedBootTimeout.components.seconds)
+        let bootTimeoutSecs = 60 // Hardcoded — if boot takes >60s, something is broken
 
-        var parsedVolumes: [VolumeMount] = []
+        // Parse --volume: host path (starts with / or .) forwarded as mount,
+        // otherwise resolved as named volume
+        var sessionVolumes: [(String, String)] = [] // (left, guestPath) pairs for subprocess
         for spec in volume {
             guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use name:guest_path format\n".utf8))
+                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
                 throw ExitCode.failure
             }
-            let name = String(spec[spec.startIndex..<colonIndex])
+            let left = String(spec[spec.startIndex..<colonIndex])
             let guestPath = String(spec[spec.index(after: colonIndex)...])
-            parsedVolumes.append(VolumeMount(name: name, guestPath: guestPath))
+
+            if left.hasPrefix("/") || left.hasPrefix(".") {
+                // Validate host directory exists
+                let hostURL = URL(fileURLWithPath: left)
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
+                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
+                    throw ExitCode.failure
+                }
+                sessionVolumes.append((left, guestPath))
+            } else {
+                // Validate named volume exists
+                let volumeStore = VolumeStore()
+                guard volumeStore.resolve(name: left) != nil else {
+                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
+                    throw ExitCode.failure
+                }
+                sessionVolumes.append((left, guestPath))
+            }
         }
 
         let sid = UUID().uuidString
@@ -630,14 +604,14 @@ struct SessionStart: AsyncParsableCommand {
             "_session-serve",
             "--sid", sid,
             "--image", image,
-            "--cpus", String(cpus),
+            "--cpus", String(resolvedCpus),
             "--memory", String(parsedMemory),
         ]
-        for v in parsedVolumes {
-            process.arguments! += ["--volume", "\(v.name):\(v.guestPath)"]
+        for (left, guestPath) in sessionVolumes {
+            process.arguments! += ["--volume", "\(left):\(guestPath)"]
         }
-        if rosetta {
-            process.arguments! += ["--rosetta"]
+        if let ds = resolveDiskSize(flag: diskSize) {
+            process.arguments! += ["--disk-size", ds]
         }
 
         // Capture stderr from child process so boot failures are surfaced
@@ -675,13 +649,13 @@ struct SessionStart: AsyncParsableCommand {
             if !process.isRunning && !stderrStr.isEmpty {
                 FileHandle.standardError.write(Data("lumina: session failed to start: \(stderrStr)\n".utf8))
             } else {
-                FileHandle.standardError.write(Data("lumina: session failed to start within \(bootTimeout)\n".utf8))
+                FileHandle.standardError.write(Data("lumina: session failed to start within 60s\n".utf8))
             }
             throw ExitCode.failure
         }
 
         // Output session ID
-        let format = resolveOutputFormat(textFlag: false)
+        let format = resolveOutputFormat()
         switch format {
         case .json:
             let output = try JSONSerialization.data(withJSONObject: ["sid": sid], options: [.sortedKeys])
@@ -697,9 +671,6 @@ struct SessionStop: AsyncParsableCommand {
 
     @Argument(help: "Session ID")
     var sid: String
-
-    @Flag(name: .long, help: "Force human-readable text output")
-    var text = false
 
     func run() async throws {
         let client = SessionClient()
@@ -721,7 +692,7 @@ struct SessionStop: AsyncParsableCommand {
                 confirmed = true
             }
 
-            let format = resolveOutputFormat(textFlag: text)
+            let format = resolveOutputFormat()
             switch format {
             case .json:
                 struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
@@ -746,12 +717,9 @@ struct SessionStop: AsyncParsableCommand {
 struct SessionList: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "list", abstract: "List active sessions")
 
-    @Flag(name: .long, help: "Force human-readable text output")
-    var text = false
-
     func run() throws {
         let sessions = SessionPaths.listAll()
-        let format = resolveOutputFormat(textFlag: text)
+        let format = resolveOutputFormat()
         switch format {
         case .json:
             let encoder = JSONEncoder()
@@ -785,30 +753,19 @@ struct Exec: AsyncParsableCommand {
     @Argument(help: "Command to run")
     var command: String
 
-    @Flag(name: .long, help: "Stream output in real time")
-    var stream = false
-
-    @Flag(name: .long, help: "Force human-readable text output")
-    var text = false
-
-    @Option(name: .long, help: "Timeout (e.g. 30s, 5m)")
+    @Option(name: .long, help: "Timeout (e.g. 30s, 5m). Env: LUMINA_TIMEOUT")
     var timeout: String = "60s"
 
     @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
     var env: [String] = []
 
-    @Option(name: .long, help: "Copy file into VM (local:remote, repeatable)")
-    var copy: [String] = []
-
-    @Option(name: .long, help: "Download file from VM (remote:local, repeatable)")
-    var download: [String] = []
-
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
 
     func run() async throws {
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'\n".utf8))
+        let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
+        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'\n".utf8))
             throw ExitCode.failure
         }
         let timeoutSecs = Int(parsedTimeout.components.seconds)
@@ -838,28 +795,12 @@ struct Exec: AsyncParsableCommand {
         }
         defer { client.disconnect() }
 
-        // Handle file uploads before exec
-        for spec in copy {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'\n".utf8))
-                throw ExitCode.failure
-            }
-            let localStr = String(spec[..<colonIndex])
-            let remote = String(spec[spec.index(after: colonIndex)...])
-            try client.send(.upload(localPath: localStr, remotePath: remote))
-            let resp = try client.receive()
-            if case .error(let msg) = resp {
-                FileHandle.standardError.write(Data("lumina: upload failed: \(msg)\n".utf8))
-                throw ExitCode.failure
-            }
-        }
-
         // Forward SIGINT/SIGTERM to the guest command via cancel message
         let cleanupSignals = installSignalForwarding(client: client)
         defer { cleanupSignals() }
 
         // Execute
-        let format = resolveOutputFormat(textFlag: text)
+        let format = resolveOutputFormat()
         try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv, cwd: workdir))
 
         while true {
@@ -883,19 +824,6 @@ struct Exec: AsyncParsableCommand {
                 case .text:
                     break
                 }
-
-                // Handle file downloads after exec
-                for spec in download {
-                    guard let colonIndex = spec.firstIndex(of: ":") else { continue }
-                    let remote = String(spec[..<colonIndex])
-                    let localStr = String(spec[spec.index(after: colonIndex)...])
-                    try client.send(.download(remotePath: remote, localPath: localStr))
-                    let dlResp = try client.receive()
-                    if case .error(let msg) = dlResp {
-                        FileHandle.standardError.write(Data("lumina: download failed: \(msg)\n".utf8))
-                    }
-                }
-
                 if code != 0 { throw ExitCode(code) }
                 return
             case .error(let message):
@@ -905,6 +833,101 @@ struct Exec: AsyncParsableCommand {
                 continue
             }
         }
+    }
+}
+
+// MARK: - Cp (Session File Transfer)
+
+struct Cp: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Copy files to/from a running session",
+        discussion: """
+        Copy direction is determined by argument format:
+          lumina cp ./local.txt <sid>:/remote.txt    (upload)
+          lumina cp <sid>:/remote.txt ./local.txt    (download)
+        """
+    )
+
+    @Argument(help: "Source (local path or <sid>:/remote/path)")
+    var source: String
+
+    @Argument(help: "Destination (local path or <sid>:/remote/path)")
+    var destination: String
+
+    func run() async throws {
+        let (sid, isUpload, localPath, remotePath) = try parseCpArgs()
+
+        let client = SessionClient()
+        do {
+            try client.connect(sid: sid)
+        } catch let error as LuminaError {
+            switch error {
+            case .sessionNotFound:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+            case .sessionDead:
+                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+            default:
+                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+            }
+            throw ExitCode.failure
+        }
+        defer { client.disconnect() }
+
+        if isUpload {
+            guard FileManager.default.fileExists(atPath: localPath) else {
+                FileHandle.standardError.write(Data("lumina: not found: \(localPath)\n".utf8))
+                throw ExitCode.failure
+            }
+            try client.send(.upload(localPath: localPath, remotePath: remotePath))
+            let resp = try client.receive()
+            switch resp {
+            case .uploadDone:
+                break
+            case .error(let msg):
+                FileHandle.standardError.write(Data("lumina: upload failed: \(msg)\n".utf8))
+                throw ExitCode.failure
+            default:
+                break
+            }
+        } else {
+            try client.send(.download(remotePath: remotePath, localPath: localPath))
+            let resp = try client.receive()
+            switch resp {
+            case .downloadDone:
+                break
+            case .error(let msg):
+                FileHandle.standardError.write(Data("lumina: download failed: \(msg)\n".utf8))
+                throw ExitCode.failure
+            default:
+                break
+            }
+        }
+    }
+
+    /// Parse source/destination to determine session ID, direction, and paths.
+    /// Format: one arg is `<sid>:/path`, the other is a local path.
+    private func parseCpArgs() throws -> (sid: String, isUpload: Bool, localPath: String, remotePath: String) {
+        if let (sid, remote) = parseSessionRef(source) {
+            // Source is session ref → download
+            return (sid: sid, isUpload: false, localPath: destination, remotePath: remote)
+        } else if let (sid, remote) = parseSessionRef(destination) {
+            // Destination is session ref → upload
+            return (sid: sid, isUpload: true, localPath: source, remotePath: remote)
+        } else {
+            FileHandle.standardError.write(Data("lumina: one argument must be <sid>:/path (e.g. lumina cp ./file ABC123:/remote)\n".utf8))
+            throw ExitCode.failure
+        }
+    }
+
+    /// Try to parse a string as `<session-id>:/path`. Session IDs are UUIDs (36 chars).
+    private func parseSessionRef(_ arg: String) -> (sid: String, path: String)? {
+        guard let colonIndex = arg.firstIndex(of: ":") else { return nil }
+        let candidate = String(arg[arg.startIndex..<colonIndex])
+        let path = String(arg[arg.index(after: colonIndex)...])
+        // Session IDs are UUIDs — reject if it looks like a local path
+        guard !candidate.hasPrefix("/"), !candidate.hasPrefix("."),
+              candidate.count >= 8, path.hasPrefix("/") else { return nil }
+        return (sid: candidate, path: path)
     }
 }
 
@@ -1000,7 +1023,7 @@ struct NetworkCmd: AsyncParsableCommand {
 struct NetworkRun: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "run", abstract: "Run VMs from a manifest file")
 
-    @Option(name: .long, help: "Path to network manifest JSON file")
+    @Argument(help: "Path to network manifest JSON file")
     var file: String
 
     func run() async throws {

@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import Lumina
 
-@Test func imageStoreResolveFindsImage() throws {
+@Test func imageStoreResolveFindsLegacyImage() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-test-\(UUID().uuidString)")
     let imageDir = tempDir.appendingPathComponent("images/default")
     try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
@@ -16,8 +16,31 @@ import Testing
     let paths = try store.resolve(name: "default")
 
     #expect(paths.kernel.lastPathComponent == "vmlinuz")
-    #expect(paths.initrd.lastPathComponent == "initrd")
+    #expect(paths.initrd?.lastPathComponent == "initrd")
     #expect(paths.rootfs.lastPathComponent == "rootfs.img")
+    #expect(!paths.isBaked)
+
+    try FileManager.default.removeItem(at: tempDir)
+}
+
+@Test func imageStoreResolvesFindsBakedImage() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-test-\(UUID().uuidString)")
+    let imageDir = tempDir.appendingPathComponent("images/default")
+    try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+
+    // Baked image: only vmlinuz + rootfs.img (no initrd, no agent, no modules)
+    try Data("kernel".utf8).write(to: imageDir.appendingPathComponent("vmlinuz"))
+    try Data("rootfs".utf8).write(to: imageDir.appendingPathComponent("rootfs.img"))
+
+    let store = ImageStore(baseDir: tempDir.appendingPathComponent("images"))
+    let paths = try store.resolve(name: "default")
+
+    #expect(paths.kernel.lastPathComponent == "vmlinuz")
+    #expect(paths.initrd == nil)
+    #expect(paths.rootfs.lastPathComponent == "rootfs.img")
+    #expect(paths.agent == nil)
+    #expect(paths.modulesDir == nil)
+    #expect(paths.isBaked)
 
     try FileManager.default.removeItem(at: tempDir)
 }
@@ -122,7 +145,7 @@ import Testing
     let pythonDir = tmpDir.appendingPathComponent("python")
     try FileManager.default.createDirectory(at: pythonDir, withIntermediateDirectories: true)
     try Data("r2".utf8).write(to: pythonDir.appendingPathComponent("rootfs.img"))
-    let meta = ImageMeta(base: "default", command: "apk add python3", created: Date())
+    let meta = ImageMeta(base: "default", command: "apk add python3", created: Date(), rosetta: false)
     try JSONEncoder().encode(meta).write(to: pythonDir.appendingPathComponent("meta.json"))
 
     // Should refuse to remove default (python depends on it)
@@ -155,6 +178,107 @@ import Testing
     let names = store.list()
     #expect(names.contains("default"))
     #expect(!names.contains(".tmp-staging123"))
+}
+
+@Test func imageMetaBackwardCompatibleDecoding() throws {
+    // Old meta.json without rosetta field — should decode with rosetta = false
+    let json = """
+    {"base":"default","command":"apk add python3","created":694224000}
+    """
+    let data = Data(json.utf8)
+    let meta = try JSONDecoder().decode(ImageMeta.self, from: data)
+    #expect(meta.base == "default")
+    #expect(meta.command == "apk add python3")
+    #expect(meta.rosetta == false)
+}
+
+@Test func imageMetaWithRosetta() throws {
+    let meta = ImageMeta(base: "default", command: "apt install gcc", created: Date(), rosetta: true)
+    let encoded = try JSONEncoder().encode(meta)
+    let decoded = try JSONDecoder().decode(ImageMeta.self, from: encoded)
+    #expect(decoded.rosetta == true)
+    #expect(decoded.base == "default")
+    #expect(decoded.command == "apt install gcc")
+}
+
+@Test func imageStoreReadMeta() throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-imgtest-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let store = ImageStore(baseDir: tmpDir)
+
+    // No meta.json → nil
+    let imageDir = tmpDir.appendingPathComponent("nometa")
+    try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+    #expect(store.readMeta(name: "nometa") == nil)
+
+    // With meta.json
+    let metaDir = tmpDir.appendingPathComponent("withmeta")
+    try FileManager.default.createDirectory(at: metaDir, withIntermediateDirectories: true)
+    let meta = ImageMeta(base: "default", command: "test", created: Date(), rosetta: true)
+    try JSONEncoder().encode(meta).write(to: metaDir.appendingPathComponent("meta.json"))
+
+    let read = store.readMeta(name: "withmeta")
+    #expect(read != nil)
+    #expect(read?.rosetta == true)
+    #expect(read?.base == "default")
+}
+
+@Test func imageCreateWithRosetta() throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-imgtest-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let store = ImageStore(baseDir: tmpDir)
+
+    // Create base image
+    let baseDir = tmpDir.appendingPathComponent("default")
+    try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+    try Data("kernel".utf8).write(to: baseDir.appendingPathComponent("vmlinuz"))
+    try Data("rootfs".utf8).write(to: baseDir.appendingPathComponent("rootfs.img"))
+
+    let modifiedRootfs = tmpDir.appendingPathComponent("modified-rootfs.img")
+    try Data("modified rootfs".utf8).write(to: modifiedRootfs)
+
+    // Create image with rosetta = true
+    try store.createImage(name: "x86dev", from: "default", rootfsSource: modifiedRootfs, command: "apt install gcc", rosetta: true)
+
+    // Verify rosetta stored in metadata
+    let meta = store.readMeta(name: "x86dev")
+    #expect(meta != nil)
+    #expect(meta?.rosetta == true)
+
+    // Verify inspect shows rosetta
+    let info = try store.inspect(name: "x86dev")
+    #expect(info.rosetta == true)
+    #expect(info.name == "x86dev")
+}
+
+@Test func imageCreateWithoutRosetta() throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-imgtest-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let store = ImageStore(baseDir: tmpDir)
+
+    let baseDir = tmpDir.appendingPathComponent("default")
+    try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+    try Data("kernel".utf8).write(to: baseDir.appendingPathComponent("vmlinuz"))
+    try Data("rootfs".utf8).write(to: baseDir.appendingPathComponent("rootfs.img"))
+
+    let modifiedRootfs = tmpDir.appendingPathComponent("modified-rootfs.img")
+    try Data("modified".utf8).write(to: modifiedRootfs)
+
+    // Create image with rosetta = false (default)
+    try store.createImage(name: "alpine", from: "default", rootfsSource: modifiedRootfs, command: "apk add vim")
+
+    let meta = store.readMeta(name: "alpine")
+    #expect(meta != nil)
+    #expect(meta?.rosetta == false)
+
+    let info = try store.inspect(name: "alpine")
+    #expect(info.rosetta == false)
 }
 
 @Test func imageStoreCleanStagingDirs() throws {

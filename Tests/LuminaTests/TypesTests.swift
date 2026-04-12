@@ -6,7 +6,7 @@ import Testing
 @Test func runOptionsDefaults() {
     let opts = RunOptions.default
     #expect(opts.timeout == .seconds(60))
-    #expect(opts.memory == 512 * 1024 * 1024)
+    #expect(opts.memory == 1024 * 1024 * 1024)
     #expect(opts.cpuCount == 2)
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
@@ -72,7 +72,37 @@ import Testing
     #expect(opts.rosetta == false)
 }
 
-@Test func runOptionsRosettaDefaultFalse() {
+@Test func runOptionsNoRosettaField() {
+    // rosetta moved to image metadata — RunOptions no longer has it
     let opts = RunOptions()
-    #expect(opts.rosetta == false)
+    #expect(opts.image == "default")
+    #expect(opts.diskSize == nil)
+    // Verify no directoryUploads/Downloads by default
+    #expect(opts.directoryUploads.isEmpty)
+    #expect(opts.directoryDownloads.isEmpty)
+}
+
+@Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
+    // Create a temp image with rosetta metadata
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-types-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmpDir.appendingPathComponent("rosetta-img"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let meta = ImageMeta(base: nil, command: nil, created: Date(), rosetta: true)
+    try JSONEncoder().encode(meta).write(to: tmpDir.appendingPathComponent("rosetta-img/meta.json"))
+    try Data("k".utf8).write(to: tmpDir.appendingPathComponent("rosetta-img/vmlinuz"))
+    try Data("r".utf8).write(to: tmpDir.appendingPathComponent("rosetta-img/rootfs.img"))
+
+    // VMOptions.init(from:) reads ImageStore().readMeta — but uses default baseDir
+    // So test the readMeta path directly
+    let store = ImageStore(baseDir: tmpDir)
+    let readMeta = store.readMeta(name: "rosetta-img")
+    #expect(readMeta?.rosetta == true)
+
+    // And verify no-meta image returns false
+    try FileManager.default.createDirectory(at: tmpDir.appendingPathComponent("plain-img"), withIntermediateDirectories: true)
+    try Data("k".utf8).write(to: tmpDir.appendingPathComponent("plain-img/vmlinuz"))
+    try Data("r".utf8).write(to: tmpDir.appendingPathComponent("plain-img/rootfs.img"))
+    let plainMeta = store.readMeta(name: "plain-img")
+    #expect(plainMeta == nil) // no meta.json → nil
 }
