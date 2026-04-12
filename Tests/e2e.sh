@@ -414,16 +414,21 @@ pkill -f "_session-serve" 2>/dev/null || true
 rm -rf ~/.lumina/sessions/* 2>/dev/null || true
 sleep 18
 OK=true
+CYCLE_ERR=""
 for i in $(seq 1 3); do
-  S=$($LUMINA session start --boot-timeout 30s 2>/dev/null | jq -r '.sid')
+  START_OUT=$($LUMINA session start --boot-timeout 30s 2>&1)
+  S=$(echo "$START_OUT" | jq -r '.sid' 2>/dev/null)
   if [ -z "$S" ] || [ "$S" = "null" ]; then
-    OK=false; break
+    OK=false; CYCLE_ERR="start failed at $i: $START_OUT"; break
   fi
-  $LUMINA exec "$S" "echo cycle_$i" 2>/dev/null | grep -q "cycle_$i" || { OK=false; break; }
+  EXEC_OUT=$($LUMINA exec "$S" "echo cycle_$i" 2>&1)
+  if ! echo "$EXEC_OUT" | grep -q "cycle_$i"; then
+    OK=false; CYCLE_ERR="exec failed at $i: $EXEC_OUT"; break
+  fi
   $LUMINA session stop "$S" 2>/dev/null
   sleep 3
 done
-$OK && pass "8.3 3 start/exec/stop cycles" || fail "8.3 lifecycle cycles" "failed at $i"
+$OK && pass "8.3 3 start/exec/stop cycles" || fail "8.3 lifecycle cycles" "$CYCLE_ERR"
 
 # ═══════════════════════════════════════════════════════════════
 section "9. VOLUMES"
@@ -491,9 +496,14 @@ section "12. CONCURRENT VM STRESS"
 
 # Cleanup: previous sections used many sessions/VMs. VZ framework
 # needs time to fully release resources before we stress concurrent VMs.
+# Gracefully stop sessions first, then force-kill stragglers.
+for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
+  $LUMINA session stop "$sid" 2>/dev/null || true
+done
+sleep 3
 pkill -f "_session-serve" 2>/dev/null || true
 rm -rf ~/.lumina/sessions/* 2>/dev/null || true
-sleep 10
+sleep 15
 
 # 5 disposable VMs simultaneously — push the host harder
 PIDS=()
@@ -502,18 +512,20 @@ for i in 1 2 3 4 5; do
   PIDS+=($!)
 done
 ALL_OK=true
+FAIL_DETAIL=""
 for i in 1 2 3 4 5; do
   wait ${PIDS[$((i-1))]} 2>/dev/null || true
   OUT=$(cat /tmp/lumina-e2e-stress-$i.json 2>/dev/null)
-  if ! echo "$OUT" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-    ALL_OK=false
-  fi
-  STDOUT=$(echo "$OUT" | jq -r '.stdout' 2>/dev/null)
-  if ! echo "$STDOUT" | grep -q "stress_$i" || ! echo "$STDOUT" | grep -q "done_$i"; then
-    ALL_OK=false
+  EXIT=$(echo "$OUT" | jq -r '.exit_code // "null"' 2>/dev/null)
+  STDOUT=$(echo "$OUT" | jq -r '.stdout // ""' 2>/dev/null)
+  ERR=$(echo "$OUT" | jq -r '.error // ""' 2>/dev/null)
+  if [ "$EXIT" != "0" ]; then
+    ALL_OK=false; FAIL_DETAIL="${FAIL_DETAIL}vm${i}:exit=${EXIT}(${ERR}) "
+  elif ! echo "$STDOUT" | grep -q "stress_$i" || ! echo "$STDOUT" | grep -q "done_$i"; then
+    ALL_OK=false; FAIL_DETAIL="${FAIL_DETAIL}vm${i}:missing_output "
   fi
 done
-$ALL_OK && pass "12.1 5 concurrent disposable VMs (each verified)" || fail "12.1 5 concurrent VMs" "output mismatch"
+$ALL_OK && pass "12.1 5 concurrent disposable VMs (each verified)" || fail "12.1 5 concurrent VMs" "$FAIL_DETAIL"
 
 # 3 sessions running simultaneously with rapid execs
 SID_X=$($LUMINA session start 2>/dev/null | jq -r '.sid')
