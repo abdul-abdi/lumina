@@ -34,6 +34,7 @@ public actor VM {
     private var clone: DiskClone?
     private var _state: VMState = .idle
     private var pipeHandles: [FileHandle] = []
+    private var macLastByte: UInt8?  // Last byte of MAC for IP derivation
 
     /// The actor executor, backed by a serial DispatchQueue.
     /// VZVirtualMachine is created with executor.queue so all VZ calls
@@ -69,8 +70,11 @@ public actor VM {
         // Resolve image
         let imagePaths = try imageStore.resolve(name: options.image)
 
-        // Create COW clone
+        // Create COW clone (and resize if requested)
         let diskClone = try DiskClone.create(from: imagePaths.rootfs)
+        if let diskSize = options.diskSize {
+            try diskClone.resize(to: diskSize)
+        }
         self.clone = diskClone
 
         // Configure VM
@@ -169,6 +173,7 @@ public actor VM {
             _state = .idle
             throw .bootFailed(underlying: error)
         }
+        self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
         var networkDevices: [VZVirtioNetworkDeviceConfiguration] = [networkDevice]
 
         // Private network interface (eth1) for VM-to-VM networking
@@ -531,6 +536,21 @@ public actor VM {
         }
         try await runner.reconnect()
         _state = .ready
+    }
+
+    /// Configure guest network via host-driven protocol (Apple-style).
+    /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
+    /// and waits for network_ready (carrier up + IP assigned).
+    public func configureNetwork() async throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        guard let lastByte = macLastByte else { throw .connectionFailed }
+
+        let hostNum = (Int(lastByte) % 253) + 2
+        let ip = "192.168.64.\(hostNum)/24"
+        let gateway = "192.168.64.1"
+        let dns = "192.168.64.1"
+
+        try await runner.configureNetwork(ip: ip, gateway: gateway, dns: dns)
     }
 
     /// Number of exec commands currently in flight on this VM.

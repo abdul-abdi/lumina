@@ -14,6 +14,8 @@ public enum HostMessage: Sendable {
     case stdin(id: String, data: String)
     /// Close the stdin pipe for a running command.
     case stdinClose(id: String)
+    /// Configure guest network (host-driven, Apple-style).
+    case configureNetwork(ip: String, gateway: String, dns: String)
 }
 
 // MARK: - Guest Messages (received from guest)
@@ -28,6 +30,7 @@ public enum GuestMessage: Sendable, Equatable {
     case uploadError(path: String, error: String)
     case downloadData(path: String, data: String, seq: Int, eof: Bool)
     case downloadError(path: String, error: String)
+    case networkReady(ip: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -60,6 +63,8 @@ enum LuminaProtocol {
             dict = ["type": "stdin", "id": id, "data": data]
         case .stdinClose(let id):
             dict = ["type": "stdin_close", "id": id]
+        case .configureNetwork(let ip, let gateway, let dns):
+            dict = ["type": "configure_network", "ip": ip, "gateway": gateway, "dns": dns]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -124,6 +129,9 @@ enum LuminaProtocol {
                 throw LuminaError.protocolError("Malformed download_error: missing path/error")
             }
             return .downloadError(path: path, error: errorStr)
+        case "network_ready":
+            let ip = json["ip"] as? String ?? ""
+            return .networkReady(ip: ip)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }

@@ -72,6 +72,10 @@ public struct RunOptions: Sendable {
     public var mounts: [MountPoint]
     public var workingDirectory: String?
     public var rosetta: Bool
+    public var waitForNetwork: Bool
+    /// Disk size in bytes. When larger than the image rootfs, the COW clone
+    /// is resized before boot. Nil means use the image's original size.
+    public var diskSize: UInt64?
 
     public static let `default` = RunOptions()
 
@@ -87,7 +91,9 @@ public struct RunOptions: Sendable {
         directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
-        rosetta: Bool = false
+        rosetta: Bool = false,
+        waitForNetwork: Bool = false,
+        diskSize: UInt64? = nil
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -101,6 +107,8 @@ public struct RunOptions: Sendable {
         self.mounts = mounts
         self.workingDirectory = workingDirectory
         self.rosetta = rosetta
+        self.waitForNetwork = waitForNetwork
+        self.diskSize = diskSize
     }
 }
 
@@ -116,6 +124,7 @@ public struct VMOptions: Sendable {
     public var networkHosts: [String: String]?
     public var networkIP: String?
     public var rosetta: Bool
+    public var diskSize: UInt64?
 
     public static let `default` = VMOptions()
 
@@ -128,7 +137,8 @@ public struct VMOptions: Sendable {
         privateNetworkFd: Int32? = nil,
         networkHosts: [String: String]? = nil,
         networkIP: String? = nil,
-        rosetta: Bool = false
+        rosetta: Bool = false,
+        diskSize: UInt64? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -139,6 +149,7 @@ public struct VMOptions: Sendable {
         self.networkHosts = networkHosts
         self.networkIP = networkIP
         self.rosetta = rosetta
+        self.diskSize = diskSize
     }
 
     public init(from runOptions: RunOptions) {
@@ -151,6 +162,7 @@ public struct VMOptions: Sendable {
         self.networkHosts = nil
         self.networkIP = nil
         self.rosetta = runOptions.rosetta
+        self.diskSize = runOptions.diskSize
     }
 }
 

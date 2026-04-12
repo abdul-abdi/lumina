@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -110,6 +111,18 @@ type StdinCloseMsg struct {
 	ID   string `json:"id"`
 }
 
+type ConfigureNetworkMsg struct {
+	Type    string `json:"type"`
+	IP      string `json:"ip"`
+	Gateway string `json:"gateway"`
+	DNS     string `json:"dns"`
+}
+
+type NetworkReadyMsg struct {
+	Type string `json:"type"`
+	IP   string `json:"ip"`
+}
+
 func main() {
 	// Log to serial console (stderr goes to serial on most VM setups)
 	fmt.Fprintln(os.Stderr, agentStartMsg)
@@ -214,6 +227,14 @@ func serveConnection(conn net.Conn) {
 				continue
 			}
 			handleCancel(msg)
+
+		case "configure_network":
+			var msg ConfigureNetworkMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid configure_network request: %v\n", err)
+				continue
+			}
+			go handleConfigureNetwork(conn, msg)
 
 		default:
 			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", header.Type)
@@ -496,6 +517,59 @@ func waitForAllCommands() {
 
 	for _, rc := range cmds {
 		<-rc.done
+	}
+}
+
+// handleConfigureNetwork applies host-driven network configuration, then polls
+// for carrier and sends network_ready once traffic can flow.
+func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
+	fmt.Fprintf(os.Stderr, "configuring network: ip=%s gw=%s dns=%s\n", msg.IP, msg.Gateway, msg.DNS)
+
+	// Bring interface up
+	run("ip", "link", "set", "eth0", "up")
+
+	// Disable IPv6 — VZ NAT only provides IPv4
+	os.WriteFile("/proc/sys/net/ipv6/conf/all/disable_ipv6", []byte("1"), 0644)
+
+	// Apply static IP and route
+	run("ip", "addr", "add", msg.IP, "dev", "eth0")
+	run("ip", "route", "add", "default", "via", msg.Gateway)
+
+	// Write DNS
+	os.MkdirAll("/etc", 0755)
+	os.WriteFile("/etc/resolv.conf", []byte("nameserver "+msg.DNS+"\n"), 0644)
+
+	// Extract bare IP (strip /24 suffix) for the ready message
+	bareIP := msg.IP
+	if idx := len(bareIP) - 1; idx > 0 {
+		for i, c := range bareIP {
+			if c == '/' {
+				bareIP = bareIP[:i]
+				break
+			}
+		}
+	}
+
+	// Poll for carrier — once carrier appears, traffic can flow
+	for i := 0; i < 500; i++ { // 500 * 10ms = 5s max
+		out, err := exec.Command("ip", "link", "show", "eth0").Output()
+		if err == nil && !bytes.Contains(out, []byte("NO-CARRIER")) {
+			fmt.Fprintf(os.Stderr, "network carrier up after %dms\n", i*10)
+			sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Timeout — send ready anyway, network may work despite no carrier flag
+	fmt.Fprintln(os.Stderr, "network carrier timeout, sending network_ready anyway")
+	sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
+}
+
+// run executes a command silently, logging errors to stderr.
+func run(name string, args ...string) {
+	if err := exec.Command(name, args...).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s %v: %v\n", name, args, err)
 	}
 }
 

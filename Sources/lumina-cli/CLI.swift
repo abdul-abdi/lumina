@@ -68,6 +68,12 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
     var rosetta = false
 
+    @Flag(name: .long, help: "Wait for network before executing command")
+    var waitNetwork = false
+
+    @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default.")
+    var diskSize: String? = nil
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -206,6 +212,15 @@ struct Run: AsyncParsableCommand {
             parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
         }
 
+        var parsedDiskSize: UInt64? = nil
+        if let diskSize {
+            guard let size = parseMemory(diskSize) else {
+                FileHandle.standardError.write(Data("lumina: invalid --disk-size '\(diskSize)'. Use e.g. 2GB, 4GB\n".utf8))
+                throw ExitCode.failure
+            }
+            parsedDiskSize = size
+        }
+
         let options = RunOptions(
             timeout: parsedTimeout,
             memory: parsedMemory,
@@ -218,7 +233,9 @@ struct Run: AsyncParsableCommand {
             directoryDownloads: parsedDirDownloads,
             mounts: parsedMounts,
             workingDirectory: workdir,
-            rosetta: rosetta
+            rosetta: rosetta,
+            waitForNetwork: waitNetwork,
+            diskSize: parsedDiskSize
         )
 
         let format = resolveOutputFormat(textFlag: text)

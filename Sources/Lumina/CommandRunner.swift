@@ -40,6 +40,9 @@ final class CommandRunner: @unchecked Sendable {
     // instead of sharing the exec map. Concurrent transfers are rejected.
     private var transferContinuation: AsyncStream<GuestMessage>.Continuation?
 
+    // ── Network readiness: one-shot continuation for configure_network flow ──
+    private var networkContinuation: CheckedContinuation<GuestMessage, Never>?
+
     /// Background task that reads all messages from the vsock and dispatches
     /// them to registered handlers.
     private var dispatcherTask: Task<Void, Never>?
@@ -321,6 +324,29 @@ final class CommandRunner: @unchecked Sendable {
         try writeToOutput(msgData)
     }
 
+    // MARK: - Network Configuration (host-driven)
+
+    /// Send network configuration to the guest and wait for network_ready.
+    /// The guest agent configures eth0 with the given IP, gateway, and DNS,
+    /// then polls for carrier and responds with network_ready.
+    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) {
+        let msg = HostMessage.configureNetwork(ip: ip, gateway: gateway, dns: dns)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode configure_network: \(error)")
+        }
+        try writeToOutput(msgData)
+
+        // Wait for network_ready from the dispatcher
+        _ = await withCheckedContinuation { (cont: CheckedContinuation<GuestMessage, Never>) in
+            lock.lock()
+            networkContinuation = cont
+            lock.unlock()
+        }
+    }
+
     // MARK: - File Upload (async, through dispatcher)
 
     /// Upload a file to the guest via the vsock protocol.
@@ -498,6 +524,12 @@ final class CommandRunner: @unchecked Sendable {
             let handler = transferContinuation
             lock.unlock()
             handler?.yield(msg)
+        case .networkReady:
+            lock.lock()
+            let cont = networkContinuation
+            networkContinuation = nil
+            lock.unlock()
+            cont?.resume(returning: msg)
         case .ready:
             // Unexpected ready during active connection — ignore
             break

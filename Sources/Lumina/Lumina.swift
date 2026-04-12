@@ -14,6 +14,11 @@ public struct Lumina {
 
             try await vm.bootResult().get()
 
+            // Host-driven network config — wait for carrier before exec
+            if options.waitForNetwork {
+                try await vm.configureNetwork()
+            }
+
             let elapsed = ContinuousClock.now - start
             guard elapsed < options.timeout else {
                 throw LuminaError.timeout
@@ -63,6 +68,10 @@ public struct Lumina {
                     try await withVM(options: options) { vm in
                         let start = ContinuousClock.now
                         try await vm.bootResult().get()
+
+                        if options.waitForNetwork {
+                            try await vm.configureNetwork()
+                        }
 
                         let elapsed = ContinuousClock.now - start
                         guard elapsed < options.timeout else {
@@ -122,6 +131,8 @@ public struct Lumina {
         // Phase 1: Run command (VM owns everything — shutdown handles cleanup on failure)
         do {
             try await vm.bootResult().get()
+            // Image builds always need network (package installation)
+            try await vm.configureNetwork()
         } catch {
             await vm.shutdown()
             throw error
@@ -167,6 +178,7 @@ public struct Lumina {
 
         do {
             try await vm.bootResult().get()
+            try await vm.configureNetwork()
         } catch {
             await vm.shutdown()
             throw error
