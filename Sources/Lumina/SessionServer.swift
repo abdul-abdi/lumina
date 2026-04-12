@@ -183,6 +183,11 @@ public final class SessionServer: @unchecked Sendable {
                         try? writeResponse(.error(message: "Cancel failed: \(error)"), to: handles.write)
                     }
 
+                case .stdin:
+                    // Stdin forwarding via sessions requires exec ID tracking.
+                    // For now, stdin is supported via the library API (VM.sendStdin).
+                    break
+
                 case .shutdown:
                     await vm.shutdown()
                     try? writeResponse(.exit(code: 0, durationMs: 0), to: handles.write)

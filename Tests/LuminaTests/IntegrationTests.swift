@@ -176,7 +176,7 @@ func integrationVMStreamThenExec() async throws {
     }
     #expect(streamOutput.contains("streamed"))
 
-    // After stream finishes, state must be .ready (not stuck in .executing)
+    // After stream finishes, state must be .ready
     #expect(await vm.state == .ready)
 
     // Now exec should work without error
@@ -359,6 +359,482 @@ func integrationVMCancel() async throws {
 
     // After cancel, VM state should return to ready
     #expect(await vm.state == .ready)
+}
+
+// MARK: - Concurrent Exec Tests (P3 — multiple commands on same VM)
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecTwoCommands() async throws {
+    // THE core concurrent exec test: two execs on the same VM at the same time,
+    // output correctly demultiplexed — no mixing of stdout between commands.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+    #expect(await vm.state == .ready)
+
+    // Fire two execs concurrently using a task group
+    try await withThrowingTaskGroup(of: (String, RunResult).self) { group in
+        group.addTask {
+            let r = try await vm.exec("echo ALPHA && sleep 0.5 && echo ALPHA_DONE", timeout: 30)
+            return ("alpha", r)
+        }
+        group.addTask {
+            let r = try await vm.exec("echo BRAVO && sleep 0.5 && echo BRAVO_DONE", timeout: 30)
+            return ("bravo", r)
+        }
+
+        var results: [String: RunResult] = [:]
+        for try await (tag, result) in group {
+            results[tag] = result
+        }
+
+        // Both must succeed
+        #expect(results["alpha"]!.success, "alpha failed: \(results["alpha"]!.stderr)")
+        #expect(results["bravo"]!.success, "bravo failed: \(results["bravo"]!.stderr)")
+
+        // Output must not be crossed — alpha's stdout contains ALPHA, not BRAVO
+        #expect(results["alpha"]!.stdout.contains("ALPHA"))
+        #expect(results["alpha"]!.stdout.contains("ALPHA_DONE"))
+        #expect(!results["alpha"]!.stdout.contains("BRAVO"), "alpha stdout contaminated with bravo output")
+
+        #expect(results["bravo"]!.stdout.contains("BRAVO"))
+        #expect(results["bravo"]!.stdout.contains("BRAVO_DONE"))
+        #expect(!results["bravo"]!.stdout.contains("ALPHA"), "bravo stdout contaminated with alpha output")
+    }
+
+    // VM must still be ready after concurrent execs
+    #expect(await vm.state == .ready)
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecFiveWay() async throws {
+    // Push harder: 5 concurrent execs on the same VM.
+    // Each produces unique output — verify no cross-contamination.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    let tags = ["one", "two", "three", "four", "five"]
+
+    try await withThrowingTaskGroup(of: (String, RunResult).self) { group in
+        for tag in tags {
+            group.addTask {
+                let r = try await vm.exec("echo TAG_\(tag)_START && sleep 0.3 && echo TAG_\(tag)_END", timeout: 30)
+                return (tag, r)
+            }
+        }
+
+        var results: [String: RunResult] = [:]
+        for try await (tag, result) in group {
+            results[tag] = result
+        }
+
+        for tag in tags {
+            let r = results[tag]!
+            #expect(r.success, "\(tag) failed: \(r.stderr)")
+            #expect(r.stdout.contains("TAG_\(tag)_START"), "\(tag) missing START marker")
+            #expect(r.stdout.contains("TAG_\(tag)_END"), "\(tag) missing END marker")
+
+            // Verify no other tag's output leaked into this result
+            for other in tags where other != tag {
+                #expect(!r.stdout.contains("TAG_\(other)_"), "\(tag) stdout contains \(other) output")
+            }
+        }
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentStreams() async throws {
+    // Two concurrent streams on the same VM — verify interleaved output is correctly routed.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    try await withThrowingTaskGroup(of: (String, String).self) { group in
+        group.addTask {
+            let stream = try await vm.stream("for i in 1 2 3 4 5; do echo STREAM_A_$i; sleep 0.1; done", timeout: 30)
+            var output = ""
+            for try await chunk in stream {
+                if case .stdout(let s) = chunk { output += s }
+            }
+            return ("A", output)
+        }
+        group.addTask {
+            let stream = try await vm.stream("for i in 1 2 3 4 5; do echo STREAM_B_$i; sleep 0.1; done", timeout: 30)
+            var output = ""
+            for try await chunk in stream {
+                if case .stdout(let s) = chunk { output += s }
+            }
+            return ("B", output)
+        }
+
+        var outputs: [String: String] = [:]
+        for try await (tag, output) in group {
+            outputs[tag] = output
+        }
+
+        // Verify each stream got its own output
+        for i in 1...5 {
+            #expect(outputs["A"]!.contains("STREAM_A_\(i)"), "Stream A missing line \(i)")
+            #expect(outputs["B"]!.contains("STREAM_B_\(i)"), "Stream B missing line \(i)")
+        }
+        // Verify no cross-contamination
+        #expect(!outputs["A"]!.contains("STREAM_B_"), "Stream A contains B output")
+        #expect(!outputs["B"]!.contains("STREAM_A_"), "Stream B contains A output")
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecWithDifferentExitCodes() async throws {
+    // Concurrent execs with different exit codes — verify each gets the right code.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    try await withThrowingTaskGroup(of: (Int, RunResult).self) { group in
+        for code in [0, 1, 2, 42, 127] {
+            group.addTask {
+                let r = try await vm.exec("exit \(code)", timeout: 30)
+                return (code, r)
+            }
+        }
+
+        var results: [Int: RunResult] = [:]
+        for try await (code, result) in group {
+            results[code] = result
+        }
+
+        for code in [0, 1, 2, 42, 127] {
+            #expect(results[code]!.exitCode == Int32(code),
+                    "Expected exit code \(code), got \(results[code]!.exitCode)")
+        }
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecWithLargeOutput() async throws {
+    // Two concurrent execs each producing 5K lines — tests dispatcher under volume.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    try await withThrowingTaskGroup(of: (String, RunResult).self) { group in
+        group.addTask {
+            let r = try await vm.exec("seq 1 5000 | sed 's/^/A_/'", timeout: 60)
+            return ("A", r)
+        }
+        group.addTask {
+            let r = try await vm.exec("seq 1 5000 | sed 's/^/B_/'", timeout: 60)
+            return ("B", r)
+        }
+
+        var results: [String: RunResult] = [:]
+        for try await (tag, result) in group {
+            results[tag] = result
+        }
+
+        let aLines = results["A"]!.stdout.split(separator: "\n")
+        let bLines = results["B"]!.stdout.split(separator: "\n")
+
+        #expect(aLines.count == 5000, "A expected 5000 lines, got \(aLines.count)")
+        #expect(bLines.count == 5000, "B expected 5000 lines, got \(bLines.count)")
+
+        // Verify no cross-contamination
+        #expect(aLines.allSatisfy { $0.hasPrefix("A_") }, "A output contains non-A lines")
+        #expect(bLines.allSatisfy { $0.hasPrefix("B_") }, "B output contains non-B lines")
+
+        // Verify first and last lines
+        #expect(aLines.first == "A_1")
+        #expect(aLines.last == "A_5000")
+        #expect(bLines.first == "B_1")
+        #expect(bLines.last == "B_5000")
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecThenSequential() async throws {
+    // Run concurrent execs, then sequential — verify no state corruption.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    // Phase 1: Concurrent
+    try await withThrowingTaskGroup(of: RunResult.self) { group in
+        group.addTask { try await vm.exec("echo concurrent_1", timeout: 30) }
+        group.addTask { try await vm.exec("echo concurrent_2", timeout: 30) }
+        for try await r in group {
+            #expect(r.success)
+        }
+    }
+
+    // Phase 2: Sequential — must still work after concurrent phase
+    for i in 1...5 {
+        let r = try await vm.exec("echo sequential_\(i)", timeout: 30)
+        #expect(r.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "sequential_\(i)")
+    }
+
+    // Phase 3: Concurrent again
+    try await withThrowingTaskGroup(of: RunResult.self) { group in
+        group.addTask { try await vm.exec("echo final_1", timeout: 30) }
+        group.addTask { try await vm.exec("echo final_2", timeout: 30) }
+        group.addTask { try await vm.exec("echo final_3", timeout: 30) }
+        for try await r in group {
+            #expect(r.success)
+        }
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecStderrRouting() async throws {
+    // Concurrent execs producing stderr — verify stderr is also correctly demuxed.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    try await withThrowingTaskGroup(of: (String, RunResult).self) { group in
+        group.addTask {
+            let r = try await vm.exec("echo ERR_X >&2 && echo OUT_X", timeout: 30)
+            return ("X", r)
+        }
+        group.addTask {
+            let r = try await vm.exec("echo ERR_Y >&2 && echo OUT_Y", timeout: 30)
+            return ("Y", r)
+        }
+
+        var results: [String: RunResult] = [:]
+        for try await (tag, result) in group {
+            results[tag] = result
+        }
+
+        #expect(results["X"]!.stdout.contains("OUT_X"))
+        #expect(results["X"]!.stderr.contains("ERR_X"))
+        #expect(!results["X"]!.stderr.contains("ERR_Y"), "X stderr contaminated with Y")
+
+        #expect(results["Y"]!.stdout.contains("OUT_Y"))
+        #expect(results["Y"]!.stderr.contains("ERR_Y"))
+        #expect(!results["Y"]!.stderr.contains("ERR_X"), "Y stderr contaminated with X")
+    }
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationConcurrentExecOneTimeout() async throws {
+    // One exec times out while another succeeds — verify the successful one isn't disrupted.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    try await withThrowingTaskGroup(of: (String, Result<RunResult, any Error>).self) { group in
+        group.addTask {
+            do {
+                let r = try await vm.exec("sleep 60", timeout: 3)
+                return ("slow", .success(r))
+            } catch {
+                return ("slow", .failure(error))
+            }
+        }
+        group.addTask {
+            do {
+                let r = try await vm.exec("echo fast_result", timeout: 30)
+                return ("fast", .success(r))
+            } catch {
+                return ("fast", .failure(error))
+            }
+        }
+
+        var results: [String: Result<RunResult, any Error>] = [:]
+        for try await (tag, result) in group {
+            results[tag] = result
+        }
+
+        // Fast should succeed
+        if case .success(let r) = results["fast"]! {
+            #expect(r.success)
+            #expect(r.stdout.contains("fast_result"))
+        } else {
+            Issue.record("Fast exec should have succeeded")
+        }
+
+        // Slow should have timed out
+        if case .failure = results["slow"]! {
+            // Expected — timeout
+        } else {
+            Issue.record("Slow exec should have timed out")
+        }
+    }
+
+    // VM should recover — next exec should work
+    // Reconnect may be needed since timeout sends cancel which may disrupt
+    try await Task.sleep(for: .seconds(8))
+    let recovery = try await vm.exec("echo post_timeout_ok", timeout: 30)
+    #expect(recovery.success)
+    #expect(recovery.stdout.contains("post_timeout_ok"))
+}
+
+// MARK: - Stdin Tests (P3 — pipe data to running commands)
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationStdinBasic() async throws {
+    // Use the VM actor directly with a known exec ID to test stdin.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    // Start a stream that reads from stdin via `head -1`
+    // We need the exec ID to send stdin, so we use the runner directly.
+    guard let runner = await vm.commandRunner else {
+        Issue.record("No command runner")
+        return
+    }
+
+    let id = UUID().uuidString
+    let stream = try runner.execStream(id: id, command: "head -1", timeout: 30)
+
+    // Give the command a moment to start
+    try await Task.sleep(for: .milliseconds(500))
+
+    // Send stdin data
+    try runner.sendStdin(id: id, data: "hello from stdin\n")
+
+    // Collect output
+    var output = ""
+    var exitCode: Int32?
+    for try await chunk in stream {
+        switch chunk {
+        case .stdout(let s): output += s
+        case .exit(let code): exitCode = code
+        default: break
+        }
+    }
+
+    #expect(output.contains("hello from stdin"), "Expected stdin data in output, got: \(output)")
+    #expect(exitCode == 0, "Expected exit 0, got: \(String(describing: exitCode))")
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationStdinMultiLine() async throws {
+    // Pipe multiple lines of stdin to `wc -l`
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    guard let runner = await vm.commandRunner else {
+        Issue.record("No command runner")
+        return
+    }
+
+    let id = UUID().uuidString
+    let stream = try runner.execStream(id: id, command: "wc -l", timeout: 30)
+
+    try await Task.sleep(for: .milliseconds(500))
+
+    // Send 5 lines then close stdin
+    for i in 1...5 {
+        try runner.sendStdin(id: id, data: "line \(i)\n")
+    }
+    try runner.closeStdin(id: id)
+
+    var output = ""
+    for try await chunk in stream {
+        if case .stdout(let s) = chunk { output += s }
+    }
+
+    let count = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(count == "5", "Expected wc -l to return 5, got: \(count)")
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationStdinCloseTriggersEOF() async throws {
+    // `cat` with no args reads stdin until EOF. Close stdin, cat should exit.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    guard let runner = await vm.commandRunner else {
+        Issue.record("No command runner")
+        return
+    }
+
+    let id = UUID().uuidString
+    let stream = try runner.execStream(id: id, command: "cat", timeout: 30)
+
+    try await Task.sleep(for: .milliseconds(500))
+
+    // Send some data
+    try runner.sendStdin(id: id, data: "payload\n")
+
+    // Close stdin — cat should see EOF and exit
+    try runner.closeStdin(id: id)
+
+    var output = ""
+    var exitCode: Int32?
+    for try await chunk in stream {
+        switch chunk {
+        case .stdout(let s): output += s
+        case .exit(let code): exitCode = code
+        default: break
+        }
+    }
+
+    #expect(output.contains("payload"), "cat should echo stdin: got \(output)")
+    #expect(exitCode == 0, "cat should exit 0 after EOF, got: \(String(describing: exitCode))")
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationStdinConcurrentWithExec() async throws {
+    // Run a stdin-consuming command concurrently with a normal exec.
+    // Verify they don't interfere.
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+
+    try await vm.boot()
+
+    guard let runner = await vm.commandRunner else {
+        Issue.record("No command runner")
+        return
+    }
+
+    try await withThrowingTaskGroup(of: (String, String).self) { group in
+        // Task 1: stdin-consuming command
+        group.addTask {
+            let id = UUID().uuidString
+            let stream = try runner.execStream(id: id, command: "cat", timeout: 30)
+
+            try await Task.sleep(for: .milliseconds(300))
+            try runner.sendStdin(id: id, data: "STDIN_DATA\n")
+            try runner.closeStdin(id: id)
+
+            var output = ""
+            for try await chunk in stream {
+                if case .stdout(let s) = chunk { output += s }
+            }
+            return ("stdin", output)
+        }
+
+        // Task 2: normal exec running concurrently
+        group.addTask {
+            let r = try await vm.exec("echo NORMAL_EXEC", timeout: 30)
+            return ("exec", r.stdout)
+        }
+
+        var results: [String: String] = [:]
+        for try await (tag, output) in group {
+            results[tag] = output
+        }
+
+        #expect(results["stdin"]!.contains("STDIN_DATA"), "stdin task got: \(results["stdin"]!)")
+        #expect(results["exec"]!.contains("NORMAL_EXEC"), "exec task got: \(results["exec"]!)")
+    }
 }
 
 // MARK: - Error Handling Tests

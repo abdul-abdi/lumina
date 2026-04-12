@@ -27,7 +27,7 @@ final class VMExecutor: SerialExecutor {
 
 public actor VM {
     private var virtualMachine: VZVirtualMachine?
-    private var commandRunner: CommandRunner?
+    var commandRunner: CommandRunner?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
     private let imageStore: ImageStore
@@ -84,7 +84,6 @@ public actor VM {
 
         // If the image includes a guest agent binary, create a combined initrd
         // that injects the agent + custom init into the Alpine initramfs.
-        // This avoids requiring the rootfs to have lumina-agent pre-installed.
         if let agentURL = imagePaths.agent {
             let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
             try InitrdPatcher.createCombinedInitrd(
@@ -110,7 +109,6 @@ public actor VM {
         var cmdLine = "console=hvc0 root=/dev/vda rw"
 
         // Encode mount specs as kernel param so the init script can mount them.
-        // Format: lumina_mounts=tag:path,tag:path
         if !options.mounts.isEmpty {
             let specs = options.mounts.enumerated().map { "lumina\($0.offset):\($0.element.guestPath)" }
             cmdLine += " lumina_mounts=\(specs.joined(separator: ","))"
@@ -143,7 +141,6 @@ public actor VM {
             fileHandleForWriting: guestToHostWrite
         )
         config.serialPorts = [serialPort]
-        // Track all pipe handles for cleanup in shutdownVM()
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
         // Start reading serial output in background
@@ -171,7 +168,6 @@ public actor VM {
         // Private network interface (eth1) for VM-to-VM networking
         if let netFd = options.privateNetworkFd {
             let privateNet = VZVirtioNetworkDeviceConfiguration()
-            // Create FileHandle from raw fd here on the actor's executor (FileHandle isn't Sendable)
             let netHandle = FileHandle(fileDescriptor: netFd, closeOnDealloc: false)
             privateNet.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: netHandle)
             networkDevices.append(privateNet)
@@ -208,9 +204,6 @@ public actor VM {
         }
 
         // Create VM on the executor's queue.
-        // Note: VZ start/stop use completion-handler dispatch because Swift's
-        // ObjC async bridge doesn't guarantee the call lands on the actor's
-        // executor — only the continuation does. Explicit dispatch is required.
         let queue = executor.queue
         let vm = VZVirtualMachine(configuration: config, queue: queue)
         self.virtualMachine = vm
@@ -230,7 +223,6 @@ public actor VM {
         }
 
         // Connect CommandRunner via vsock
-        // Access vm.socketDevices on the VZ queue (thread-affinity requirement)
         let socketDevice: VZVirtioSocketDevice
         do {
             socketDevice = try await withCheckedThrowingContinuation { cont in
@@ -263,10 +255,6 @@ public actor VM {
     }
 
     // MARK: - Internal Result API
-    // Used by Lumina.swift to avoid typed-throws boxing across actor boundaries.
-    // Swift 6 can lose the concrete LuminaError type when errors cross from a
-    // custom-executor actor back to the caller. Catching inside the actor and
-    // returning Result preserves the type as a value.
 
     public func bootResult() async -> Result<Void, LuminaError> {
         do {
@@ -291,36 +279,35 @@ public actor VM {
 
     // MARK: - File Transfer
 
-    /// Upload files to the guest. Must be called after boot(), before exec().
-    public func uploadFiles(_ uploads: [FileUpload]) throws(LuminaError) {
+    /// Upload files to the guest. Must be called after boot().
+    public func uploadFiles(_ uploads: [FileUpload]) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot upload from state: \(_state)"))
         }
         for file in uploads {
-            try runner.upload(file)
+            try await runner.upload(file)
         }
     }
 
-    /// Download files from the guest. Must be called after exec() completes.
-    public func downloadFiles(_ downloads: [FileDownload]) throws(LuminaError) {
+    /// Download files from the guest.
+    public func downloadFiles(_ downloads: [FileDownload]) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
         }
         for file in downloads {
-            try runner.download(file)
+            try await runner.download(file)
         }
     }
 
     // MARK: - Directory Transfer
 
     /// Upload a local directory to the guest by creating a tarball, uploading it,
-    /// and extracting on the guest side. Requires the VM to be in `ready` state.
+    /// and extracting on the guest side.
     public func uploadDirectory(localPath: URL, remotePath: String) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot upload from state: \(_state)"))
         }
 
-        // Create a temporary tarball of the local directory
         let tarName = ".lumina-upload-\(UUID().uuidString).tar.gz"
         let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
         defer { try? FileManager.default.removeItem(at: tarLocal) }
@@ -340,11 +327,9 @@ public actor VM {
             throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tarProcess.terminationStatus)")
         }
 
-        // Upload the tarball to a temp path on the guest
         let guestTar = "/tmp/\(tarName)"
-        try runner.upload(FileUpload(localPath: tarLocal, remotePath: guestTar))
+        try await runner.upload(FileUpload(localPath: tarLocal, remotePath: guestTar))
 
-        // Create the target directory and extract
         let mkdirResult = try await exec("mkdir -p '\(remotePath)'", timeout: 10)
         guard mkdirResult.success else {
             throw .uploadFailed(path: localPath.path, reason: "mkdir failed: \(mkdirResult.stderr)")
@@ -356,14 +341,12 @@ public actor VM {
         }
     }
 
-    /// Download a remote directory from the guest by tarring on the guest,
-    /// downloading the tarball, and extracting locally.
+    /// Download a remote directory from the guest.
     public func downloadDirectory(remotePath: String, localPath: URL) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
         }
 
-        // Tar the remote directory on the guest
         let tarName = ".lumina-download-\(UUID().uuidString).tar.gz"
         let guestTar = "/tmp/\(tarName)"
         let tarResult = try await exec("tar czf '\(guestTar)' -C '\(remotePath)' .", timeout: 60)
@@ -371,16 +354,13 @@ public actor VM {
             throw .downloadFailed(path: remotePath, reason: "tar failed: \(tarResult.stderr)")
         }
 
-        // Download the tarball
         let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
         defer { try? FileManager.default.removeItem(at: tarLocal) }
 
-        try runner.download(FileDownload(remotePath: guestTar, localPath: tarLocal))
+        try await runner.download(FileDownload(remotePath: guestTar, localPath: tarLocal))
 
-        // Clean up on guest (best effort)
         _ = try? await exec("rm -f '\(guestTar)'", timeout: 10)
 
-        // Create local directory and extract
         do {
             try FileManager.default.createDirectory(at: localPath, withIntermediateDirectories: true)
         } catch {
@@ -403,23 +383,25 @@ public actor VM {
         }
     }
 
-    func uploadFilesResult(_ uploads: [FileUpload]) -> Result<Void, LuminaError> {
+    func uploadFilesResult(_ uploads: [FileUpload]) async -> Result<Void, LuminaError> {
         do {
-            try uploadFiles(uploads)
+            try await uploadFiles(uploads)
             return .success(())
         } catch {
             return .failure(error)
         }
     }
 
-    func downloadFilesResult(_ downloads: [FileDownload]) -> Result<Void, LuminaError> {
+    func downloadFilesResult(_ downloads: [FileDownload]) async -> Result<Void, LuminaError> {
         do {
-            try downloadFiles(downloads)
+            try await downloadFiles(downloads)
             return .success(())
         } catch {
             return .failure(error)
         }
     }
+
+    // MARK: - Exec (concurrent — multiple execs can be in flight)
 
     public func exec(
         _ command: String,
@@ -430,27 +412,15 @@ public actor VM {
             throw .bootFailed(underlying: VMError.invalidState("Cannot exec from state: \(_state)"))
         }
 
-        // If the CommandRunner lost its connection (failed timeout, cancelled
-        // stream, or a proactive reconnect that didn't succeed), reconnect
-        // before starting a new exec.
+        // Reconnect if the CommandRunner lost its connection
         if runner.state == .failed || runner.state == .disconnected {
             try await runner.reconnect()
         }
 
-        _state = .executing
-
+        let id = UUID().uuidString
         let start = ContinuousClock.now
-
-        let result: RunResult
-        do {
-            result = try runner.exec(command: command, timeout: timeout, env: env)
-        } catch {
-            _state = .ready
-            throw error
-        }
-
+        let result = try await runner.exec(id: id, command: command, timeout: timeout, env: env)
         let wallTime = ContinuousClock.now - start
-        _state = .ready
         return RunResult(
             stdout: result.stdout,
             stderr: result.stderr,
@@ -460,9 +430,7 @@ public actor VM {
     }
 
     /// Stream output chunks from a command in real time.
-    /// Each output message from the guest agent is yielded as it arrives.
-    /// The returned stream wraps CommandRunner's stream and resets the VM
-    /// state to `.ready` when the stream finishes (success, error, or cancel).
+    /// Multiple streams can be active concurrently on the same VM.
     public func stream(
         _ command: String,
         timeout: Int = 60,
@@ -472,64 +440,53 @@ public actor VM {
             throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
         }
 
-        // If the CommandRunner lost its connection (failed timeout, cancelled
-        // stream, or a proactive reconnect that didn't succeed), reconnect
-        // before starting a new exec.
         if runner.state == .failed || runner.state == .disconnected {
             try await runner.reconnect()
         }
 
-        _state = .executing
-        let innerStream = try runner.execStream(command: command, timeout: timeout, env: env)
-
-        // Wrap the inner stream so we can reset VM state on completion.
-        // Task inherits actor isolation, so `self.streamDidFinish()` is safe.
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    for try await chunk in innerStream {
-                        continuation.yield(chunk)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-                self.streamDidFinish()
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
-        }
+        let id = UUID().uuidString
+        return try runner.execStream(id: id, command: command, timeout: timeout, env: env)
     }
 
-    /// Reset state after a streamed exec completes.
-    /// The CommandRunner may be in .failed state (timeout, connection drop,
-    /// cancelled stream). We leave it in that state — the next exec/stream
-    /// call detects it and drives the reconnect synchronously, avoiding
-    /// races between a proactive reconnect and a concurrent exec.
-    private func streamDidFinish() {
-        if _state == .executing {
-            _state = .ready
-        }
+    // MARK: - Stdin
+
+    /// Send stdin data to a running command.
+    public func sendStdin(_ data: String, execId: String) throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        try runner.sendStdin(id: execId, data: data)
+    }
+
+    /// Close the stdin pipe for a running command.
+    public func closeStdin(execId: String) throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        try runner.closeStdin(id: execId)
     }
 
     /// Attempt to reconnect to the guest agent after a connection drop.
-    /// The guest agent accepts new connections, so this works without rebooting.
+    /// State is only set to `.ready` after the reconnect succeeds.
     public func reconnect() async throws(LuminaError) {
         guard let runner = commandRunner else {
             throw .connectionFailed
         }
-        _state = .ready
         try await runner.reconnect()
+        _state = .ready
     }
 
-    /// Send a signal to the currently executing guest command.
-    /// The guest agent forwards the signal to the process group, then
-    /// sends SIGKILL after `gracePeriod` seconds if the process hasn't exited.
-    /// No-op if no command is executing.
+    /// Number of exec commands currently in flight on this VM.
+    public var activeExecCount: Int {
+        commandRunner?.activeExecCount ?? 0
+    }
+
+    /// Send a signal to a running guest command (by ID) or all commands (nil).
     public func cancel(signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
         guard let runner = commandRunner else { return }
-        try runner.cancel(signal: signal, gracePeriod: gracePeriod)
+        try runner.cancel(id: nil, signal: signal, gracePeriod: gracePeriod)
+    }
+
+    /// Send a signal to a specific running guest command.
+    public func cancel(execId: String, signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
+        guard let runner = commandRunner else { return }
+        try runner.cancel(id: execId, signal: signal, gracePeriod: gracePeriod)
     }
 
     public func shutdown() async {
@@ -538,10 +495,7 @@ public actor VM {
         await shutdownVM()
     }
 
-    /// Detach the disk clone from this VM. The caller takes ownership and is
-    /// responsible for cleanup. After detaching, shutdown() will NOT remove the
-    /// clone directory. Used by `createImage` to preserve the rootfs after a
-    /// clean VM shutdown.
+    /// Detach the disk clone from this VM (caller takes ownership).
     public func detachClone() -> DiskClone? {
         let c = clone
         clone = nil
@@ -567,7 +521,6 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
-        // Close pipe file handles to prevent FD leaks
         for handle in pipeHandles {
             try? handle.close()
         }

@@ -404,21 +404,31 @@ $LUMINA session stop "$SID_A" 2>/dev/null
 $LUMINA session stop "$SID_B" 2>/dev/null
 
 # Rapid session start/stop cycle — resource leak test
-# Hard cleanup: kill ALL session serve processes, wait for VMs to fully release
+# Clean stop all sessions first (graceful), then pkill stragglers.
+# VZ framework needs 15-20s to fully dealloc VMs after forced kill.
+for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
+  $LUMINA session stop "$sid" 2>/dev/null || true
+done
+sleep 3
 pkill -f "_session-serve" 2>/dev/null || true
 rm -rf ~/.lumina/sessions/* 2>/dev/null || true
-sleep 8
+sleep 18
 OK=true
+CYCLE_ERR=""
 for i in $(seq 1 3); do
-  S=$($LUMINA session start --boot-timeout 30s 2>/dev/null | jq -r '.sid')
+  START_OUT=$($LUMINA session start --boot-timeout 30s 2>&1)
+  S=$(echo "$START_OUT" | jq -r '.sid' 2>/dev/null)
   if [ -z "$S" ] || [ "$S" = "null" ]; then
-    OK=false; break
+    OK=false; CYCLE_ERR="start failed at $i: $START_OUT"; break
   fi
-  $LUMINA exec "$S" "echo cycle_$i" 2>/dev/null | grep -q "cycle_$i" || { OK=false; break; }
+  EXEC_OUT=$($LUMINA exec "$S" "echo cycle_$i" 2>&1)
+  if ! echo "$EXEC_OUT" | grep -q "cycle_$i"; then
+    OK=false; CYCLE_ERR="exec failed at $i: $EXEC_OUT"; break
+  fi
   $LUMINA session stop "$S" 2>/dev/null
-  sleep 2
+  sleep 3
 done
-$OK && pass "8.3 3 start/exec/stop cycles" || fail "8.3 lifecycle cycles" "failed at $i"
+$OK && pass "8.3 3 start/exec/stop cycles" || fail "8.3 lifecycle cycles" "$CYCLE_ERR"
 
 # ═══════════════════════════════════════════════════════════════
 section "9. VOLUMES"
@@ -478,6 +488,153 @@ while IFS= read -r line; do
   echo "$line" | jq . >/dev/null 2>&1 || BAD=$((BAD + 1))
 done <<< "$OUT"
 [ "$BAD" -eq 0 ] && pass "11.3 session NDJSON validity ($TOTAL lines)" || fail "11.3" "$BAD/$TOTAL invalid"
+$LUMINA session stop "$SID" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════
+section "12. CONCURRENT VM STRESS"
+# ═══════════════════════════════════════════════════════════════
+
+# Cleanup: previous sections used many sessions/VMs. VZ framework
+# needs time to fully release resources before we stress concurrent VMs.
+# Gracefully stop sessions first, then force-kill stragglers.
+for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
+  $LUMINA session stop "$sid" 2>/dev/null || true
+done
+sleep 3
+pkill -f "_session-serve" 2>/dev/null || true
+rm -rf ~/.lumina/sessions/* 2>/dev/null || true
+sleep 15
+
+# 5 disposable VMs simultaneously — push the host harder
+PIDS=()
+for i in 1 2 3 4 5; do
+  $LUMINA run "echo stress_$i && sleep 1 && echo done_$i" --timeout 30s > /tmp/lumina-e2e-stress-$i.json 2>/dev/null &
+  PIDS+=($!)
+done
+ALL_OK=true
+FAIL_DETAIL=""
+for i in 1 2 3 4 5; do
+  wait ${PIDS[$((i-1))]} 2>/dev/null || true
+  OUT=$(cat /tmp/lumina-e2e-stress-$i.json 2>/dev/null)
+  EXIT=$(echo "$OUT" | jq -r '.exit_code // "null"' 2>/dev/null)
+  STDOUT=$(echo "$OUT" | jq -r '.stdout // ""' 2>/dev/null)
+  ERR=$(echo "$OUT" | jq -r '.error // ""' 2>/dev/null)
+  if [ "$EXIT" != "0" ]; then
+    ALL_OK=false; FAIL_DETAIL="${FAIL_DETAIL}vm${i}:exit=${EXIT}(${ERR}) "
+  elif ! echo "$STDOUT" | grep -q "stress_$i" || ! echo "$STDOUT" | grep -q "done_$i"; then
+    ALL_OK=false; FAIL_DETAIL="${FAIL_DETAIL}vm${i}:missing_output "
+  fi
+done
+$ALL_OK && pass "12.1 5 concurrent disposable VMs (each verified)" || fail "12.1 5 concurrent VMs" "$FAIL_DETAIL"
+
+# 3 sessions running simultaneously with rapid execs
+SID_X=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+SID_Y=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+SID_Z=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+
+# Fire execs at all 3 in parallel
+$LUMINA exec "$SID_X" "echo from_X && sleep 0.5 && echo X_done" > /tmp/lumina-e2e-px.json 2>/dev/null &
+PX=$!
+$LUMINA exec "$SID_Y" "echo from_Y && sleep 0.5 && echo Y_done" > /tmp/lumina-e2e-py.json 2>/dev/null &
+PY=$!
+$LUMINA exec "$SID_Z" "echo from_Z && sleep 0.5 && echo Z_done" > /tmp/lumina-e2e-pz.json 2>/dev/null &
+PZ=$!
+wait $PX 2>/dev/null; wait $PY 2>/dev/null; wait $PZ 2>/dev/null
+
+OX=$(cat /tmp/lumina-e2e-px.json 2>/dev/null)
+OY=$(cat /tmp/lumina-e2e-py.json 2>/dev/null)
+OZ=$(cat /tmp/lumina-e2e-pz.json 2>/dev/null)
+if echo "$OX" | grep -q "from_X" && echo "$OX" | grep -q "X_done" &&
+   echo "$OY" | grep -q "from_Y" && echo "$OY" | grep -q "Y_done" &&
+   echo "$OZ" | grep -q "from_Z" && echo "$OZ" | grep -q "Z_done"; then
+  pass "12.2 3 parallel session execs (all correct)"
+else
+  fail "12.2 parallel sessions" "x=$OX y=$OY z=$OZ"
+fi
+
+# Rapid sequential execs on one session while others are running long commands
+$LUMINA exec "$SID_X" "sleep 10" --timeout 15s > /dev/null 2>/dev/null &
+PX_LONG=$!
+# While X is busy with sleep, Y and Z handle rapid execs
+OK=true
+for i in $(seq 1 5); do
+  OUT_Y=$($LUMINA exec "$SID_Y" "echo rapid_Y_$i" 2>/dev/null)
+  OUT_Z=$($LUMINA exec "$SID_Z" "echo rapid_Z_$i" 2>/dev/null)
+  if ! echo "$OUT_Y" | grep -q "rapid_Y_$i" || ! echo "$OUT_Z" | grep -q "rapid_Z_$i"; then
+    OK=false; break
+  fi
+done
+$OK && pass "12.3 rapid execs on 2 sessions while 3rd is busy" || fail "12.3 cross-session rapid" "failed at $i"
+
+# Clean up sessions
+kill $PX_LONG 2>/dev/null || true
+wait $PX_LONG 2>/dev/null || true
+$LUMINA session stop "$SID_X" 2>/dev/null
+$LUMINA session stop "$SID_Y" 2>/dev/null
+$LUMINA session stop "$SID_Z" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════
+section "13. PROTOCOL RESILIENCE"
+# ═══════════════════════════════════════════════════════════════
+
+# Large stderr + stdout simultaneously in a disposable VM
+OUT=$($LUMINA run "for i in \$(seq 1 1000); do echo out_\$i; echo err_\$i >&2; done" --timeout 30s 2>/dev/null)
+STDOUT_COUNT=$(echo "$OUT" | jq -r '.stdout' | grep -c "out_" || true)
+STDERR_COUNT=$(echo "$OUT" | jq -r '.stderr' | grep -c "err_" || true)
+if [ "$STDOUT_COUNT" -ge 990 ] && [ "$STDERR_COUNT" -ge 990 ]; then
+  pass "13.1 1K lines interleaved stdout/stderr ($STDOUT_COUNT/$STDERR_COUNT)"
+else
+  fail "13.1 interleaved 1K" "stdout=$STDOUT_COUNT stderr=$STDERR_COUNT"
+fi
+
+# Stream 10K lines — tests chunking + buffering
+OUT=$($LUMINA run --stream "seq 1 10000" --timeout 60s 2>/dev/null)
+EXIT_LINE=$(echo "$OUT" | grep '"exit_code"' | head -1)
+if echo "$EXIT_LINE" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+  # Count how many data lines we got
+  DATA_LINES=$(echo "$OUT" | grep '"data"' | wc -l | tr -d ' ')
+  pass "13.2 stream 10K lines ($DATA_LINES chunks, exit ok)"
+else
+  fail "13.2 stream 10K" "no clean exit"
+fi
+
+# Binary output — base64 doesn't break NDJSON
+OUT=$($LUMINA run "dd if=/dev/urandom bs=1024 count=10 2>/dev/null | base64" --timeout 30s 2>/dev/null)
+echo "$OUT" | jq -e '.exit_code == 0' >/dev/null 2>&1 && pass "13.3 binary data through base64" || fail "13.3 binary base64" "exit code"
+
+# Many small outputs very fast — can the protocol keep up?
+OUT=$($LUMINA run "for i in \$(seq 1 500); do echo \$i; done" --timeout 30s 2>/dev/null)
+LINE_COUNT=$(echo "$OUT" | jq -r '.stdout' | grep -c "^[0-9]" || true)
+[ "$LINE_COUNT" -ge 490 ] && pass "13.4 500 rapid echo lines ($LINE_COUNT received)" || fail "13.4 rapid echo" "$LINE_COUNT/500"
+
+# ═══════════════════════════════════════════════════════════════
+section "14. TIMEOUT RECOVERY (concurrent-safe)"
+# ═══════════════════════════════════════════════════════════════
+
+SID=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+
+# Exec that times out
+START=$(date +%s)
+$LUMINA exec "$SID" "sleep 60" --timeout 3s 2>/dev/null || true
+ELAPSED=$(( $(date +%s) - START ))
+[ "$ELAPSED" -lt 10 ] && pass "14.1 timeout fires in ${ELAPSED}s" || fail "14.1 timeout" "${ELAPSED}s"
+
+# Wait for reconnect (guest agent needs to return to accept loop)
+sleep 12
+
+# Recovery exec after timeout
+OUT=$($LUMINA exec "$SID" "echo timeout_recovered" 2>/dev/null)
+echo "$OUT" | grep -q "timeout_recovered" && pass "14.2 recovery after timeout" || fail "14.2 recovery" "$OUT"
+
+# Multiple sequential recoveries — each timeout+reconnect cycle works
+for i in 1 2; do
+  $LUMINA exec "$SID" "sleep 60" --timeout 2s 2>/dev/null || true
+  sleep 12
+  OUT=$($LUMINA exec "$SID" "echo bounce_$i" 2>/dev/null)
+  echo "$OUT" | grep -q "bounce_$i" || { fail "14.3 repeated recovery" "failed at bounce $i"; break; }
+done
+echo "$OUT" | grep -q "bounce_2" && pass "14.3 2 timeout+recovery cycles" || true
+
 $LUMINA session stop "$SID" 2>/dev/null
 
 # ═══════════════════════════════════════════════════════════════

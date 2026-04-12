@@ -6,20 +6,22 @@ import Testing
 // MARK: - Host Message Tests
 
 @Test func encodeExecMessage() throws {
-    let msg = HostMessage.exec(cmd: "echo hello", timeout: 30, env: [:])
+    let msg = HostMessage.exec(id: "test-1", cmd: "echo hello", timeout: 30, env: [:])
     let data = try Protocol.encode(msg)
     let str = String(data: data, encoding: .utf8)!
     #expect(str.hasSuffix("\n"))
     let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
     #expect(json["type"] as? String == "exec")
+    #expect(json["id"] as? String == "test-1")
     #expect(json["cmd"] as? String == "echo hello")
     #expect(json["timeout"] as? Int == 30)
 }
 
 @Test func encodeExecMessageWithEnv() throws {
-    let msg = HostMessage.exec(cmd: "env", timeout: 60, env: ["FOO": "bar"])
+    let msg = HostMessage.exec(id: "test-2", cmd: "env", timeout: 60, env: ["FOO": "bar"])
     let data = try Protocol.encode(msg)
     let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["id"] as? String == "test-2")
     let env = json["env"] as? [String: String]
     #expect(env?["FOO"] == "bar")
 }
@@ -33,21 +35,21 @@ import Testing
 }
 
 @Test func decodeOutputMessage() throws {
-    let data = Data("{\"type\":\"output\",\"stream\":\"stdout\",\"data\":\"hello\\n\"}\n".utf8)
+    let data = Data("{\"type\":\"output\",\"id\":\"abc\",\"stream\":\"stdout\",\"data\":\"hello\\n\"}\n".utf8)
     let msg = try Protocol.decodeGuest(data)
-    #expect(msg == .output(stream: .stdout, data: "hello\n"))
+    #expect(msg == .output(id: "abc", stream: .stdout, data: "hello\n"))
 }
 
 @Test func decodeStderrMessage() throws {
-    let data = Data("{\"type\":\"output\",\"stream\":\"stderr\",\"data\":\"warn\"}\n".utf8)
+    let data = Data("{\"type\":\"output\",\"id\":\"abc\",\"stream\":\"stderr\",\"data\":\"warn\"}\n".utf8)
     let msg = try Protocol.decodeGuest(data)
-    #expect(msg == .output(stream: .stderr, data: "warn"))
+    #expect(msg == .output(id: "abc", stream: .stderr, data: "warn"))
 }
 
 @Test func decodeExitMessage() throws {
-    let data = Data("{\"type\":\"exit\",\"code\":42}\n".utf8)
+    let data = Data("{\"type\":\"exit\",\"id\":\"abc\",\"code\":42}\n".utf8)
     let msg = try Protocol.decodeGuest(data)
-    #expect(msg == .exit(code: 42))
+    #expect(msg == .exit(id: "abc", code: 42))
 }
 
 @Test func decodeInvalidJSON() {
@@ -145,7 +147,7 @@ import Testing
 // MARK: - Cancel Protocol Tests
 
 @Test func encodeCancelMessage() throws {
-    let msg = HostMessage.cancel(signal: 15, gracePeriod: 5)
+    let msg = HostMessage.cancel(id: nil, signal: 15, gracePeriod: 5)
     let data = try Protocol.encode(msg)
     let str = String(data: data, encoding: .utf8)!
     #expect(str.hasSuffix("\n"))
@@ -153,14 +155,43 @@ import Testing
     #expect(json["type"] as? String == "cancel")
     #expect(json["signal"] as? Int == 15)
     #expect(json["grace_period"] as? Int == 5)
+    #expect(json["id"] == nil)  // No id when cancelling all
 }
 
 @Test func encodeCancelSIGKILL() throws {
-    let msg = HostMessage.cancel(signal: 9, gracePeriod: 0)
+    let msg = HostMessage.cancel(id: nil, signal: 9, gracePeriod: 0)
     let data = try Protocol.encode(msg)
     let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
     #expect(json["signal"] as? Int == 9)
     #expect(json["grace_period"] as? Int == 0)
+}
+
+@Test func encodeCancelWithID() throws {
+    let msg = HostMessage.cancel(id: "exec-123", signal: 15, gracePeriod: 3)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "cancel")
+    #expect(json["id"] as? String == "exec-123")
+    #expect(json["signal"] as? Int == 15)
+}
+
+// MARK: - Stdin Protocol Tests
+
+@Test func encodeStdinMessage() throws {
+    let msg = HostMessage.stdin(id: "exec-1", data: "hello world\n")
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin")
+    #expect(json["id"] as? String == "exec-1")
+    #expect(json["data"] as? String == "hello world\n")
+}
+
+@Test func encodeStdinCloseMessage() throws {
+    let msg = HostMessage.stdinClose(id: "exec-1")
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin_close")
+    #expect(json["id"] as? String == "exec-1")
 }
 
 // MARK: - Type Default Tests
