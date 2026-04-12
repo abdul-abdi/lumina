@@ -148,6 +148,52 @@ public struct Lumina {
         try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
     }
 
+    /// Create a custom image by running multiple commands sequentially.
+    /// Aborts on first non-zero exit. Staging dir is NOT promoted on failure.
+    public static func createImage(
+        name: String,
+        from base: String = "default",
+        commands: [String],
+        options: RunOptions = .default
+    ) async throws {
+        guard !commands.isEmpty else {
+            throw LuminaError.sessionFailed("No build commands provided")
+        }
+
+        var opts = options
+        opts.image = base
+        let vmOptions = VMOptions(from: opts)
+        let vm = VM(options: vmOptions)
+
+        do {
+            try await vm.bootResult().get()
+        } catch {
+            await vm.shutdown()
+            throw error
+        }
+
+        let timeoutSecs = max(Int(opts.timeout.components.seconds), 1)
+        for (index, cmd) in commands.enumerated() {
+            let result = try await vm.execResult(cmd, timeout: timeoutSecs, env: opts.env).get()
+            guard result.success else {
+                await vm.shutdown()
+                throw LuminaError.sessionFailed(
+                    "Image build step \(index + 1)/\(commands.count) failed (exit \(result.exitCode)): \(result.stderr)"
+                )
+            }
+        }
+
+        guard let clone = await vm.detachClone() else {
+            await vm.shutdown()
+            throw LuminaError.sessionFailed("No disk clone available")
+        }
+        await vm.shutdown()
+
+        defer { clone.remove() }
+        let store = ImageStore()
+        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "))
+    }
+
     /// Run a closure with a private network of VMs.
     /// All VMs share a virtual switch for VM-to-VM communication.
     public static func withNetwork<T: Sendable>(

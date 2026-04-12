@@ -431,8 +431,8 @@ struct ImageCreate: AsyncParsableCommand {
     @Option(name: .long, help: "Base image to build from")
     var from: String = "default"
 
-    @Option(name: [.customLong("run")], help: "Command to run for setup")
-    var buildCommand: String
+    @Option(name: [.customLong("run")], help: "Command to run for setup (repeatable)")
+    var buildCommands: [String]
 
     @Option(name: .long, help: "Timeout for build command (e.g. 60s, 5m)")
     var timeout: String = "5m"
@@ -443,11 +443,21 @@ struct ImageCreate: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        FileHandle.standardError.write(Data("Creating image '\(name)' from '\(from)'...\n".utf8))
+        guard !buildCommands.isEmpty else {
+            FileHandle.standardError.write(Data("lumina: at least one --run command is required\n".utf8))
+            throw ExitCode.failure
+        }
+
+        let stepLabel = buildCommands.count == 1 ? "1 step" : "\(buildCommands.count) steps"
+        FileHandle.standardError.write(Data("Creating image '\(name)' from '\(from)' (\(stepLabel))...\n".utf8))
         do {
             var opts = RunOptions()
             opts.timeout = parsedTimeout
-            try await Lumina.createImage(name: name, from: from, command: buildCommand, options: opts)
+            if buildCommands.count == 1 {
+                try await Lumina.createImage(name: name, from: from, command: buildCommands[0], options: opts)
+            } else {
+                try await Lumina.createImage(name: name, from: from, commands: buildCommands, options: opts)
+            }
             print("Image '\(name)' created successfully.")
         } catch {
             FileHandle.standardError.write(Data("lumina: image create failed: \(error)\n".utf8))
