@@ -54,6 +54,7 @@ type ExecRequest struct {
 	Cmd     string            `json:"cmd"`
 	Timeout int               `json:"timeout"`
 	Env     map[string]string `json:"env"`
+	Cwd     string            `json:"cwd,omitempty"`
 }
 
 type UploadMsg struct {
@@ -261,6 +262,11 @@ func executeCommand(conn net.Conn, req ExecRequest) {
 	cmd.Env = os.Environ()
 	for k, v := range req.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+
+	// Set working directory if specified
+	if req.Cwd != "" {
+		cmd.Dir = req.Cwd
 	}
 
 	// Create pipes manually instead of using cmd.StdoutPipe()/StderrPipe()/StdinPipe().
