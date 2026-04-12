@@ -14,10 +14,8 @@ public struct Lumina {
 
             try await vm.bootResult().get()
 
-            // Host-driven network config — wait for carrier before exec
-            if options.waitForNetwork {
-                try await vm.configureNetwork()
-            }
+            // Host-driven network config — always configure, always wait
+            try await vm.configureNetwork()
 
             let elapsed = ContinuousClock.now - start
             guard elapsed < options.timeout else {
@@ -69,9 +67,7 @@ public struct Lumina {
                         let start = ContinuousClock.now
                         try await vm.bootResult().get()
 
-                        if options.waitForNetwork {
-                            try await vm.configureNetwork()
-                        }
+                        try await vm.configureNetwork()
 
                         let elapsed = ContinuousClock.now - start
                         guard elapsed < options.timeout else {

@@ -68,9 +68,6 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable Rosetta for x86_64 binary translation")
     var rosetta = false
 
-    @Flag(name: .long, help: "Wait for network before executing command")
-    var waitNetwork = false
-
     @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default.")
     var diskSize: String? = nil
 
@@ -234,7 +231,6 @@ struct Run: AsyncParsableCommand {
             mounts: parsedMounts,
             workingDirectory: workdir,
             rosetta: rosetta,
-            waitForNetwork: waitNetwork,
             diskSize: parsedDiskSize
         )
 

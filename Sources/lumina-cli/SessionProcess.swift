@@ -64,6 +64,9 @@ struct SessionServe: AsyncParsableCommand {
 
         do {
             try await vm.bootResult().get()
+            // Configure network at session boot — one-time cost, all subsequent
+            // exec commands have network available at no extra latency.
+            try await vm.configureNetwork()
         } catch {
             FileHandle.standardError.write(Data("lumina: session boot failed: \(error)\n".utf8))
             throw ExitCode.failure

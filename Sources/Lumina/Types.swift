@@ -72,7 +72,6 @@ public struct RunOptions: Sendable {
     public var mounts: [MountPoint]
     public var workingDirectory: String?
     public var rosetta: Bool
-    public var waitForNetwork: Bool
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
     /// is resized before boot. Nil means use the image's original size.
     public var diskSize: UInt64?
@@ -92,7 +91,6 @@ public struct RunOptions: Sendable {
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
         rosetta: Bool = false,
-        waitForNetwork: Bool = false,
         diskSize: UInt64? = nil
     ) {
         self.timeout = timeout
@@ -107,7 +105,6 @@ public struct RunOptions: Sendable {
         self.mounts = mounts
         self.workingDirectory = workingDirectory
         self.rosetta = rosetta
-        self.waitForNetwork = waitForNetwork
         self.diskSize = diskSize
     }
 }
