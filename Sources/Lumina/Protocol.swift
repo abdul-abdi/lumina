@@ -4,20 +4,24 @@ import Foundation
 // MARK: - Host Messages (sent to guest)
 
 public enum HostMessage: Sendable {
-    case exec(cmd: String, timeout: Int, env: [String: String])
+    case exec(id: String, cmd: String, timeout: Int, env: [String: String])
     case upload(path: String, data: String, mode: String, seq: Int, eof: Bool)
     case downloadReq(path: String)
-    /// Send a signal to the currently executing command's process group.
-    /// The guest sends SIGTERM first, waits `gracePeriod` seconds, then SIGKILL.
-    case cancel(signal: Int32, gracePeriod: Int)
+    /// Send a signal to a running command (by id) or all commands (id nil).
+    /// The guest sends `signal` to the process group, waits `gracePeriod` seconds, then SIGKILL.
+    case cancel(id: String?, signal: Int32, gracePeriod: Int)
+    /// Send stdin data to a running command identified by id.
+    case stdin(id: String, data: String)
+    /// Close the stdin pipe for a running command.
+    case stdinClose(id: String)
 }
 
 // MARK: - Guest Messages (received from guest)
 
 public enum GuestMessage: Sendable, Equatable {
     case ready
-    case output(stream: OutputStream, data: String)
-    case exit(code: Int32)
+    case output(id: String, stream: OutputStream, data: String)
+    case exit(id: String, code: Int32)
     case heartbeat
     case uploadAck(seq: Int)
     case uploadDone(path: String)
@@ -35,20 +39,25 @@ public enum OutputStream: String, Sendable, Equatable, Codable {
 
 enum LuminaProtocol {
     // 128KB — must accommodate 48KB raw chunks from guest agent (48*4/3 ≈ 64KB base64 + JSON envelope).
-    // Previous 64KB limit caused "Message exceeds limit" on file transfers.
     static let maxMessageSize = 131_072
 
     static func encode(_ message: HostMessage) throws -> Data {
         let dict: [String: Any]
         switch message {
-        case .exec(let cmd, let timeout, let env):
-            dict = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+        case .exec(let id, let cmd, let timeout, let env):
+            dict = ["type": "exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env]
         case .upload(let path, let dataStr, let mode, let seq, let eof):
             dict = ["type": "upload", "path": path, "data": dataStr, "mode": mode, "seq": seq, "eof": eof]
         case .downloadReq(let path):
             dict = ["type": "download_req", "path": path]
-        case .cancel(let signal, let gracePeriod):
-            dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
+        case .cancel(let id, let signal, let gracePeriod):
+            var d: [String: Any] = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
+            if let id = id { d["id"] = id }
+            dict = d
+        case .stdin(let id, let data):
+            dict = ["type": "stdin", "id": id, "data": data]
+        case .stdinClose(let id):
+            dict = ["type": "stdin_close", "id": id]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -67,18 +76,20 @@ enum LuminaProtocol {
         case "ready":
             return .ready
         case "output":
-            guard let streamStr = json["stream"] as? String,
+            guard let id = json["id"] as? String,
+                  let streamStr = json["stream"] as? String,
                   let stream = OutputStream(rawValue: streamStr),
                   let outputData = json["data"] as? String
             else {
                 throw LuminaError.protocolError("Malformed output message")
             }
-            return .output(stream: stream, data: outputData)
+            return .output(id: id, stream: stream, data: outputData)
         case "exit":
-            guard let code = json["code"] as? Int else {
-                throw LuminaError.protocolError("Malformed exit message: missing code")
+            guard let id = json["id"] as? String,
+                  let code = json["code"] as? Int else {
+                throw LuminaError.protocolError("Malformed exit message: missing id or code")
             }
-            return .exit(code: Int32(code))
+            return .exit(id: id, code: Int32(code))
         case "heartbeat":
             return .heartbeat
         case "upload_ack":

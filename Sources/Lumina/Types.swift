@@ -176,7 +176,6 @@ public enum VMState: Sendable, Equatable {
     case idle
     case booting
     case ready
-    case executing
     case shutdown
 }
 

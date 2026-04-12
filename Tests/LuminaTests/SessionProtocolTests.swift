@@ -76,3 +76,18 @@ import Testing
     let decoded = try SessionProtocol.decodeRequest(data)
     #expect(decoded == req)
 }
+
+@Test func encodeStdinRequest() throws {
+    let req = SessionRequest.stdin(data: "hello world\n")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin")
+    #expect(json["data"] as? String == "hello world\n")
+}
+
+@Test func decodeStdinRequestRoundtrip() throws {
+    let req = SessionRequest.stdin(data: "test input")
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
