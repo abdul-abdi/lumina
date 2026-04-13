@@ -326,10 +326,12 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Network Configuration (host-driven)
 
-    /// Send network configuration to the guest and wait for network_ready.
-    /// The guest agent configures eth0 with the given IP, gateway, and DNS,
-    /// then polls for carrier and responds with network_ready.
-    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) {
+    /// Send network configuration to the guest (fire-and-forget).
+    /// The guest agent configures eth0 with the given IP, gateway, and DNS.
+    /// Network config (ip addr/route/dns) is applied instantly by the guest;
+    /// only carrier detection is slow. We don't block on network_ready — the
+    /// network is usable before carrier is formally reported.
+    func configureNetwork(ip: String, gateway: String, dns: String) throws(LuminaError) {
         let msg = HostMessage.configureNetwork(ip: ip, gateway: gateway, dns: dns)
         let msgData: Data
         do {
@@ -338,13 +340,7 @@ final class CommandRunner: @unchecked Sendable {
             throw .protocolError("Failed to encode configure_network: \(error)")
         }
         try writeToOutput(msgData)
-
-        // Wait for network_ready from the dispatcher
-        _ = await withCheckedContinuation { (cont: CheckedContinuation<GuestMessage, Never>) in
-            lock.lock()
-            networkContinuation = cont
-            lock.unlock()
-        }
+        // network_ready will arrive later and be discarded by the dispatcher
     }
 
     // MARK: - File Upload (async, through dispatcher)
