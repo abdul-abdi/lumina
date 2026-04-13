@@ -174,17 +174,31 @@ cat > "$ROOTFS_DIR/sbin/init" << 'INITEOF'
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
+
+# Boot profile markers — parsed by host from dmesg (BootProfile).
+# Writes to /dev/kmsg; visible via SerialConsole or `dmesg | grep LUMINA_BOOT`.
+_lumina_mark() { echo "LUMINA_BOOT phase=$1 t=$(cut -d' ' -f1 /proc/uptime)" > /dev/kmsg 2>/dev/null; }
+_lumina_mark init_start
+
 hostname lumina 2>/dev/null
 ip link set lo up 2>/dev/null
 ip link set eth0 up 2>/dev/null
 
-# Mount virtio-fs shares BEFORE agent starts (commands may need mounted paths)
+# Parse all lumina_* kernel cmdline params in ONE pass.
 LUMINA_MOUNTS=
+LUMINA_ROSETTA=
+LUMINA_NET_IP=
+LUMINA_HOSTS=
 for param in $(cat /proc/cmdline); do
   case "$param" in
-    lumina_mounts=*) LUMINA_MOUNTS="${param#lumina_mounts=}" ;;
+    lumina_mounts=*)  LUMINA_MOUNTS="${param#lumina_mounts=}" ;;
+    lumina_rosetta=*) LUMINA_ROSETTA="${param#lumina_rosetta=}" ;;
+    lumina_ip=*)      LUMINA_NET_IP="${param#lumina_ip=}" ;;
+    lumina_hosts=*)   LUMINA_HOSTS="${param#lumina_hosts=}" ;;
   esac
 done
+
+# Mount virtio-fs shares BEFORE agent starts (commands may need mounted paths)
 if [ -n "$LUMINA_MOUNTS" ]; then
   OLD_IFS="$IFS"
   IFS=','
@@ -198,12 +212,6 @@ if [ -n "$LUMINA_MOUNTS" ]; then
 fi
 
 # Rosetta (x86_64 binary translation)
-LUMINA_ROSETTA=
-for param in $(cat /proc/cmdline); do
-  case "$param" in
-    lumina_rosetta=*) LUMINA_ROSETTA="${param#lumina_rosetta=}" ;;
-  esac
-done
 if [ "$LUMINA_ROSETTA" = "1" ]; then
   mkdir -p /mnt/rosetta
   mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null
@@ -244,15 +252,8 @@ fi
   mkdir -p /etc
   echo "nameserver 192.168.64.1" > /etc/resolv.conf
 
-  # Private networking config from kernel cmdline
-  LUMINA_NET_IP=
-  LUMINA_HOSTS=
-  for param in $(cat /proc/cmdline); do
-    case "$param" in
-      lumina_ip=*) LUMINA_NET_IP="${param#lumina_ip=}" ;;
-      lumina_hosts=*) LUMINA_HOSTS="${param#lumina_hosts=}" ;;
-    esac
-  done
+  # Private networking config — LUMINA_NET_IP / LUMINA_HOSTS were parsed
+  # from /proc/cmdline at init start (outer scope).
   if [ -n "$LUMINA_NET_IP" ]; then
     ip addr add "${LUMINA_NET_IP}/24" dev eth1 2>/dev/null
     ip link set eth1 up 2>/dev/null
@@ -275,6 +276,7 @@ fi
   fi
 ) &
 
+_lumina_mark agent_exec
 exec /usr/local/bin/lumina-agent
 INITEOF
 chmod 755 "$ROOTFS_DIR/sbin/init"

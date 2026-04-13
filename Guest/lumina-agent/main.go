@@ -123,9 +123,31 @@ type NetworkReadyMsg struct {
 	IP   string `json:"ip"`
 }
 
+// bootMark writes a boot-profile phase marker to /dev/kmsg (kernel log →
+// serial console). The host parses these from the SerialConsole buffer to
+// build a BootProfile. Safe to call before vsock is up.
+func bootMark(phase string) {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return
+	}
+	t := string(data)
+	if i := bytes.IndexByte([]byte(t), ' '); i > 0 {
+		t = t[:i]
+	}
+	msg := fmt.Sprintf("LUMINA_BOOT phase=%s t=%s\n", phase, t)
+	if f, err := os.OpenFile("/dev/kmsg", os.O_WRONLY, 0); err == nil {
+		f.WriteString(msg)
+		f.Close()
+	}
+	// Also to stderr, which VZ routes to serial console on this setup.
+	fmt.Fprint(os.Stderr, msg)
+}
+
 func main() {
 	// Log to serial console (stderr goes to serial on most VM setups)
 	fmt.Fprintln(os.Stderr, agentStartMsg)
+	bootMark("agent_start")
 
 	// Listen on vsock
 	ln, err := listenVsock(vsockPort)
@@ -134,6 +156,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer ln.Close()
+	bootMark("vsock_bound")
 
 	// Accept connections in a loop — if a connection drops (host crash, vsock
 	// reset), accept a new one so the session can reconnect without rebooting.
@@ -153,6 +176,7 @@ func main() {
 func serveConnection(conn net.Conn) {
 	// Send ready message
 	sendJSON(conn, ReadyMsg{Type: "ready"})
+	bootMark("ready_sent")
 
 	// Start heartbeat — runs continuously, including during command execution
 	ctx, cancelHeartbeat := context.WithCancel(context.Background())
@@ -550,10 +574,22 @@ func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
 		}
 	}
 
-	// Poll for carrier — once carrier appears, traffic can flow
-	for i := 0; i < 500; i++ { // 500 * 10ms = 5s max
-		out, err := exec.Command("ip", "link", "show", "eth0").Output()
-		if err == nil && !bytes.Contains(out, []byte("NO-CARRIER")) {
+	// Poll for operstate "up" via sysfs — no subprocess overhead.
+	// VZ NAT interfaces report operstate=up once the link is usable,
+	// even if carrier detection is slow. Fall back to carrier check.
+	for i := 0; i < 200; i++ { // 200 * 10ms = 2s max
+		operstate, err := os.ReadFile("/sys/class/net/eth0/operstate")
+		if err == nil {
+			state := string(bytes.TrimSpace(operstate))
+			if state == "up" || state == "unknown" {
+				fmt.Fprintf(os.Stderr, "network operstate=%s after %dms\n", state, i*10)
+				sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
+				return
+			}
+		}
+		// Also check carrier directly via sysfs (no subprocess)
+		carrier, cerr := os.ReadFile("/sys/class/net/eth0/carrier")
+		if cerr == nil && bytes.TrimSpace(carrier)[0] == '1' {
 			fmt.Fprintf(os.Stderr, "network carrier up after %dms\n", i*10)
 			sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
 			return
@@ -561,8 +597,8 @@ func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Timeout — send ready anyway, network may work despite no carrier flag
-	fmt.Fprintln(os.Stderr, "network carrier timeout, sending network_ready anyway")
+	// Timeout — send ready anyway, config is applied and network likely works
+	fmt.Fprintln(os.Stderr, "network readiness timeout, sending network_ready anyway")
 	sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
 }
 
