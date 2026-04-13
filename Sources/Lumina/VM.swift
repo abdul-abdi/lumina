@@ -123,7 +123,10 @@ public actor VM {
         if let ip = options.networkIP {
             cmdLine += " lumina_ip=\(ip)"
         }
-        if imagePaths.isBaked, let hosts = options.networkHosts {
+        // For baked images, hosts go through the kernel cmdline (no initrd overlay
+        // available). For legacy images, InitrdPatcher.appendNetworkOverlay writes
+        // them into /lumina-hosts instead.
+        if imagePaths.bootContract == .baked, let hosts = options.networkHosts {
             cmdLine += " lumina_hosts=\(Self.encodeHosts(hosts))"
         }
 
@@ -538,10 +541,10 @@ public actor VM {
         _state = .ready
     }
 
-    /// Configure guest network via host-driven protocol (Apple-style).
-    /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
-    /// and waits for network_ready (carrier up + IP assigned).
-    public func configureNetwork() async throws(LuminaError) {
+    /// Configure guest network via host-driven protocol (fire-and-forget).
+    /// Derives IP from the VZ-assigned MAC address and sends config to the guest agent.
+    /// The guest applies IP/route/DNS instantly; carrier detection happens in the background.
+    public func configureNetwork() throws(LuminaError) {
         guard let runner = commandRunner else { throw .connectionFailed }
         guard let lastByte = macLastByte else { throw .connectionFailed }
 
@@ -550,7 +553,7 @@ public actor VM {
         let gateway = "192.168.64.1"
         let dns = "192.168.64.1"
 
-        try await runner.configureNetwork(ip: ip, gateway: gateway, dns: dns)
+        try runner.configureNetwork(ip: ip, gateway: gateway, dns: dns)
     }
 
     /// Number of exec commands currently in flight on this VM.

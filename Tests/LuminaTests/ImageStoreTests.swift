@@ -18,7 +18,7 @@ import Testing
     #expect(paths.kernel.lastPathComponent == "vmlinuz")
     #expect(paths.initrd?.lastPathComponent == "initrd")
     #expect(paths.rootfs.lastPathComponent == "rootfs.img")
-    #expect(!paths.isBaked)
+    #expect(paths.bootContract == .legacyWithInitrd)
 
     try FileManager.default.removeItem(at: tempDir)
 }
@@ -40,7 +40,7 @@ import Testing
     #expect(paths.rootfs.lastPathComponent == "rootfs.img")
     #expect(paths.agent == nil)
     #expect(paths.modulesDir == nil)
-    #expect(paths.isBaked)
+    #expect(paths.bootContract == .baked)
 
     try FileManager.default.removeItem(at: tempDir)
 }

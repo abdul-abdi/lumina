@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Boot a Linux VM, run a command, get the output.<br>
-One function call. ~300ms cold start. ~30ms warm exec. Zero host access.
+One function call. ~1.6s cold start (~300ms with custom kernel). ~30ms warm exec. Zero host access.
 
 ![demo](demo.gif)
 
@@ -528,7 +528,7 @@ sequenceDiagram
 | **Network config** | Kernel cmdline params | Initrd overlay |
 | **Boot time** | ~200-300ms | ~570ms |
 
-Detection is automatic via `ImagePaths.isBaked` (initrd == nil).
+Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is absent, else `.legacyWithInitrd`).
 
 ### Design Constraints
 

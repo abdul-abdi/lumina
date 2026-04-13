@@ -1,6 +1,24 @@
 // Sources/Lumina/ImageStore.swift
 import Foundation
 
+/// Describes what an image's kernel expects at boot.
+/// Derived from the files present in the image directory; drives VM.boot()
+/// branching and the init-script generation path.
+public enum ImageBootContract: Sendable, Equatable {
+    /// Kernel has all drivers compiled built-in (`CONFIG_MODULES=n`) and boots
+    /// directly to rootfs. Agent is pre-installed at `/usr/local/bin/lumina-agent`
+    /// in the rootfs. Network hosts configured via kernel cmdline parameters.
+    /// Example: Apple's containerization kernel + Alpine rootfs.
+    case baked
+
+    /// Kernel uses loadable modules; requires an initrd to load virtio/ext4/vsock
+    /// drivers before the rootfs can be mounted. Agent is injected into the initrd
+    /// overlay by `InitrdPatcher`. Network hosts written into `/lumina-hosts` via
+    /// initrd overlay.
+    /// Example: Alpine `linux-virt` kernel.
+    case legacyWithInitrd
+}
+
 public struct ImagePaths: Sendable {
     public let kernel: URL
     /// Initramfs image. Nil for baked images where the kernel boots directly
@@ -16,9 +34,12 @@ public struct ImagePaths: Sendable {
     /// Nil for custom kernel images (drivers compiled built-in).
     public let modulesDir: URL?
 
-    /// True when the image uses the baked format (no initrd, no separate agent).
-    /// Kernel boots directly to rootfs with all drivers built-in.
-    public var isBaked: Bool { initrd == nil }
+    /// What this image's kernel expects at boot. Derived from file layout —
+    /// images without initrd require a baked-drivers kernel; images with initrd
+    /// assume a modular kernel needing per-boot module loading.
+    public var bootContract: ImageBootContract {
+        initrd == nil ? .baked : .legacyWithInitrd
+    }
 }
 
 public struct ImageStore: Sendable {
