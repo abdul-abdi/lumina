@@ -48,8 +48,8 @@ final class CommandRunner: @unchecked Sendable {
     private var dispatcherTask: Task<Void, Never>?
 
     private static let vsockPort: UInt32 = 1024
-    private static let maxRetries = 1000     // 1000 * 20ms = 20s max
-    private static let retryInterval: UInt64 = 20_000_000  // 20ms
+    private static let maxRetries = 2000     // 2000 * 10ms = 20s max
+    private static let retryInterval: UInt64 = 10_000_000  // 10ms — shaves ~10-15ms off cold boot (prev 20ms)
 
     var state: ConnectionState {
         lock.lock()
