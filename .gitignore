@@ -1,11 +1,37 @@
+# Build artifacts
 .build/
 .swiftpm/
-.claude/
-.DS_Store
-Guest/lumina-agent/lumina-agent
 *.o
 *.dSYM
-HANDOFF.md
+Guest/lumina-agent/lumina-agent
+
+# SPM lock file — library package, consumers should resolve their own versions
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Xcode (if anyone opens the project in Xcode)
+xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI agent / local tooling config
+.claude/
 CLAUDE.md
+AGENTS.md
+
+# Local planning / handoff docs
+HANDOFF.md
 LUMINA-V1.md
 docs/
+
+# Demo recording tooling (GIF is generated output; tape is dev-only)
+demo.tape
