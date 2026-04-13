@@ -93,8 +93,8 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 6. Verify all required files exist
-        let requiredFiles = ["vmlinuz", "initrd", "rootfs.img"]
+        // 6. Verify required files exist (initrd is optional for baked images)
+        let requiredFiles = ["vmlinuz", "rootfs.img"]
         var missingFiles: [String] = []
         for file in requiredFiles {
             let path = imageDir.appendingPathComponent(file)
