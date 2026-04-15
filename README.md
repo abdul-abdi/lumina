@@ -40,8 +40,8 @@ AI agents need to run untrusted code. The question is where.
 
 | | Lumina | Docker | SSH to cloud VM |
 |---|--------|--------|-----------------|
-| **Cold start** | ~300ms | ~3-5s | 30-60s |
-| **Exec after boot** | ~30ms (CLI) &middot; ~2ms (library) | ~50-100ms | ~20-50ms (RTT) |
+| **Cold start** | ~390ms P50 (M3 Pro) | ~3-5s | 30-60s |
+| **Exec after boot** | ~31ms P50 · 1ms stdev | ~50-100ms | ~20-50ms (RTT) |
 | **Isolation** | Hardware (Virtualization.framework) | Kernel namespaces (shared kernel) | Full VM |
 | **Host exposure** | None — no mounted filesystem, no Docker socket | Container escape risk, daemon access | Network-exposed |
 | **Cleanup** | Automatic — COW clone deleted on exit | Manual — images/volumes linger | Manual — VM persists |
@@ -51,6 +51,40 @@ AI agents need to run untrusted code. The question is where.
 | **Persistent sessions** | Built-in | N/A | SSH sessions |
 
 Boot time is paid once. Exec latency is paid every iteration. Lumina sessions give you both: hardware-isolated VMs with subprocess-fast execution. No daemon, no container registry, no cloud credentials.
+
+## Performance
+
+Benchmarked on M3 Pro, macOS 26.4, release build with the default baked image (Apple's stripped 6.18.5 kernel, agent baked into rootfs).
+
+| Workload | Lumina P50 | Lumina P95 | Apple `container` P50 | Apple P95 |
+|---|---|---|---|---|
+| Cold boot `true` | **390ms** | 470ms | 844ms | 1687ms |
+| Cold boot `echo hello` | **403ms** | 450ms | 783ms | 1598ms |
+| Warm session exec `true` | **31ms** (1ms stdev) | 33ms | 84ms (10ms stdev) | 111ms |
+| Daemon idle memory | **0 MB** | — | ~54 MB | — |
+| Sustained session exec rate | **100/s** | — | — | — |
+
+Lumina's zero-daemon in-process model is 2–3× faster across every workload and 10× more consistent on warm exec. File transfer sustains 75 MB/s upload / 35 MB/s download. Stdout streaming delivers 33 MB/s to the host at bit-perfect fidelity up to 10M+ lines.
+
+## Scaling
+
+macOS's Virtualization framework soft-limits concurrent VMs per process to roughly 4–6. Beyond that, new boots fail fast (~1-6ms) with `bootFailed: VM limit reached` — a hypervisor-level rejection, not OOM.
+
+For higher throughput:
+
+1. **Session (best for repeated commands on the same filesystem state)** — boot once, exec many. Warm exec is ~31ms P50 with 1ms stdev.
+   ```bash
+   SID=$(LUMINA_FORMAT=text lumina session start)
+   lumina exec $SID "command1"
+   lumina exec $SID "command2"
+   lumina session stop $SID
+   ```
+
+2. **Parallel `lumina run`** — works up to the ~4 concurrent-VM ceiling. Beyond that, serialize yourself or use a session.
+
+3. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` with `value: 4` to stay under the ceiling.
+
+Session pools (pre-booted ephemeral VMs for near-zero cold-boot latency) are planned for the next release.
 
 ## Usage
 
