@@ -57,6 +57,20 @@ public struct MountPoint: Sendable {
     }
 }
 
+// MARK: - Stdin
+
+/// Stdin source for a command. Default `.closed` sends stdinClose immediately
+/// so the guest sees EOF; `.source` streams chunks until the closure returns
+/// nil (EOF), then closes.
+///
+/// Stdin data today is UTF-8. Non-UTF-8 bytes are lossy-converted via
+/// `String(decoding:as:)`. Binary-safe stdin is planned alongside the
+/// binary-stdout base64 envelope.
+public enum Stdin: Sendable {
+    case closed
+    case source(@Sendable () async throws -> Data?)
+}
+
 // MARK: - Run Options
 
 public struct RunOptions: Sendable {
@@ -74,6 +88,8 @@ public struct RunOptions: Sendable {
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
     /// is resized before boot. Nil means use the image's original size.
     public var diskSize: UInt64?
+    /// Stdin source. Default `.closed` sends EOF immediately.
+    public var stdin: Stdin
 
     public static let `default` = RunOptions()
 
@@ -89,7 +105,8 @@ public struct RunOptions: Sendable {
         directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
-        diskSize: UInt64? = nil
+        diskSize: UInt64? = nil,
+        stdin: Stdin = .closed
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -103,6 +120,7 @@ public struct RunOptions: Sendable {
         self.mounts = mounts
         self.workingDirectory = workingDirectory
         self.diskSize = diskSize
+        self.stdin = stdin
     }
 }
 

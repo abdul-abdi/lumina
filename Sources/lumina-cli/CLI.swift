@@ -183,7 +183,8 @@ struct Run: AsyncParsableCommand {
             directoryUploads: parsedDirUploads,
             mounts: parsedMounts,
             workingDirectory: workdir,
-            diskSize: parsedDiskSize
+            diskSize: parsedDiskSize,
+            stdin: resolveStdin()
         )
 
         let format = resolveOutputFormat()

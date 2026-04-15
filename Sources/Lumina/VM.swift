@@ -1,5 +1,6 @@
 // Sources/Lumina/VM.swift
 import Foundation
+import os
 @preconcurrency import Virtualization
 
 /// Custom executor that pins all actor work to a specific DispatchQueue.
@@ -22,6 +23,40 @@ final class VMExecutor: SerialExecutor {
 
     func asUnownedSerialExecutor() -> UnownedSerialExecutor {
         UnownedSerialExecutor(ordinary: self)
+    }
+}
+
+/// One-shot gate for coordinating the stdin pump with exec dispatch.
+/// `wait()` suspends until `open()` is called; subsequent waiters return
+/// immediately. Uses OSAllocatedUnfairLock which is safe from both sync and
+/// async contexts (NSLock became async-unavailable in Swift 6).
+final class StdinPumpGate: @unchecked Sendable {
+    private struct State {
+        var opened = false
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func open() {
+        let toResume = state.withLock { s -> [CheckedContinuation<Void, Never>] in
+            if s.opened { return [] }
+            s.opened = true
+            let w = s.waiters
+            s.waiters.removeAll()
+            return w
+        }
+        for c in toResume { c.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let shouldResume = state.withLock { s -> Bool in
+                if s.opened { return true }
+                s.waiters.append(c)
+                return false
+            }
+            if shouldResume { c.resume() }
+        }
     }
 }
 
@@ -335,10 +370,11 @@ public actor VM {
         _ command: String,
         timeout: Int = 60,
         env: [String: String] = [:],
-        cwd: String? = nil
+        cwd: String? = nil,
+        stdin: Stdin = .closed
     ) async -> Result<RunResult, LuminaError> {
         do {
-            return .success(try await exec(command, timeout: timeout, env: env, cwd: cwd))
+            return .success(try await exec(command, timeout: timeout, env: env, cwd: cwd, stdin: stdin))
         } catch {
             return .failure(error)
         }
@@ -474,7 +510,8 @@ public actor VM {
         _ command: String,
         timeout: Int = 60,
         env: [String: String] = [:],
-        cwd: String? = nil
+        cwd: String? = nil,
+        stdin: Stdin = .closed
     ) async throws(LuminaError) -> RunResult {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot exec from state: \(_state)"))
@@ -487,7 +524,22 @@ public actor VM {
 
         let id = UUID().uuidString
         let start = ContinuousClock.now
-        let result = try await runner.exec(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
+        // Gate the stdin pump on exec dispatch. runner.exec fires afterDispatched
+        // synchronously after sendExecMessage completes, so the exec message is
+        // guaranteed to reach the guest before the pump's first stdin/stdin_close
+        // message. Without this gate the pump races sendExecMessage and the
+        // guest may receive stdin_close for an unknown exec id.
+        let pumpGate = StdinPumpGate()
+        let stdinTask = Self.spawnStdinPump(runner: runner, execId: id, stdin: stdin, gate: pumpGate)
+        defer { stdinTask.cancel() }
+        let result = try await runner.exec(
+            id: id,
+            command: command,
+            timeout: timeout,
+            env: env,
+            cwd: cwd,
+            afterDispatched: { pumpGate.open() }
+        )
         let wallTime = ContinuousClock.now - start
         return RunResult(
             stdout: result.stdout,
@@ -503,7 +555,8 @@ public actor VM {
         _ command: String,
         timeout: Int = 60,
         env: [String: String] = [:],
-        cwd: String? = nil
+        cwd: String? = nil,
+        stdin: Stdin = .closed
     ) async throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
@@ -514,7 +567,87 @@ public actor VM {
         }
 
         let id = UUID().uuidString
-        return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
+        let pumpGate = StdinPumpGate()
+        let stream = try runner.execStream(
+            id: id,
+            command: command,
+            timeout: timeout,
+            env: env,
+            cwd: cwd,
+            afterDispatched: { pumpGate.open() }
+        )
+        let stdinTask = Self.spawnStdinPump(runner: runner, execId: id, stdin: stdin, gate: pumpGate)
+        // Wrap the inner stream so stdinTask is cancelled when the caller
+        // stops consuming (completion, error, or explicit cancel).
+        return AsyncThrowingStream { continuation in
+            let forwardTask = Task {
+                do {
+                    for try await chunk in stream {
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+                stdinTask.cancel()
+            }
+            continuation.onTermination = { _ in
+                forwardTask.cancel()
+                stdinTask.cancel()
+            }
+        }
+    }
+
+    /// Spawn a background task that forwards stdin to the guest for a given
+    /// exec id. Returns immediately. The task waits on `gate.wait()` before
+    /// any stdin/stdin_close write, so the exec message is guaranteed dispatched
+    /// first. The task closes stdin on EOF, cancel, or error.
+    ///
+    /// Uses `Task.detached` so the pump does NOT inherit the VM actor's serial
+    /// executor. A CLI stdin source (FileHandle.availableData) blocks on a
+    /// read syscall — if run on VM's executor queue, it would starve the main
+    /// task waiting on guest output messages. Detached runs on the global
+    /// concurrent pool.
+    private static func spawnStdinPump(
+        runner: CommandRunner,
+        execId: String,
+        stdin: Stdin,
+        gate: StdinPumpGate
+    ) -> Task<Void, Never> {
+        switch stdin {
+        case .closed:
+            return Task.detached {
+                await gate.wait()
+                // Defensive delay for agents predating the pre-register fix
+                // (see Guest/lumina-agent/main.go serveConnection exec case).
+                // With the fixed guest, stdin/stdin_close cannot race goroutine
+                // registration because the scanner loop inserts the runningCmd
+                // entry synchronously before spawning. This delay is harmless
+                // on fixed agents (~5ms added to cold boot) and load-bearing
+                // for older images until they are rebuilt in CI.
+                try? await Task.sleep(for: .milliseconds(5))
+                try? runner.closeStdin(id: execId)
+            }
+        case .source(let source):
+            return Task.detached {
+                await gate.wait()
+                try? await Task.sleep(for: .milliseconds(5))
+                do {
+                    while !Task.isCancelled {
+                        guard let chunk = try await source() else { break }  // EOF
+                        // Today's protocol stdin is UTF-8. Non-UTF-8 bytes are
+                        // lossy-converted via String(decoding:as:). Binary-safe
+                        // stdin rides on the binary-stdout base64 work.
+                        let s = String(decoding: chunk, as: UTF8.self)
+                        try runner.sendStdin(id: execId, data: s)
+                    }
+                } catch {
+                    // Source errored or sendStdin failed (connection dropped).
+                    // Fall through to close.
+                }
+                try? runner.closeStdin(id: execId)
+            }
+        }
     }
 
     // MARK: - Stdin

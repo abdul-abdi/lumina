@@ -124,12 +124,24 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Concurrent Exec (returns complete result)
 
-    func exec(id: String, command: String, timeout: Int, env: [String: String] = [:], cwd: String? = nil) async throws(LuminaError) -> RunResult {
+    func exec(
+        id: String,
+        command: String,
+        timeout: Int,
+        env: [String: String] = [:],
+        cwd: String? = nil,
+        afterDispatched: (@Sendable () -> Void)? = nil
+    ) async throws(LuminaError) -> RunResult {
         let guestTimeout = max(timeout * 3, 30)
         let stream = registerExecHandler(id, guestTimeout: guestTimeout)
         defer { unregisterExecHandler(id) }
 
         try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
+        // Exec message is now on the wire; safe for callers to start the
+        // stdin pump. Called synchronously on the current task's thread,
+        // so any downstream Task.resume() it does happens-after the exec
+        // message reaches the vsock.
+        afterDispatched?()
 
         var stdout = ""
         var stderr = ""
@@ -165,12 +177,14 @@ final class CommandRunner: @unchecked Sendable {
         command: String,
         timeout: Int,
         env: [String: String] = [:],
-        cwd: String? = nil
+        cwd: String? = nil,
+        afterDispatched: (@Sendable () -> Void)? = nil
     ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
         let guestTimeout = max(timeout * 3, 30)
         let msgStream = registerExecHandler(id, guestTimeout: guestTimeout)
 
         try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
+        afterDispatched?()
 
         let runner = self
         let execId = id

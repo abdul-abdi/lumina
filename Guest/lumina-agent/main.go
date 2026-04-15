@@ -34,6 +34,11 @@ const (
 var writeMu sync.Mutex
 
 // runningCmd tracks a concurrently executing command.
+// stdinPipe is populated synchronously in the main scanner loop (before the
+// executeCommand goroutine runs) so that stdin/stdin_close messages arriving
+// immediately after exec cannot race the goroutine's registration and get
+// silently dropped. The other fields are populated by the goroutine once
+// cmd.Start succeeds.
 type runningCmd struct {
 	cmd       *exec.Cmd
 	stdinPipe io.WriteCloser
@@ -205,8 +210,23 @@ func serveConnection(conn net.Conn) {
 				fmt.Fprintf(os.Stderr, "invalid exec request: %v\n", err)
 				continue
 			}
+			// Pre-create the stdin pipe and register the runningCmd entry
+			// synchronously, before spawning the goroutine. Otherwise stdin
+			// and stdin_close messages that arrive immediately after exec
+			// would race the goroutine's registration and be silently dropped
+			// by handleStdin/handleStdinClose (nil map entry). The pipe
+			// buffers up to 64KB so data written before cmd.Start is readable.
+			stdinR, stdinW, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				sendOutput(conn, req.ID, "stderr", fmt.Sprintf("failed to create stdin pipe: %v\n", pipeErr))
+				sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 127})
+				continue
+			}
+			cmdMu.Lock()
+			runningCmds[req.ID] = &runningCmd{stdinPipe: stdinW}
+			cmdMu.Unlock()
 			// Dispatch to goroutine for concurrent execution
-			go executeCommand(conn, req)
+			go executeCommand(conn, req, stdinR, stdinW)
 
 		case "stdin":
 			var msg StdinMsg
@@ -297,7 +317,11 @@ func heartbeat(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func executeCommand(conn net.Conn, req ExecRequest) {
+// executeCommand runs the command on the goroutine. stdinR / stdinW are
+// pre-created by the main scanner loop; this function takes ownership of them.
+// The pre-registered runningCmd entry (from the scanner loop) is augmented
+// here with cmd/cancel/done once cmd.Start succeeds.
+func executeCommand(conn net.Conn, req ExecRequest, stdinR *os.File, stdinW *os.File) {
 	cmd := exec.Command("/bin/sh", "-c", req.Cmd)
 
 	// Create process group so we can kill the entire tree on timeout
@@ -314,14 +338,22 @@ func executeCommand(conn net.Conn, req ExecRequest) {
 		cmd.Dir = req.Cwd
 	}
 
-	// Create pipes manually instead of using cmd.StdoutPipe()/StderrPipe()/StdinPipe().
+	// Create stdout/stderr pipes manually instead of using cmd.StdoutPipe()/StderrPipe().
 	// Go's exec.Cmd.Wait() closes pipes in closeAfterWait BEFORE our streamPipe
 	// goroutines finish reading. For fast commands (echo), Wait() can close the
 	// read-end fd while buffered data is unread, causing EBADF and silent data loss.
 	// By creating pipes ourselves, cmd.Wait() has nothing in closeAfterWait,
 	// so we control the pipe lifecycle completely.
+	//
+	// stdin pipe is pre-created by the main scanner loop for race-free stdin
+	// forwarding (see the exec case in serveConnection).
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
+		stdinR.Close()
+		stdinW.Close()
+		cmdMu.Lock()
+		delete(runningCmds, req.ID)
+		cmdMu.Unlock()
 		sendOutput(conn, req.ID, "stderr", fmt.Sprintf("failed to create stdout pipe: %v\n", err))
 		sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 127})
 		return
@@ -330,17 +362,12 @@ func executeCommand(conn net.Conn, req ExecRequest) {
 	if err != nil {
 		stdoutR.Close()
 		stdoutW.Close()
+		stdinR.Close()
+		stdinW.Close()
+		cmdMu.Lock()
+		delete(runningCmds, req.ID)
+		cmdMu.Unlock()
 		sendOutput(conn, req.ID, "stderr", fmt.Sprintf("failed to create stderr pipe: %v\n", err))
-		sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 127})
-		return
-	}
-	stdinR, stdinW, err := os.Pipe()
-	if err != nil {
-		stdoutR.Close()
-		stdoutW.Close()
-		stderrR.Close()
-		stderrW.Close()
-		sendOutput(conn, req.ID, "stderr", fmt.Sprintf("failed to create stdin pipe: %v\n", err))
 		sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 127})
 		return
 	}
@@ -356,6 +383,9 @@ func executeCommand(conn net.Conn, req ExecRequest) {
 		stderrW.Close()
 		stdinR.Close()
 		stdinW.Close()
+		cmdMu.Lock()
+		delete(runningCmds, req.ID)
+		cmdMu.Unlock()
 		sendOutput(conn, req.ID, "stderr", fmt.Sprintf("failed to start command: %v\n", err))
 		sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 127})
 		return
@@ -368,19 +398,25 @@ func executeCommand(conn net.Conn, req ExecRequest) {
 	stderrW.Close()
 	stdinR.Close()
 
-	// Track this command for stdin/cancel routing
+	// Augment the pre-registered runningCmd entry with cmd/cancel/done.
+	// stdinPipe was already set when the scanner loop inserted the entry.
 	cmdCtx, cmdCancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 
-	rc := &runningCmd{
-		cmd:       cmd,
-		stdinPipe: stdinW, // handleStdin writes to the write-end
-		cancel:    cmdCancel,
-		done:      doneCh,
-	}
-
 	cmdMu.Lock()
-	runningCmds[req.ID] = rc
+	if rc := runningCmds[req.ID]; rc != nil {
+		rc.cmd = cmd
+		rc.cancel = cmdCancel
+		rc.done = doneCh
+	} else {
+		// Shouldn't happen — scanner loop always pre-registers. Defensive.
+		runningCmds[req.ID] = &runningCmd{
+			cmd:       cmd,
+			stdinPipe: stdinW,
+			cancel:    cmdCancel,
+			done:      doneCh,
+		}
+	}
 	cmdMu.Unlock()
 
 	defer func() {

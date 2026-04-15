@@ -162,6 +162,27 @@ func resolveStreaming() -> Bool {
     return isatty(STDOUT_FILENO) != 0
 }
 
+// MARK: - Stdin Auto-Detect
+//
+// Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),
+// pipe = streamed (agents pipe data in, matches shell conventions).
+
+/// Resolve stdin source: if host stdin is a TTY, return `.closed` so the guest
+/// sees EOF immediately. Otherwise, return a `.source` that reads from
+/// FileHandle.standardInput in chunks and closes on EOF.
+func resolveStdin() -> Stdin {
+    if isatty(fileno(stdin)) != 0 {
+        return .closed
+    }
+    let handle = FileHandle.standardInput
+    return .source { @Sendable in
+        // availableData blocks until data is ready or EOF. Returns empty
+        // Data on EOF, which we signal to the pump as nil.
+        let chunk = handle.availableData
+        return chunk.isEmpty ? nil : chunk
+    }
+}
+
 // MARK: - NDJSON Output Types (streaming / session exec)
 
 /// Stream chunk: stdout or stderr data.
