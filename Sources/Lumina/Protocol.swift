@@ -22,7 +22,12 @@ public enum HostMessage: Sendable {
 
 public enum GuestMessage: Sendable, Equatable {
     case ready
+    /// Text output (UTF-8). `data` carries the text verbatim.
     case output(id: String, stream: OutputStream, data: String)
+    /// Binary output. `bytes` carries the raw bytes that were base64-encoded
+    /// on the wire. Produced when the guest detects a non-UTF-8 chunk via
+    /// `utf8.Valid()` before emitting.
+    case outputBinary(id: String, stream: OutputStream, bytes: Data)
     case exit(id: String, code: Int32)
     case heartbeat
     case uploadAck(seq: Int)
@@ -89,6 +94,16 @@ enum LuminaProtocol {
                   let outputData = json["data"] as? String
             else {
                 throw LuminaError.protocolError("Malformed output message")
+            }
+            // Backward-compatible binary-output envelope. Old guests never set
+            // "encoding" → treated as UTF-8 text. New guests emitting non-UTF-8
+            // chunks set "encoding":"base64" and base64-encode the bytes in the
+            // "data" string.
+            if let encoding = json["encoding"] as? String, encoding == "base64" {
+                guard let bytes = Data(base64Encoded: outputData) else {
+                    throw LuminaError.protocolError("Malformed base64 output data")
+                }
+                return .outputBinary(id: id, stream: stream, bytes: bytes)
             }
             return .output(id: id, stream: stream, data: outputData)
         case "exit":

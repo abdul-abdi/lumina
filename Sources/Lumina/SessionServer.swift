@@ -245,6 +245,11 @@ public final class SessionServer: @unchecked Sendable {
                     try? writeResponse(.output(stream: .stdout, data: data), to: handle)
                 case .stderr(let data):
                     try? writeResponse(.output(stream: .stderr, data: data), to: handle)
+                case .stdoutBytes(let bytes):
+                    // Binary chunk: lossy-convert for session text protocol (binary session transfers not yet supported)
+                    try? writeResponse(.output(stream: .stdout, data: String(decoding: bytes, as: UTF8.self)), to: handle)
+                case .stderrBytes(let bytes):
+                    try? writeResponse(.output(stream: .stderr, data: String(decoding: bytes, as: UTF8.self)), to: handle)
                 case .exit(let code):
                     let ms = (ContinuousClock.now - start).totalMilliseconds
                     try? writeResponse(.exit(code: code, durationMs: ms), to: handle)

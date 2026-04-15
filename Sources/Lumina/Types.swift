@@ -187,13 +187,22 @@ public struct RunResult: Sendable {
     public let exitCode: Int32
     public let wallTime: Duration
 
+    /// Raw stdout bytes when any chunk was binary (non-UTF-8). When set,
+    /// `stdout` is the lossy UTF-8 conversion; `stdoutBytes` is byte-exact.
+    /// Nil when all chunks were valid UTF-8 — in which case `stdout` is
+    /// byte-exact as well via String.utf8.
+    public let stdoutBytes: Data?
+    public let stderrBytes: Data?
+
     public var success: Bool { exitCode == 0 }
 
-    public init(stdout: String, stderr: String, exitCode: Int32, wallTime: Duration) {
+    public init(stdout: String, stderr: String, exitCode: Int32, wallTime: Duration, stdoutBytes: Data? = nil, stderrBytes: Data? = nil) {
         self.stdout = stdout
         self.stderr = stderr
         self.exitCode = exitCode
         self.wallTime = wallTime
+        self.stdoutBytes = stdoutBytes
+        self.stderrBytes = stderrBytes
     }
 }
 
@@ -202,6 +211,12 @@ public struct RunResult: Sendable {
 public enum OutputChunk: Sendable, Equatable {
     case stdout(String)
     case stderr(String)
+    /// Raw binary chunk. Produced when the guest emits a non-UTF-8 chunk
+    /// (wire-encoded as base64). Consumers that want binary-safe output
+    /// should handle these cases; text-only consumers can ignore them or
+    /// convert with `String(decoding:as:)` which will be lossy.
+    case stdoutBytes(Data)
+    case stderrBytes(Data)
     case exit(Int32)
 }
 

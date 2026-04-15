@@ -128,6 +128,7 @@ func integrationStreamStderr() async throws {
         case .stdout(let s): stdoutData += s
         case .stderr(let s): stderrData += s
         case .exit(let code): exitCode = code
+        default: break
         }
     }
     #expect(stdoutData.contains("out"))

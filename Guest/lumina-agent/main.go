@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -78,10 +79,11 @@ type DownloadReqMsg struct {
 }
 
 type OutputMsg struct {
-	Type   string `json:"type"`
-	ID     string `json:"id"`
-	Stream string `json:"stream"`
-	Data   string `json:"data"`
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Stream   string `json:"stream"`
+	Data     string `json:"data"`
+	Encoding string `json:"encoding,omitempty"` // "base64" for non-UTF-8 binary chunks; absent for text
 }
 
 type ExitMsg struct {
@@ -777,7 +779,12 @@ func streamPipe(conn net.Conn, id string, stream string, pipe io.ReadCloser) {
 	for {
 		n, err := pipe.Read(buf)
 		if n > 0 {
-			sendOutput(conn, id, stream, string(buf[:n]))
+			chunk := buf[:n]
+			if isValidUTF8(chunk) {
+				sendOutput(conn, id, stream, string(chunk))
+			} else {
+				sendOutputBinary(conn, id, stream, chunk)
+			}
 		}
 		if err != nil {
 			break
@@ -795,6 +802,27 @@ func sendOutput(conn net.Conn, id string, stream string, data string) {
 		data = data[len(chunk):]
 		sendJSON(conn, OutputMsg{Type: "output", ID: id, Stream: stream, Data: chunk})
 	}
+}
+
+// sendOutputBinary sends raw bytes as a base64-encoded output message.
+// Used when a chunk fails UTF-8 validation so the host receives byte-exact data.
+func sendOutputBinary(conn net.Conn, id string, stream string, raw []byte) {
+	// Chunk to stay under maxChunkSize (base64 expands ~4/3, so chunk at 48KB raw → 64KB base64)
+	const rawChunk = (maxChunkSize / 4) * 3 // 48KB
+	for len(raw) > 0 {
+		n := len(raw)
+		if n > rawChunk {
+			n = rawChunk
+		}
+		encoded := base64.StdEncoding.EncodeToString(raw[:n])
+		raw = raw[n:]
+		sendJSON(conn, OutputMsg{Type: "output", ID: id, Stream: stream, Data: encoded, Encoding: "base64"})
+	}
+}
+
+// isValidUTF8 reports whether b is valid UTF-8.
+func isValidUTF8(b []byte) bool {
+	return utf8.Valid(b)
 }
 
 func sendJSON(conn net.Conn, v interface{}) {

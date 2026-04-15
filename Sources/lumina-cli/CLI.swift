@@ -208,8 +208,15 @@ struct Run: AsyncParsableCommand {
             case .json:
                 printResultJSON(result, durationMs: ms)
             case .text:
-                print(result.stdout, terminator: "")
-                if !result.stderr.isEmpty {
+                // Prefer raw bytes when available (binary output); fall back to lossy UTF-8 string
+                if let bytes = result.stdoutBytes {
+                    FileHandle.standardOutput.write(bytes)
+                } else {
+                    print(result.stdout, terminator: "")
+                }
+                if let bytes = result.stderrBytes {
+                    FileHandle.standardError.write(bytes)
+                } else if !result.stderr.isEmpty {
                     FileHandle.standardError.write(Data(result.stderr.utf8))
                 }
             }
@@ -245,6 +252,11 @@ struct Run: AsyncParsableCommand {
                         printNDJSONLine(StreamChunk(stream: "stdout", data: data))
                     case .stderr(let data):
                         printNDJSONLine(StreamChunk(stream: "stderr", data: data))
+                    case .stdoutBytes(let bytes):
+                        // Binary stdout: write raw bytes to stdout fd directly (bypasses print buffering)
+                        FileHandle.standardOutput.write(bytes)
+                    case .stderrBytes(let bytes):
+                        FileHandle.standardError.write(bytes)
                     case .exit(let code):
                         printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: millisSince(start)))
                         if code != 0 { throw ExitCode(code) }
@@ -255,6 +267,10 @@ struct Run: AsyncParsableCommand {
                         print(data, terminator: "")
                     case .stderr(let data):
                         FileHandle.standardError.write(Data(data.utf8))
+                    case .stdoutBytes(let bytes):
+                        FileHandle.standardOutput.write(bytes)
+                    case .stderrBytes(let bytes):
+                        FileHandle.standardError.write(bytes)
                     case .exit(let code):
                         if code != 0 { throw ExitCode(code) }
                     }
@@ -303,6 +319,10 @@ private func handleTextError(_ error: any Error, timeout: String) throws -> Neve
 private struct ResultJSON: Encodable {
     var stdout: String?
     var stderr: String?
+    /// Base64-encoded raw stdout bytes. Set only when stdout contained non-UTF-8 data.
+    /// When set, `stdout` is a lossy UTF-8 conversion; this field is byte-exact.
+    var stdout_bytes: String?
+    var stderr_bytes: String?
     var exit_code: Int?
     var error: String?
     var duration_ms: Int
@@ -312,6 +332,8 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
     let r = ResultJSON(
         stdout: result.stdout,
         stderr: result.stderr,
+        stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
+        stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
         exit_code: Int(result.exitCode),
         duration_ms: durationMs
     )

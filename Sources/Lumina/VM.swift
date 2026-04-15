@@ -545,7 +545,9 @@ public actor VM {
             stdout: result.stdout,
             stderr: result.stderr,
             exitCode: result.exitCode,
-            wallTime: wallTime
+            wallTime: wallTime,
+            stdoutBytes: result.stdoutBytes,
+            stderrBytes: result.stderrBytes
         )
     }
 

@@ -145,6 +145,11 @@ final class CommandRunner: @unchecked Sendable {
 
         var stdout = ""
         var stderr = ""
+        // Binary accumulators only populated when the guest emits at least one
+        // base64-encoded (non-UTF-8) chunk. If every chunk is UTF-8 these stay
+        // nil and RunResult.stdoutBytes/stderrBytes are nil.
+        var stdoutBytes: Data? = nil
+        var stderrBytes: Data? = nil
         let deadline = ContinuousClock.now + .seconds(timeout)
 
         for await msg in stream {
@@ -156,11 +161,42 @@ final class CommandRunner: @unchecked Sendable {
             switch msg {
             case .output(_, let s, let data):
                 switch s {
-                case .stdout: stdout += data
-                case .stderr: stderr += data
+                case .stdout:
+                    stdout += data
+                    if stdoutBytes != nil {
+                        stdoutBytes!.append(Data(data.utf8))
+                    }
+                case .stderr:
+                    stderr += data
+                    if stderrBytes != nil {
+                        stderrBytes!.append(Data(data.utf8))
+                    }
+                }
+            case .outputBinary(_, let s, let bytes):
+                // First binary chunk: seed bytes accumulator with whatever
+                // UTF-8 text has been collected so far, so downstream consumers
+                // reading stdoutBytes get a byte-exact view of the full stream.
+                switch s {
+                case .stdout:
+                    if stdoutBytes == nil { stdoutBytes = Data(stdout.utf8) }
+                    stdoutBytes!.append(bytes)
+                    // Also append a best-effort UTF-8 view to `stdout` so text-only
+                    // consumers see approximate output; may contain replacement chars.
+                    stdout += String(decoding: bytes, as: UTF8.self)
+                case .stderr:
+                    if stderrBytes == nil { stderrBytes = Data(stderr.utf8) }
+                    stderrBytes!.append(bytes)
+                    stderr += String(decoding: bytes, as: UTF8.self)
                 }
             case .exit(_, let code):
-                return RunResult(stdout: stdout, stderr: stderr, exitCode: code, wallTime: .zero)
+                return RunResult(
+                    stdout: stdout,
+                    stderr: stderr,
+                    exitCode: code,
+                    wallTime: .zero,
+                    stdoutBytes: stdoutBytes,
+                    stderrBytes: stderrBytes
+                )
             case .heartbeat:
                 continue
             default:
@@ -205,6 +241,8 @@ final class CommandRunner: @unchecked Sendable {
                     switch msg {
                     case .output(_, let stream, let data):
                         continuation.yield(stream == .stdout ? .stdout(data) : .stderr(data))
+                    case .outputBinary(_, let stream, let bytes):
+                        continuation.yield(stream == .stdout ? .stdoutBytes(bytes) : .stderrBytes(bytes))
                     case .exit(_, let code):
                         continuation.yield(.exit(code))
                         continuation.finish()
@@ -508,7 +546,7 @@ final class CommandRunner: @unchecked Sendable {
     /// Heartbeats broadcast to all exec handlers.
     private func dispatchMessage(_ msg: GuestMessage) {
         switch msg {
-        case .output(let id, _, _):
+        case .output(let id, _, _), .outputBinary(let id, _, _):
             lock.lock()
             let handler = execHandlers[id]
             lock.unlock()

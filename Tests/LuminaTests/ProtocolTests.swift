@@ -191,6 +191,52 @@ import Testing
     #expect(json["signal"] as? Int == 15)
 }
 
+// MARK: - Binary Output Protocol Tests
+
+@Test func decodeBinaryOutputMessage() throws {
+    // Guest emits base64-encoded bytes for non-UTF-8 output
+    let rawBytes = Data([0xFF, 0xFE, 0x00, 0x01])
+    let encoded = rawBytes.base64EncodedString()
+    let json = "{\"type\":\"output\",\"id\":\"exec-1\",\"stream\":\"stdout\",\"data\":\"\(encoded)\",\"encoding\":\"base64\"}\n"
+    let msg = try Protocol.decodeGuest(Data(json.utf8))
+    if case .outputBinary(let id, let stream, let bytes) = msg {
+        #expect(id == "exec-1")
+        #expect(stream == .stdout)
+        #expect(bytes == rawBytes)
+    } else {
+        Issue.record("Expected .outputBinary, got \(msg)")
+    }
+}
+
+@Test func decodeBinaryOutputMessageStderr() throws {
+    let rawBytes = Data([0xAB, 0xCD, 0xEF])
+    let encoded = rawBytes.base64EncodedString()
+    let json = "{\"type\":\"output\",\"id\":\"exec-2\",\"stream\":\"stderr\",\"data\":\"\(encoded)\",\"encoding\":\"base64\"}\n"
+    let msg = try Protocol.decodeGuest(Data(json.utf8))
+    if case .outputBinary(let id, let stream, let bytes) = msg {
+        #expect(id == "exec-2")
+        #expect(stream == .stderr)
+        #expect(bytes == rawBytes)
+    } else {
+        Issue.record("Expected .outputBinary, got \(msg)")
+    }
+}
+
+@Test func decodeTextOutputMessageBackwardCompat() throws {
+    // Old guests never set "encoding" → must still decode as .output (text)
+    let json = "{\"type\":\"output\",\"id\":\"exec-1\",\"stream\":\"stdout\",\"data\":\"hello world\"}\n"
+    let msg = try Protocol.decodeGuest(Data(json.utf8))
+    #expect(msg == .output(id: "exec-1", stream: .stdout, data: "hello world"))
+}
+
+@Test func decodeMalformedBase64OutputMessage() throws {
+    // Invalid base64 in a message with encoding:base64 should throw
+    let json = "{\"type\":\"output\",\"id\":\"exec-1\",\"stream\":\"stdout\",\"data\":\"not-valid-base64!!!\",\"encoding\":\"base64\"}\n"
+    #expect(throws: LuminaError.self) {
+        _ = try Protocol.decodeGuest(Data(json.utf8))
+    }
+}
+
 // MARK: - Stdin Protocol Tests
 
 @Test func encodeStdinMessage() throws {

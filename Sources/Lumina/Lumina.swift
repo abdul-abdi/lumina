@@ -55,7 +55,9 @@ public struct Lumina {
                 stdout: result.stdout,
                 stderr: result.stderr,
                 exitCode: result.exitCode,
-                wallTime: totalWallTime
+                wallTime: totalWallTime,
+                stdoutBytes: result.stdoutBytes,
+                stderrBytes: result.stderrBytes
             )
         }
     }
