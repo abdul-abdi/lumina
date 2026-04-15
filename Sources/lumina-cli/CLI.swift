@@ -11,7 +11,7 @@ struct LuminaCLI: AsyncParsableCommand {
         version: "0.5.0",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
-                      Volume.self, NetworkCmd.self]
+                      Volume.self, NetworkCmd.self, PoolCmd.self]
     )
 }
 
@@ -1152,6 +1152,161 @@ struct NetworkSession: Codable {
     let name: String
     let image: String?
     let volumes: [String]?
+}
+
+// MARK: - Pool
+
+struct PoolCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "pool",
+        abstract: "Run commands across a pre-warmed VM pool",
+        subcommands: [PoolRun.self]
+    )
+}
+
+/// `lumina pool run --size N [--count C] [--concurrency K] "cmd"`
+///
+/// Boots N VMs, then runs `cmd` C times (default N) using up to K concurrent
+/// workers (default N). Prints per-run JSON results to stdout and a summary
+/// to stderr. Useful for throughput benchmarking and parallel workloads.
+struct PoolRun: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "run", abstract: "Run a command on a pre-warmed VM pool")
+
+    @Argument(help: "Command to run in pooled VMs")
+    var command: String
+
+    @Option(name: .long, help: "Number of VMs to pre-warm (default 4)")
+    var size: Int = 4
+
+    @Option(name: .long, help: "Total number of runs (default equals pool size)")
+    var count: Int? = nil
+
+    @Option(name: .long, help: "Max concurrent runs (default equals pool size)")
+    var concurrency: Int? = nil
+
+    @Option(name: .long, help: "Image to boot from")
+    var image: String = "default"
+
+    @Option(name: .long, help: "Per-run timeout (e.g. 30s, 2m)")
+    var timeout: String = "60s"
+
+    @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
+    var env: [String] = []
+
+    @Option(name: .long, help: "Memory per VM (e.g. 512MB, 1GB)")
+    var memory: String = "1GB"
+
+    @Option(name: .long, help: "vCPUs per VM")
+    var cpus: Int = 2
+
+    func run() async throws {
+        installSignalHandlers()
+        atexit { DiskClone.cleanOrphans() }
+
+        let totalRuns = count ?? size
+        let maxConcurrent = concurrency ?? size
+
+        guard let parsedTimeout = parseDuration(timeout) else {
+            FileHandle.standardError.write(Data("lumina: invalid timeout: \(timeout)\n".utf8))
+            throw ExitCode.failure
+        }
+        guard let parsedMemory = parseMemory(memory) else {
+            FileHandle.standardError.write(Data("lumina: invalid memory: \(memory)\n".utf8))
+            throw ExitCode.failure
+        }
+        var parsedEnv: [String: String] = [:]
+        for pair in env {
+            guard let eqIndex = pair.firstIndex(of: "=") else {
+                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL format\n".utf8))
+                throw ExitCode.failure
+            }
+            parsedEnv[String(pair[pair.startIndex..<eqIndex])] = String(pair[pair.index(after: eqIndex)...])
+        }
+        let opts = VMOptions(memory: parsedMemory, cpuCount: cpus, image: image)
+
+        let format = resolveOutputFormat()
+
+        FileHandle.standardError.write(Data("Booting \(size) VMs (image: \(image))...\n".utf8))
+        let bootStart = ContinuousClock.now
+
+        let pool = Pool(size: size, options: opts)
+        try await pool.boot()
+
+        let bootMs = (ContinuousClock.now - bootStart).totalMilliseconds
+        FileHandle.standardError.write(Data("Pool ready in \(bootMs)ms. Running \(totalRuns)×\"\(command)\" (concurrency \(maxConcurrent))...\n".utf8))
+
+        let runStart = ContinuousClock.now
+
+        // Collect (index, result) pairs; print each one as it arrives.
+        let cmdCopy = command
+        let envCopy = parsedEnv
+        let timeoutCopy = parsedTimeout
+        var collectedResults: [(Int, RunResult)] = []
+
+        await withTaskGroup(of: (Int, RunResult).self) { group in
+            var inFlight = 0
+            var nextIdx = 0
+            // Throttle to maxConcurrent in-flight runs
+            while nextIdx < totalRuns || inFlight > 0 {
+                while inFlight < maxConcurrent && nextIdx < totalRuns {
+                    let idx = nextIdx
+                    nextIdx += 1
+                    inFlight += 1
+                    group.addTask { [pool] in
+                        do {
+                            let r = try await pool.run(
+                                cmdCopy,
+                                timeout: timeoutCopy,
+                                env: envCopy
+                            )
+                            return (idx, r)
+                        } catch {
+                            return (idx, RunResult(stdout: "", stderr: String(describing: error), exitCode: 1, wallTime: .zero))
+                        }
+                    }
+                }
+                if let (idx, result) = await group.next() {
+                    collectedResults.append((idx, result))
+                    inFlight -= 1
+                    // Print result immediately as it arrives
+                    if format == .json {
+                        printNDJSONLine(PoolResultJSON(
+                            run: idx + 1,
+                            exit_code: Int(result.exitCode),
+                            stdout: result.stdout,
+                            stderr: result.stderr,
+                            duration_ms: result.wallTime.totalMilliseconds
+                        ))
+                    } else {
+                        let prefix = "[\(idx + 1)/\(totalRuns)] exit=\(result.exitCode) "
+                        FileHandle.standardOutput.write(Data(prefix.utf8))
+                        FileHandle.standardOutput.write(Data(result.stdout.utf8))
+                    }
+                }
+            }
+        }
+        let results = collectedResults.map { $0.1 }
+
+        await pool.shutdown()
+
+        let totalMs = (ContinuousClock.now - runStart).totalMilliseconds
+        let successes = results.filter { $0.success }.count
+        let avgMs = totalRuns > 0 ? results.map { $0.wallTime.totalMilliseconds }.reduce(0, +) / totalRuns : 0
+
+        FileHandle.standardError.write(Data(
+            "Done: \(successes)/\(totalRuns) succeeded, total \(totalMs)ms, avg \(avgMs)ms/run\n".utf8
+        ))
+
+        if successes < totalRuns { throw ExitCode.failure }
+    }
+}
+
+private struct PoolResultJSON: Encodable {
+    var run: Int
+    var exit_code: Int
+    var stdout: String
+    var stderr: String
+    var duration_ms: Int
 }
 
 // Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift
