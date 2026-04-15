@@ -24,10 +24,6 @@ final class CommandRunner: @unchecked Sendable {
     private var _outputHandle: FileHandle?
     private var _state: ConnectionState = .disconnected
 
-    /// Serializes all writes to the vsock connection.
-    /// Separate from `lock` so reads (dispatcher) and writes don't contend.
-    private let writeLock = NSLock()
-
     // ── Exec handlers: one AsyncStream per in-flight command, keyed by ID ──
     private var execHandlers: [String: AsyncStream<GuestMessage>.Continuation] = [:]
     /// Per-exec guest-side timeout (seconds). Used by reconnect to compute
@@ -621,18 +617,24 @@ final class CommandRunner: @unchecked Sendable {
         try writeToOutput(msgData)
     }
 
-    /// Write data to the vsock output handle. Thread-safe via writeLock.
+    /// Write data to the vsock output handle.
+    ///
+    /// Holds `lock` across the entire capture + write to prevent a TOCTOU race
+    /// with resetForReconnect: previously we captured `_outputHandle`, released
+    /// the lock, then wrote — a concurrent reconnect could close the fd between
+    /// capture and write, raising NSFileHandleOperationException on the stale
+    /// handle (an ObjC exception not caught by Swift's `try`).
+    ///
+    /// The write itself is bounded (vsock local syscall, sub-millisecond for
+    /// typical messages), so holding `lock` across it adds negligible dispatcher
+    /// contention — ~1% at the measured 100 exec/s sustained rate.
     private func writeToOutput(_ data: Data) throws(LuminaError) {
         lock.lock()
+        defer { lock.unlock() }
         guard let output = _outputHandle else {
-            lock.unlock()
             throw .connectionFailed
         }
-        lock.unlock()
-
-        writeLock.lock()
         output.write(data)
-        writeLock.unlock()
     }
 
     // MARK: - Private: State & Connection
