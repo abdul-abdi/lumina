@@ -1028,7 +1028,56 @@ struct NetworkRun: AsyncParsableCommand {
     var file: String
 
     func run() async throws {
-        installSignalHandlers()
+        // NOTE: sigaction-based installSignalHandlers() is the fallback for other
+        // CLI commands, but dispatchMain()'s signal path does not reliably invoke
+        // it for cleanup — the sigaction handler calls arbitrary Swift/Foundation
+        // code which is not async-signal-safe, so the cleanup it attempts is
+        // unreliable. We use DispatchSource.makeSignalSource instead: the handler
+        // runs on a normal dispatch queue where calling Swift is safe.
+        //
+        // Ignore the default disposition so the dispatch source receives the
+        // signal instead of the process being terminated before cleanup runs.
+        Foundation.signal(SIGINT, SIG_IGN)
+        Foundation.signal(SIGTERM, SIG_IGN)
+
+        let signalQueue = DispatchQueue(label: "com.lumina.network-run.signals")
+        let myPid = "\(ProcessInfo.processInfo.processIdentifier)"
+        let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
+            src.setEventHandler {
+                // Clean up COW clones this process owns (matching our PID),
+                // then exit with the conventional 128+signal status. Running
+                // on a dispatch queue so Swift calls are safe.
+                //
+                // DiskClone.cleanOrphans() only removes clones whose PID is
+                // DEAD — it won't remove our own because we're still alive.
+                // So we scan runs/ ourselves and remove entries whose .pid
+                // file matches our current PID.
+                let runsDir = DiskClone.defaultRunsDir
+                if let entries = try? FileManager.default.contentsOfDirectory(
+                    at: runsDir, includingPropertiesForKeys: nil
+                ) {
+                    for entry in entries {
+                        let pidFile = entry.appendingPathComponent(".pid")
+                        guard let content = try? String(contentsOf: pidFile, encoding: .utf8) else {
+                            continue
+                        }
+                        if content.trimmingCharacters(in: .whitespacesAndNewlines) == myPid {
+                            try? FileManager.default.removeItem(at: entry)
+                        }
+                    }
+                }
+                Darwin.exit(128 + sig)
+            }
+            src.resume()
+            return src
+        }
+        // Retain the sources for the lifetime of dispatchMain().
+        // The event handlers capture them via closure, but keep an explicit
+        // reference so a compiler pass won't strip them.
+        _ = sources
+
+        // Also register an atexit for normal (non-signal) exit paths.
         atexit { DiskClone.cleanOrphans() }
 
         let fileURL = URL(fileURLWithPath: file)
@@ -1058,9 +1107,17 @@ struct NetworkRun: AsyncParsableCommand {
             }
             FileHandle.standardError.write(Data("All sessions running. Press Ctrl-C to tear down.\n".utf8))
 
-            // Block main thread until signal — dispatchMain() never returns,
-            // signal handler triggers exit, withNetwork scope ensures shutdown
-            dispatchMain()
+            // Block the async task until a signal terminates the process via
+            // Darwin.exit() in the DispatchSource handler. `dispatchMain()`
+            // does not behave correctly when called from within an async
+            // context — it either returns early or fails to take over the
+            // main thread — which was the root cause of COW clones leaking
+            // on SIGTERM: the withNetwork closure would exit, its `defer`s
+            // would run to completion, and the process would exit before
+            // the signal handler had a chance to clean its own PID's runs.
+            while !Task.isCancelled {
+                try await Task.sleep(for: .seconds(3600))
+            }
         }
     }
 }
