@@ -41,6 +41,13 @@ public final class SessionClient: @unchecked Sendable {
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathStr = paths.socket.path
         let pathBytes = pathStr.utf8CString
+        guard pathStr.utf8.count <= 103 else {
+            Darwin.close(clientFd)
+            clientFd = -1
+            throw LuminaError.sessionFailed(
+                "Socket path too long (\(pathStr.utf8.count) bytes, max 103): \(pathStr)"
+            )
+        }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
                 pathBytes.withUnsafeBufferPointer { src in

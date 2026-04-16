@@ -35,6 +35,15 @@ public final class SessionServer: @unchecked Sendable {
         addr.sun_family = sa_family_t(AF_UNIX)
         let path = socketPath.path
         let pathBytes = path.utf8CString
+        // sockaddr_un.sun_path is 104 bytes on macOS (including null terminator).
+        // A path longer than 103 bytes would be silently truncated — fail early.
+        guard path.utf8.count <= 103 else {
+            Darwin.close(serverFd)
+            serverFd = -1
+            throw LuminaError.sessionFailed(
+                "Socket path too long (\(path.utf8.count) bytes, max 103): \(path)"
+            )
+        }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
                 pathBytes.withUnsafeBufferPointer { src in
