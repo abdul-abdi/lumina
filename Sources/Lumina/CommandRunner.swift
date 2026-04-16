@@ -739,10 +739,13 @@ final class CommandRunner: @unchecked Sendable {
         var remaining = data.count
         var offset = 0
         while remaining > 0 {
-            let written: Int = data.withUnsafeBytes { buf in
-                Darwin.write(rawFd, buf.baseAddress! + offset, remaining)
+            let written: Int = data.withUnsafeBytes { buf -> Int in
+                guard let base = buf.baseAddress else { return -1 }
+                var n: Int
+                repeat { n = Darwin.write(rawFd, base + offset, remaining) } while n < 0 && errno == EINTR
+                return n
             }
-            if written <= 0 { throw .connectionFailed }
+            if written < 0 { throw .connectionFailed }
             offset += written
             remaining -= written
         }
