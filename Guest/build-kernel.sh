@@ -42,53 +42,37 @@ KERNEL_MINOR="${KERNEL_REST%%.*}"
 echo "  Alpine linux-virt: $PKGVER"
 echo "  Kernel version:    $KERNEL_VERSION"
 
-# ── Step 2: Download Alpine's virt kernel config ────────────
-echo "--- Step 2: Fetching Alpine virt kernel config ---"
-curl -fSL "${ALPINE_MIRROR}/main/${ALPINE_ARCH}/linux-virt-${PKGVER}.apk" \
-    -o "$WORK_DIR/linux-virt.apk"
-mkdir -p "$WORK_DIR/apk"
-tar xzf "$WORK_DIR/linux-virt.apk" -C "$WORK_DIR/apk"
-
-# Alpine stores the config in /boot/config-<version>-virt or similar
-ALPINE_CONFIG=$(find "$WORK_DIR/apk/boot" -name "config-*" 2>/dev/null | head -1)
-if [ -z "$ALPINE_CONFIG" ]; then
-    # Fallback: extract from /lib/modules/*/build/.config
-    ALPINE_CONFIG=$(find "$WORK_DIR/apk" -name ".config" 2>/dev/null | head -1)
-fi
-
-if [ -z "$ALPINE_CONFIG" ]; then
-    echo "Warning: No Alpine config found in APK, will download from APORTS"
-    # Fallback: download from Alpine's aports repository
-    APORTS_URL="https://gitlab.alpinelinux.org/alpine/aports/-/raw/master/main/linux-virt/config-virt.aarch64"
-    curl -fsSL "$APORTS_URL" -o "$WORK_DIR/alpine.config" 2>/dev/null || true
-    ALPINE_CONFIG="$WORK_DIR/alpine.config"
-fi
-
-if [ ! -f "$ALPINE_CONFIG" ]; then
-    echo "Error: Could not obtain Alpine virt kernel config"
-    exit 1
-fi
-echo "  Config: $ALPINE_CONFIG"
-
-# ── Step 3: Download kernel source ──────────────────────────
-echo "--- Step 3: Downloading kernel $KERNEL_VERSION source ---"
+# ── Step 2: Download kernel source ──────────────────────────
+echo "--- Step 2: Downloading kernel $KERNEL_VERSION source ---"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
 curl -fSL "$KERNEL_URL" -o "$WORK_DIR/linux.tar.xz"
 echo "  Extracting..."
 tar xf "$WORK_DIR/linux.tar.xz" -C "$WORK_DIR"
 KERNEL_SRC="$WORK_DIR/linux-${KERNEL_VERSION}"
 
-# ── Step 4: Configure kernel ───────────────────────────────
-echo "--- Step 4: Configuring kernel ---"
-cp "$ALPINE_CONFIG" "$KERNEL_SRC/.config"
-
+# ── Step 3: Configure kernel ───────────────────────────────
+echo "--- Step 3: Configuring kernel ---"
 cd "$KERNEL_SRC"
 
-# Apply overrides: modules → built-in, disable module support.
-# Use --disable for bools (writes "# CONFIG_X is not set") and --enable for
-# tristate/bool configs set to y (writes "CONFIG_X=y"). Do NOT use
-# --set-val for bool configs — "CONFIG_MODULES=n" is invalid .config format
-# and causes conf --olddefconfig to exit 1 after writing the config.
+# Use arm64 defconfig as the base — NOT Alpine's virt config.
+#
+# Alpine's virt config has hundreds of =m (module) entries because Alpine
+# uses initramfs to load modules at boot. When we set CONFIG_MODULES=n,
+# conf --olddefconfig hits dependency violations: some =y config selects a
+# symbol that depends on MODULES, which is now disabled. conf writes the
+# .config and then exits 1 (conf_errors() > 0) with no error message printed.
+#
+# arm64 defconfig is cleaner: virtio configs are already =y, there are far
+# fewer =m entries, and no Alpine-specific quirks.
+echo "  Base config: arm64 defconfig"
+make defconfig 2>&1
+
+echo "  Applying Lumina overrides..."
+
+# Disable module support entirely — all drivers must be built-in.
+# --disable writes "# CONFIG_MODULES is not set" (correct bool form).
+# Do NOT use --set-val X n — "CONFIG_X=n" is invalid for bool configs and
+# causes conf --olddefconfig to exit 1.
 "$KERNEL_SRC/scripts/config" --disable CONFIG_MODULES
 
 # Filesystem: ext4 + dependencies
@@ -111,34 +95,34 @@ cd "$KERNEL_SRC"
 # vsock (agent communication)
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VSOCKETS
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_VSOCKETS
-# NOTE: CONFIG_VIRTIO_VSOCKETS_COMMON is a hidden symbol selected by
-# CONFIG_VIRTIO_VSOCKETS — do not set it explicitly, olddefconfig handles it.
+# CONFIG_VIRTIO_VSOCKETS_COMMON is a hidden symbol selected automatically —
+# do not set it explicitly.
 
 # FUSE + virtiofs (directory sharing)
 "$KERNEL_SRC/scripts/config" --enable CONFIG_FUSE_FS
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_FS
 
-# VirtIO core (must be built-in)
+# VirtIO core (must be built-in for all virtio devices)
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_MMIO
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_PCI
 
-# Serial console (VZ console)
+# Serial console (Apple Virtualization.framework console)
 "$KERNEL_SRC/scripts/config" --enable CONFIG_HVC_DRIVER
 "$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_CONSOLE
 
-# Entropy
+# Entropy source
 "$KERNEL_SRC/scripts/config" --enable CONFIG_HW_RANDOM_VIRTIO
 
-# devtmpfs (auto-populated /dev)
+# devtmpfs (auto-populated /dev at boot)
 "$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS
 "$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS_MOUNT
 
-# Resolve any config dependencies
-# Stderr is kept visible so any Kconfig warnings appear in CI logs.
+echo "  Resolving dependencies (olddefconfig)..."
 if ! make olddefconfig 2>&1; then
-    echo "ERROR: make olddefconfig failed — checking .config state:"
-    grep -E "^CONFIG_MODULES|^CONFIG_VSOCKETS|^CONFIG_VIRTIO" .config 2>/dev/null | sort || true
+    echo "ERROR: make olddefconfig failed. .config snapshot:"
+    grep -E "^CONFIG_MODULES|^CONFIG_VIRTIO|^CONFIG_VSOCK|^CONFIG_EXT4|^CONFIG_FUSE" \
+        .config 2>/dev/null | sort || true
     exit 1
 fi
 
@@ -146,6 +130,7 @@ fi
 # =y to =m or =n if dependency resolution conflicts. If any of these aren't
 # built-in, the VM will boot but fail silently (no vsock = no agent comms,
 # no ext4 = can't mount root, no virtio_blk = no disk).
+echo "  Verifying critical configs..."
 CRITICAL_CONFIGS=(
     CONFIG_MODULES:n          # No module loading
     CONFIG_EXT4_FS:y          # Root filesystem
@@ -164,7 +149,6 @@ for entry in "${CRITICAL_CONFIGS[@]}"; do
     KEY="${entry%%:*}"
     EXPECTED="${entry#*:}"
     if [ "$EXPECTED" = "n" ]; then
-        # For CONFIG_MODULES=n, check it's not set or is explicitly "n"
         ACTUAL=$(grep "^${KEY}=" .config 2>/dev/null | cut -d= -f2)
         if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "n" ]; then
             echo "  FAIL: $KEY=$ACTUAL (expected not set or =n)"
@@ -189,8 +173,8 @@ if [ "$FAILED" = true ]; then
     exit 1
 fi
 
-# ── Step 5: Build kernel ───────────────────────────────────
-echo "--- Step 5: Building kernel ($(nproc) threads) ---"
+# ── Step 4: Build kernel ───────────────────────────────────
+echo "--- Step 4: Building kernel ($(nproc) threads) ---"
 make -j"$(nproc)" Image
 
 # The raw ARM64 Image is at arch/arm64/boot/Image
@@ -200,14 +184,14 @@ if [ ! -f "$KERNEL_IMAGE" ]; then
     exit 1
 fi
 
-# ── Step 6: Verify ARM64 Image magic ──────────────────────
+# ── Step 5: Verify ARM64 Image magic ──────────────────────
 MAGIC=$(dd if="$KERNEL_IMAGE" bs=1 skip=56 count=4 2>/dev/null | od -A n -t x1 | tr -cd '0-9a-f')
 if [ "$MAGIC" != "41524d64" ]; then
     echo "Error: Built kernel missing ARM64 Image magic (got: $MAGIC)"
     exit 1
 fi
 
-# ── Step 7: Copy output ───────────────────────────────────
+# ── Step 6: Copy output ───────────────────────────────────
 mkdir -p "$(dirname "$OUTPUT")"
 cp "$KERNEL_IMAGE" "$OUTPUT"
 
