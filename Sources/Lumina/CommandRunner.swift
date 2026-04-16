@@ -710,22 +710,42 @@ final class CommandRunner: @unchecked Sendable {
 
     /// Write data to the vsock output handle.
     ///
-    /// Holds `lock` across the entire capture + write to prevent a TOCTOU race
-    /// with resetForReconnect: previously we captured `_outputHandle`, released
-    /// the lock, then wrote — a concurrent reconnect could close the fd between
-    /// capture and write, raising NSFileHandleOperationException on the stale
-    /// handle (an ObjC exception not caught by Swift's `try`).
+    /// Dups the fd under the lock and releases immediately before writing so
+    /// the lock is never held across a blocking syscall. This prevents a deadlock
+    /// where the dispatcher (which also acquires the lock per message) is blocked
+    /// waiting for the lock while a write stalls on vsock backpressure.
     ///
-    /// The write itself is bounded (vsock local syscall, sub-millisecond for
-    /// typical messages), so holding `lock` across it adds negligible dispatcher
-    /// contention — ~1% at the measured 100 exec/s sustained rate.
+    /// Uses POSIX `write()` instead of `FileHandle.write()` — same reason as
+    /// `SessionServer.writeResponse`: NSFileHandle raises an Obj-C exception on
+    /// EPIPE that Swift's `try` cannot catch.
+    ///
+    /// The dup'd fd remains valid even if `resetForReconnect` closes the original
+    /// between lock release and write. A failed write surfaces as `.connectionFailed`
+    /// rather than a crash or deadlock.
     private func writeToOutput(_ data: Data) throws(LuminaError) {
+        // Dup under lock, write after lock is released.
+        let rawFd: Int32
         lock.lock()
-        defer { lock.unlock() }
         guard let output = _outputHandle else {
+            lock.unlock()
             throw .connectionFailed
         }
-        output.write(data)
+        rawFd = dup(output.fileDescriptor)
+        lock.unlock()
+
+        guard rawFd >= 0 else { throw .connectionFailed }
+        defer { Darwin.close(rawFd) }
+
+        var remaining = data.count
+        var offset = 0
+        while remaining > 0 {
+            let written: Int = data.withUnsafeBytes { buf in
+                Darwin.write(rawFd, buf.baseAddress! + offset, remaining)
+            }
+            if written <= 0 { throw .connectionFailed }
+            offset += written
+            remaining -= written
+        }
     }
 
     // MARK: - Private: State & Connection
