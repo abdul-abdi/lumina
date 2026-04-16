@@ -233,7 +233,14 @@ final class CommandRunner: @unchecked Sendable {
         let guestTimeout = max(timeout * 3, 30)
         let msgStream = registerExecHandler(id, guestTimeout: guestTimeout)
 
-        try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
+        // If sendExecMessage throws, the AsyncThrowingStream is never created and
+        // onTermination is never registered, so we must explicitly clean up here.
+        do {
+            try sendExecMessage(id: id, command: command, guestTimeout: guestTimeout, env: env, cwd: cwd)
+        } catch {
+            unregisterExecHandler(id)
+            throw error
+        }
         afterDispatched?()
 
         let runner = self
@@ -345,11 +352,16 @@ final class CommandRunner: @unchecked Sendable {
 
         let transferCont = transferContinuation
         transferContinuation = nil
+
+        let networkCont = networkContinuation
+        networkContinuation = nil
         lock.unlock()
 
         // Finish all handlers — unblocks any waiting exec/stream/upload/download
         for (_, handler) in execHandlersCopy { handler.finish() }
         transferCont?.finish()
+        // Resume any pending configureNetwork() caller so it doesn't hang forever.
+        networkCont?.resume(returning: .networkReady(ip: ""))
 
         // Best-effort cancel: tell the guest agent to kill running commands
         if let fd = fd {
@@ -613,6 +625,8 @@ final class CommandRunner: @unchecked Sendable {
     /// Handle a dispatcher error (connection drop, protocol error).
     /// Fails all in-flight operations.
     private func handleDispatcherError(_ error: any Error) {
+        NSLog("[Lumina.CommandRunner] Dispatcher error: %@", String(describing: error))
+
         lock.lock()
         _state = .failed
 
@@ -622,11 +636,16 @@ final class CommandRunner: @unchecked Sendable {
 
         let transferCont = transferContinuation
         transferContinuation = nil
+
+        let networkCont = networkContinuation
+        networkContinuation = nil
         lock.unlock()
 
         // Finish all handlers so waiting callers get unblocked
         for (_, handler) in execHandlersCopy { handler.finish() }
         transferCont?.finish()
+        // Resume any pending configureNetwork() caller so it doesn't hang forever.
+        networkCont?.resume(returning: .networkReady(ip: ""))
     }
 
     // MARK: - Private: Exec Handler Registration

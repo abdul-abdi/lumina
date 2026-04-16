@@ -1,5 +1,6 @@
 // Sources/Lumina/SessionClient.swift
 import Foundation
+import Darwin
 
 /// Connects to a session's Unix domain socket and sends/receives
 /// SessionProtocol messages. Used by the CLI `exec` and `session stop` commands.
@@ -79,12 +80,27 @@ public final class SessionClient: @unchecked Sendable {
     }
 
     /// Send a request to the session server.
+    ///
+    /// Uses POSIX `write()` instead of `FileHandle.write()` — NSFileHandle raises
+    /// an Obj-C NSFileHandleOperationException on EPIPE that Swift's `try` cannot catch.
     public func send(_ request: SessionRequest) throws {
-        guard let handle = writeHandle else {
+        guard clientFd >= 0 else {
             throw LuminaError.connectionFailed
         }
         let data = try SessionProtocol.encode(request)
-        handle.write(data)
+        var remaining = data.count
+        var offset = 0
+        while remaining > 0 {
+            let written: Int = data.withUnsafeBytes { buf -> Int in
+                guard let base = buf.baseAddress else { return -1 }
+                var n: Int
+                repeat { n = Darwin.write(clientFd, base + offset, remaining) } while n < 0 && errno == EINTR
+                return n
+            }
+            if written <= 0 { throw LuminaError.connectionFailed }
+            offset += written
+            remaining -= written
+        }
     }
 
     /// Read one response from the session server.
