@@ -152,9 +152,23 @@ final class CommandRunner: @unchecked Sendable {
         var stderrBytes: Data? = nil
         let deadline = ContinuousClock.now + .seconds(timeout)
 
+        // Precision watchdog: guest heartbeats arrive every 2s, so a deadline
+        // shorter than two heartbeats would never be checked promptly. This task
+        // fires at exactly `timeout` seconds, cancels the guest command, and
+        // injects a synthetic heartbeat to unblock the for-await loop below.
+        let watchdogId = id
+        let watchdog = Task.detached { [weak self] in
+            do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+            guard let self else { return }
+            try? self.cancel(id: watchdogId, signal: 15, gracePeriod: 5)
+            self.yieldSyntheticHeartbeat(to: watchdogId)
+        }
+        defer { watchdog.cancel() }
+
         for await msg in stream {
             if ContinuousClock.now > deadline {
-                // Send cancel to clean up the guest side
+                // Send cancel to clean up the guest side (watchdog may have
+                // already sent it — cancel is idempotent on the guest).
                 try? cancel(id: id, signal: 15, gracePeriod: 5)
                 throw .timeout
             }
@@ -626,6 +640,15 @@ final class CommandRunner: @unchecked Sendable {
         execTimeouts[id] = guestTimeout
         lock.unlock()
         return stream
+    }
+
+    /// Inject a synthetic heartbeat into an exec handler's stream.
+    /// Used by the timeout watchdog to unblock the for-await loop in exec().
+    private func yieldSyntheticHeartbeat(to id: String) {
+        lock.lock()
+        let handler = execHandlers[id]
+        lock.unlock()
+        handler?.yield(.heartbeat)
     }
 
     /// Unregister an exec handler and finish its stream.
