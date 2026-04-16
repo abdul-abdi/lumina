@@ -290,10 +290,9 @@ public final class SessionServer: @unchecked Sendable {
                         case .stderr(let data):
                             try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
                         case .stdoutBytes(let bytes):
-                            // Lossy UTF-8 conversion — binary session stdin/stdout not yet supported
-                            try? self.writeResponse(.output(stream: .stdout, data: String(decoding: bytes, as: UTF8.self)), to: writeHandle)
+                            try? self.writeResponse(.outputBytes(stream: .stdout, base64: bytes.base64EncodedString()), to: writeHandle)
                         case .stderrBytes(let bytes):
-                            try? self.writeResponse(.output(stream: .stderr, data: String(decoding: bytes, as: UTF8.self)), to: writeHandle)
+                            try? self.writeResponse(.outputBytes(stream: .stderr, base64: bytes.base64EncodedString()), to: writeHandle)
                         case .exit(let code):
                             let ms = (ContinuousClock.now - start).totalMilliseconds
                             try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)

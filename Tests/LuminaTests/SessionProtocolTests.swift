@@ -131,3 +131,20 @@ import Testing
     let req = try SessionProtocol.decodeRequest(Data(json.utf8))
     #expect(req == .exec(cmd: "pwd", timeout: 30, env: [:], cwd: nil))
 }
+
+@Test func encodeOutputBytesResponse() throws {
+    let bytes = Data([0x00, 0xFF, 0xDE, 0xAD])
+    let response = SessionResponse.outputBytes(stream: .stdout, base64: bytes.base64EncodedString())
+    let data = try SessionProtocol.encode(response)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "output_bytes")
+    #expect(json["stream"] as? String == "stdout")
+    #expect(json["base64"] as? String == bytes.base64EncodedString())
+}
+
+@Test func decodeOutputBytesResponse() throws {
+    let b64 = Data([0x00, 0xFF]).base64EncodedString()
+    let raw = Data("{\"base64\":\"\(b64)\",\"stream\":\"stdout\",\"type\":\"output_bytes\"}\n".utf8)
+    let msg = try SessionProtocol.decodeResponse(raw)
+    #expect(msg == .outputBytes(stream: .stdout, base64: b64))
+}

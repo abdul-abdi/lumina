@@ -886,6 +886,12 @@ struct Exec: AsyncParsableCommand {
                 }
                 if code != 0 { throw ExitCode(code) }
                 return
+            case .outputBytes(let outputStream, let base64):
+                guard let rawBytes = Data(base64Encoded: base64) else { break }
+                let fd = outputStream == .stdout
+                    ? FileHandle.standardOutput
+                    : FileHandle.standardError
+                fd.write(rawBytes)
             case .error(let message):
                 stdinTask?.cancel()
                 FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))

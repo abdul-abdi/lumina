@@ -17,6 +17,10 @@ public enum SessionRequest: Sendable, Equatable {
 
 public enum SessionResponse: Sendable, Equatable {
     case output(stream: OutputStream, data: String)
+    /// Binary output chunk — `base64` is the base64-encoded raw bytes.
+    /// Matches the vsock binary stdout envelope so binary data survives
+    /// the session IPC layer without lossy UTF-8 conversion.
+    case outputBytes(stream: OutputStream, base64: String)
     case exit(code: Int32, durationMs: Int)
     case error(message: String)
     case uploadDone(path: String)
@@ -58,6 +62,8 @@ public enum SessionProtocol {
         switch response {
         case .output(let stream, let data):
             dict = ["type": "output", "stream": stream.rawValue, "data": data]
+        case .outputBytes(let stream, let base64):
+            dict = ["type": "output_bytes", "stream": stream.rawValue, "base64": base64]
         case .exit(let code, let durationMs):
             dict = ["type": "exit", "code": Int(code), "duration_ms": durationMs]
         case .error(let message):
@@ -135,6 +141,13 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed output response")
             }
             return .output(stream: stream, data: data)
+        case "output_bytes":
+            guard let streamStr = json["stream"] as? String,
+                  let stream = OutputStream(rawValue: streamStr),
+                  let base64 = json["base64"] as? String else {
+                throw LuminaError.protocolError("Malformed output_bytes response")
+            }
+            return .outputBytes(stream: stream, base64: base64)
         case "exit":
             guard let code = json["code"] as? Int,
                   let durationMs = json["duration_ms"] as? Int else {
