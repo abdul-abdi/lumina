@@ -959,3 +959,104 @@ func integrationStreamCancelThenExec() async throws {
     #expect(result.success)
     #expect(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "after_cancel")
 }
+
+// MARK: - Session IPC Stdin Tests
+
+@Test(.enabled(if: integrationEnabled()))
+func integrationSessionExecStdinViaIPC() async throws {
+    // Exercise the SessionServer/SessionClient IPC path for stdin piping.
+    // Existing stdin tests use the VM actor directly (execStream + sendStdin).
+    // This test goes through: SessionClient → Unix socket → SessionServer.handleExec
+    //   → StdinChannel → CommandRunner → vsock → guest.
+
+    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    defer { Task { await vm.shutdown() } }
+    try await vm.boot()
+
+    // Create a temporary Unix socket for the server.
+    let tmpDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+    let socketPath = tmpDir.appendingPathComponent("ipc-test.sock")
+
+    let server = SessionServer(socketPath: socketPath)
+    try server.bind()
+    defer { server.close() }
+
+    // Serve in a background task — exits when server.close() is called.
+    let serveTask = Task { await server.serve(vm: vm) }
+    defer { serveTask.cancel() }
+
+    // Give the server a moment to enter accept().
+    try await Task.sleep(for: .milliseconds(50))
+
+    // Connect a raw socket and inject into SessionClient.
+    let clientFd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard clientFd >= 0 else {
+        Issue.record("Failed to create client socket: \(errno)")
+        return
+    }
+    // clientFd will be closed by SessionClient.disconnect() via Darwin.close.
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.path.utf8CString
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
+            pathBytes.withUnsafeBufferPointer { src in
+                dest.update(from: src.baseAddress!, count: min(src.count, 104))
+            }
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+            Darwin.connect(clientFd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard connected == 0 else {
+        Darwin.close(clientFd)
+        Issue.record("Failed to connect to session socket: \(errno)")
+        return
+    }
+
+    let client = SessionClient()
+    client.injectTestSocket(readFd: clientFd, writeFd: clientFd)
+    defer { client.disconnect() }
+
+    // Send exec for `cat` (echoes stdin until EOF).
+    try client.send(.exec(cmd: "cat", timeout: 30, env: [:]))
+
+    // Give the guest a moment to start `cat`.
+    try await Task.sleep(for: .milliseconds(300))
+
+    // Send stdin data then close.
+    try client.send(.stdin(data: "hello from IPC\n"))
+    try client.send(.stdinClose)
+
+    // Collect responses until exit or error.
+    var output = ""
+    var exitCode: Int32?
+    for _ in 0..<200 {
+        let response = try client.receive()
+        switch response {
+        case .output(_, let data):
+            output += data
+        case .outputBytes(_, let base64):
+            if let raw = Data(base64Encoded: base64) {
+                output += String(decoding: raw, as: UTF8.self)
+            }
+        case .exit(let code, _):
+            exitCode = code
+        case .error(let msg):
+            Issue.record("Unexpected session error: \(msg)")
+            return
+        default:
+            break
+        }
+        if exitCode != nil { break }
+    }
+
+    #expect(output.contains("hello from IPC"), "Expected stdin echoed by cat, got: \(output)")
+    #expect(exitCode == 0, "Expected cat to exit 0 after stdinClose, got: \(String(describing: exitCode))")
+}
