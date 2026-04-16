@@ -43,6 +43,9 @@ public actor Pool {
     /// True after shutdown() is called — rejects new runs.
     private var isShutdown = false
 
+    /// Exposed for testing only. Count of VMs currently in inventory.
+    internal var availableCount: Int { available.count }
+
     // MARK: - Init
 
     public init(size: Int = 4, options: VMOptions = VMOptions()) {
@@ -173,13 +176,19 @@ public actor Pool {
     }
 
     /// Add a fresh VM to the pool: fulfil the first waiter, or add to inventory.
+    /// If the pool is shut down, immediately shuts down the VM to prevent leaks.
     private func depositVM(_ vm: VM?) async {
         guard let vm else {
-            // Boot failed: nothing to deposit. Pool shrinks temporarily.
             booting = max(0, booting - 1)
             return
         }
         booting = max(0, booting - 1)
+        // If shutdown() was called while this VM was booting, shut it down
+        // immediately rather than adding it to inventory — prevents leaked VMs.
+        if isShutdown {
+            await vm.shutdown()
+            return
+        }
         if let waiter = waiters.first {
             waiters.removeFirst()
             waiter.resume(returning: vm)
