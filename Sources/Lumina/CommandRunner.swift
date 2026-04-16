@@ -745,7 +745,7 @@ final class CommandRunner: @unchecked Sendable {
                 repeat { n = Darwin.write(rawFd, base + offset, remaining) } while n < 0 && errno == EINTR
                 return n
             }
-            if written < 0 { throw .connectionFailed }
+            if written <= 0 { throw .connectionFailed }
             offset += written
             remaining -= written
         }

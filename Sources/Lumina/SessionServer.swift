@@ -130,7 +130,7 @@ public final class SessionServer: @unchecked Sendable {
             while remaining > 0 {
                 var written: Int
                 repeat { written = Darwin.write(fd, base + offset, remaining) } while written < 0 && errno == EINTR
-                if written < 0 {
+                if written <= 0 {
                     throw LuminaError.sessionFailed("Write failed: \(errno)")
                 }
                 offset += written
