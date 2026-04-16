@@ -190,7 +190,7 @@ struct Run: AsyncParsableCommand {
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()
 
-        if shouldStream {
+        if shouldUseStreaming(format: format, streaming: shouldStream) {
             try await runStreaming(options: options, format: format)
         } else {
             try await runBuffered(options: options, format: format)
@@ -1267,6 +1267,15 @@ struct PoolRun: AsyncParsableCommand {
     @Option(name: .long, help: "vCPUs per VM")
     var cpus: Int = 2
 
+    @Option(name: .long, help: "Copy file or directory into each VM before run (local:remote, repeatable)")
+    var copy: [String] = []
+
+    @Option(name: .long, help: "Download from VM after each run (remote:local, repeatable). Per-run: each run produces its own download.")
+    var download: [String] = []
+
+    @Option(name: .long, help: "Mount host dir or named volume into every VM (path_or_name:guest, repeatable). Applied at pool boot time.")
+    var volume: [String] = []
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -1290,7 +1299,72 @@ struct PoolRun: AsyncParsableCommand {
             }
             parsedEnv[String(pair[pair.startIndex..<eqIndex])] = String(pair[pair.index(after: eqIndex)...])
         }
-        let opts = VMOptions(memory: parsedMemory, cpuCount: cpus, image: image)
+
+        // Parse --copy: auto-detect file vs directory from local path
+        var parsedUploads: [FileUpload] = []
+        var parsedDirUploads: [DirectoryUpload] = []
+        for spec in copy {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'. Use local:remote format\n".utf8))
+                throw ExitCode.failure
+            }
+            let localStr = String(spec[spec.startIndex..<colonIndex])
+            let remote = String(spec[spec.index(after: colonIndex)...])
+            let localURL = URL(fileURLWithPath: localStr)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir) else {
+                FileHandle.standardError.write(Data("lumina: not found: \(localStr)\n".utf8))
+                throw ExitCode.failure
+            }
+            if isDir.boolValue {
+                parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
+            } else {
+                let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
+                parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
+            }
+        }
+
+        // Parse --download: auto-detected as file vs directory at runtime on guest
+        var parsedDownloads: [FileDownload] = []
+        for spec in download {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --download '\(spec)'. Use remote:local format\n".utf8))
+                throw ExitCode.failure
+            }
+            let remote = String(spec[spec.startIndex..<colonIndex])
+            let localStr = String(spec[spec.index(after: colonIndex)...])
+            parsedDownloads.append(FileDownload(remotePath: remote, localPath: URL(fileURLWithPath: localStr)))
+        }
+
+        // Parse --volume: applied at pool boot time (VM-level config)
+        var parsedMounts: [MountPoint] = []
+        let volumeStore = VolumeStore()
+        for spec in volume {
+            guard let colonIndex = spec.firstIndex(of: ":") else {
+                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
+                throw ExitCode.failure
+            }
+            let left = String(spec[spec.startIndex..<colonIndex])
+            let guestPath = String(spec[spec.index(after: colonIndex)...])
+            if left.hasPrefix("/") || left.hasPrefix(".") {
+                let hostURL = URL(fileURLWithPath: left)
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
+                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
+                    throw ExitCode.failure
+                }
+                parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
+            } else {
+                guard let hostDir = volumeStore.resolve(name: left) else {
+                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
+                    throw ExitCode.failure
+                }
+                volumeStore.touch(name: left)
+                parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
+            }
+        }
+
+        let opts = VMOptions(memory: parsedMemory, cpuCount: cpus, image: image, mounts: parsedMounts)
 
         let format = resolveOutputFormat()
 
@@ -1309,6 +1383,9 @@ struct PoolRun: AsyncParsableCommand {
         let cmdCopy = command
         let envCopy = parsedEnv
         let timeoutCopy = parsedTimeout
+        let uploadsCopy = parsedUploads
+        let dirUploadsCopy = parsedDirUploads
+        let downloadsCopy = parsedDownloads
         var collectedResults: [(Int, RunResult)] = []
 
         await withTaskGroup(of: (Int, RunResult).self) { group in
@@ -1325,7 +1402,10 @@ struct PoolRun: AsyncParsableCommand {
                             let r = try await pool.run(
                                 cmdCopy,
                                 timeout: timeoutCopy,
-                                env: envCopy
+                                env: envCopy,
+                                uploads: uploadsCopy,
+                                directoryUploads: dirUploadsCopy,
+                                downloads: downloadsCopy
                             )
                             return (idx, r)
                         } catch {

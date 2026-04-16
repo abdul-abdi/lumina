@@ -94,6 +94,7 @@ import Testing
     #expect(LuminaError.downloadFailed(path: "/tmp/y", reason: "file not found").errorDescription == "download failed for '/tmp/y': file not found")
 }
 
+
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
     // Create a temp image with rosetta metadata
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-types-\(UUID().uuidString)")

@@ -149,8 +149,9 @@ func resolveDiskSize(flag: String?) -> String? {
 
 // MARK: - Streaming Mode
 //
-// Default: TTY = stream (humans want real-time), pipe = buffer (agents want complete JSON).
-// Override: LUMINA_STREAM=0|1 env var.
+// Default: TTY = stream (humans want real-time), pipe = NDJSON stream (agents parse line-by-line).
+// JSON mode always streams to keep the output schema consistent with `exec`.
+// Override: LUMINA_STREAM=0|1 env var (only affects text mode).
 
 /// Resolve streaming mode: LUMINA_STREAM env > isatty auto-detect.
 func resolveStreaming() -> Bool {
@@ -158,8 +159,14 @@ func resolveStreaming() -> Bool {
     if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
         return envVal == "1" || envVal == "true"
     }
-    // 3. Auto-detect: TTY = stream, pipe = buffer
+    // 2. Auto-detect: TTY = stream, pipe = buffer (JSON mode overrides this in shouldUseStreaming)
     return isatty(STDOUT_FILENO) != 0
+}
+
+/// Whether to use streaming output. JSON format always streams (NDJSON, consistent with `exec`).
+/// Text format follows isatty / LUMINA_STREAM — streaming for TTYs, buffered for pipes.
+func shouldUseStreaming(format: OutputFormat, streaming: Bool) -> Bool {
+    return streaming || format == .json
 }
 
 // MARK: - Session ID Parsing
