@@ -84,54 +84,63 @@ cp "$ALPINE_CONFIG" "$KERNEL_SRC/.config"
 
 cd "$KERNEL_SRC"
 
-# Apply overrides: modules → built-in, disable module support
-# These are the exact modules InitrdPatcher currently loads at boot.
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_MODULES n
+# Apply overrides: modules → built-in, disable module support.
+# Use --disable for bools (writes "# CONFIG_X is not set") and --enable for
+# tristate/bool configs set to y (writes "CONFIG_X=y"). Do NOT use
+# --set-val for bool configs — "CONFIG_MODULES=n" is invalid .config format
+# and causes conf --olddefconfig to exit 1 after writing the config.
+"$KERNEL_SRC/scripts/config" --disable CONFIG_MODULES
 
 # Filesystem: ext4 + dependencies
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_EXT4_FS y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_JBD2 y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_MBCACHE y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_CRC16 y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_CRC32 y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_CRYPTO_CRC32C y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_EXT4_FS
+"$KERNEL_SRC/scripts/config" --enable CONFIG_JBD2
+"$KERNEL_SRC/scripts/config" --enable CONFIG_MBCACHE
+"$KERNEL_SRC/scripts/config" --enable CONFIG_CRC16
+"$KERNEL_SRC/scripts/config" --enable CONFIG_CRC32
+"$KERNEL_SRC/scripts/config" --enable CONFIG_CRYPTO_CRC32C
 
 # Block device
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_BLK y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_BLK
 
 # Networking
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_NET y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_PACKET y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_NET_FAILOVER y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_FAILOVER y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_NET
+"$KERNEL_SRC/scripts/config" --enable CONFIG_PACKET
+"$KERNEL_SRC/scripts/config" --enable CONFIG_NET_FAILOVER
+"$KERNEL_SRC/scripts/config" --enable CONFIG_FAILOVER
 
 # vsock (agent communication)
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VSOCKETS y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_VSOCKETS y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_VSOCKETS_COMMON y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VSOCKETS
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_VSOCKETS
+# NOTE: CONFIG_VIRTIO_VSOCKETS_COMMON is a hidden symbol selected by
+# CONFIG_VIRTIO_VSOCKETS — do not set it explicitly, olddefconfig handles it.
 
 # FUSE + virtiofs (directory sharing)
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_FUSE_FS y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_FS y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_FUSE_FS
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_FS
 
 # VirtIO core (must be built-in)
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_MMIO y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_PCI y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_MMIO
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_PCI
 
 # Serial console (VZ console)
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_HVC_DRIVER y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_VIRTIO_CONSOLE y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_HVC_DRIVER
+"$KERNEL_SRC/scripts/config" --enable CONFIG_VIRTIO_CONSOLE
 
 # Entropy
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_HW_RANDOM_VIRTIO y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_HW_RANDOM_VIRTIO
 
 # devtmpfs (auto-populated /dev)
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_DEVTMPFS y
-"$KERNEL_SRC/scripts/config" --set-val CONFIG_DEVTMPFS_MOUNT y
+"$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS
+"$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS_MOUNT
 
 # Resolve any config dependencies
-make olddefconfig
+# Stderr is kept visible so any Kconfig warnings appear in CI logs.
+if ! make olddefconfig 2>&1; then
+    echo "ERROR: make olddefconfig failed — checking .config state:"
+    grep -E "^CONFIG_MODULES|^CONFIG_VSOCKETS|^CONFIG_VIRTIO" .config 2>/dev/null | sort || true
+    exit 1
+fi
 
 # Verify critical configs survived olddefconfig — it can silently downgrade
 # =y to =m or =n if dependency resolution conflicts. If any of these aren't
