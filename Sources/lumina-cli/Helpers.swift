@@ -18,9 +18,9 @@ func friendlyError(_ error: any Error) -> String {
         if nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOTSUP) {
             return "bootFailed: VM limit reached — macOS restricts the number of concurrent VMs. Reduce parallel runs or use sessions."
         }
-        return String(describing: luminaError)
+        return luminaError.localizedDescription
     default:
-        return String(describing: luminaError)
+        return luminaError.localizedDescription
     }
 }
 
@@ -160,6 +160,22 @@ func resolveStreaming() -> Bool {
     }
     // 3. Auto-detect: TTY = stream, pipe = buffer
     return isatty(STDOUT_FILENO) != 0
+}
+
+// MARK: - Session ID Parsing
+
+/// Parse a session ID from either a bare UUID string or a JSON {"sid":"UUID"} object.
+/// Allows agents to pipe `session start` output directly without JSON extraction:
+///   SID=$(lumina session start) && lumina exec "$SID" "cmd"
+/// Works with both bare UUID (LUMINA_FORMAT=text) and JSON (default piped output).
+func parseSID(_ input: String) -> String {
+    let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let data = trimmed.data(using: .utf8),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let sid = json["sid"] as? String {
+        return sid
+    }
+    return trimmed
 }
 
 // MARK: - Stdin Auto-Detect

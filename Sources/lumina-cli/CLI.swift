@@ -407,10 +407,21 @@ struct ImageList: ParsableCommand {
     func run() throws {
         let store = ImageStore()
         let names = store.list()
-        if names.isEmpty {
-            print("No images found. Run 'lumina pull' first.")
-        } else {
-            for name in names { print(name) }
+        let format = resolveOutputFormat()
+        switch format {
+        case .json:
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            if let data = try? encoder.encode(names),
+               let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+        case .text:
+            if names.isEmpty {
+                print("No images found. Run 'lumina pull' first.")
+            } else {
+                for name in names { print(name) }
+            }
         }
     }
 }
@@ -696,6 +707,7 @@ struct SessionStop: AsyncParsableCommand {
     var sid: String
 
     func run() async throws {
+        let sid = parseSID(self.sid)
         let client = SessionClient()
         do {
             try client.connect(sid: sid)
@@ -786,6 +798,7 @@ struct Exec: AsyncParsableCommand {
     var workdir: String? = nil
 
     func run() async throws {
+        let sid = parseSID(self.sid)
         let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
         guard let parsedTimeout = parseDuration(resolvedTimeout) else {
             FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'\n".utf8))
@@ -826,6 +839,29 @@ struct Exec: AsyncParsableCommand {
         let format = resolveOutputFormat()
         try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv, cwd: workdir))
 
+        // If stdin is piped, forward it to the session server concurrently.
+        // The server routes each stdin chunk to the in-flight exec via StdinChannel.
+        // `stdinClose` signals EOF so the guest command sees its stdin close cleanly.
+        let stdinTask: Task<Void, Never>?
+        if isatty(fileno(stdin)) == 0 {
+            let handle = FileHandle.standardInput
+            stdinTask = Task.detached {
+                while !Task.isCancelled {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty {
+                        // EOF — tell the server stdin is done
+                        try? client.send(.stdinClose)
+                        break
+                    }
+                    let text = String(decoding: chunk, as: UTF8.self)
+                    try? client.send(.stdin(data: text))
+                }
+            }
+        } else {
+            stdinTask = nil
+        }
+        defer { stdinTask?.cancel() }
+
         while true {
             let response = try client.receive()
             switch response {
@@ -841,6 +877,7 @@ struct Exec: AsyncParsableCommand {
                     }
                 }
             case .exit(let code, let durationMs):
+                stdinTask?.cancel()
                 switch format {
                 case .json:
                     printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
@@ -850,6 +887,7 @@ struct Exec: AsyncParsableCommand {
                 if code != 0 { throw ExitCode(code) }
                 return
             case .error(let message):
+                stdinTask?.cancel()
                 FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
                 throw ExitCode.failure
             default:
@@ -982,10 +1020,21 @@ struct VolumeList: ParsableCommand {
     func run() throws {
         let store = VolumeStore()
         let names = store.list()
-        if names.isEmpty {
-            print("No volumes.")
-        } else {
-            for name in names { print(name) }
+        let format = resolveOutputFormat()
+        switch format {
+        case .json:
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            if let data = try? encoder.encode(names),
+               let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+        case .text:
+            if names.isEmpty {
+                print("No volumes.")
+            } else {
+                for name in names { print(name) }
+            }
         }
     }
 }
@@ -1048,6 +1097,9 @@ struct NetworkRun: AsyncParsableCommand {
 
     @Argument(help: "Path to network manifest JSON file")
     var file: String
+
+    @Option(name: .long, help: "Maximum run time (e.g. 30s, 5m, 2h). Exits cleanly on timeout. Default: run until signal.")
+    var timeout: String = ""
 
     func run() async throws {
         // NOTE: sigaction-based installSignalHandlers() is the fallback for other
@@ -1113,8 +1165,19 @@ struct NetworkRun: AsyncParsableCommand {
         do {
             manifest = try JSONDecoder().decode(NetworkManifest.self, from: data)
         } catch {
-            FileHandle.standardError.write(Data("lumina: invalid manifest: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("lumina: invalid manifest: \(error.localizedDescription)\nExpected format: {\"sessions\": [{\"name\": \"vm-name\", \"image\": \"default\"}]}\n".utf8))
             throw ExitCode.failure
+        }
+
+        let timeoutDuration: Duration?
+        if !timeout.isEmpty {
+            guard let parsed = parseDuration(timeout) else {
+                FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 30s, 5m\n".utf8))
+                throw ExitCode.failure
+            }
+            timeoutDuration = parsed
+        } else {
+            timeoutDuration = nil
         }
 
         FileHandle.standardError.write(Data("Starting \(manifest.sessions.count) sessions on shared network...\n".utf8))
@@ -1137,8 +1200,13 @@ struct NetworkRun: AsyncParsableCommand {
             // on SIGTERM: the withNetwork closure would exit, its `defer`s
             // would run to completion, and the process would exit before
             // the signal handler had a chance to clean its own PID's runs.
-            while !Task.isCancelled {
-                try await Task.sleep(for: .seconds(3600))
+            if let td = timeoutDuration {
+                try await Task.sleep(for: td)
+                FileHandle.standardError.write(Data("Timeout reached. Tearing down sessions...\n".utf8))
+            } else {
+                while !Task.isCancelled {
+                    try await Task.sleep(for: .seconds(3600))
+                }
             }
         }
     }

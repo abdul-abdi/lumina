@@ -82,6 +82,18 @@ import Testing
     #expect(opts.directoryDownloads.isEmpty)
 }
 
+@Test func luminaErrorDescriptions() {
+    #expect(LuminaError.imageNotFound("myimg").errorDescription == "image 'myimg' not found")
+    #expect(LuminaError.sessionNotFound("abc-123").errorDescription == "session 'abc-123' not found")
+    #expect(LuminaError.sessionDead("abc-123").errorDescription == "session 'abc-123' is no longer running")
+    #expect(LuminaError.sessionFailed("disk full").errorDescription == "session failed: disk full")
+    #expect(LuminaError.connectionFailed.errorDescription == "failed to connect to guest agent")
+    #expect(LuminaError.timeout.errorDescription == "command timed out")
+    #expect(LuminaError.protocolError("bad json").errorDescription == "protocol error: bad json")
+    #expect(LuminaError.uploadFailed(path: "/tmp/x", reason: "disk full").errorDescription == "upload failed for '/tmp/x': disk full")
+    #expect(LuminaError.downloadFailed(path: "/tmp/y", reason: "file not found").errorDescription == "download failed for '/tmp/y': file not found")
+}
+
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
     // Create a temp image with rosetta metadata
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-types-\(UUID().uuidString)")

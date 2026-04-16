@@ -354,6 +354,25 @@ public enum LuminaError: Error, Sendable {
     case sessionFailed(String)
 }
 
+extension LuminaError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .imageNotFound(let name): "image '\(name)' not found"
+        case .cloneFailed(let e): "failed to clone disk image: \(e.localizedDescription)"
+        case .bootFailed(let e): "VM failed to boot: \(e.localizedDescription)"
+        case .connectionFailed: "failed to connect to guest agent"
+        case .timeout: "command timed out"
+        case .guestCrashed(let output): output.isEmpty ? "guest crashed" : "guest crashed: \(output)"
+        case .protocolError(let msg): "protocol error: \(msg)"
+        case .uploadFailed(let path, let reason): "upload failed for '\(path)': \(reason)"
+        case .downloadFailed(let path, let reason): "download failed for '\(path)': \(reason)"
+        case .sessionNotFound(let id): "session '\(id)' not found"
+        case .sessionDead(let id): "session '\(id)' is no longer running"
+        case .sessionFailed(let reason): "session failed: \(reason)"
+        }
+    }
+}
+
 // MARK: - Duration Helpers
 
 extension Duration {
