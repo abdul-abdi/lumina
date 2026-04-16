@@ -235,22 +235,12 @@ fi
   # Disable IPv6 — VZ NAT only provides IPv4 routing
   echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null
 
-  # Static IP derived from MAC (avoids macOS vmnet DHCP degradation)
-  LUMINA_MAC=$(ip link show eth0 2>/dev/null | awk '/ether/{print $2}')
-  if [ -n "$LUMINA_MAC" ]; then
-    LUMINA_LAST=$(printf '%d' "0x$(echo $LUMINA_MAC | cut -d: -f6)")
-    LUMINA_IP="192.168.64.$(( (LUMINA_LAST % 253) + 2 ))"
-    ip addr add "${LUMINA_IP}/24" dev eth0 2>/dev/null
-    ip route add default via 192.168.64.1 2>/dev/null
-  fi
-  # Fallback: DHCP if static assignment failed
-  if ! ip addr show eth0 2>/dev/null | grep -q 'inet '; then
-    udhcpc -i eth0 -t 1 -T 1 -n -q -s /usr/share/udhcpc/default.script 2>/dev/null
-  fi
-
-  # DNS — gateway as sole nameserver (vmnet runs named(8) on gateway)
-  mkdir -p /etc
-  echo "nameserver 192.168.64.1" > /etc/resolv.conf
+  # DHCP — let vmnet assign the correct IP and gateway.
+  # Static MAC-derived IPs hardcoded the subnet to 192.168.64.0/24, but
+  # vmnet will pick a different range (e.g. 192.168.65.0/24) when that
+  # range is already in use by another interface or VPN. DHCP always gets
+  # the right subnet regardless of which one vmnet chose.
+  udhcpc -i eth0 -t 5 -T 1 -n -q -s /usr/share/udhcpc/default.script 2>/dev/null
 
   # Private networking config — LUMINA_NET_IP / LUMINA_HOSTS were parsed
   # from /proc/cmdline at init start (outer scope).

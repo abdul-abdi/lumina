@@ -593,9 +593,9 @@ func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
 	// Disable IPv6 — VZ NAT only provides IPv4
 	os.WriteFile("/proc/sys/net/ipv6/conf/all/disable_ipv6", []byte("1"), 0644)
 
-	// Apply static IP and route
+	// Apply static IP and replace default route (replace beats init-script race)
 	run("ip", "addr", "add", msg.IP, "dev", "eth0")
-	run("ip", "route", "add", "default", "via", msg.Gateway)
+	run("ip", "route", "replace", "default", "via", msg.Gateway)
 
 	// Write DNS
 	os.MkdirAll("/etc", 0755)

@@ -2,6 +2,7 @@
 import Foundation
 import os
 @preconcurrency import Virtualization
+import Darwin
 
 /// Custom executor that pins all actor work to a specific DispatchQueue.
 /// This satisfies VZVirtualMachine's thread-affinity requirement by making
@@ -676,19 +677,86 @@ public actor VM {
         _state = .ready
     }
 
-    /// Configure guest network via host-driven protocol (fire-and-forget).
-    /// Derives IP from the VZ-assigned MAC address and sends config to the guest agent.
-    /// The guest applies IP/route/DNS instantly; carrier detection happens in the background.
-    public func configureNetwork() throws(LuminaError) {
+    /// Configure guest network via host-driven protocol.
+    /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
+    /// and waits for network_ready before returning — ensuring DNS is live for all
+    /// subsequent exec commands.
+    public func configureNetwork() async throws(LuminaError) {
         guard let runner = commandRunner else { throw .connectionFailed }
         guard let lastByte = macLastByte else { throw .connectionFailed }
 
-        let hostNum = (Int(lastByte) % 253) + 2
-        let ip = "192.168.64.\(hostNum)/24"
-        let gateway = "192.168.64.1"
-        let dns = "192.168.64.1"
+        // Discover the actual vmnet gateway by reading the host bridge interface
+        // that VZNATNetworkDeviceAttachment created. The subnet can vary (e.g.
+        // 192.168.65.0/24 instead of 192.168.64.0/24) if another process or VPN
+        // already holds the default range. Fall back to the historic default if
+        // discovery fails (e.g. no bridge interfaces found yet).
+        let (gateway, subnetPrefix) = Self.discoverVmnetGateway() ?? ("192.168.64.1", "192.168.64")
 
-        try runner.configureNetwork(ip: ip, gateway: gateway, dns: dns)
+        let hostNum = (Int(lastByte) % 253) + 2
+        let ip = "\(subnetPrefix).\(hostNum)/24"
+
+        try await runner.configureNetwork(ip: ip, gateway: gateway, dns: gateway)
+    }
+
+    /// Find the IPv4 address of the host-side vmnet bridge (bridge100, bridge101, …).
+    /// VZNATNetworkDeviceAttachment creates a bridgeXXX interface on the host; its
+    /// IPv4 address is the gateway the guest must route through. The default subnet
+    /// Apple uses is 192.168.64.0/24 but vmnet will pick another (e.g. 192.168.65.0/24)
+    /// when that range is already in use.
+    ///
+    /// The bridge exists immediately, but vmnet assigns its IPv4 address ~20-50ms after
+    /// the VM starts. We poll briefly (up to 300ms) to handle this race.
+    ///
+    /// Returns (gatewayIP, subnetPrefix) e.g. ("192.168.65.1", "192.168.65"), or nil
+    /// if no suitable bridge is found within the timeout.
+    ///
+    /// Note: with multiple concurrent VMs each VM gets its own bridge. This heuristic
+    /// picks the first one found, which is correct for sequential boots but may pick
+    /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
+    /// be needed for a fully correct multi-VM implementation.
+    private static func discoverVmnetGateway() -> (gateway: String, subnetPrefix: String)? {
+        // Poll up to 300ms in 25ms increments. The bridge IPv4 typically appears
+        // within 50ms of boot; 300ms gives comfortable headroom.
+        for attempt in 0..<12 {
+            if attempt > 0 {
+                Thread.sleep(forTimeInterval: 0.025)
+            }
+            if let result = discoverVmnetGatewayOnce() { return result }
+        }
+        return nil
+    }
+
+    private static func discoverVmnetGatewayOnce() -> (gateway: String, subnetPrefix: String)? {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let head = ifap else { return nil }
+        defer { freeifaddrs(head) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = head
+        while let iface = ptr {
+            defer { ptr = iface.pointee.ifa_next }
+
+            guard let namePtr = iface.pointee.ifa_name,
+                  let addrPtr = iface.pointee.ifa_addr else { continue }
+
+            let name = String(cString: namePtr)
+            // VZ NAT creates bridge100, bridge101, … — never bridge0 (Thunderbolt)
+            guard name.hasPrefix("bridge"), name != "bridge0" else { continue }
+            guard addrPtr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let rc = getnameinfo(addrPtr, socklen_t(addrPtr.pointee.sa_len),
+                                 &host, socklen_t(NI_MAXHOST),
+                                 nil, 0, NI_NUMERICHOST)
+            guard rc == 0 else { continue }
+
+            let ip = String(cString: host)
+            let parts = ip.split(separator: ".")
+            guard parts.count == 4 else { continue }
+
+            let prefix = parts.dropLast().joined(separator: ".")
+            return (gateway: ip, subnetPrefix: prefix)
+        }
+        return nil
     }
 
     /// Number of exec commands currently in flight on this VM.
