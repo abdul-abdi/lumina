@@ -155,14 +155,18 @@ public struct Lumina {
             throw LuminaError.sessionFailed("Image build command failed with exit code \(result.exitCode): \(result.stderr)")
         }
 
+        // Flush all dirty pages to the block device before capture.
+        // vm.stop() is a hard stop — without sync, data in the page cache
+        // may not reach the ext4 journal, causing files written by --run
+        // commands to be absent from the captured rootfs.
+        _ = await vm.execResult("sync", timeout: 10)
+
         // Phase 2: Transfer ownership — clone detached, VM shut down cleanly.
         // After this point, WE own the clone and must clean it up.
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()
             throw LuminaError.sessionFailed("No disk clone available")
         }
-        // Clean shutdown flushes the Virtualization framework's disk cache
-        // and the guest kernel's ext4 journal, producing a consistent rootfs.
         await vm.shutdown()
 
         // Phase 3: Copy rootfs into image store (caller owns clone)
@@ -208,6 +212,9 @@ public struct Lumina {
                 )
             }
         }
+
+        // Flush dirty pages before clone capture (same rationale as single-command path).
+        _ = await vm.execResult("sync", timeout: 10)
 
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()
