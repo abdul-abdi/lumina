@@ -110,7 +110,7 @@ import Testing
     let longPath = tmpDir.appendingPathComponent(longName)
     // Verify our constructed path is actually over 103 bytes.
     guard longPath.path.utf8.count > 103 else {
-        // Path construction failed to exceed 103 bytes — skip rather than false-pass.
+        Issue.record("Path construction did not exceed 103 bytes — test cannot verify guard. tmpDir: \(tmpDir.path)")
         return
     }
     let server = SessionServer(socketPath: longPath)

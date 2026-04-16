@@ -1020,6 +1020,11 @@ func integrationSessionExecStdinViaIPC() async throws {
         return
     }
 
+    // Set a 10s read timeout so receive() can't block CI indefinitely if the
+    // guest never responds (e.g. boot failure, agent crash).
+    var tv = timeval(tv_sec: 10, tv_usec: 0)
+    setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
     let client = SessionClient()
     client.injectTestSocket(readFd: clientFd, writeFd: clientFd)
     defer { client.disconnect() }

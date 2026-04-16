@@ -51,6 +51,7 @@ public final class SessionClient: @unchecked Sendable {
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
                 pathBytes.withUnsafeBufferPointer { src in
+                    // Guard above ensures src.count <= 104; min is a safety backstop.
                     let count = min(src.count, 104)
                     dest.update(from: src.baseAddress!, count: count)
                 }

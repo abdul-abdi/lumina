@@ -887,7 +887,10 @@ struct Exec: AsyncParsableCommand {
                 if code != 0 { throw ExitCode(code) }
                 return
             case .outputBytes(let outputStream, let base64):
-                guard let rawBytes = Data(base64Encoded: base64) else { break }
+                guard let rawBytes = Data(base64Encoded: base64) else {
+                    FileHandle.standardError.write(Data("lumina: malformed base64 in outputBytes\n".utf8))
+                    break
+                }
                 let fd = outputStream == .stdout
                     ? FileHandle.standardOutput
                     : FileHandle.standardError
