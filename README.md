@@ -74,17 +74,21 @@ For higher throughput:
 
 1. **Session (best for repeated commands on the same filesystem state)** — boot once, exec many. Warm exec is ~31ms P50 with 1ms stdev.
    ```bash
-   SID=$(LUMINA_FORMAT=text lumina session start)
+   SID=$(lumina session start)
    lumina exec $SID "command1"
    lumina exec $SID "command2"
    lumina session stop $SID
    ```
 
-2. **Parallel `lumina run`** — works up to the ~4 concurrent-VM ceiling. Beyond that, serialize yourself or use a session.
+2. **Pool** — pre-warm N VMs, run commands across them at zero cold-boot cost. Concurrent, results streamed as NDJSON.
+   ```bash
+   lumina pool run --size 4 --count 20 "python3 -c 'import random; print(random.random())'"
+   # Boots 4 VMs once, runs the command 20 times, 4 concurrent
+   ```
 
-3. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` with `value: 4` to stay under the ceiling.
+3. **Parallel `lumina run`** — works up to the ~4 concurrent-VM ceiling. Beyond that, use a session or pool.
 
-Session pools (pre-booted ephemeral VMs for near-zero cold-boot latency) are planned for the next release.
+4. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` with `value: 4` to stay under the ceiling.
 
 ## Usage
 
@@ -122,14 +126,18 @@ Boot once, exec many. Pay ~300ms boot once, then run commands at ~30ms each.
 
 ```bash
 # Start a session — configure resources at creation time
-SID=$(LUMINA_FORMAT=text lumina session start)
-SID=$(LUMINA_FORMAT=text lumina session start --memory 4GB --cpus 4 --disk-size 8GB)
+SID=$(lumina session start)
+SID=$(lumina session start --memory 4GB --cpus 4 --disk-size 8GB)
 
 # Execute commands — ~30ms each (VM already running)
 lumina exec $SID "apk add python3"
 lumina exec $SID "python3 -c 'print(42)'"
 lumina exec $SID -e MY_VAR=hello "echo \$MY_VAR"
 lumina exec $SID --workdir /tmp "pwd"
+
+# Stdin piping — pipe data into a session exec
+echo '{"key": "value"}' | lumina exec $SID "python3 -c 'import sys,json; d=json.load(sys.stdin); print(d)'"
+cat large_file.csv | lumina exec $SID "awk -F, '{sum+=$2} END {print sum}'"
 
 # File transfers via lumina cp
 lumina cp ./script.py $SID:/tmp/script.py
@@ -145,7 +153,7 @@ Sessions with volumes — data persists across sessions and disposable runs:
 
 ```bash
 lumina volume create workspace
-SID=$(LUMINA_FORMAT=text lumina session start --volume workspace:/data)
+SID=$(lumina session start --volume workspace:/data)
 lumina exec $SID "echo 'cached result' > /data/output.txt"
 lumina session stop $SID
 
@@ -246,6 +254,7 @@ Lumina auto-detects everything it can so you type less:
 | **Rosetta** | Read from image metadata at boot. Set via `images create --rosetta`. |
 | **Network** | Always configured. No flags needed. |
 | **Image pull** | Auto-pulls default image on first run if not present. |
+| **Session ID parsing** | `exec` and `session stop` accept `{"sid":"UUID"}` JSON or bare UUID — pipe `session start` output directly without `jq`. |
 
 ---
 
@@ -314,6 +323,17 @@ lumina volume inspect NAME                    # show details + size
 lumina volume remove NAME                     # delete volume
 ```
 
+### `lumina pool` (6 flags on run)
+
+```bash
+lumina pool run --size 4 "command"            # boot 4 VMs, run once each
+lumina pool run --size 4 --count 20 "cmd"     # 4 VMs, 20 total runs (5 per VM)
+lumina pool run --size 4 --concurrency 2 "cmd" # 4 VMs, 2 concurrent at a time
+lumina pool run --size 4 --image python "cmd" # custom image
+lumina pool run --size 4 --memory 2GB "cmd"   # per-VM memory
+lumina pool run --size 4 -e KEY=VAL "cmd"     # env vars
+```
+
 ### `lumina pull` / `lumina clean` / `lumina network`
 
 ```bash
@@ -323,7 +343,7 @@ lumina clean                                  # remove orphaned COW clones
 lumina network run manifest.json              # boot VMs from manifest
 ```
 
-**20 flags total across 17 commands.**
+**26 flags total across 18 commands.**
 
 </details>
 
@@ -445,10 +465,15 @@ sequenceDiagram
 
     EC->>SS: connect to socket
     EC->>SS: {"type":"exec","cmd":"..."}
-    SS->>VM: exec(cmd)
+    par concurrent during exec
+        EC->>SS: {"type":"stdin","data":"..."}
+        SS->>VM: sendStdin via StdinChannel
+        EC->>SS: {"type":"stdin_close"}
+    end
+    SS->>VM: exec(cmd, stdin: StdinChannel)
     VM-->>SS: output chunks + exit
     SS-->>EC: stream responses
-    Note over EC,VM: ~30ms per exec
+    Note over EC,VM: ~30ms per exec (stdin-piped or not)
 
     CP->>SS: connect to socket
     CP->>SS: {"type":"upload","localPath":"..."}
@@ -460,7 +485,7 @@ sequenceDiagram
     SS->>SP: cleanup session directory
 ```
 
-Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts connections, and dispatches to the VM actor. File transfers go through `lumina cp` — a separate command with scp-style syntax.
+Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts concurrent connections, and dispatches to the VM actor. Stdin piping uses a `StdinChannel` bridge — the server reads `stdin`/`stdin_close` messages from the socket concurrently with forwarding exec output. File transfers go through `lumina cp` — a separate command with scp-style syntax.
 
 </details>
 
@@ -547,7 +572,7 @@ sequenceDiagram
 | **DiskClone** | Per-run ephemeral COW clones | PID file-based orphan detection; `cleanOrphans()` via `atexit` + signal handlers |
 | **ImageStore** | Image cache + custom creation | Staging-dir atomicity for crash-safe builds. Rosetta stored in `ImageMeta`. |
 | **VolumeStore** | Named persistent volumes | Host directories at `~/.lumina/volumes/<name>/data/`, mounted via virtio-fs |
-| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, dispatches to VM actor |
+| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, Task-per-connection, concurrent exec stdin via `StdinChannel` |
 | **SessionClient** | Unix socket IPC client | Validates session liveness, sends requests, receives streamed responses |
 | **NetworkSwitch** | Ethernet frame relay | SOCK_DGRAM socketpairs, poll-based broadcast, dynamic port addition |
 | **Network** | VM group manager | Actor coordinating multiple VMs on a shared virtual switch with IP assignment |
@@ -571,7 +596,8 @@ Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is ab
 - **All public types are `Sendable`** — safe to use across concurrency domains
 - **Concurrent exec** — multiple commands run on the same VM via ID-keyed dispatcher
 - **Configuration vs invocation** — image-level settings (rosetta) in metadata, environment-level (memory/cpus) in env vars, per-invocation (timeout/env/workdir) as CLI flags
-- **Network always on** — host-driven config, IP derived from MAC, no flags needed
+- **Network always on** — host-driven config, `network_ready` awaited before exec, no flags needed
+- **Clean error messages** — `LuminaError` conforms to `LocalizedError`; agents see `"image 'x' not found"` not `imageNotFound("x")`
 
 </details>
 
@@ -581,7 +607,7 @@ Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is ab
 
 ```bash
 make build               # debug build + codesign (entitlements required)
-make test                # unit + integration tests (146 tests)
+make test                # unit + integration tests (163 tests)
 make test-integration    # e2e tests (requires VM image + jq)
 make release             # optimized build + codesign
 make install             # release build -> ~/.local/bin/lumina
