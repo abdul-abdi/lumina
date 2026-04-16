@@ -18,7 +18,10 @@ jobs:
           go-version: '1.21'
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs build-essential flex bison bc \
+            libelf-dev libssl-dev curl xz-utils cpio
 
       - name: Build guest agent
         run: |
@@ -26,19 +29,22 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
           file lumina-agent
 
-      - name: Build VM image
-        run: sudo bash Guest/build-image.sh /tmp/lumina-image
+      - name: Build custom kernel (CONFIG_MODULES=n)
+        run: bash Guest/build-kernel.sh /tmp/lumina-kernel/vmlinuz
+
+      - name: Build VM image (baked)
+        run: LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh /tmp/lumina-image
 
       - name: Package image
         run: |
           cd /tmp/lumina-image
-          sudo chmod 644 vmlinuz initrd rootfs.img
-          [ -f lumina-agent ] && sudo chmod 755 lumina-agent
-          [ -d modules ] && sudo chmod 644 modules/*
+          chmod 644 vmlinuz rootfs.img
+          FILES="vmlinuz rootfs.img"
+          [ -f initrd ] && chmod 644 initrd && FILES="$FILES initrd"
+          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES="$FILES lumina-agent"
+          [ -d modules ] && chmod 644 modules/* && FILES="$FILES modules/"
           ls -lhR
-          tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img \
-            $([ -f lumina-agent ] && echo lumina-agent) \
-            $([ -d modules ] && echo modules/)
+          tar czf /tmp/lumina-image-default.tar.gz $FILES
           echo "--- Package ---"
           ls -lh /tmp/lumina-image-default.tar.gz
           echo "--- SHA256 ---"

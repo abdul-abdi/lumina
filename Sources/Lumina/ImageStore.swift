@@ -1,16 +1,45 @@
 // Sources/Lumina/ImageStore.swift
 import Foundation
 
+/// Describes what an image's kernel expects at boot.
+/// Derived from the files present in the image directory; drives VM.boot()
+/// branching and the init-script generation path.
+public enum ImageBootContract: Sendable, Equatable {
+    /// Kernel has all drivers compiled built-in (`CONFIG_MODULES=n`) and boots
+    /// directly to rootfs. Agent is pre-installed at `/usr/local/bin/lumina-agent`
+    /// in the rootfs. Network hosts configured via kernel cmdline parameters.
+    /// Example: Apple's containerization kernel + Alpine rootfs.
+    case baked
+
+    /// Kernel uses loadable modules; requires an initrd to load virtio/ext4/vsock
+    /// drivers before the rootfs can be mounted. Agent is injected into the initrd
+    /// overlay by `InitrdPatcher`. Network hosts written into `/lumina-hosts` via
+    /// initrd overlay.
+    /// Example: Alpine `linux-virt` kernel.
+    case legacyWithInitrd
+}
+
 public struct ImagePaths: Sendable {
     public let kernel: URL
-    public let initrd: URL
+    /// Initramfs image. Nil for baked images where the kernel boots directly
+    /// to rootfs (custom kernel with all drivers built-in, agent in rootfs).
+    public let initrd: URL?
     public let rootfs: URL
     /// Path to the guest agent binary (linux/arm64 ELF).
     /// Present when the image directory contains a `lumina-agent` file.
+    /// Nil for baked images (agent pre-installed in rootfs).
     public let agent: URL?
     /// Directory containing vsock kernel modules (.ko.gz).
     /// Present when the image directory contains a `modules/` subdirectory.
+    /// Nil for custom kernel images (drivers compiled built-in).
     public let modulesDir: URL?
+
+    /// What this image's kernel expects at boot. Derived from file layout —
+    /// images without initrd require a baked-drivers kernel; images with initrd
+    /// assume a modular kernel needing per-boot module loading.
+    public var bootContract: ImageBootContract {
+        initrd == nil ? .baked : .legacyWithInitrd
+    }
 }
 
 public struct ImageStore: Sendable {
@@ -33,12 +62,13 @@ public struct ImageStore: Sendable {
         let agent = dir.appendingPathComponent("lumina-agent")
 
         guard FileManager.default.fileExists(atPath: kernel.path),
-              FileManager.default.fileExists(atPath: initrd.path),
               FileManager.default.fileExists(atPath: rootfs.path)
         else {
             throw .imageNotFound(name)
         }
 
+        // initrd is optional — baked images (custom kernel) boot directly to rootfs
+        let initrdURL: URL? = FileManager.default.fileExists(atPath: initrd.path) ? initrd : nil
         let agentURL: URL? = FileManager.default.fileExists(atPath: agent.path) ? agent : nil
         let modulesURL: URL? = {
             let dir = dir.appendingPathComponent("modules")
@@ -46,7 +76,7 @@ public struct ImageStore: Sendable {
             return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir)
                 && isDir.boolValue ? dir : nil
         }()
-        return ImagePaths(kernel: kernel, initrd: initrd, rootfs: rootfs, agent: agentURL, modulesDir: modulesURL)
+        return ImagePaths(kernel: kernel, initrd: initrdURL, rootfs: rootfs, agent: agentURL, modulesDir: modulesURL)
     }
 
     public func list() -> [String] {
@@ -63,6 +93,16 @@ public struct ImageStore: Sendable {
             .sorted()
     }
 
+    /// Read image metadata. Returns nil if the image has no meta.json.
+    public func readMeta(name: String) -> ImageMeta? {
+        let metaFile = baseDir.appendingPathComponent(name).appendingPathComponent("meta.json")
+        guard let data = try? Data(contentsOf: metaFile),
+              let meta = try? JSONDecoder().decode(ImageMeta.self, from: data) else {
+            return nil
+        }
+        return meta
+    }
+
     public func clean(name: String) {
         let dir = baseDir.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: dir)
@@ -74,7 +114,8 @@ public struct ImageStore: Sendable {
         name: String,
         from base: String,
         rootfsSource: URL,
-        command: String
+        command: String,
+        rosetta: Bool = false
     ) throws {
         let fm = FileManager.default
 
@@ -115,7 +156,7 @@ public struct ImageStore: Sendable {
             }
 
             // Write meta.json
-            let meta = ImageMeta(base: base, command: command, created: Date())
+            let meta = ImageMeta(base: base, command: command, created: Date(), rosetta: rosetta)
             let metaData = try JSONEncoder().encode(meta)
             try metaData.write(to: stagingDir.appendingPathComponent("meta.json"))
 
@@ -158,19 +199,21 @@ public struct ImageStore: Sendable {
 
         var base: String? = nil
         var command: String? = nil
+        var rosetta = false
         var created = Date()
 
         if let data = try? Data(contentsOf: metaFile),
            let meta = try? JSONDecoder().decode(ImageMeta.self, from: data) {
             base = meta.base
             command = meta.command
+            rosetta = meta.rosetta
             created = meta.created
         }
 
         let attrs = try? FileManager.default.attributesOfItem(atPath: rootfs.path)
         let size = attrs?[.size] as? UInt64 ?? 0
 
-        return ImageInfo(name: name, base: base, command: command, created: created, sizeBytes: size)
+        return ImageInfo(name: name, base: base, command: command, rosetta: rosetta, created: created, sizeBytes: size)
     }
 
     /// Clean up staging directories left by crashed image creation attempts.

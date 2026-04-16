@@ -76,3 +76,75 @@ import Testing
     let decoded = try SessionProtocol.decodeRequest(data)
     #expect(decoded == req)
 }
+
+@Test func encodeStdinRequest() throws {
+    let req = SessionRequest.stdin(data: "hello world\n")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin")
+    #expect(json["data"] as? String == "hello world\n")
+}
+
+@Test func decodeStdinRequestRoundtrip() throws {
+    let req = SessionRequest.stdin(data: "test input")
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
+
+@Test func encodeStdinCloseRequest() throws {
+    let req = SessionRequest.stdinClose
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin_close")
+}
+
+@Test func decodeStdinCloseRoundtrip() throws {
+    let data = Data("{\"type\":\"stdin_close\"}\n".utf8)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == .stdinClose)
+}
+
+@Test func decodeStdinCloseEncodeRoundtrip() throws {
+    let req = SessionRequest.stdinClose
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
+
+@Test func encodeExecRequestWithCwd() throws {
+    let req = SessionRequest.exec(cmd: "pwd", timeout: 30, env: [:], cwd: "/code")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["cmd"] as? String == "pwd")
+    #expect(json["cwd"] as? String == "/code")
+}
+
+@Test func decodeExecRequestWithCwd() throws {
+    let json = "{\"type\":\"exec\",\"cmd\":\"pwd\",\"timeout\":30,\"env\":{},\"cwd\":\"/code\"}\n"
+    let req = try SessionProtocol.decodeRequest(Data(json.utf8))
+    #expect(req == .exec(cmd: "pwd", timeout: 30, env: [:], cwd: "/code"))
+}
+
+@Test func decodeExecRequestWithoutCwd() throws {
+    let json = "{\"type\":\"exec\",\"cmd\":\"pwd\",\"timeout\":30,\"env\":{}}\n"
+    let req = try SessionProtocol.decodeRequest(Data(json.utf8))
+    #expect(req == .exec(cmd: "pwd", timeout: 30, env: [:], cwd: nil))
+}
+
+@Test func encodeOutputBytesResponse() throws {
+    let bytes = Data([0x00, 0xFF, 0xDE, 0xAD])
+    let response = SessionResponse.outputBytes(stream: .stdout, base64: bytes.base64EncodedString())
+    let data = try SessionProtocol.encode(response)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "output_bytes")
+    #expect(json["stream"] as? String == "stdout")
+    #expect(json["base64"] as? String == bytes.base64EncodedString())
+}
+
+@Test func decodeOutputBytesResponse() throws {
+    let b64 = Data([0x00, 0xFF]).base64EncodedString()
+    let raw = Data("{\"base64\":\"\(b64)\",\"stream\":\"stdout\",\"type\":\"output_bytes\"}\n".utf8)
+    let msg = try SessionProtocol.decodeResponse(raw)
+    #expect(msg == .outputBytes(stream: .stdout, base64: b64))
+}

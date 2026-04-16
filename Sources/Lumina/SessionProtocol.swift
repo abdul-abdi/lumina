@@ -4,10 +4,12 @@ import Foundation
 // MARK: - Session Request (host → session server)
 
 public enum SessionRequest: Sendable, Equatable {
-    case exec(cmd: String, timeout: Int, env: [String: String])
+    case exec(cmd: String, timeout: Int, env: [String: String], cwd: String? = nil)
     case upload(localPath: String, remotePath: String)
     case download(remotePath: String, localPath: String)
     case cancel(signal: Int32, gracePeriod: Int)
+    case stdin(data: String)
+    case stdinClose
     case shutdown
 }
 
@@ -15,6 +17,10 @@ public enum SessionRequest: Sendable, Equatable {
 
 public enum SessionResponse: Sendable, Equatable {
     case output(stream: OutputStream, data: String)
+    /// Binary output chunk — `base64` is the base64-encoded raw bytes.
+    /// Matches the vsock binary stdout envelope so binary data survives
+    /// the session IPC layer without lossy UTF-8 conversion.
+    case outputBytes(stream: OutputStream, base64: String)
     case exit(code: Int32, durationMs: Int)
     case error(message: String)
     case uploadDone(path: String)
@@ -29,14 +35,20 @@ public enum SessionProtocol {
     public static func encode(_ request: SessionRequest) throws -> Data {
         let dict: [String: Any]
         switch request {
-        case .exec(let cmd, let timeout, let env):
-            dict = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+        case .exec(let cmd, let timeout, let env, let cwd):
+            var d: [String: Any] = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
+            if let cwd = cwd { d["cwd"] = cwd }
+            dict = d
         case .upload(let localPath, let remotePath):
             dict = ["type": "upload", "local_path": localPath, "remote_path": remotePath]
         case .download(let remotePath, let localPath):
             dict = ["type": "download", "remote_path": remotePath, "local_path": localPath]
         case .cancel(let signal, let gracePeriod):
             dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
+        case .stdin(let data):
+            dict = ["type": "stdin", "data": data]
+        case .stdinClose:
+            dict = ["type": "stdin_close"]
         case .shutdown:
             dict = ["type": "shutdown"]
         }
@@ -50,6 +62,8 @@ public enum SessionProtocol {
         switch response {
         case .output(let stream, let data):
             dict = ["type": "output", "stream": stream.rawValue, "data": data]
+        case .outputBytes(let stream, let base64):
+            dict = ["type": "output_bytes", "stream": stream.rawValue, "base64": base64]
         case .exit(let code, let durationMs):
             dict = ["type": "exit", "code": Int(code), "duration_ms": durationMs]
         case .error(let message):
@@ -79,7 +93,8 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed exec request")
             }
             let env = json["env"] as? [String: String] ?? [:]
-            return .exec(cmd: cmd, timeout: timeout, env: env)
+            let cwd = json["cwd"] as? String
+            return .exec(cmd: cmd, timeout: timeout, env: env, cwd: cwd)
         case "upload":
             guard let localPath = json["local_path"] as? String,
                   let remotePath = json["remote_path"] as? String else {
@@ -96,6 +111,13 @@ public enum SessionProtocol {
             let signal = (json["signal"] as? Int).map { Int32($0) } ?? Int32(SIGTERM)
             let gracePeriod = json["grace_period"] as? Int ?? 5
             return .cancel(signal: signal, gracePeriod: gracePeriod)
+        case "stdin":
+            guard let data = json["data"] as? String else {
+                throw LuminaError.protocolError("Malformed stdin request")
+            }
+            return .stdin(data: data)
+        case "stdin_close":
+            return .stdinClose
         case "shutdown":
             return .shutdown
         default:
@@ -119,6 +141,13 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed output response")
             }
             return .output(stream: stream, data: data)
+        case "output_bytes":
+            guard let streamStr = json["stream"] as? String,
+                  let stream = OutputStream(rawValue: streamStr),
+                  let base64 = json["base64"] as? String else {
+                throw LuminaError.protocolError("Malformed output_bytes response")
+            }
+            return .outputBytes(stream: stream, base64: base64)
         case "exit":
             guard let code = json["code"] as? Int,
                   let durationMs = json["duration_ms"] as? Int else {

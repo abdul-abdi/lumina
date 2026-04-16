@@ -50,25 +50,33 @@ jobs:
           cache-dependency-path: Guest/lumina-agent/go.sum
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs build-essential flex bison bc \
+            libelf-dev libssl-dev curl xz-utils cpio
 
       - name: Build guest agent
         run: |
           cd Guest/lumina-agent
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
-      - name: Build VM image
-        run: sudo bash Guest/build-image.sh /tmp/lumina-image
+      - name: Build custom kernel (CONFIG_MODULES=n)
+        run: bash Guest/build-kernel.sh /tmp/lumina-kernel/vmlinuz
+
+      - name: Build VM image (baked)
+        run: LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh /tmp/lumina-image
 
       - name: Package image
         run: |
           cd /tmp/lumina-image
-          sudo chmod 644 vmlinuz initrd rootfs.img
-          [ -f lumina-agent ] && sudo chmod 755 lumina-agent
-          [ -d modules ] && sudo chmod 644 modules/*
-          tar czf /tmp/lumina-image-default.tar.gz vmlinuz initrd rootfs.img \
-            $([ -f lumina-agent ] && echo lumina-agent) \
-            $([ -d modules ] && echo modules/)
+          chmod 644 vmlinuz rootfs.img
+          # Baked images: only vmlinuz + rootfs.img
+          # Legacy images: also include initrd, lumina-agent, modules/
+          FILES="vmlinuz rootfs.img"
+          [ -f initrd ] && chmod 644 initrd && FILES="$FILES initrd"
+          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES="$FILES lumina-agent"
+          [ -d modules ] && chmod 644 modules/* && FILES="$FILES modules/"
+          tar czf /tmp/lumina-image-default.tar.gz $FILES
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -76,7 +84,7 @@ jobs:
           name: lumina-image-default
           path: /tmp/lumina-image-default.tar.gz
 
-  # ── Job 3: Create release (waits for both builds) ───────────
+  # ── Job 3: Create release with structured notes ─────────────
   publish:
     name: Publish Release
     needs: [build-cli, build-image]
@@ -96,13 +104,117 @@ jobs:
           name: lumina-image-default
           path: artifacts/
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#lumina-v}"
+
+          # Find previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep "^lumina-v" | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Collect commits by category
+          FEATS=""
+          FIXES=""
+          PERF=""
+          CHORE=""
+          OTHER=""
+
+          while IFS= read -r line; do
+            HASH=$(echo "$line" | cut -d' ' -f1)
+            MSG=$(echo "$line" | cut -d' ' -f2-)
+            ENTRY="- ${MSG} (\`${HASH}\`)"
+
+            case "$MSG" in
+              feat:*|feat\(*) FEATS="${FEATS}${ENTRY}"$'\n' ;;
+              fix:*|fix\(*)   FIXES="${FIXES}${ENTRY}"$'\n' ;;
+              perf:*|perf\(*) PERF="${PERF}${ENTRY}"$'\n' ;;
+              chore:*|ci:*|docs:*|test:*|refactor:*) CHORE="${CHORE}${ENTRY}"$'\n' ;;
+              *)              OTHER="${OTHER}${ENTRY}"$'\n' ;;
+            esac
+          done < <(git log --oneline "$RANGE" 2>/dev/null)
+
+          # Generate checksums
+          CLI_SHA=$(sha256sum artifacts/lumina | cut -d' ' -f1)
+          IMG_SHA=$(sha256sum artifacts/lumina-image-default.tar.gz | cut -d' ' -f1)
+          CLI_SIZE=$(du -h artifacts/lumina | cut -f1 | tr -d ' ')
+          IMG_SIZE=$(du -h artifacts/lumina-image-default.tar.gz | cut -f1 | tr -d ' ')
+
+          # Build release body
+          cat > /tmp/release-body.md << BODY_EOF
+          ## What's New
+
+          BODY_EOF
+
+          [ -n "$FEATS" ] && printf '### Features\n%s\n' "$FEATS" >> /tmp/release-body.md
+          [ -n "$FIXES" ] && printf '### Bug Fixes\n%s\n' "$FIXES" >> /tmp/release-body.md
+          [ -n "$PERF" ]  && printf '### Performance\n%s\n' "$PERF" >> /tmp/release-body.md
+          [ -n "$CHORE" ] && printf '### Maintenance\n%s\n' "$CHORE" >> /tmp/release-body.md
+          [ -n "$OTHER" ] && printf '### Other\n%s\n' "$OTHER" >> /tmp/release-body.md
+
+          cat >> /tmp/release-body.md << BODY_EOF
+
+          ## Install
+
+          \`\`\`bash
+          # Download and install the CLI
+          curl -fsSL https://github.com/abdul-abdi/lumina/releases/download/${TAG}/lumina -o lumina
+          chmod +x lumina
+          sudo mv lumina /usr/local/bin/
+
+          # Download the default VM image
+          curl -fsSL https://github.com/abdul-abdi/lumina/releases/download/${TAG}/lumina-image-default.tar.gz -o lumina-image.tar.gz
+          mkdir -p ~/.lumina/images/default
+          tar xzf lumina-image.tar.gz -C ~/.lumina/images/default
+          rm lumina-image.tar.gz
+
+          # Verify
+          lumina run "echo hello from lumina v${VERSION}"
+          \`\`\`
+
+          Or add as a Swift package dependency:
+          \`\`\`swift
+          .package(url: "https://github.com/abdul-abdi/lumina.git", from: "${VERSION}")
+          \`\`\`
+
+          ## Artifacts
+
+          | File | Size | SHA-256 |
+          |------|------|---------|
+          | \`lumina\` (macOS arm64 CLI) | ${CLI_SIZE} | \`${CLI_SHA}\` |
+          | \`lumina-image-default.tar.gz\` (Alpine VM image) | ${IMG_SIZE} | \`${IMG_SHA}\` |
+
+          ## Requirements
+
+          - macOS 14+ on Apple Silicon
+          - No external dependencies (library), swift-argument-parser (CLI only)
+
+          ---
+          **Full Changelog**: https://github.com/abdul-abdi/lumina/compare/${PREV_TAG}...${TAG}
+          BODY_EOF
+
+          # Extract a human-readable title from the first feat commit, or use version
+          TITLE_HINT=$(echo "$FEATS" | head -1 | sed 's/^- feat: //' | sed 's/ (`.*$//' | head -c 60)
+          if [ -n "$TITLE_HINT" ]; then
+            TITLE="Lumina v${VERSION} — ${TITLE_HINT}"
+          else
+            TITLE="Lumina v${VERSION}"
+          fi
+
+          echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
+            --title "${{ steps.notes.outputs.title }}" \
+            --notes-file /tmp/release-body.md \
             --latest \
             artifacts/lumina \
             artifacts/lumina-image-default.tar.gz

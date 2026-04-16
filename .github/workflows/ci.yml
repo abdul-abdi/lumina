@@ -7,9 +7,9 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    name: Build & Smoke Test
-    runs-on: macos-15  # Apple Silicon runner with Swift 6
+  test:
+    name: Build & Test
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
@@ -18,27 +18,23 @@ jobs:
       - name: Swift version
         run: swift --version
 
-      - name: Build
-        run: swift build
-
-      - name: Codesign with entitlements
+      - name: Build & codesign
         run: |
+          swift build
           BIN_PATH=$(swift build --show-bin-path)/lumina
           codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
-
-      - name: Smoke test (--help)
-        run: |
-          BIN_PATH=$(swift build --show-bin-path)/lumina
           "$BIN_PATH" --help
 
-  test:
-    name: Unit Tests
-    runs-on: macos-15
-    permissions:
-      contents: read
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run all unit tests
+      - name: Run unit tests
         run: swift test
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache-dependency-path: Guest/lumina-agent/go.sum
+
+      - name: Verify guest agent compiles
+        run: |
+          cd Guest/lumina-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
+          echo "Guest agent: OK"

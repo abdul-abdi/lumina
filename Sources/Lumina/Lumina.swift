@@ -14,6 +14,9 @@ public struct Lumina {
 
             try await vm.bootResult().get()
 
+            // Host-driven network config — always configure, always wait
+            try await vm.configureNetwork()
+
             let elapsed = ContinuousClock.now - start
             guard elapsed < options.timeout else {
                 throw LuminaError.timeout
@@ -30,13 +33,19 @@ public struct Lumina {
 
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env).get()
+            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin).get()
 
-            // Download files after exec
-            if !options.downloads.isEmpty {
-                try await vm.downloadFilesResult(options.downloads).get()
+            // Download after exec — auto-detect file vs directory on guest
+            for dl in options.downloads {
+                let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+                let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
+                if check.exitCode == 0 {
+                    try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+                } else {
+                    try await vm.downloadFiles([dl])
+                }
             }
-            // Download directories after exec
+            // Explicit directory downloads (library API)
             for dir in options.directoryDownloads {
                 try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
             }
@@ -46,7 +55,9 @@ public struct Lumina {
                 stdout: result.stdout,
                 stderr: result.stderr,
                 exitCode: result.exitCode,
-                wallTime: totalWallTime
+                wallTime: totalWallTime,
+                stdoutBytes: result.stdoutBytes,
+                stderrBytes: result.stderrBytes
             )
         }
     }
@@ -64,6 +75,8 @@ public struct Lumina {
                         let start = ContinuousClock.now
                         try await vm.bootResult().get()
 
+                        try await vm.configureNetwork()
+
                         let elapsed = ContinuousClock.now - start
                         guard elapsed < options.timeout else {
                             throw LuminaError.timeout
@@ -80,14 +93,20 @@ public struct Lumina {
                         let remaining = options.timeout - elapsed
                         let remainingSeconds = max(Int(remaining.components.seconds), 1)
 
-                        let chunks = try await vm.stream(command, timeout: remainingSeconds, env: options.env)
+                        let chunks = try await vm.stream(command, timeout: remainingSeconds, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
                         for try await chunk in chunks {
                             continuation.yield(chunk)
                         }
 
-                        // Download files after stream completes
-                        if !options.downloads.isEmpty {
-                            try await vm.downloadFilesResult(options.downloads).get()
+                        // Download after stream — auto-detect file vs directory on guest
+                        for dl in options.downloads {
+                            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+                            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
+                            if check.exitCode == 0 {
+                                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+                            } else {
+                                try await vm.downloadFiles([dl])
+                            }
                         }
                         for dir in options.directoryDownloads {
                             try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
@@ -108,44 +127,67 @@ public struct Lumina {
     /// Unlike `run`, this manages the VM lifecycle manually: after the build
     /// command completes, the clone is detached, the VM is shut down cleanly
     /// (flushing the ext4 journal), and then the rootfs is copied to the image store.
+    /// Delegates to the multi-command overload with a single-element array.
     public static func createImage(
         name: String,
         from base: String = "default",
         command: String,
-        options: RunOptions = .default
+        options: RunOptions = .default,
+        rosetta: Bool = false
     ) async throws {
+        try await createImage(name: name, from: base, commands: [command], options: options, rosetta: rosetta)
+    }
+
+    /// Create a custom image by running multiple commands sequentially.
+    /// Aborts on first non-zero exit. Staging dir is NOT promoted on failure.
+    public static func createImage(
+        name: String,
+        from base: String = "default",
+        commands: [String],
+        options: RunOptions = .default,
+        rosetta: Bool = false
+    ) async throws {
+        guard !commands.isEmpty else {
+            throw LuminaError.sessionFailed("No build commands provided")
+        }
+
         var opts = options
         opts.image = base
-        let vmOptions = VMOptions(from: opts)
+        var vmOptions = VMOptions(from: opts)
+        if rosetta { vmOptions.rosetta = true }
         let vm = VM(options: vmOptions)
 
-        // Phase 1: Run command (VM owns everything — shutdown handles cleanup on failure)
         do {
             try await vm.bootResult().get()
+            try await vm.configureNetwork()
         } catch {
             await vm.shutdown()
             throw error
         }
-        let result = try await vm.execResult(command, timeout: max(Int(opts.timeout.components.seconds), 1), env: opts.env).get()
-        guard result.success else {
-            await vm.shutdown()
-            throw LuminaError.sessionFailed("Image build command failed with exit code \(result.exitCode): \(result.stderr)")
+
+        let timeoutSecs = max(Int(opts.timeout.components.seconds), 1)
+        for (index, cmd) in commands.enumerated() {
+            let result = try await vm.execResult(cmd, timeout: timeoutSecs, env: opts.env).get()
+            guard result.success else {
+                await vm.shutdown()
+                throw LuminaError.sessionFailed(
+                    "Image build step \(index + 1)/\(commands.count) failed (exit \(result.exitCode)): \(result.stderr)"
+                )
+            }
         }
 
-        // Phase 2: Transfer ownership — clone detached, VM shut down cleanly.
-        // After this point, WE own the clone and must clean it up.
+        // Flush dirty pages before clone capture (same rationale as single-command path).
+        _ = await vm.execResult("sync", timeout: 10)
+
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()
             throw LuminaError.sessionFailed("No disk clone available")
         }
-        // Clean shutdown flushes the Virtualization framework's disk cache
-        // and the guest kernel's ext4 journal, producing a consistent rootfs.
         await vm.shutdown()
 
-        // Phase 3: Copy rootfs into image store (caller owns clone)
         defer { clone.remove() }
         let store = ImageStore()
-        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: command)
+        try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "), rosetta: rosetta)
     }
 
     /// Run a closure with a private network of VMs.

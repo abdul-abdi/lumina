@@ -6,7 +6,7 @@ import Testing
 @Test func sessionOptionsDefaults() {
     let opts = SessionOptions()
     #expect(opts.cpuCount == 2)
-    #expect(opts.memory == 512 * 1024 * 1024)
+    #expect(opts.memory == 1024 * 1024 * 1024)
     #expect(opts.image == "default")
     #expect(opts.volumes.isEmpty)
 }

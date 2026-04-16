@@ -98,3 +98,23 @@ import Testing
 
     _ = server // keep server alive
 }
+
+@Test func bindRejectsPathExceeding103Bytes() throws {
+    // sockaddr_un.sun_path is 104 bytes on macOS (including null terminator).
+    // Paths > 103 bytes must be rejected before silent truncation occurs.
+    let tmpDir = FileManager.default.temporaryDirectory
+    // Build a path that uses all of the available 103 bytes.
+    // tmpDir.path is typically ~40 chars; pad with 'a's to reach exactly 104.
+    let padding = String(repeating: "a", count: max(1, 104 - tmpDir.path.count - 1))
+    let longName = padding + ".sock"
+    let longPath = tmpDir.appendingPathComponent(longName)
+    // Verify our constructed path is actually over 103 bytes.
+    guard longPath.path.utf8.count > 103 else {
+        Issue.record("Path construction did not exceed 103 bytes — test cannot verify guard. tmpDir: \(tmpDir.path)")
+        return
+    }
+    let server = SessionServer(socketPath: longPath)
+    #expect(throws: (any Error).self) {
+        try server.bind()
+    }
+}

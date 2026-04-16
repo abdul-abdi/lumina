@@ -57,6 +57,20 @@ public struct MountPoint: Sendable {
     }
 }
 
+// MARK: - Stdin
+
+/// Stdin source for a command. Default `.closed` sends stdinClose immediately
+/// so the guest sees EOF; `.source` streams chunks until the closure returns
+/// nil (EOF), then closes.
+///
+/// Stdin data today is UTF-8. Non-UTF-8 bytes are lossy-converted via
+/// `String(decoding:as:)`. Binary-safe stdin is planned alongside the
+/// binary-stdout base64 envelope.
+public enum Stdin: Sendable {
+    case closed
+    case source(@Sendable () async throws -> Data?)
+}
+
 // MARK: - Run Options
 
 public struct RunOptions: Sendable {
@@ -70,12 +84,18 @@ public struct RunOptions: Sendable {
     public var directoryUploads: [DirectoryUpload]
     public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
+    public var workingDirectory: String?
+    /// Disk size in bytes. When larger than the image rootfs, the COW clone
+    /// is resized before boot. Nil means use the image's original size.
+    public var diskSize: UInt64?
+    /// Stdin source. Default `.closed` sends EOF immediately.
+    public var stdin: Stdin
 
     public static let `default` = RunOptions()
 
     public init(
         timeout: Duration = .seconds(60),
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
         env: [String: String] = [:],
@@ -83,7 +103,10 @@ public struct RunOptions: Sendable {
         downloads: [FileDownload] = [],
         directoryUploads: [DirectoryUpload] = [],
         directoryDownloads: [DirectoryDownload] = [],
-        mounts: [MountPoint] = []
+        mounts: [MountPoint] = [],
+        workingDirectory: String? = nil,
+        diskSize: UInt64? = nil,
+        stdin: Stdin = .closed
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -95,6 +118,9 @@ public struct RunOptions: Sendable {
         self.directoryUploads = directoryUploads
         self.directoryDownloads = directoryDownloads
         self.mounts = mounts
+        self.workingDirectory = workingDirectory
+        self.diskSize = diskSize
+        self.stdin = stdin
     }
 }
 
@@ -109,18 +135,22 @@ public struct VMOptions: Sendable {
     public var privateNetworkFd: Int32?  // Raw fd, not FileHandle (FileHandle isn't Sendable)
     public var networkHosts: [String: String]?
     public var networkIP: String?
+    public var rosetta: Bool
+    public var diskSize: UInt64?
 
     public static let `default` = VMOptions()
 
     public init(
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         cpuCount: Int = 2,
         image: String = "default",
         networkProvider: any NetworkProvider = NATNetworkProvider(),
         mounts: [MountPoint] = [],
         privateNetworkFd: Int32? = nil,
         networkHosts: [String: String]? = nil,
-        networkIP: String? = nil
+        networkIP: String? = nil,
+        rosetta: Bool = false,
+        diskSize: UInt64? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -130,6 +160,8 @@ public struct VMOptions: Sendable {
         self.privateNetworkFd = privateNetworkFd
         self.networkHosts = networkHosts
         self.networkIP = networkIP
+        self.rosetta = rosetta
+        self.diskSize = diskSize
     }
 
     public init(from runOptions: RunOptions) {
@@ -141,6 +173,9 @@ public struct VMOptions: Sendable {
         self.privateNetworkFd = nil
         self.networkHosts = nil
         self.networkIP = nil
+        self.diskSize = runOptions.diskSize
+        // Auto-detect rosetta from image metadata
+        self.rosetta = ImageStore().readMeta(name: runOptions.image)?.rosetta ?? false
     }
 }
 
@@ -152,13 +187,22 @@ public struct RunResult: Sendable {
     public let exitCode: Int32
     public let wallTime: Duration
 
+    /// Raw stdout bytes when any chunk was binary (non-UTF-8). When set,
+    /// `stdout` is the lossy UTF-8 conversion; `stdoutBytes` is byte-exact.
+    /// Nil when all chunks were valid UTF-8 — in which case `stdout` is
+    /// byte-exact as well via String.utf8.
+    public let stdoutBytes: Data?
+    public let stderrBytes: Data?
+
     public var success: Bool { exitCode == 0 }
 
-    public init(stdout: String, stderr: String, exitCode: Int32, wallTime: Duration) {
+    public init(stdout: String, stderr: String, exitCode: Int32, wallTime: Duration, stdoutBytes: Data? = nil, stderrBytes: Data? = nil) {
         self.stdout = stdout
         self.stderr = stderr
         self.exitCode = exitCode
         self.wallTime = wallTime
+        self.stdoutBytes = stdoutBytes
+        self.stderrBytes = stderrBytes
     }
 }
 
@@ -167,6 +211,12 @@ public struct RunResult: Sendable {
 public enum OutputChunk: Sendable, Equatable {
     case stdout(String)
     case stderr(String)
+    /// Raw binary chunk. Produced when the guest emits a non-UTF-8 chunk
+    /// (wire-encoded as base64). Consumers that want binary-safe output
+    /// should handle these cases; text-only consumers can ignore them or
+    /// convert with `String(decoding:as:)` which will be lossy.
+    case stdoutBytes(Data)
+    case stderrBytes(Data)
     case exit(Int32)
 }
 
@@ -176,7 +226,6 @@ public enum VMState: Sendable, Equatable {
     case idle
     case booting
     case ready
-    case executing
     case shutdown
 }
 
@@ -192,7 +241,7 @@ public struct SessionOptions: Sendable {
 
     public init(
         cpuCount: Int = 2,
-        memory: UInt64 = 512 * 1024 * 1024,
+        memory: UInt64 = 1024 * 1024 * 1024,
         image: String = "default",
         timeout: Duration = .seconds(60),
         env: [String: String] = [:],
@@ -256,6 +305,7 @@ public struct ImageInfo: Sendable {
     public let name: String
     public let base: String?
     public let command: String?
+    public let rosetta: Bool
     public let created: Date
     public let sizeBytes: UInt64
 }
@@ -264,11 +314,26 @@ public struct ImageMeta: Sendable, Codable {
     public let base: String?
     public let command: String?
     public let created: Date
+    public let rosetta: Bool
 
-    public init(base: String?, command: String?, created: Date) {
+    public init(base: String?, command: String?, created: Date, rosetta: Bool = false) {
         self.base = base
         self.command = command
         self.created = created
+        self.rosetta = rosetta
+    }
+
+    // Backward-compatible decoding: old images lack the rosetta field
+    private enum CodingKeys: String, CodingKey {
+        case base, command, created, rosetta
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        base = try container.decodeIfPresent(String.self, forKey: .base)
+        command = try container.decodeIfPresent(String.self, forKey: .command)
+        created = try container.decode(Date.self, forKey: .created)
+        rosetta = try container.decodeIfPresent(Bool.self, forKey: .rosetta) ?? false
     }
 }
 
@@ -287,6 +352,25 @@ public enum LuminaError: Error, Sendable {
     case sessionNotFound(String)
     case sessionDead(String)
     case sessionFailed(String)
+}
+
+extension LuminaError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .imageNotFound(let name): "image '\(name)' not found"
+        case .cloneFailed(let e): "failed to clone disk image: \(e.localizedDescription)"
+        case .bootFailed(let e): "VM failed to boot: \(e.localizedDescription)"
+        case .connectionFailed: "failed to connect to guest agent"
+        case .timeout: "command timed out"
+        case .guestCrashed(let output): output.isEmpty ? "guest crashed" : "guest crashed: \(output)"
+        case .protocolError(let msg): "protocol error: \(msg)"
+        case .uploadFailed(let path, let reason): "upload failed for '\(path)': \(reason)"
+        case .downloadFailed(let path, let reason): "download failed for '\(path)': \(reason)"
+        case .sessionNotFound(let id): "session '\(id)' not found"
+        case .sessionDead(let id): "session '\(id)' is no longer running"
+        case .sessionFailed(let reason): "session failed: \(reason)"
+        }
+    }
 }
 
 // MARK: - Duration Helpers

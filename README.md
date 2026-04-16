@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Boot a Linux VM, run a command, get the output.<br>
-One function call. ~1.6s cold start. ~30ms warm exec. Zero host access.
+One function call. ~1.6s cold start (~300ms with custom kernel). ~30ms warm exec. Zero host access.
 
 ![demo](demo.gif)
 
@@ -23,14 +23,14 @@ One function call. ~1.6s cold start. ~30ms warm exec. Zero host access.
 
 ## Get Started
 
-> **Requires:** macOS 14+ (Sonoma) · Apple Silicon (M1/M2/M3/M4) · Go 1.21+ (guest agent only)
+> **Requires:** macOS 14+ (Sonoma) &middot; Apple Silicon (M1/M2/M3/M4)
 
 ```bash
 make install                        # build + install to ~/.local/bin
 lumina run "echo hello world"       # image auto-pulls on first run
 ```
 
-> If `~/.local/bin` isn't on your PATH, add it: `export PATH="$HOME/.local/bin:$PATH"`
+> If `~/.local/bin` isn't on your PATH: `export PATH="$HOME/.local/bin:$PATH"`
 >
 > For a system-wide install: `sudo make install PREFIX=/usr/local`
 
@@ -40,82 +40,112 @@ AI agents need to run untrusted code. The question is where.
 
 | | Lumina | Docker | SSH to cloud VM |
 |---|--------|--------|-----------------|
-| **Cold start** | ~1.6s | ~3-5s | 30-60s |
-| **Exec after boot** | ~30ms (CLI) · ~2ms (library) | ~50-100ms | ~20-50ms (RTT) |
+| **Cold start** | ~390ms P50 (M3 Pro) | ~3-5s | 30-60s |
+| **Exec after boot** | ~31ms P50 · 1ms stdev | ~50-100ms | ~20-50ms (RTT) |
 | **Isolation** | Hardware (Virtualization.framework) | Kernel namespaces (shared kernel) | Full VM |
 | **Host exposure** | None — no mounted filesystem, no Docker socket | Container escape risk, daemon access | Network-exposed |
 | **Cleanup** | Automatic — COW clone deleted on exit | Manual — images/volumes linger | Manual — VM persists |
 | **Dependencies** | Zero — ships as one binary | Docker daemon | Cloud account + SSH keys |
 | **macOS native** | Yes — `VZVirtualMachine` | Linux-first (Docker Desktop is a VM) | N/A |
-| **Agent-friendly output** | JSON by default when piped | Text only (needs parsing) | Text only |
+| **Agent-friendly** | JSON when piped, text on TTY — zero config | Text only (needs parsing) | Text only |
 | **Persistent sessions** | Built-in | N/A | SSH sessions |
 
-For agents, boot time is paid once. Exec latency is paid every iteration. Lumina sessions give you both: hardware-isolated VMs with subprocess-fast execution. No daemon, no container registry, no cloud credentials.
+Boot time is paid once. Exec latency is paid every iteration. Lumina sessions give you both: hardware-isolated VMs with subprocess-fast execution. No daemon, no container registry, no cloud credentials.
 
-## Features
+## Performance
 
-| | Feature | Detail |
-|---|---------|--------|
-| ⚡ | **Instant VMs** | ~1.6s cold start, APFS copy-on-write clones |
-| 🔒 | **Full isolation** | No host filesystem, credentials, or process access |
-| 🔄 | **Persistent sessions** | Boot once, exec many — ~30ms per command (CLI), ~2ms (library) |
-| 🐍 | **Custom images** | `images create python --run "apk add python3"` |
-| 💾 | **Named volumes** | Persistent storage across VMs and sessions |
-| 🌐 | **VM-to-VM networking** | Private ethernet switch for multi-VM setups |
-| 📡 | **Live streaming** | `--stream` for real-time stdout/stderr |
-| 📁 | **File transfers** | `--copy local:remote` / `--download remote:local` |
-| 📂 | **Directory mounts** | `--mount host:guest` / `--volume name:guest` via virtio-fs |
-| 🔑 | **Environment vars** | `-e KEY=VAL` (repeatable) |
-| 🔄 | **Smart output** | Auto-JSON when piped, human text on TTY |
-| 🧹 | **Self-cleaning** | Orphaned clones removed via signal handlers + `atexit` |
+Benchmarked on M3 Pro, macOS 26.4, release build with the default baked image (Apple's stripped 6.18.5 kernel, agent baked into rootfs).
 
----
+| Workload | Lumina P50 | Lumina P95 | Apple `container` P50 | Apple P95 |
+|---|---|---|---|---|
+| Cold boot `true` | **390ms** | 470ms | 844ms | 1687ms |
+| Cold boot `echo hello` | **403ms** | 450ms | 783ms | 1598ms |
+| Warm session exec `true` | **31ms** (1ms stdev) | 33ms | 84ms (10ms stdev) | 111ms |
+| Daemon idle memory | **0 MB** | — | ~54 MB | — |
+| Sustained session exec rate | **100/s** | — | — | — |
+
+Lumina's zero-daemon in-process model is 2–3× faster across every workload and 10× more consistent on warm exec. File transfer sustains 75 MB/s upload / 35 MB/s download. Stdout streaming delivers 33 MB/s to the host at bit-perfect fidelity up to 10M+ lines.
+
+## Scaling
+
+macOS's Virtualization framework soft-limits concurrent VMs per process to roughly 4–6. Beyond that, new boots fail fast (~1-6ms) with `bootFailed: VM limit reached` — a hypervisor-level rejection, not OOM.
+
+For higher throughput:
+
+1. **Session (best for repeated commands on the same filesystem state)** — boot once, exec many. Warm exec is ~31ms P50 with 1ms stdev.
+   ```bash
+   SID=$(lumina session start)
+   lumina exec $SID "command1"
+   lumina exec $SID "command2"
+   lumina session stop $SID
+   ```
+
+2. **Pool** — pre-warm N VMs, run commands across them at zero cold-boot cost. Concurrent, results streamed as NDJSON.
+   ```bash
+   lumina pool run --size 4 --count 20 "python3 -c 'import random; print(random.random())'"
+   # Boots 4 VMs once, runs the command 20 times, 4 concurrent
+   ```
+
+3. **Parallel `lumina run`** — works up to the ~4 concurrent-VM ceiling. Beyond that, use a session or pool.
+
+4. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` with `value: 4` to stay under the ceiling.
 
 ## Usage
 
-### CLI
+### One-shot (Disposable VMs)
 
 ```bash
-# Basics
+# Run a command — streams output on terminal, returns JSON when piped
 lumina run "echo hello"
-lumina run --stream "make build"
-lumina run --timeout 2m --memory 1GB --cpus 4 "cargo test"
+lumina run "make build"
 
 # Environment variables
 lumina run -e API_KEY=sk-123 -e DEBUG=1 "env | grep API"
 
-# File transfers
-lumina run --copy ./data.csv:/tmp/data.csv \
-           --download /tmp/results.json:./results.json \
-           "python3 process.py"
+# File transfers — auto-detects file vs directory
+lumina run --copy ./data.csv:/tmp/data.csv "python3 process.py"
+lumina run --copy ./project:/code --workdir /code "make build"
+lumina run --download /tmp/results.json:./results.json "generate-report"
 
-# Mount a host directory
-lumina run --mount ./src:/mnt/src "cat /mnt/src/README.md"
+# Named volumes — data persists across runs
+lumina run --volume mydata:/data "echo hello > /data/file.txt"
+lumina run --volume mydata:/data "cat /data/file.txt"   # still there
+
+# Host directory mount
+lumina run --volume ./src:/mnt/src "cat /mnt/src/README.md"
 
 # Pipe-friendly — JSON output by default when not a TTY
 lumina run "uname -a" | jq .stdout
 ```
 
+`lumina run` has 7 flags. Everything else (memory, CPUs, streaming, output format) is auto-detected or configurable via environment variables. See [Environment Variables](#environment-variables).
+
 ### Sessions (Persistent VMs)
 
-Boot once, exec many. The right abstraction for agents — pay the ~1.6s boot once, then run commands at ~30ms each.
+Boot once, exec many. Pay ~300ms boot once, then run commands at ~30ms each.
 
 ```bash
-# Start a persistent session (~1.6s boot)
-SID=$(lumina session start | jq -r .sid)
+# Start a session — configure resources at creation time
+SID=$(lumina session start)
+SID=$(lumina session start --memory 4GB --cpus 4 --disk-size 8GB)
 
 # Execute commands — ~30ms each (VM already running)
 lumina exec $SID "apk add python3"
 lumina exec $SID "python3 -c 'print(42)'"
 lumina exec $SID -e MY_VAR=hello "echo \$MY_VAR"
+lumina exec $SID --workdir /tmp "pwd"
 
-# File transfers work too
-lumina exec $SID --copy ./script.py:/tmp/script.py "python3 /tmp/script.py"
+# Stdin piping — pipe data into a session exec
+echo '{"key": "value"}' | lumina exec $SID "python3 -c 'import sys,json; d=json.load(sys.stdin); print(d)'"
+cat large_file.csv | lumina exec $SID "awk -F, '{sum+=$2} END {print sum}'"
 
-# List active sessions
+# File transfers via lumina cp
+lumina cp ./script.py $SID:/tmp/script.py
+lumina exec $SID "python3 /tmp/script.py"
+lumina cp $SID:/tmp/output.txt ./output.txt
+
+# List and stop
 lumina session list
-
-# Stop when done
 lumina session stop $SID
 ```
 
@@ -123,7 +153,7 @@ Sessions with volumes — data persists across sessions and disposable runs:
 
 ```bash
 lumina volume create workspace
-SID=$(lumina session start --volume workspace:/data | jq -r .sid)
+SID=$(lumina session start --volume workspace:/data)
 lumina exec $SID "echo 'cached result' > /data/output.txt"
 lumina session stop $SID
 
@@ -136,15 +166,17 @@ lumina run --volume workspace:/data "cat /data/output.txt"
 Pre-install packages so every run starts ready:
 
 ```bash
-# Create a Python image (~17s to build, then ~1.6s to boot forever after)
+# Create a Python image (~17s to build, then ~300ms to boot forever after)
 lumina images create python --from default --run "apk add --no-cache python3"
 
-# Use it — no install wait
-lumina run --image python "python3 -c 'import sys; print(sys.version)'"
+# Multi-step builds — abort on first failure
+lumina images create godev --from default --run "apk add go" --run "apk add git"
 
-# Sessions with custom images
-SID=$(lumina session start --image python | jq -r .sid)
-lumina exec $SID "python3 script.py"   # instant, python pre-installed
+# Rosetta for x86_64 binaries — stored in image metadata, auto-detected at boot
+lumina images create x86dev --from default --run "apt install gcc" --rosetta
+
+# Use custom images — no install wait
+lumina run --image python "python3 -c 'import sys; print(sys.version)'"
 
 # Manage images
 lumina images list
@@ -171,7 +203,6 @@ lumina volume remove mydata
 Run interconnected VMs on a shared private network:
 
 ```bash
-# Create a manifest
 cat > network.json << 'EOF'
 {
   "sessions": [
@@ -182,81 +213,108 @@ cat > network.json << 'EOF'
 EOF
 
 # Boot all VMs on a shared ethernet switch
-lumina network run --file network.json
+lumina network run network.json
 # VMs can reach each other by name (db, api) via /etc/hosts
 ```
+
+---
+
+## Environment Variables
+
+Resource configuration, output format, and streaming are controlled via environment variables. Set once, forget forever.
+
+| Variable | Controls | Default | Example |
+|----------|----------|---------|---------|
+| `LUMINA_MEMORY` | VM memory | `1GB` | `LUMINA_MEMORY=2GB` |
+| `LUMINA_CPUS` | CPU cores | `2` | `LUMINA_CPUS=4` |
+| `LUMINA_TIMEOUT` | Command timeout | `60s` | `LUMINA_TIMEOUT=300s` |
+| `LUMINA_DISK_SIZE` | Rootfs size | image default | `LUMINA_DISK_SIZE=4GB` |
+| `LUMINA_FORMAT` | Output format | auto (JSON piped, text TTY) | `LUMINA_FORMAT=text` |
+| `LUMINA_STREAM` | Streaming mode | auto (stream TTY, buffer piped) | `LUMINA_STREAM=1` |
+
+**Priority:** `session start` flags > env var > built-in default.
+
+For `lumina run`, resource settings come from env vars only (no flags). This keeps the common case clean — agents set env vars once in their environment, every `run` command inherits them.
+
+For `lumina session start`, resource flags (`--memory`, `--cpus`, `--disk-size`) override env vars. This lets you provision different sessions with different resources in the same workflow.
+
+---
+
+## Auto-Detection
+
+Lumina auto-detects everything it can so you type less:
+
+| Feature | How it works |
+|---------|-------------|
+| **Output format** | JSON when piped (for agents), text on TTY (for humans) |
+| **Streaming** | Streams on TTY (real-time output), buffers when piped (complete JSON result) |
+| **`--copy` file/dir** | Stats the local path — routes to file upload or directory tar+upload |
+| **`--download` file/dir** | Execs `test -d` on the guest — routes to file download or directory tar+download |
+| **`--volume` mount/volume** | Path prefix (`/` or `.`) = host directory mount, otherwise = named volume lookup |
+| **Rosetta** | Read from image metadata at boot. Set via `images create --rosetta`. |
+| **Network** | Always configured. No flags needed. |
+| **Image pull** | Auto-pulls default image on first run if not present. |
+| **Session ID parsing** | `exec` and `session stop` accept `{"sid":"UUID"}` JSON or bare UUID — pipe `session start` output directly without `jq`. |
+
+---
 
 <details>
 <summary><strong>Full CLI Reference</strong></summary>
 
-```
-USAGE: lumina <subcommand>
-
-SUBCOMMANDS:
-  run               Run a command in a disposable VM
-  pull              Pull the default Alpine image from GitHub Releases
-  images            Manage cached images (list, create, remove, inspect)
-  clean             Remove orphaned COW clones and stale images
-  session           Manage persistent VM sessions (start, stop, list)
-  exec              Execute a command in a running session
-  volume            Manage persistent volumes (create, list, remove, inspect)
-  network           Run a group of VMs on a shared network
-```
-
-**`lumina run`**
+### `lumina run` (7 flags)
 
 ```bash
-lumina run <command>                          # run, print stdout
+lumina run <command>                          # run, stream on TTY, JSON when piped
 lumina run --image python <command>           # use a custom image
-lumina run --stream <command>                 # stream output live
-lumina run --timeout 30s <command>            # command timeout (default: 60s, excludes boot)
-lumina run --memory 1GB --cpus 4 <command>    # resources (default: 512MB, 2 CPUs)
+lumina run --timeout 5m <command>             # command timeout (default: 60s)
 lumina run -e KEY=VAL <command>               # env vars (repeatable)
-lumina run --copy local:remote <command>      # upload file before exec
-lumina run --download remote:local <command>  # download file after exec
-lumina run --mount host:guest <command>       # virtio-fs directory sharing
-lumina run --volume name:guest <command>      # mount named volume
-lumina run --text <command>                   # force human-readable output
-LUMINA_FORMAT=json lumina run <command>       # force JSON output
+lumina run --copy local:remote <command>      # upload file or directory before exec
+lumina run --download remote:local <command>  # download file or directory after exec
+lumina run --volume path_or_name:guest <cmd>  # mount host dir or named volume
+lumina run --workdir /code <command>          # working directory inside VM
 ```
 
-**`lumina session`**
+### `lumina exec` (3 flags)
 
 ```bash
-lumina session start                         # start with defaults
-lumina session start --image python           # use custom image
-lumina session start --memory 1GB --cpus 4    # configure resources
+lumina exec <sid> <command>                   # always streams
+lumina exec <sid> --timeout 5m <command>      # timeout
+lumina exec <sid> -e KEY=VAL <command>        # env vars (repeatable)
+lumina exec <sid> --workdir /code <command>   # working directory
+```
+
+### `lumina cp` (0 flags)
+
+```bash
+lumina cp ./local.txt <sid>:/remote.txt       # upload to session
+lumina cp <sid>:/remote.txt ./local.txt       # download from session
+```
+
+### `lumina session` (5 flags on start)
+
+```bash
+lumina session start                          # start with defaults
+lumina session start --image python           # custom image
+lumina session start --memory 4GB --cpus 4    # configure resources
+lumina session start --disk-size 8GB          # larger rootfs
 lumina session start --volume data:/mnt       # mount volume at boot
-lumina session start --boot-timeout 2m        # boot timeout (default: 60s)
 lumina session list                           # list active sessions
-lumina session list --text                    # human-readable output
-lumina session stop <sid>                     # stop and confirm
-# → {"confirmed":true,"stopped":"<sid>"}
+lumina session stop <sid>                     # stop session
 ```
 
-**`lumina exec`**
-
-```bash
-lumina exec <sid> <command>                   # execute in session
-lumina exec <sid> <command> --stream          # stream output live
-lumina exec <sid> <command> -e KEY=VAL        # env vars (repeatable)
-lumina exec <sid> <command> --copy l:r        # upload before exec
-lumina exec <sid> <command> --download r:l    # download after exec
-lumina exec <sid> <command> --timeout 2m      # timeout (default: 60s)
-lumina exec <sid> <command> --text            # human-readable output
-```
-
-**`lumina images`**
+### `lumina images` (4 flags on create)
 
 ```bash
 lumina images list                            # list cached images
 lumina images create NAME --from BASE --run CMD  # build custom image
-lumina images create NAME --run CMD --timeout 5m # with build timeout (default: 5m)
+lumina images create NAME --run CMD --run CMD2   # multi-step build
+lumina images create NAME --run CMD --rosetta    # x86_64 image
+lumina images create NAME --timeout 10m --run CMD  # build timeout
 lumina images inspect NAME                    # show image details
 lumina images remove NAME                     # remove (checks deps)
 ```
 
-**`lumina volume`**
+### `lumina volume`
 
 ```bash
 lumina volume create NAME                     # create named volume
@@ -265,17 +323,31 @@ lumina volume inspect NAME                    # show details + size
 lumina volume remove NAME                     # delete volume
 ```
 
-**`lumina pull` / `lumina clean`**
+### `lumina pool` (6 flags on run)
+
+```bash
+lumina pool run --size 4 "command"            # boot 4 VMs, run once each
+lumina pool run --size 4 --count 20 "cmd"     # 4 VMs, 20 total runs (5 per VM)
+lumina pool run --size 4 --concurrency 2 "cmd" # 4 VMs, 2 concurrent at a time
+lumina pool run --size 4 --image python "cmd" # custom image
+lumina pool run --size 4 --memory 2GB "cmd"   # per-VM memory
+lumina pool run --size 4 -e KEY=VAL "cmd"     # env vars
+```
+
+### `lumina pull` / `lumina clean` / `lumina network`
 
 ```bash
 lumina pull                                   # download default image
 lumina pull --force                           # re-download even if exists
 lumina clean                                  # remove orphaned COW clones
+lumina network run manifest.json              # boot VMs from manifest
 ```
 
-**Output format priority:** `LUMINA_FORMAT` env var > `--text` flag > auto-detect (JSON when piped, text on TTY).
+**26 flags total across 18 commands.**
 
 </details>
+
+---
 
 ### Swift Library
 
@@ -285,8 +357,7 @@ import Lumina
 // One-shot — boot, exec, teardown in one call
 let result = try await Lumina.run("cargo test", options: RunOptions(
     timeout: .seconds(120),
-    memory: 1024 * 1024 * 1024,    // 1 GB
-    cpuCount: 4,
+    image: "default",
     env: ["CI": "true"]
 ))
 print(result.stdout)               // RunResult { stdout, stderr, exitCode, wallTime }
@@ -311,32 +382,30 @@ let result = try await Lumina.run("python3 /tmp/process.py", options: RunOptions
     downloads: [FileDownload(remotePath: "/tmp/out.json", localPath: outputURL)]
 ))
 
-// Lifecycle API — explicit control, multi-command sessions, connection reuse
+// Custom image creation — build once, boot fast forever
+try await Lumina.createImage(
+    name: "python", from: "default", command: "apk add python3"
+)
+
+// Rosetta images for x86_64 binaries
+try await Lumina.createImage(
+    name: "x86dev", from: "default", command: "apt install gcc", rosetta: true
+)
+
+// Lifecycle API — explicit control, multi-command sessions
 let vm = VM(options: VMOptions(cpuCount: 4))
 try await vm.boot()
-try vm.uploadFiles([FileUpload(localPath: scriptURL, remotePath: "/tmp/run.sh")])
+try await vm.uploadFiles([FileUpload(localPath: scriptURL, remotePath: "/tmp/run.sh")])
 let r1 = try await vm.exec("chmod +x /tmp/run.sh && /tmp/run.sh")
-let r2 = try await vm.exec("cat /tmp/results.json")  // reuses same connection
-try vm.downloadFiles([FileDownload(remotePath: "/tmp/results.json", localPath: resultsURL)])
+let r2 = try await vm.exec("cat /tmp/results.json")
 await vm.shutdown()
-
-// Custom image creation — build once, boot fast forever
-try await Lumina.createImage(name: "python", from: "default", command: "apk add python3")
 
 // Private networking — VM-to-VM communication
 try await Lumina.withNetwork("mynet") { network in
     let db  = try await network.session(name: "db",  image: "default")
     let api = try await network.session(name: "api", image: "default")
-    // VMs share a private ethernet switch, can reach each other by name
     let result = try await api.exec("ping -c1 db")
-    await network.shutdown()
 }
-
-// Custom networking — implement the NetworkProvider protocol
-struct TapProvider: NetworkProvider {
-    func createAttachment() throws -> VZNetworkDeviceAttachment { /* ... */ }
-}
-let vm = VM(options: VMOptions(networkProvider: TapProvider()))
 ```
 
 </details>
@@ -350,31 +419,30 @@ sequenceDiagram
     participant CLI as lumina run
     participant IS as ImageStore
     participant DC as DiskClone
-    participant IP as InitrdPatcher
     participant VM as VM Actor
     participant CR as CommandRunner
     participant GA as Guest Agent
 
     CLI->>IS: resolve("default")
-    IS-->>CLI: kernel, initrd, rootfs, agent
+    IS-->>CLI: kernel + rootfs (baked image)
     CLI->>DC: create APFS COW clone
     DC-->>CLI: ephemeral rootfs copy
-    CLI->>IP: inject agent + kernel modules
-    IP-->>CLI: combined initramfs
     CLI->>VM: boot(VZVirtualMachine)
-    Note over VM: Dedicated SerialExecutor
+    Note over VM: Dedicated SerialExecutor<br/>for thread affinity
+    VM->>VM: configure network (host-driven)
     VM->>CR: connect vsock:1024
     CR->>GA: waiting...
     GA-->>CR: {"type":"ready"}
-    CR->>GA: {"type":"exec","cmd":"..."}
-    loop streaming
-        GA-->>CR: {"type":"output","stream":"stdout","data":"..."}
+    Note over VM,GA: Network configured via<br/>{"type":"configure_network"}
+    GA-->>CR: {"type":"network_ready"}
+    CR->>GA: {"type":"exec","id":"uuid","cmd":"..."}
+    loop streaming output
+        GA-->>CR: {"type":"output","id":"uuid","stream":"stdout","data":"..."}
     end
-    GA-->>CR: {"type":"exit","code":0}
+    GA-->>CR: {"type":"exit","id":"uuid","code":0}
     CR-->>CLI: RunResult
     CLI->>VM: shutdown()
     VM->>DC: delete clone
-    Note over CLI,GA: Every run is fully isolated
 ```
 
 <details>
@@ -387,33 +455,44 @@ sequenceDiagram
     participant SS as SessionServer
     participant VM as VM Actor
     participant EC as lumina exec
+    participant CP as lumina cp
 
     CLI->>SP: spawn background process
-    SP->>VM: boot VM
+    SP->>VM: boot VM + configure network
     SP->>SS: bind Unix socket
     SS-->>CLI: socket ready
     CLI-->>CLI: return SID
 
     EC->>SS: connect to socket
     EC->>SS: {"type":"exec","cmd":"..."}
-    SS->>VM: exec(cmd)
-    VM-->>SS: RunResult
-    SS-->>EC: {"type":"output"} + {"type":"exit"}
-    Note over EC,VM: ~30ms per exec (VM already booted)
+    par concurrent during exec
+        EC->>SS: {"type":"stdin","data":"..."}
+        SS->>VM: sendStdin via StdinChannel
+        EC->>SS: {"type":"stdin_close"}
+    end
+    SS->>VM: exec(cmd, stdin: StdinChannel)
+    VM-->>SS: output chunks + exit
+    SS-->>EC: stream responses
+    Note over EC,VM: ~30ms per exec (stdin-piped or not)
+
+    CP->>SS: connect to socket
+    CP->>SS: {"type":"upload","localPath":"..."}
+    SS->>VM: upload via vsock
+    SS-->>CP: {"type":"uploadDone"}
 
     EC->>SS: {"type":"shutdown"}
     SS->>VM: shutdown()
     SS->>SP: cleanup session directory
 ```
 
-Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts connections, and dispatches requests to the VM actor.
+Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts concurrent connections, and dispatches to the VM actor. Stdin piping uses a `StdinChannel` bridge — the server reads `stdin`/`stdin_close` messages from the socket concurrently with forwarding exec output. File transfers go through `lumina cp` — a separate command with scp-style syntax.
 
 </details>
 
 <details>
 <summary><strong>Guest Agent Protocol</strong></summary>
 
-Newline-delimited JSON over virtio-socket (port 1024, max 64KB per message):
+Newline-delimited JSON over virtio-socket (port 1024, max 128KB per message). All exec messages carry an `id` field for concurrent command multiplexing.
 
 ```mermaid
 sequenceDiagram
@@ -421,13 +500,17 @@ sequenceDiagram
     participant G as Guest (lumina-agent)
 
     G->>H: {"type":"ready"}
-    H->>G: {"type":"exec","cmd":"...","timeout":N,"env":{}}
-    loop streaming
-        G->>H: {"type":"output","stream":"stdout","data":"..."}
-        G->>H: {"type":"output","stream":"stderr","data":"..."}
+    H->>G: {"type":"configure_network","ip":"...","gateway":"...","dns":"..."}
+    G->>H: {"type":"network_ready","ip":"192.168.64.X"}
+    H->>G: {"type":"exec","id":"a","cmd":"make build","timeout":60}
+    H->>G: {"type":"exec","id":"b","cmd":"make test","timeout":60}
+    par concurrent output
+        G->>H: {"type":"output","id":"a","stream":"stdout","data":"..."}
+        G->>H: {"type":"output","id":"b","stream":"stderr","data":"..."}
     end
-    G->>H: {"type":"exit","code":0}
-    Note over G,H: Connection supports reuse — send another exec
+    G->>H: {"type":"exit","id":"a","code":0}
+    G->>H: {"type":"exit","id":"b","code":0}
+    Note over G,H: Multiple execs can run concurrently
     loop idle
         G-->>H: {"type":"heartbeat"} (every 2s)
     end
@@ -437,10 +520,22 @@ sequenceDiagram
 
 | Direction | Flow |
 |-----------|------|
-| **Upload** (host → guest) | `upload` → `upload_ack` per 48KB chunk → `upload_done` |
-| **Download** (guest → host) | `download_req` → `download_data` per 48KB chunk (seq + EOF) |
+| **Upload** (host -> guest) | `upload` -> `upload_ack` per 48KB chunk -> `upload_done` |
+| **Download** (guest -> host) | `download_req` -> `download_data` per 48KB chunk (seq + EOF) |
 
-The host enforces deadlines. The guest receives a safety-net timeout at 3× the host value (minimum 30s) — loose enough to never race, tight enough to clean up if the host crashes.
+**Stdin piping:**
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `{"type":"stdin","id":"uuid","data":"..."}` | host -> guest | Pipe data to running command |
+| `{"type":"stdin_close","id":"uuid"}` | host -> guest | Close stdin pipe (triggers EOF) |
+
+**Cancellation:**
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `{"type":"cancel","id":"uuid","signal":15,"grace_period":5}` | host -> guest | Signal a specific command |
+| `{"type":"cancel","signal":9}` | host -> guest | Kill all running commands |
 
 </details>
 
@@ -450,22 +545,22 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 ### Three-Layer API
 
 ```
-                         ┌─────────────────────────────────┐
-  Convenience API        │  Lumina.run() / Lumina.stream()  │
-  (one-shot)             │  withVM { boot → exec → shut }  │
-                         └──────────────┬──────────────────┘
-                                        │
-                         ┌──────────────▼──────────────────┐
-  Session API            │  session start / exec / stop     │
-  (persistent)           │  Unix socket IPC, ~30ms exec     │
-                         └──────────────┬──────────────────┘
-                                        │
-                         ┌──────────────▼──────────────────┐
-  Lifecycle API          │           VM actor               │
-  (multi-command)        │  boot() → exec() → exec() → …   │
-                         │  uploadFiles() / downloadFiles() │
-                         │  shutdown()                      │
-                         └─────────────────────────────────┘
+                         +-----------------------------------+
+  Convenience API        |  Lumina.run() / Lumina.stream()   |
+  (one-shot)             |  withVM { boot -> exec -> shut }  |
+                         +----------------+------------------+
+                                          |
+                         +----------------v------------------+
+  Session API            |  session start / exec / cp / stop |
+  (persistent)           |  Unix socket IPC, ~30ms exec      |
+                         +----------------+------------------+
+                                          |
+                         +----------------v------------------+
+  Lifecycle API          |           VM actor                |
+  (multi-command)        |  boot() -> exec() -> exec() -> .. |
+                         |  uploadFiles() / downloadFiles()  |
+                         |  shutdown()                       |
+                         +-----------------------------------+
 ```
 
 ### Internal Components
@@ -473,28 +568,36 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 | Component | Role | Key Detail |
 |-----------|------|------------|
 | **VM** | Actor wrapping `VZVirtualMachine` | Custom `VMExecutor` (SerialExecutor) pins all VZ calls to a dedicated DispatchQueue |
-| **CommandRunner** | vsock protocol + state machine | `ConnectionState` enum with explicit transitions, NSLock for thread safety |
-| **InitrdPatcher** | Initramfs injection | Builds cpio newc archives, concatenates with base initrd. Composable network overlay. |
-| **DiskClone** | Per-run ephemeral COW clones | PID file–based orphan detection; `cleanOrphans()` invoked via `atexit` + signal handlers |
-| **ImageStore** | Image cache + custom creation | Staging-dir atomicity for crash-safe image builds. Symlinks shared assets from base. |
+| **CommandRunner** | vsock protocol + dispatcher | Per-exec `AsyncStream` handlers keyed by ID for concurrent multiplexing |
+| **DiskClone** | Per-run ephemeral COW clones | PID file-based orphan detection; `cleanOrphans()` via `atexit` + signal handlers |
+| **ImageStore** | Image cache + custom creation | Staging-dir atomicity for crash-safe builds. Rosetta stored in `ImageMeta`. |
 | **VolumeStore** | Named persistent volumes | Host directories at `~/.lumina/volumes/<name>/data/`, mounted via virtio-fs |
-| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, dispatches to VM actor |
+| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, Task-per-connection, concurrent exec stdin via `StdinChannel` |
 | **SessionClient** | Unix socket IPC client | Validates session liveness, sends requests, receives streamed responses |
 | **NetworkSwitch** | Ethernet frame relay | SOCK_DGRAM socketpairs, poll-based broadcast, dynamic port addition |
 | **Network** | VM group manager | Actor coordinating multiple VMs on a shared virtual switch with IP assignment |
-| **ImagePuller** | GitHub Releases downloader | SHA256 verification, auto-pull on first run from `abdul-abdi/lumina` releases |
-| **NetworkProvider** | Pluggable network backend | Default: `NATNetworkProvider` (VZ NAT). Protocol for custom implementations. |
 | **SerialConsole** | Serial output capture | Reads `hvc0` for crash diagnostics; surfaced in `LuminaError.guestCrashed` |
+
+### Image Formats
+
+| | Baked (default) | Legacy (backward-compat) |
+|---|---|---|
+| **Contents** | `vmlinuz` + `rootfs.img` | `vmlinuz` + `initrd` + `rootfs.img` + `lumina-agent` + `modules/` |
+| **Boot path** | kernel -> mount root -> `/sbin/init` -> agent | kernel -> initrd -> load modules -> switch_root -> agent |
+| **Network config** | Kernel cmdline params | Initrd overlay |
+| **Boot time** | ~200-300ms | ~570ms |
+
+Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is absent, else `.legacyWithInitrd`).
 
 ### Design Constraints
 
 - **No shared mutable state** — each `Lumina.run()` creates its own VM, COW clone, and vsock connection
-- **Zero external Swift dependencies** — library target links only `Virtualization.framework`
+- **Zero external Swift dependencies** — library links only `Virtualization.framework` (CLI adds `swift-argument-parser`)
 - **All public types are `Sendable`** — safe to use across concurrency domains
-- **Guest agent uses raw `AF_VSOCK` syscalls** — Go's `net` package doesn't support vsock
-- **Static IP networking** — NAT via `VZNATNetworkDeviceAttachment`, IP derived from MAC, DNS via gateway. DHCP fallback for edge cases.
-- **Session IPC** — NDJSON over Unix domain sockets, one client at a time per session
-- **Network relay** — reads ports under lock each iteration for dynamic VM join
+- **Concurrent exec** — multiple commands run on the same VM via ID-keyed dispatcher
+- **Configuration vs invocation** — image-level settings (rosetta) in metadata, environment-level (memory/cpus) in env vars, per-invocation (timeout/env/workdir) as CLI flags
+- **Network always on** — host-driven config, `network_ready` awaited before exec, no flags needed
+- **Clean error messages** — `LuminaError` conforms to `LocalizedError`; agents see `"image 'x' not found"` not `imageNotFound("x")`
 
 </details>
 
@@ -504,10 +607,10 @@ The host enforces deadlines. The guest receives a safety-net timeout at 3× the 
 
 ```bash
 make build               # debug build + codesign (entitlements required)
-make test                # unit tests (swift test)
+make test                # unit + integration tests (163 tests)
 make test-integration    # e2e tests (requires VM image + jq)
 make release             # optimized build + codesign
-make install             # release build → ~/.local/bin/lumina
+make install             # release build -> ~/.local/bin/lumina
 make run ARGS="echo hi"  # build, sign, and run in one step
 make clean               # remove .build/
 ```
@@ -516,11 +619,28 @@ make clean               # remove .build/
 <summary><strong>Building Components Separately</strong></summary>
 
 ```bash
-# Build guest agent (cross-compile Go → linux/arm64)
-cd Guest/lumina-agent && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
+# Build guest agent (cross-compile Go -> linux/arm64)
+cd Guest/lumina-agent
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
 # Build VM image (requires e2fsprogs: brew install e2fsprogs)
 cd Guest && bash build-image.sh
+
+# Build custom kernel (Linux arm64 only — runs on CI)
+bash Guest/build-kernel.sh /tmp/lumina-kernel/vmlinuz
+
+# Build baked image with custom kernel
+LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh
 ```
 
 </details>
+
+## Requirements
+
+- macOS 14+ (Sonoma)
+- Apple Silicon (M1, M2, M3, M4)
+- Go 1.21+ (guest agent build only — not needed for CLI usage)
+
+## License
+
+[MIT](LICENSE) &copy; 2026 Abdullahi Abdi
