@@ -77,25 +77,57 @@ public actor Pool {
 
     /// Run a command in a pooled VM. Returns when the command completes.
     /// The VM is automatically returned to the pool and a fresh one is booted.
+    ///
+    /// File transfers run on the pre-warmed VM before (uploads) and after (downloads) exec.
+    /// Note: mounts (volumes) are VM-level configuration — pass them in `VMOptions.mounts`
+    /// at pool init time so all slots boot with the mount already attached.
     public func run(
         _ command: String,
         timeout: Duration = .seconds(60),
         env: [String: String] = [:],
         workingDirectory: String? = nil,
+        uploads: [FileUpload] = [],
+        directoryUploads: [DirectoryUpload] = [],
+        downloads: [FileDownload] = [],
+        directoryDownloads: [DirectoryDownload] = [],
         stdin: Stdin = .closed
     ) async throws -> RunResult {
         guard !isShutdown else { throw LuminaError.sessionFailed("Pool is shut down") }
         let vm = try await acquire()
         defer { Task { await self.releaseAndRefill(vm) } }
 
+        // Upload files before exec
+        if !uploads.isEmpty {
+            try await vm.uploadFilesResult(uploads).get()
+        }
+        for dir in directoryUploads {
+            try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
+        }
+
         let timeoutSecs = max(Int(timeout.components.seconds), 1)
-        return try await vm.execResult(
+        let result = try await vm.execResult(
             command,
             timeout: timeoutSecs,
             env: env,
             cwd: workingDirectory,
             stdin: stdin
         ).get()
+
+        // Download after exec — auto-detect file vs directory on guest (mirrors Lumina.run)
+        for dl in downloads {
+            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
+            if check.exitCode == 0 {
+                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+            } else {
+                try await vm.downloadFiles([dl])
+            }
+        }
+        for dir in directoryDownloads {
+            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
+        }
+
+        return result
     }
 
     // MARK: - Shutdown

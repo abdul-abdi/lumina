@@ -94,6 +94,62 @@ func poolRefillsAfterUse() async throws {
     #expect(r2.stdout.contains("run2"))
 }
 
+// RED: pool.run() should accept uploads and downloads parameters.
+// Fails to compile until Pool.run() is extended with transfer params.
+@Test func poolRunRejectsTransfersWhenShutdown() async throws {
+    let pool = Pool(size: 1)
+    await pool.shutdown()
+    do {
+        _ = try await pool.run(
+            "echo hi",
+            timeout: .seconds(5),
+            uploads: [FileUpload(localPath: URL(fileURLWithPath: "/tmp/x"), remotePath: "/tmp/x")],
+            downloads: [FileDownload(remotePath: "/tmp/y", localPath: URL(fileURLWithPath: "/tmp/y"))]
+        )
+        Issue.record("Expected LuminaError.sessionFailed")
+    } catch let e as LuminaError {
+        if case .sessionFailed = e { /* expected: pool shut down */ } else {
+            Issue.record("Unexpected error: \(e)")
+        }
+    }
+}
+
+// RED: pool VMs should boot with mounts when VMOptions includes them.
+// This passes already (VMOptions supports mounts) — documents expected behavior.
+@Test func poolOptionsPreserveMounts() {
+    let mount = MountPoint(hostPath: URL(fileURLWithPath: "/tmp"), guestPath: "/host-tmp")
+    let opts = VMOptions(mounts: [mount])
+    let pool = Pool(size: 2, options: opts)
+    #expect(pool.options.mounts.count == 1)
+    #expect(pool.options.mounts.first?.guestPath == "/host-tmp")
+}
+
+@Test(.enabled(if: integrationEnabled()))
+func poolRunWithUploadsAndDownloads() async throws {
+    // Create a temp file to upload
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    let inputFile = tmpDir.appendingPathComponent("input.txt")
+    try Data("pool-transfer-test\n".utf8).write(to: inputFile)
+    let outputFile = tmpDir.appendingPathComponent("output.txt")
+
+    let pool = Pool(size: 1, options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
+    try await pool.boot()
+    defer { Task { await pool.shutdown() } }
+
+    let result = try await pool.run(
+        "cat /tmp/input.txt > /tmp/output.txt",
+        timeout: .seconds(30),
+        uploads: [FileUpload(localPath: inputFile, remotePath: "/tmp/input.txt")],
+        downloads: [FileDownload(remotePath: "/tmp/output.txt", localPath: outputFile)]
+    )
+    #expect(result.exitCode == 0)
+    let outputContent = try String(contentsOf: outputFile, encoding: .utf8)
+    #expect(outputContent.contains("pool-transfer-test"))
+}
+
 @Test(.enabled(if: integrationEnabled()))
 func poolShutdownRejectsNewRuns() async throws {
     let pool = Pool(size: 1, options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
