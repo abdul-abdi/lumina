@@ -62,6 +62,13 @@ public actor Pool {
 
     /// Pre-boot all pool slots. Call once before `run()`.
     /// Boots VMs concurrently via detached tasks.
+    ///
+    /// **Network note:** VMs use NAT networking. The gateway discovery heuristic
+    /// picks the first available vmnet bridge, which is correct for sequential boots.
+    /// When multiple slots boot simultaneously on a host with several active vmnet
+    /// bridges, a VM may pick the wrong bridge (rare in practice — Apple typically
+    /// assigns one bridge per process). Call `boot()` and let it complete before
+    /// serving traffic if strict per-VM networking is required.
     public func boot() async throws {
         guard !isShutdown else { throw LuminaError.sessionFailed("Pool is shut down") }
         await withTaskGroup(of: Void.self) { group in
@@ -215,6 +222,9 @@ public actor Pool {
             return vm
         } catch {
             await vm.shutdown()
+            // Log boot failure so operators can detect pool drain.
+            // A pool that drains to zero causes acquire() to suspend indefinitely.
+            NSLog("[Lumina.Pool] Slot boot failed: %@", String(describing: error))
             return nil
         }
     }
@@ -224,6 +234,9 @@ public actor Pool {
 
 extension Lumina {
     /// Create and boot a pre-warmed VM pool.
+    ///
+    /// VMs use NAT networking. The gateway heuristic is correct for typical
+    /// single-process usage. See ``Pool/boot()`` for known limitations.
     ///
     /// ```swift
     /// let pool = try await Lumina.pool(size: 4, image: "default")
