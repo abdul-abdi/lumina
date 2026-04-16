@@ -92,6 +92,26 @@ import Testing
     #expect(decoded == req)
 }
 
+@Test func encodeStdinCloseRequest() throws {
+    let req = SessionRequest.stdinClose
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "stdin_close")
+}
+
+@Test func decodeStdinCloseRoundtrip() throws {
+    let data = Data("{\"type\":\"stdin_close\"}\n".utf8)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == .stdinClose)
+}
+
+@Test func decodeStdinCloseEncodeRoundtrip() throws {
+    let req = SessionRequest.stdinClose
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
+
 @Test func encodeExecRequestWithCwd() throws {
     let req = SessionRequest.exec(cmd: "pwd", timeout: 30, env: [:], cwd: "/code")
     let data = try SessionProtocol.encode(req)

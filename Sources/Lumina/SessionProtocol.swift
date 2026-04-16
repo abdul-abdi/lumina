@@ -9,6 +9,7 @@ public enum SessionRequest: Sendable, Equatable {
     case download(remotePath: String, localPath: String)
     case cancel(signal: Int32, gracePeriod: Int)
     case stdin(data: String)
+    case stdinClose
     case shutdown
 }
 
@@ -42,6 +43,8 @@ public enum SessionProtocol {
             dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
         case .stdin(let data):
             dict = ["type": "stdin", "data": data]
+        case .stdinClose:
+            dict = ["type": "stdin_close"]
         case .shutdown:
             dict = ["type": "shutdown"]
         }
@@ -107,6 +110,8 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed stdin request")
             }
             return .stdin(data: data)
+        case "stdin_close":
+            return .stdinClose
         case "shutdown":
             return .shutdown
         default:

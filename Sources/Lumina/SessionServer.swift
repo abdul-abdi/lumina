@@ -199,7 +199,17 @@ public final class SessionServer: @unchecked Sendable {
 
             switch request {
             case .exec(let cmd, let timeout, let env, let cwd):
-                await handleExec(cmd: cmd, timeout: timeout, env: env, cwd: cwd, vm: vm, handle: handles.write)
+                // Pass the current read buffer so any bytes already buffered
+                // (e.g. stdin messages that arrived in the same TCP segment as
+                // the exec request) are not dropped. handleExec owns the read
+                // handle and buffer for the exec's lifetime.
+                let bufSnapshot = readBuf
+                readBuf = Data()
+                await handleExec(
+                    cmd: cmd, timeout: timeout, env: env, cwd: cwd,
+                    vm: vm, writeHandle: handles.write,
+                    readHandle: handles.read, initialBuffer: bufSnapshot
+                )
 
             case .upload(let localPath, let remotePath):
                 await handleUpload(localPath: localPath, remotePath: remotePath, vm: vm, handle: handles.write)
@@ -214,12 +224,10 @@ public final class SessionServer: @unchecked Sendable {
                     try? writeResponse(.error(message: "Cancel failed: \(error)"), to: handles.write)
                 }
 
-            case .stdin:
-                // Stdin forwarding via sessions requires exec ID tracking.
-                // The library API (VM.sendStdin) is the current path for
-                // session stdin. SessionProtocol.stdin(data:) does not carry
-                // an exec ID and cannot target the right in-flight exec on
-                // a shared VM, so it is intentionally a no-op here.
+            case .stdin, .stdinClose:
+                // Stdin messages outside of an exec context are no-ops.
+                // They should not appear here because handleExec reads them
+                // directly from the socket during exec, but guard defensively.
                 break
 
             case .shutdown:
@@ -233,30 +241,96 @@ public final class SessionServer: @unchecked Sendable {
 
     // MARK: - Request Handlers
 
-    private func handleExec(cmd: String, timeout: Int, env: [String: String], cwd: String?, vm: VM, handle: FileHandle) async {
-        let start = ContinuousClock.now
-        do {
-            // Stream output in real time — each chunk is sent to the client as it arrives
-            // from the guest agent, rather than buffering the entire result.
-            let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd)
-            for try await chunk in chunks {
-                switch chunk {
-                case .stdout(let data):
-                    try? writeResponse(.output(stream: .stdout, data: data), to: handle)
-                case .stderr(let data):
-                    try? writeResponse(.output(stream: .stderr, data: data), to: handle)
-                case .stdoutBytes(let bytes):
-                    // Binary chunk: lossy-convert for session text protocol (binary session transfers not yet supported)
-                    try? writeResponse(.output(stream: .stdout, data: String(decoding: bytes, as: UTF8.self)), to: handle)
-                case .stderrBytes(let bytes):
-                    try? writeResponse(.output(stream: .stderr, data: String(decoding: bytes, as: UTF8.self)), to: handle)
-                case .exit(let code):
-                    let ms = (ContinuousClock.now - start).totalMilliseconds
-                    try? writeResponse(.exit(code: code, durationMs: ms), to: handle)
+    /// Execute a command in the VM and stream output back to the client.
+    ///
+    /// During the exec, this method takes over reading from `readHandle` so
+    /// that `stdin` and `stdinClose` messages from the client are forwarded
+    /// to the VM exec. `cancel` messages are also handled inline.
+    ///
+    /// When the exec completes, `Darwin.shutdown(SHUT_RD)` is called on the
+    /// read fd to unblock the socket-reader task (which may be blocked in
+    /// `availableData`). This does NOT close the write direction — the
+    /// connection remains open for subsequent requests.
+    ///
+    /// `initialBuffer` contains any bytes already read from the socket
+    /// before the exec request was parsed (coalesced NDJSON frames). The
+    /// stdin reader starts from these bytes before issuing new reads.
+    private func handleExec(
+        cmd: String, timeout: Int, env: [String: String], cwd: String?,
+        vm: VM, writeHandle: FileHandle,
+        readHandle: FileHandle, initialBuffer: Data
+    ) async {
+        let channel = StdinChannel()
+        let stdin = Stdin.source { @Sendable [channel] in await channel.next() }
+
+        await withTaskGroup(of: Void.self) { group in
+            // Task 1: run the exec and forward output chunks to the client.
+            // When the exec finishes (success, error, or timeout), signals
+            // EOF to the stdin channel and shuts down the read side of the
+            // socket to unblock Task 2.
+            group.addTask { [weak self] in
+                guard let self else { return }
+                let start = ContinuousClock.now
+                do {
+                    let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd, stdin: stdin)
+                    for try await chunk in chunks {
+                        switch chunk {
+                        case .stdout(let data):
+                            try? self.writeResponse(.output(stream: .stdout, data: data), to: writeHandle)
+                        case .stderr(let data):
+                            try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
+                        case .stdoutBytes(let bytes):
+                            // Lossy UTF-8 conversion — binary session stdin/stdout not yet supported
+                            try? self.writeResponse(.output(stream: .stdout, data: String(decoding: bytes, as: UTF8.self)), to: writeHandle)
+                        case .stderrBytes(let bytes):
+                            try? self.writeResponse(.output(stream: .stderr, data: String(decoding: bytes, as: UTF8.self)), to: writeHandle)
+                        case .exit(let code):
+                            let ms = (ContinuousClock.now - start).totalMilliseconds
+                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
+                        }
+                    }
+                } catch {
+                    try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
                 }
+                // Signal EOF to the stdin pump so the pump task exits cleanly.
+                channel.close()
+                // Unblock Task 2's blocking availableData call by shutting
+                // down the read direction of the socket. The write direction
+                // remains open for subsequent responses after exec.
+                Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
             }
-        } catch {
-            try? writeResponse(.error(message: String(describing: error)), to: handle)
+
+            // Task 2: read stdin/stdinClose/cancel messages from the client
+            // socket and route them to the appropriate handler during exec.
+            // Exits when the socket read side is shut down (by Task 1 on
+            // exec completion) or when the client disconnects.
+            group.addTask { [weak self] in
+                guard let self else { return }
+                var buf = initialBuffer
+                while !Task.isCancelled {
+                    let msgData: Data
+                    do {
+                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                    } catch {
+                        break // socket closed or shut down
+                    }
+                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
+                    switch request {
+                    case .stdin(let data):
+                        channel.send(Data(data.utf8))
+                    case .stdinClose:
+                        channel.close()
+                    case .cancel(let signal, let gracePeriod):
+                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+                    default:
+                        // Other message types are not expected during exec;
+                        // ignore to avoid protocol confusion.
+                        break
+                    }
+                }
+                // Ensure channel is closed even if socket closed unexpectedly.
+                channel.close()
+            }
         }
     }
 
@@ -279,6 +353,66 @@ public final class SessionServer: @unchecked Sendable {
             try? writeResponse(.downloadDone(path: localPath), to: handle)
         case .failure(let error):
             try? writeResponse(.error(message: "Download failed: \(error)"), to: handle)
+        }
+    }
+}
+
+// MARK: - StdinChannel
+
+/// Thread-safe single-producer, single-consumer queue for stdin data.
+///
+/// Bridges the session IPC socket reader (Task 2 in handleExec) with the
+/// VM exec's `Stdin.source` pump (which runs as a detached Task inside
+/// CommandRunner.spawnStdinPump). The pump calls `next()` in a loop;
+/// the socket reader calls `send(_:)` for each chunk and `close()` on EOF.
+///
+/// Uses NSLock + CheckedContinuation rather than an actor to avoid
+/// re-entrancy issues: `send()` must resume a waiting `next()` without
+/// suspending, which actors would prevent.
+final class StdinChannel: @unchecked Sendable {
+    private let lock = NSLock()
+    private var queue: [Data] = []
+    private var closed = false
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    /// Enqueue a chunk of stdin data.
+    /// If `next()` is currently suspended waiting for data, resumes it immediately.
+    func send(_ data: Data) {
+        lock.withLock {
+            if let cont = waiter {
+                waiter = nil
+                cont.resume(returning: data)
+            } else {
+                queue.append(data)
+            }
+        }
+    }
+
+    /// Signal EOF. Subsequent calls to `next()` return nil.
+    /// Safe to call multiple times (idempotent).
+    func close() {
+        lock.withLock {
+            closed = true
+            if let cont = waiter {
+                waiter = nil
+                cont.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Return the next stdin chunk, suspending until one is available.
+    /// Returns nil when the channel is closed (EOF).
+    func next() async -> Data? {
+        await withCheckedContinuation { cont in
+            lock.withLock {
+                if !queue.isEmpty {
+                    cont.resume(returning: queue.removeFirst())
+                } else if closed {
+                    cont.resume(returning: nil)
+                } else {
+                    waiter = cont
+                }
+            }
         }
     }
 }
