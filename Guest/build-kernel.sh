@@ -148,8 +148,12 @@ FAILED=false
 for entry in "${CRITICAL_CONFIGS[@]}"; do
     KEY="${entry%%:*}"
     EXPECTED="${entry#*:}"
+    # Use || true to prevent bash 4.4+ set -e from exiting when grep finds no
+    # match (exit 1). With set -euo pipefail, a failed pipeline inside $()
+    # propagates as a non-zero assignment exit status and triggers errexit
+    # before any echo runs — silently killing the loop.
     if [ "$EXPECTED" = "n" ]; then
-        ACTUAL=$(grep "^${KEY}=" .config 2>/dev/null | cut -d= -f2)
+        ACTUAL=$(grep "^${KEY}=" .config 2>/dev/null | cut -d= -f2) || true
         if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "n" ]; then
             echo "  FAIL: $KEY=$ACTUAL (expected not set or =n)"
             FAILED=true
@@ -157,7 +161,7 @@ for entry in "${CRITICAL_CONFIGS[@]}"; do
             echo "  OK:   $KEY is disabled"
         fi
     else
-        ACTUAL=$(grep "^${KEY}=" .config 2>/dev/null | cut -d= -f2)
+        ACTUAL=$(grep "^${KEY}=" .config 2>/dev/null | cut -d= -f2) || true
         if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "  FAIL: $KEY=$ACTUAL (expected =$EXPECTED)"
             FAILED=true
