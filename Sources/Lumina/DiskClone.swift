@@ -149,9 +149,18 @@ public struct DiskClone: Sendable {
     }
 }
 
-enum ResizeError: Error, Sendable {
+enum ResizeError: Error, LocalizedError, Sendable {
     case cannotReadSize
     case truncateFailed
     case resize2fsNotFound
     case resize2fsFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .cannotReadSize: "cannot read current disk size"
+        case .truncateFailed: "failed to truncate disk image"
+        case .resize2fsNotFound: "resize2fs not found — install e2fsprogs"
+        case .resize2fsFailed(let stderr): "resize2fs failed: \(stderr)"
+        }
+    }
 }

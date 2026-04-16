@@ -187,6 +187,16 @@ public actor Pool {
     private func depositVM(_ vm: VM?) async {
         guard let vm else {
             booting = max(0, booting - 1)
+            // If all in-flight boots just failed and callers are waiting, flush
+            // them with an error. Without this, acquire() suspends indefinitely
+            // when the pool drains post-boot (boot() initial guard doesn't help here).
+            if booting == 0 && !waiters.isEmpty {
+                let pending = waiters
+                waiters.removeAll()
+                for waiter in pending {
+                    waiter.resume(throwing: LuminaError.sessionFailed("Pool drained: all VM slots failed to boot"))
+                }
+            }
             return
         }
         booting = max(0, booting - 1)

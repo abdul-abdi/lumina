@@ -63,7 +63,7 @@ final class StdinPumpGate: @unchecked Sendable {
 
 public actor VM {
     private var virtualMachine: VZVirtualMachine?
-    var commandRunner: CommandRunner?
+    private var commandRunner: CommandRunner?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
     private let imageStore: ImageStore
@@ -667,6 +667,22 @@ public actor VM {
         try runner.closeStdin(id: execId)
     }
 
+    /// Low-level streaming exec with a caller-supplied exec ID.
+    /// Use this when you need to interleave sendStdin(_:execId:) calls during execution.
+    /// The caller is responsible for stdin timing — no StdinPumpGate is applied.
+    public func execStream(
+        id: String,
+        _ command: String,
+        timeout: Int = 60,
+        env: [String: String] = [:],
+        cwd: String? = nil
+    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
+        }
+        return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
+    }
+
     /// Attempt to reconnect to the guest agent after a connection drop.
     /// State is only set to `.ready` after the reconnect succeeds.
     public func reconnect() async throws(LuminaError) {
@@ -690,7 +706,7 @@ public actor VM {
         // 192.168.65.0/24 instead of 192.168.64.0/24) if another process or VPN
         // already holds the default range. Fall back to the historic default if
         // discovery fails (e.g. no bridge interfaces found yet).
-        let (gateway, subnetPrefix) = Self.discoverVmnetGateway() ?? ("192.168.64.1", "192.168.64")
+        let (gateway, subnetPrefix) = await Self.discoverVmnetGateway() ?? ("192.168.64.1", "192.168.64")
 
         let hostNum = (Int(lastByte) % 253) + 2
         let ip = "\(subnetPrefix).\(hostNum)/24"
@@ -714,12 +730,14 @@ public actor VM {
     /// picks the first one found, which is correct for sequential boots but may pick
     /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
     /// be needed for a fully correct multi-VM implementation.
-    private static func discoverVmnetGateway() -> (gateway: String, subnetPrefix: String)? {
+    private static func discoverVmnetGateway() async -> (gateway: String, subnetPrefix: String)? {
         // Poll up to 300ms in 25ms increments. The bridge IPv4 typically appears
         // within 50ms of boot; 300ms gives comfortable headroom.
+        // Task.sleep suspends the task (releases the actor executor) rather than
+        // blocking the underlying OS thread between polls.
         for attempt in 0..<12 {
             if attempt > 0 {
-                Thread.sleep(forTimeInterval: 0.025)
+                try? await Task.sleep(for: .milliseconds(25))
             }
             if let result = discoverVmnetGatewayOnce() { return result }
         }

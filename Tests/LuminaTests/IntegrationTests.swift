@@ -689,21 +689,15 @@ func integrationStdinBasic() async throws {
 
     try await vm.boot()
 
-    // Start a stream that reads from stdin via `head -1`
-    // We need the exec ID to send stdin, so we use the runner directly.
-    guard let runner = await vm.commandRunner else {
-        Issue.record("No command runner")
-        return
-    }
-
+    // Use a caller-supplied exec ID so we can target sendStdin at this specific exec.
     let id = UUID().uuidString
-    let stream = try runner.execStream(id: id, command: "head -1", timeout: 30)
+    let stream = try await vm.execStream(id: id, "head -1", timeout: 30)
 
     // Give the command a moment to start
     try await Task.sleep(for: .milliseconds(500))
 
     // Send stdin data
-    try runner.sendStdin(id: id, data: "hello from stdin\n")
+    try await vm.sendStdin("hello from stdin\n", execId: id)
 
     // Collect output
     var output = ""
@@ -728,21 +722,16 @@ func integrationStdinMultiLine() async throws {
 
     try await vm.boot()
 
-    guard let runner = await vm.commandRunner else {
-        Issue.record("No command runner")
-        return
-    }
-
     let id = UUID().uuidString
-    let stream = try runner.execStream(id: id, command: "wc -l", timeout: 30)
+    let stream = try await vm.execStream(id: id, "wc -l", timeout: 30)
 
     try await Task.sleep(for: .milliseconds(500))
 
     // Send 5 lines then close stdin
     for i in 1...5 {
-        try runner.sendStdin(id: id, data: "line \(i)\n")
+        try await vm.sendStdin("line \(i)\n", execId: id)
     }
-    try runner.closeStdin(id: id)
+    try await vm.closeStdin(execId: id)
 
     var output = ""
     for try await chunk in stream {
@@ -761,21 +750,16 @@ func integrationStdinCloseTriggersEOF() async throws {
 
     try await vm.boot()
 
-    guard let runner = await vm.commandRunner else {
-        Issue.record("No command runner")
-        return
-    }
-
     let id = UUID().uuidString
-    let stream = try runner.execStream(id: id, command: "cat", timeout: 30)
+    let stream = try await vm.execStream(id: id, "cat", timeout: 30)
 
     try await Task.sleep(for: .milliseconds(500))
 
     // Send some data
-    try runner.sendStdin(id: id, data: "payload\n")
+    try await vm.sendStdin("payload\n", execId: id)
 
     // Close stdin — cat should see EOF and exit
-    try runner.closeStdin(id: id)
+    try await vm.closeStdin(execId: id)
 
     var output = ""
     var exitCode: Int32?
@@ -800,20 +784,15 @@ func integrationStdinConcurrentWithExec() async throws {
 
     try await vm.boot()
 
-    guard let runner = await vm.commandRunner else {
-        Issue.record("No command runner")
-        return
-    }
-
     try await withThrowingTaskGroup(of: (String, String).self) { group in
         // Task 1: stdin-consuming command
         group.addTask {
             let id = UUID().uuidString
-            let stream = try runner.execStream(id: id, command: "cat", timeout: 30)
+            let stream = try await vm.execStream(id: id, "cat", timeout: 30)
 
             try await Task.sleep(for: .milliseconds(300))
-            try runner.sendStdin(id: id, data: "STDIN_DATA\n")
-            try runner.closeStdin(id: id)
+            try await vm.sendStdin("STDIN_DATA\n", execId: id)
+            try await vm.closeStdin(execId: id)
 
             var output = ""
             for try await chunk in stream {

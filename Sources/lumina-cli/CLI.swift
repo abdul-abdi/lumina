@@ -994,9 +994,8 @@ struct Cp: AsyncParsableCommand {
         guard let colonIndex = arg.firstIndex(of: ":") else { return nil }
         let candidate = String(arg[arg.startIndex..<colonIndex])
         let path = String(arg[arg.index(after: colonIndex)...])
-        // Session IDs are UUIDs — reject if it looks like a local path
-        guard !candidate.hasPrefix("/"), !candidate.hasPrefix("."),
-              candidate.count >= 8, path.hasPrefix("/") else { return nil }
+        // Session IDs are full UUIDs — validate the format exactly
+        guard UUID(uuidString: candidate) != nil, path.hasPrefix("/") else { return nil }
         return (sid: candidate, path: path)
     }
 }
