@@ -246,3 +246,101 @@ func printNDJSONLine<T: Encodable>(_ value: T) {
         fflush(stdout)
     }
 }
+
+// MARK: - Raw Terminal Mode (PTY support)
+
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Module-level saved termios used by PTY signal handlers. Signal handlers run on
+/// a dispatch queue and need access to the original termios to restore the
+/// terminal before re-raising the signal. Safe because at most one PTY session
+/// is active per CLI process.
+nonisolated(unsafe) private var savedTermios: termios?
+
+/// Switch the terminal (stdin) into raw mode, returning the original termios so
+/// the caller can restore it. Returns nil if stdin is not a TTY or the ioctl fails.
+///
+/// Caller contract: always pair with `restoreTerminal(_:)` via `defer` to
+/// guarantee the terminal is reset on exit — including error paths.
+func enableRawMode() -> termios? {
+    var original = termios()
+    guard tcgetattr(STDIN_FILENO, &original) == 0 else { return nil }
+    savedTermios = original
+
+    var raw = original
+    cfmakeraw(&raw)
+    // Keep ISIG so Ctrl-C still generates SIGINT on the host side — the PTY
+    // code translates that into a pty_input(0x03) sent to the guest.
+    raw.c_lflag |= UInt(ISIG)
+    guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else {
+        savedTermios = nil
+        return nil
+    }
+    return original
+}
+
+/// Restore the terminal (stdin) to the original termios captured by `enableRawMode`.
+func restoreTerminal(_ original: termios) {
+    var t = original
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)
+    savedTermios = nil
+}
+
+/// Return the current terminal window size (cols, rows) from stdout, or nil if
+/// stdout is not attached to a TTY.
+func getTerminalSize() -> (cols: Int, rows: Int)? {
+    var ws = winsize()
+    // `TIOCGWINSZ` type varies by SDK (UInt on some, UInt32 on others); force to UInt.
+    guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &ws) == 0 else { return nil }
+    return (cols: Int(ws.ws_col), rows: Int(ws.ws_row))
+}
+
+/// Install PTY signal handlers using DispatchSource (C `signal()` callbacks
+/// cannot capture state). SIGINT/SIGTERM restore termios then re-raise with
+/// default disposition so the parent process observes the correct wait status.
+/// SIGWINCH invokes `onResize` with the fresh terminal size.
+///
+/// The caller MUST retain the returned cleanup closure and invoke it on exit
+/// (typically via `defer`) so the DispatchSources are cancelled and the signal
+/// dispositions are restored.
+func installPtySignalHandlers(
+    onResize: @escaping @Sendable (Int, Int) -> Void
+) -> () -> Void {
+    let queue = DispatchQueue(label: "com.lumina.pty-signals")
+
+    // SIGINT/SIGTERM: restore terminal, then re-raise with default disposition
+    let termSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+        Foundation.signal(sig, SIG_IGN) // Let the dispatch source deliver it
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+        source.setEventHandler {
+            if var saved = savedTermios {
+                tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved)
+                savedTermios = nil
+            }
+            Foundation.signal(sig, SIG_DFL)
+            raise(sig)
+        }
+        source.resume()
+        return source
+    }
+
+    // SIGWINCH: report new size to caller
+    Foundation.signal(SIGWINCH, SIG_IGN)
+    let winchSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: queue)
+    winchSource.setEventHandler {
+        if let size = getTerminalSize() {
+            onResize(size.cols, size.rows)
+        }
+    }
+    winchSource.resume()
+
+    return {
+        for source in termSources { source.cancel() }
+        winchSource.cancel()
+        Foundation.signal(SIGINT, SIG_DFL)
+        Foundation.signal(SIGTERM, SIG_DFL)
+        Foundation.signal(SIGWINCH, SIG_DFL)
+    }
+}

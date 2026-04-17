@@ -44,12 +44,25 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
 
+    @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
+    var pty: Bool = false
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
 
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             FileHandle.standardError.write(Data("lumina: command cannot be empty\n".utf8))
+            throw ExitCode.failure
+        }
+
+        // PTY on disposable `run` is not supported in v0.6.0. Interactive mode
+        // requires a persistent session (Unix-socket IPC + bidirectional
+        // streaming), so we redirect users to `session start` + `exec --pty`.
+        if pty {
+            FileHandle.standardError.write(Data(
+                "lumina: --pty on `run` requires a session. Use `lumina session start` then `lumina exec --pty <sid> \"<cmd>\"`.\n".utf8
+            ))
             throw ExitCode.failure
         }
 
@@ -812,6 +825,9 @@ struct Exec: AsyncParsableCommand {
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
 
+    @Flag(name: .long, help: "Run in PTY mode (interactive terminal)")
+    var pty: Bool = false
+
     func run() async throws {
         let sid = parseSID(self.sid)
         let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
@@ -845,6 +861,19 @@ struct Exec: AsyncParsableCommand {
             throw ExitCode.failure
         }
         defer { client.disconnect() }
+
+        // PTY mode: interactive, raw-byte bidirectional streaming.
+        // Bypasses the non-PTY output/stdin loops entirely — signal handling,
+        // stdin pumping, and output decoding all differ.
+        if pty {
+            try runPtyExec(
+                client: client,
+                command: command,
+                timeoutSecs: timeoutSecs,
+                env: parsedEnv
+            )
+            return
+        }
 
         // Forward SIGINT/SIGTERM to the guest command via cancel message
         let cleanupSignals = installSignalForwarding(client: client)
@@ -983,6 +1012,103 @@ struct Exec: AsyncParsableCommand {
                 default:
                     continue
                 }
+            }
+        }
+    }
+
+    // MARK: - PTY Exec
+
+    /// Drive an interactive PTY-backed command over a session client.
+    ///
+    /// Flow:
+    ///   1. Require stdin to be a TTY; capture window size.
+    ///   2. Switch stdin into raw mode (restored on every exit path).
+    ///   3. Install SIGINT/SIGTERM + SIGWINCH dispatch sources.
+    ///      - SIGINT is swallowed by the dispatch source; the raw 0x03 byte from
+    ///        the terminal is what actually reaches the guest as pty_input.
+    ///      - SIGWINCH reads the new size and forwards it as `window_resize`.
+    ///   4. Send `pty_exec` with the initial cols/rows.
+    ///   5. Pump stdin: read raw bytes from fd 0, forward as base64 `pty_input`.
+    ///   6. Consume responses: `pty_output` → raw bytes to stdout, `exit` → done,
+    ///      `error` → print to stderr and fail.
+    private func runPtyExec(
+        client: SessionClient,
+        command: String,
+        timeoutSecs: Int,
+        env: [String: String]
+    ) throws {
+        guard isatty(STDIN_FILENO) != 0 else {
+            FileHandle.standardError.write(Data("lumina: --pty requires stdin to be a TTY\n".utf8))
+            throw ExitCode.failure
+        }
+        guard let termSize = getTerminalSize() else {
+            FileHandle.standardError.write(Data("lumina: cannot determine terminal size (not a TTY?)\n".utf8))
+            throw ExitCode.failure
+        }
+        guard let originalTermios = enableRawMode() else {
+            FileHandle.standardError.write(Data("lumina: failed to set raw mode\n".utf8))
+            throw ExitCode.failure
+        }
+        defer { restoreTerminal(originalTermios) }
+
+        // SIGWINCH forwards resize events; SIGINT/SIGTERM restore the terminal.
+        // `client` is Sendable (@unchecked), so capturing it in the @Sendable
+        // closure is fine.
+        let cleanupPtySignals = installPtySignalHandlers { [client] cols, rows in
+            try? client.send(.windowResize(cols: cols, rows: rows))
+        }
+        defer { cleanupPtySignals() }
+
+        // Send pty_exec request
+        try client.send(.ptyExec(
+            cmd: command,
+            timeout: timeoutSecs,
+            env: env,
+            cols: termSize.cols,
+            rows: termSize.rows
+        ))
+
+        // Stdin pump: raw bytes from fd 0 → base64 pty_input frames.
+        // `availableData` blocks until data is ready or EOF; on EOF we stop.
+        let stdinPtyTask = Task.detached { [client] in
+            let handle = FileHandle.standardInput
+            while !Task.isCancelled {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break } // EOF — host-side stdin closed
+                let base64 = chunk.base64EncodedString()
+                try? client.send(.ptyInput(data: base64))
+            }
+        }
+        defer { stdinPtyTask.cancel() }
+
+        // Output pump: pty_output → raw bytes to stdout, exit → done.
+        while true {
+            let response: SessionResponse
+            do {
+                response = try client.receive()
+            } catch {
+                // Connection dropped mid-session — best effort restore and exit.
+                stdinPtyTask.cancel()
+                FileHandle.standardError.write(Data("\r\nlumina: session disconnected\r\n".utf8))
+                throw ExitCode.failure
+            }
+            switch response {
+            case .ptyOutput(let base64Data):
+                if let rawBytes = Data(base64Encoded: base64Data) {
+                    FileHandle.standardOutput.write(rawBytes)
+                    fflush(stdout)
+                }
+            case .exit(let code, _):
+                stdinPtyTask.cancel()
+                if code != 0 { throw ExitCode(code) }
+                return
+            case .error(let message):
+                stdinPtyTask.cancel()
+                FileHandle.standardError.write(Data("\r\nlumina: \(message)\r\n".utf8))
+                throw ExitCode.failure
+            default:
+                // Ignore any non-PTY responses (shouldn't occur during a PTY session).
+                continue
             }
         }
     }
