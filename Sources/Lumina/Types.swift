@@ -413,6 +413,29 @@ public func parseDuration(_ str: String) -> Duration? {
     return .seconds(num)
 }
 
+/// A parsed `--forward host:guest` spec. Both ports are in [1, 65535].
+public struct ForwardSpec: Equatable, Sendable {
+    public let hostPort: Int
+    public let guestPort: Int
+    public init(hostPort: Int, guestPort: Int) {
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+    }
+}
+
+/// Parse a `--forward host:guest` spec. Returns nil if the input is
+/// malformed or either port is out of range.
+public func parseForwardSpec(_ spec: String) -> ForwardSpec? {
+    let parts = spec.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 2,
+          let hostPort = Int(parts[0]),
+          let guestPort = Int(parts[1]),
+          (1...65_535).contains(hostPort),
+          (1...65_535).contains(guestPort)
+    else { return nil }
+    return ForwardSpec(hostPort: hostPort, guestPort: guestPort)
+}
+
 /// Parse a human-readable memory string (e.g. "512MB", "1GB") into bytes.
 /// Returns nil on invalid input. Requires MB or GB suffix.
 public func parseMemory(_ str: String) -> UInt64? {

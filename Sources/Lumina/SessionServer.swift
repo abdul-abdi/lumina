@@ -183,7 +183,7 @@ public final class SessionServer: @unchecked Sendable {
     /// The enclosing TaskGroup awaits all in-flight connection tasks on scope
     /// exit, so a shutdown on one client still lets other clients finish
     /// their pending response before the serve call returns.
-    public func serve(vm: VM) async {
+    public func serve(vm: VM, onShutdown: (@Sendable () async -> Void)? = nil) async {
         await withTaskGroup(of: Void.self) { group in
             while serverFd >= 0 {
                 let handles: (read: FileHandle, write: FileHandle)
@@ -195,7 +195,7 @@ public final class SessionServer: @unchecked Sendable {
                 }
 
                 group.addTask { [weak self] in
-                    await self?.handleConnection(handles: handles, vm: vm)
+                    await self?.handleConnection(handles: handles, vm: vm, onShutdown: onShutdown)
                 }
             }
             // TaskGroup auto-awaits remaining children on scope exit.
@@ -210,7 +210,8 @@ public final class SessionServer: @unchecked Sendable {
     /// internal locks (per-exec AsyncStream map, transferContinuation slot).
     private func handleConnection(
         handles: (read: FileHandle, write: FileHandle),
-        vm: VM
+        vm: VM,
+        onShutdown: (@Sendable () async -> Void)? = nil
     ) async {
         let clientFd = handles.read.fileDescriptor
         defer { Darwin.close(clientFd) }
@@ -269,6 +270,9 @@ public final class SessionServer: @unchecked Sendable {
                 break
 
             case .shutdown:
+                // Teardown forwards (or any other caller-provided resources)
+                // BEFORE vm.shutdown so VZ calls can still reach the guest.
+                await onShutdown?()
                 await vm.shutdown()
                 try? writeResponse(.exit(code: 0, durationMs: 0), to: handles.write)
                 close()

@@ -46,6 +46,12 @@ final class CommandRunner: @unchecked Sendable {
     // ── Network readiness: one-shot continuation for configure_network flow ──
     private var networkContinuation: CheckedContinuation<GuestMessage, Never>?
 
+    // ── Port forward continuations: one per in-flight port_forward_start ──
+    // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
+    // surface `.connectionFailed` to the caller instead of silently succeeding
+    // with a bogus vsock port.
+    private var portForwardContinuations: [Int: CheckedContinuation<Int, any Error>] = [:]
+
     /// Background task that reads all messages from the vsock and dispatches
     /// them to registered handlers.
     private var dispatcherTask: Task<Void, Never>?
@@ -475,6 +481,9 @@ final class CommandRunner: @unchecked Sendable {
 
         let networkCont = networkContinuation
         networkContinuation = nil
+
+        let pfConts = portForwardContinuations
+        portForwardContinuations = [:]
         lock.unlock()
 
         ptyLock.lock()
@@ -488,6 +497,8 @@ final class CommandRunner: @unchecked Sendable {
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending requestPortForward() callers with connectionFailed.
+        for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
 
         // Best-effort cancel: tell the guest agent to kill running commands
         if let fd = fd {
@@ -557,6 +568,73 @@ final class CommandRunner: @unchecked Sendable {
             }
         }
         // network_ready received; DNS, route, and IP are now live on the guest.
+    }
+
+    // MARK: - Port Forwarding (host-driven)
+
+    /// Ask the guest agent to open a TCP listener on `guestPort` and allocate a
+    /// reverse-channel vsock port. Suspends until the guest responds with
+    /// `port_forward_ready` carrying the vsock port, or until the connection
+    /// tears down (in which case the continuation is resumed with
+    /// `.connectionFailed`).
+    func requestPortForward(guestPort: Int) async throws(LuminaError) -> Int {
+        let msg = HostMessage.portForwardStart(guestPort: guestPort)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode port_forward_start: \(error)")
+        }
+
+        // Register continuation BEFORE sending so a fast guest reply cannot
+        // arrive before the map entry exists. All lock operations happen inside
+        // this synchronous closure — NSLock is async-unavailable in Swift 6.
+        do {
+            return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, any Error>) in
+                lock.lock()
+                guard _state == .ready else {
+                    lock.unlock()
+                    cont.resume(throwing: LuminaError.connectionFailed)
+                    return
+                }
+                if portForwardContinuations[guestPort] != nil {
+                    lock.unlock()
+                    cont.resume(throwing: LuminaError.protocolError(
+                        "port_forward_start already in flight for guest port \(guestPort)"
+                    ))
+                    return
+                }
+                portForwardContinuations[guestPort] = cont
+                lock.unlock()
+
+                do {
+                    try writeToOutput(msgData)
+                } catch {
+                    // writeToOutput failed — remove entry and resume before
+                    // the dispatcher has any chance of finding it.
+                    lock.lock()
+                    let pending = portForwardContinuations.removeValue(forKey: guestPort)
+                    lock.unlock()
+                    pending?.resume(throwing: LuminaError.connectionFailed)
+                }
+            }
+        } catch let luminaError as LuminaError {
+            throw luminaError
+        } catch {
+            throw .connectionFailed
+        }
+    }
+
+    /// Tell the guest to stop forwarding `guestPort`. Idempotent on the guest.
+    func stopPortForward(guestPort: Int) throws(LuminaError) {
+        let msg = HostMessage.portForwardStop(guestPort: guestPort)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode port_forward_stop: \(error)")
+        }
+        try writeToOutput(msgData)
     }
 
     // MARK: - File Upload (async, through dispatcher)
@@ -756,11 +834,11 @@ final class CommandRunner: @unchecked Sendable {
             networkContinuation = nil
             lock.unlock()
             cont?.resume(returning: msg)
-        case .portForwardReady:
-            // Task 13: wire to CommandRunner.portForwardContinuations. For now,
-            // the message is acknowledged and dropped — keeps the switch exhaustive
-            // and prevents a compile error while Task 11 lands protocol-only changes.
-            break
+        case .portForwardReady(let guestPort, let vsockPort):
+            lock.lock()
+            let cont = portForwardContinuations.removeValue(forKey: guestPort)
+            lock.unlock()
+            cont?.resume(returning: vsockPort)
         case .ready:
             // Unexpected ready during active connection — ignore
             break
@@ -784,6 +862,9 @@ final class CommandRunner: @unchecked Sendable {
 
         let networkCont = networkContinuation
         networkContinuation = nil
+
+        let pfConts = portForwardContinuations
+        portForwardContinuations = [:]
         lock.unlock()
 
         ptyLock.lock()
@@ -797,6 +878,8 @@ final class CommandRunner: @unchecked Sendable {
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending requestPortForward() callers with connectionFailed.
+        for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
     }
 
     // MARK: - Private: Exec Handler Registration

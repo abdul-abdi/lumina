@@ -720,6 +720,78 @@ public actor VM {
         try runner.sendWindowResize(id: id, cols: cols, rows: rows)
     }
 
+    // MARK: - Port Forwarding (v0.6.0)
+
+    /// Ask the guest agent to open a TCP listener on `guestPort` and return the
+    /// vsock port the host should dial for each new proxied connection.
+    ///
+    /// Actor-isolated: runs on the VM's executor queue. Callers (e.g. the
+    /// SessionProcess port-forward proxy) await this method, and the write to
+    /// the vsock happens on the correct queue.
+    public func requestPortForward(guestPort: Int) async throws(LuminaError) -> Int {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .connectionFailed
+        }
+        return try await runner.requestPortForward(guestPort: guestPort)
+    }
+
+    /// Tell the guest agent to stop forwarding `guestPort`. Idempotent.
+    public func stopPortForward(guestPort: Int) throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        try runner.stopPortForward(guestPort: guestPort)
+    }
+
+    /// Open a vsock connection to the guest on `port` and return a duplicated
+    /// POSIX file descriptor the caller owns. This method is actor-isolated —
+    /// the underlying `VZVirtioSocketDevice.connect(toPort:)` call must run on
+    /// the VM's executor queue (Carmack review: detached tasks would violate
+    /// VZ's thread-affinity requirement).
+    ///
+    /// Callers from detached tasks (e.g. port-forward TCP proxies) await this
+    /// method, read/write the returned fd with standard POSIX syscalls, and
+    /// MUST `close()` the fd when done. The original VZVirtioSocketConnection
+    /// is released inside the actor once its fd is duped — the dup'd fd stays
+    /// valid independently.
+    ///
+    /// Returns a fd instead of VZVirtioSocketConnection so the non-Sendable
+    /// VZ object never leaves the actor isolation domain.
+    public func connectVsock(port: UInt32) async throws(LuminaError) -> Int32 {
+        guard _state == .ready, let vm = virtualMachine else {
+            throw .connectionFailed
+        }
+        guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
+            throw .connectionFailed
+        }
+        let queue = executor.queue
+        // Dup the connection's fd inside the callback so the non-Sendable
+        // VZVirtioSocketConnection never crosses the actor boundary — only
+        // an Int32 does. The VZ object drops out of scope on the queue and its
+        // underlying fd is closed on dealloc; the dup'd fd remains valid.
+        let fd: Int32
+        do {
+            fd = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, any Error>) in
+                queue.async {
+                    socketDevice.connect(toPort: port) { result in
+                        switch result {
+                        case .success(let c):
+                            let d = dup(c.fileDescriptor)
+                            if d < 0 {
+                                cont.resume(throwing: LuminaError.connectionFailed)
+                            } else {
+                                cont.resume(returning: d)
+                            }
+                        case .failure(let err):
+                            cont.resume(throwing: err)
+                        }
+                    }
+                }
+            }
+        } catch {
+            throw .connectionFailed
+        }
+        return fd
+    }
+
     /// Attempt to reconnect to the guest agent after a connection drop.
     /// State is only set to `.ready` after the reconnect succeeds.
     public func reconnect() async throws(LuminaError) {

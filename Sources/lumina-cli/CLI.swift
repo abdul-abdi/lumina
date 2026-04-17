@@ -595,6 +595,9 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default. Env: LUMINA_DISK_SIZE")
     var diskSize: String? = nil
 
+    @Option(name: .long, help: "Forward port (host:guest, repeatable). Host side binds 127.0.0.1 only.")
+    var forward: [String] = []
+
     func run() async throws {
         // Check if requested image exists before spawning background process
         let puller = ImagePuller()
@@ -656,6 +659,16 @@ struct SessionStart: AsyncParsableCommand {
             }
         }
 
+        // Parse --forward early so invalid specs fail before spawning the child.
+        // Forwarded specs are passed verbatim to _session-serve, which re-parses
+        // them after VM boot.
+        for spec in forward {
+            guard parseForwardSpec(spec) != nil else {
+                FileHandle.standardError.write(Data("lumina: invalid --forward '\(spec)'. Use host:guest\n".utf8))
+                throw ExitCode.failure
+            }
+        }
+
         let sid = UUID().uuidString
         let execPath = ProcessInfo.processInfo.arguments[0]
 
@@ -674,6 +687,9 @@ struct SessionStart: AsyncParsableCommand {
         }
         if let ds = resolveDiskSize(flag: diskSize) {
             process.arguments! += ["--disk-size", ds]
+        }
+        for spec in forward {
+            process.arguments! += ["--forward", spec]
         }
 
         // Capture stderr from child process so boot failures are surfaced
