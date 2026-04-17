@@ -177,6 +177,38 @@ type PtyOutputMsg struct {
 	Data string `json:"data"`
 }
 
+// Port forwarding messages
+
+type PortForwardStartMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+}
+
+type PortForwardStopMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+}
+
+type PortForwardReadyMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+	VsockPort int    `json:"vsock_port"`
+}
+
+// portFwdState tracks a single active port forward: the vsock listener the
+// guest exposes for this mapping, plus a cancellation context so we can stop
+// the accept loop and abort in-flight proxy connections on port_forward_stop.
+type portFwdState struct {
+	ln     net.Listener
+	cancel context.CancelFunc
+}
+
+var (
+	portFwdMu      sync.Mutex
+	nextVsockPort  = uint32(1025)
+	activeForwards = make(map[int]*portFwdState) // guest_port -> state
+)
+
 // bootMark writes a boot-profile phase marker to /dev/kmsg (kernel log →
 // serial console). The host parses these from the SerialConsole buffer to
 // build a BootProfile. Safe to call before vsock is up.
@@ -364,6 +396,25 @@ func serveConnection(conn net.Conn) {
 				unix.Write(pty.masterFd, decoded)
 			}
 			// If PTY not found (already exited), silently drop
+
+		case "port_forward_start":
+			var msg PortForwardStartMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid port_forward_start: %v\n", err)
+				continue
+			}
+			// Dispatch to a goroutine — listenVsock + sendJSON should be
+			// fast, but we never want to block the message loop on a new
+			// listener creation.
+			go handlePortForwardStart(conn, msg.GuestPort)
+
+		case "port_forward_stop":
+			var msg PortForwardStopMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid port_forward_stop: %v\n", err)
+				continue
+			}
+			handlePortForwardStop(msg.GuestPort)
 
 		case "window_resize":
 			var msg WindowResizeMsg
@@ -912,6 +963,136 @@ func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
 	// Timeout — send ready anyway, config is applied and network likely works
 	fmt.Fprintln(os.Stderr, "network readiness timeout, sending network_ready anyway")
 	sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
+}
+
+// handlePortForwardStart opens a vsock listener on a dynamically-chosen port,
+// replies with port_forward_ready so the host learns the mapping, and then
+// accepts incoming vsock connections. Each accepted connection is proxied to
+// localhost:<guest_port> inside the VM. All accept-loop / proxy goroutines
+// honour the per-forward context so port_forward_stop can tear them down
+// cleanly.
+func handlePortForwardStart(conn net.Conn, guestPort int) {
+	portFwdMu.Lock()
+	// Reject duplicate forward for the same guest_port — the host shouldn't
+	// start the same forward twice, and if it does we'd leak the previous
+	// listener. The host is expected to send port_forward_stop first.
+	if _, exists := activeForwards[guestPort]; exists {
+		portFwdMu.Unlock()
+		fmt.Fprintf(os.Stderr, "port_forward: already active for guest_port=%d\n", guestPort)
+		return
+	}
+	vsockPort := nextVsockPort
+	nextVsockPort++
+	portFwdMu.Unlock()
+
+	ln, err := listenVsock(int(vsockPort))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "port_forward: vsock listen on %d failed: %v\n", vsockPort, err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	portFwdMu.Lock()
+	activeForwards[guestPort] = &portFwdState{ln: ln, cancel: cancel}
+	portFwdMu.Unlock()
+
+	// Notify host of the negotiated vsock port BEFORE the accept goroutine
+	// starts — otherwise the host could connect before we've finished
+	// listening, though listenVsock's unix.Listen() has already succeeded so
+	// accept is safe immediately.
+	sendJSON(conn, PortForwardReadyMsg{
+		Type:      "port_forward_ready",
+		GuestPort: guestPort,
+		VsockPort: int(vsockPort),
+	})
+
+	go func() {
+		defer func() {
+			ln.Close()
+			portFwdMu.Lock()
+			// Only delete if the map entry still points at this listener —
+			// guard against a stop+restart race where a later forward on the
+			// same guest_port replaced the entry.
+			if cur, ok := activeForwards[guestPort]; ok && cur.ln == ln {
+				delete(activeForwards, guestPort)
+			}
+			portFwdMu.Unlock()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			vsockConn, err := ln.Accept()
+			if err != nil {
+				// If cancelled, ln.Close() unblocks Accept with an error —
+				// that's the normal teardown path.
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "port_forward: accept on vsock %d failed: %v\n", vsockPort, err)
+				return
+			}
+			go proxyPortForwardConn(ctx, vsockConn, guestPort)
+		}
+	}()
+}
+
+// proxyPortForwardConn bridges a vsock connection (from the host) to a local
+// TCP connection at 127.0.0.1:<guest_port>. Closes both ends on ctx.Done() or
+// when either side of the stream finishes, so port_forward_stop aborts
+// in-flight transfers.
+func proxyPortForwardConn(ctx context.Context, vsockConn net.Conn, guestPort int) {
+	defer vsockConn.Close()
+
+	tcpConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", guestPort), 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "port_forward: connect to 127.0.0.1:%d failed: %v\n", guestPort, err)
+		return
+	}
+	defer tcpConn.Close()
+
+	// Bidirectional copy. When either side closes, signal done so the other
+	// goroutine's blocked Read unblocks via the deferred Close calls above.
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(tcpConn, vsockConn)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(vsockConn, tcpConn)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+		// One side closed. Defers close both; the other goroutine's io.Copy
+		// will return and push to the buffered channel, but we don't block
+		// waiting for it — the channel has capacity 2 so it won't leak.
+	case <-ctx.Done():
+		// Forward torn down; defers close both ends.
+	}
+}
+
+// handlePortForwardStop closes the vsock listener and cancels the context for
+// a previously-started forward. In-flight proxy goroutines unblock via the
+// deferred Close calls in proxyPortForwardConn once ctx is cancelled.
+func handlePortForwardStop(guestPort int) {
+	portFwdMu.Lock()
+	state, ok := activeForwards[guestPort]
+	if ok {
+		delete(activeForwards, guestPort)
+	}
+	portFwdMu.Unlock()
+	if !ok {
+		return
+	}
+	// Close the listener first so Accept returns; then cancel so in-flight
+	// proxy connections observe ctx.Done() and tear down.
+	state.ln.Close()
+	state.cancel()
 }
 
 // run executes a command silently, logging errors to stderr.
