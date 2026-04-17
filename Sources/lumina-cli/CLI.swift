@@ -326,6 +326,9 @@ private struct ResultJSON: Encodable {
     var exit_code: Int?
     var error: String?
     var duration_ms: Int
+    // v0.6.0: partial data on error
+    var partial_stdout: String?
+    var partial_stderr: String?
 }
 
 private func printResultJSON(_ result: RunResult, durationMs: Int) {
@@ -340,9 +343,21 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
     encodeAndPrint(r)
 }
 
-private func printErrorJSON(_ error: any Error, durationMs: Int, friendly: Bool = false) {
+private func printErrorJSON(
+    _ error: any Error,
+    durationMs: Int,
+    friendly: Bool = false,
+    errorState: String? = nil,
+    partialStdout: String? = nil,
+    partialStderr: String? = nil
+) {
     let msg = friendly ? friendlyError(error) : String(describing: error)
-    let r = ResultJSON(error: msg, duration_ms: durationMs)
+    var r = ResultJSON(error: msg, duration_ms: durationMs)
+    if let state = errorState {
+        r.error = state
+    }
+    if let ps = partialStdout { r.partial_stdout = ps }
+    if let pe = partialStderr { r.partial_stderr = pe }
     encodeAndPrint(r)
 }
 
@@ -862,45 +877,112 @@ struct Exec: AsyncParsableCommand {
         }
         defer { stdinTask?.cancel() }
 
-        while true {
-            let response = try client.receive()
-            switch response {
-            case .output(let outputStream, let data):
-                switch format {
-                case .json:
-                    printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
-                case .text:
-                    if outputStream == .stdout {
-                        print(data, terminator: "")
-                    } else {
-                        FileHandle.standardError.write(Data(data.utf8))
+        // Output routing: v0.6.0 unifies JSON output for exec with run (single envelope).
+        // Legacy NDJSON streaming is preserved behind LUMINA_OUTPUT=ndjson.
+        let legacyNDJSON = useLegacyExecOutput()
+        let start = ContinuousClock.now
+
+        if format == .json && !legacyNDJSON {
+            // Unified envelope: buffer output, emit single JSON object (matches `run`)
+            var stdoutBuf = ""
+            var stderrBuf = ""
+
+            while true {
+                let response: SessionResponse
+                do {
+                    response = try client.receive()
+                } catch {
+                    stdinTask?.cancel()
+                    let ms = millisSince(start)
+                    printErrorJSON(
+                        error,
+                        durationMs: ms,
+                        friendly: true,
+                        errorState: "session_disconnected",
+                        partialStdout: stdoutBuf,
+                        partialStderr: stderrBuf
+                    )
+                    throw ExitCode.failure
+                }
+
+                switch response {
+                case .output(let outputStream, let data):
+                    if outputStream == .stdout { stdoutBuf += data } else { stderrBuf += data }
+                case .outputBytes(let outputStream, let base64):
+                    guard let rawBytes = Data(base64Encoded: base64) else {
+                        stderrBuf += "lumina: malformed base64 in outputBytes\n"
+                        continue
                     }
+                    let text = String(decoding: rawBytes, as: UTF8.self)
+                    if outputStream == .stdout { stdoutBuf += text } else { stderrBuf += text }
+                case .exit(let code, let durationMs):
+                    stdinTask?.cancel()
+                    let r = ResultJSON(
+                        stdout: stdoutBuf,
+                        stderr: stderrBuf,
+                        exit_code: Int(code),
+                        duration_ms: durationMs
+                    )
+                    encodeAndPrint(r)
+                    if code != 0 { throw ExitCode(code) }
+                    return
+                case .error(let message):
+                    stdinTask?.cancel()
+                    let ms = millisSince(start)
+                    printErrorJSON(
+                        LuminaError.sessionFailed(message),
+                        durationMs: ms,
+                        friendly: true,
+                        partialStdout: stdoutBuf,
+                        partialStderr: stderrBuf
+                    )
+                    throw ExitCode.failure
+                default:
+                    continue
                 }
-            case .exit(let code, let durationMs):
-                stdinTask?.cancel()
-                switch format {
-                case .json:
-                    printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
-                case .text:
-                    break
+            }
+        } else {
+            // Legacy NDJSON (LUMINA_OUTPUT=ndjson) or text mode: existing streaming behavior.
+            while true {
+                let response = try client.receive()
+                switch response {
+                case .output(let outputStream, let data):
+                    switch format {
+                    case .json:
+                        printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
+                    case .text:
+                        if outputStream == .stdout {
+                            print(data, terminator: "")
+                        } else {
+                            FileHandle.standardError.write(Data(data.utf8))
+                        }
+                    }
+                case .exit(let code, let durationMs):
+                    stdinTask?.cancel()
+                    switch format {
+                    case .json:
+                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
+                    case .text:
+                        break
+                    }
+                    if code != 0 { throw ExitCode(code) }
+                    return
+                case .outputBytes(let outputStream, let base64):
+                    guard let rawBytes = Data(base64Encoded: base64) else {
+                        FileHandle.standardError.write(Data("lumina: malformed base64 in outputBytes\n".utf8))
+                        break
+                    }
+                    let fd = outputStream == .stdout
+                        ? FileHandle.standardOutput
+                        : FileHandle.standardError
+                    fd.write(rawBytes)
+                case .error(let message):
+                    stdinTask?.cancel()
+                    FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
+                    throw ExitCode.failure
+                default:
+                    continue
                 }
-                if code != 0 { throw ExitCode(code) }
-                return
-            case .outputBytes(let outputStream, let base64):
-                guard let rawBytes = Data(base64Encoded: base64) else {
-                    FileHandle.standardError.write(Data("lumina: malformed base64 in outputBytes\n".utf8))
-                    break
-                }
-                let fd = outputStream == .stdout
-                    ? FileHandle.standardOutput
-                    : FileHandle.standardError
-                fd.write(rawBytes)
-            case .error(let message):
-                stdinTask?.cancel()
-                FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
-                throw ExitCode.failure
-            default:
-                continue
             }
         }
     }

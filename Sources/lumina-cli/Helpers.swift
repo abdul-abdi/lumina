@@ -206,6 +206,15 @@ func resolveStdin() -> Stdin {
     }
 }
 
+// MARK: - Legacy Output Mode
+
+/// Check if legacy NDJSON output is requested for exec.
+/// `LUMINA_OUTPUT=ndjson` preserves pre-v0.6.0 streaming behavior for exec when piped.
+/// Default (absent or any other value) = unified envelope. Removed in v0.8.0.
+func useLegacyExecOutput() -> Bool {
+    ProcessInfo.processInfo.environment["LUMINA_OUTPUT"]?.lowercased() == "ndjson"
+}
+
 // MARK: - NDJSON Output Types (streaming / session exec)
 
 /// Stream chunk: stdout or stderr data.
