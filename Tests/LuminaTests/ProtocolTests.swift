@@ -282,3 +282,47 @@ import Testing
     #expect(vmOpts.mounts.count == 1)
     #expect(vmOpts.mounts[0].guestPath == "/mnt")
 }
+
+// MARK: - PTY Message Tests
+
+@Test func encodePtyExecMessage() throws {
+    let msg = HostMessage.ptyExec(id: "pty-1", cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_exec")
+    #expect(json["id"] as? String == "pty-1")
+    #expect(json["cmd"] as? String == "claude")
+    #expect(json["cols"] as? Int == 120)
+    #expect(json["rows"] as? Int == 40)
+}
+
+@Test func encodePtyInputMessage() throws {
+    let msg = HostMessage.ptyInput(id: "pty-1", data: "aGVsbG8=")
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_input")
+    #expect(json["id"] as? String == "pty-1")
+    #expect(json["data"] as? String == "aGVsbG8=")
+}
+
+@Test func encodeWindowResizeMessage() throws {
+    let msg = HostMessage.windowResize(id: "pty-1", cols: 200, rows: 50)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "window_resize")
+    #expect(json["cols"] as? Int == 200)
+    #expect(json["rows"] as? Int == 50)
+}
+
+@Test func decodePtyOutputMessage() throws {
+    let raw = Data("{\"type\":\"pty_output\",\"id\":\"pty-1\",\"data\":\"aGVsbG8=\"}\n".utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .ptyOutput(id: "pty-1", data: "aGVsbG8="))
+}
+
+@Test func decodePtyExitMessage() throws {
+    // PTY uses the same exit message type as regular exec
+    let raw = Data("{\"type\":\"exit\",\"id\":\"pty-1\",\"code\":0}\n".utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .exit(id: "pty-1", code: 0))
+}

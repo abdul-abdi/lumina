@@ -593,6 +593,13 @@ final class CommandRunner: @unchecked Sendable {
             let handler = execHandlers[id]
             lock.unlock()
             handler?.yield(msg)
+        case .ptyOutput(let id, _):
+            // Route PTY output to the exec handler registered for this id.
+            // Full PTY integration (dedicated handlers, chunk fan-out) lands in Task 5.
+            lock.lock()
+            let handler = execHandlers[id]
+            lock.unlock()
+            handler?.yield(msg)
         case .exit(let id, _):
             lock.lock()
             let handler = execHandlers[id]

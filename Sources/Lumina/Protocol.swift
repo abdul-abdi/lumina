@@ -16,6 +16,13 @@ public enum HostMessage: Sendable {
     case stdinClose(id: String)
     /// Configure guest network (host-driven, Apple-style).
     case configureNetwork(ip: String, gateway: String, dns: String)
+    /// Start a PTY-backed interactive command. Output flows back as `.ptyOutput`
+    /// and the process exits via the shared `.exit(id:code:)` message.
+    case ptyExec(id: String, cmd: String, timeout: Int, env: [String: String], cols: Int, rows: Int)
+    /// Write base64-encoded bytes to a running PTY's master side (keyboard input).
+    case ptyInput(id: String, data: String)
+    /// Resize the window of a running PTY (sends TIOCSWINSZ on the guest).
+    case windowResize(id: String, cols: Int, rows: Int)
 }
 
 // MARK: - Guest Messages (received from guest)
@@ -36,6 +43,9 @@ public enum GuestMessage: Sendable, Equatable {
     case downloadData(path: String, data: String, seq: Int, eof: Bool)
     case downloadError(path: String, error: String)
     case networkReady(ip: String)
+    /// PTY-backed output (merged stdout+stderr). `data` is the base64-encoded raw bytes
+    /// read from the PTY master. Exit is delivered via the shared `.exit(id:code:)` case.
+    case ptyOutput(id: String, data: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -70,6 +80,12 @@ enum LuminaProtocol {
             dict = ["type": "stdin_close", "id": id]
         case .configureNetwork(let ip, let gateway, let dns):
             dict = ["type": "configure_network", "ip": ip, "gateway": gateway, "dns": dns]
+        case .ptyExec(let id, let cmd, let timeout, let env, let cols, let rows):
+            dict = ["type": "pty_exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env, "cols": cols, "rows": rows]
+        case .ptyInput(let id, let data):
+            dict = ["type": "pty_input", "id": id, "data": data]
+        case .windowResize(let id, let cols, let rows):
+            dict = ["type": "window_resize", "id": id, "cols": cols, "rows": rows]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -147,6 +163,12 @@ enum LuminaProtocol {
         case "network_ready":
             let ip = json["ip"] as? String ?? ""
             return .networkReady(ip: ip)
+        case "pty_output":
+            guard let id = json["id"] as? String,
+                  let outputData = json["data"] as? String else {
+                throw LuminaError.protocolError("Malformed pty_output: missing id or data")
+            }
+            return .ptyOutput(id: id, data: outputData)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }
