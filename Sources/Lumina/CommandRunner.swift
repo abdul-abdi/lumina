@@ -30,6 +30,13 @@ final class CommandRunner: @unchecked Sendable {
     /// retry duration as max(all in-flight timeouts).
     private var execTimeouts: [String: Int] = [:]
 
+    // ── PTY handlers: separate lock + map (PTY and exec are distinct I/O models) ──
+    // PTY has its own lock to avoid contending with exec on high-frequency
+    // resize/input traffic. Hickey review: shared locks across independent
+    // concerns is accidental complexity.
+    private let ptyLock = NSLock()
+    private var ptyHandlers: [String: AsyncStream<GuestMessage>.Continuation] = [:]
+
     // ── Transfer handler: at most ONE transfer at a time ──
     // Upload and download are sequential, ACK-driven protocols — different
     // from the multiplexed exec protocol. They get a dedicated handler slot
@@ -309,6 +316,119 @@ final class CommandRunner: @unchecked Sendable {
         try writeToOutput(msgData)
     }
 
+    // MARK: - PTY Exec
+
+    /// Execute a command in a PTY on the guest. Returns an AsyncThrowingStream of PtyChunk.
+    /// The caller reads raw terminal output and receives an exit code when the process ends.
+    func execPty(
+        id: String,
+        command: String,
+        timeout: Int,
+        env: [String: String] = [:],
+        cols: Int,
+        rows: Int
+    ) throws(LuminaError) -> AsyncThrowingStream<PtyChunk, any Error> {
+        lock.lock()
+        let currentState = _state
+        lock.unlock()
+        guard currentState == .ready else {
+            throw .connectionFailed
+        }
+
+        let (stream, continuation) = AsyncStream<GuestMessage>.makeStream()
+
+        ptyLock.lock()
+        ptyHandlers[id] = continuation
+        ptyLock.unlock()
+
+        // Send pty_exec message
+        let msg = HostMessage.ptyExec(id: id, cmd: command, timeout: timeout, env: env, cols: cols, rows: rows)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            ptyLock.lock()
+            ptyHandlers.removeValue(forKey: id)
+            ptyLock.unlock()
+            continuation.finish()
+            throw .protocolError("Failed to encode pty_exec message: \(error)")
+        }
+        do {
+            try writeToOutput(msgData)
+        } catch {
+            ptyLock.lock()
+            ptyHandlers.removeValue(forKey: id)
+            ptyLock.unlock()
+            continuation.finish()
+            throw error
+        }
+
+        // Transform GuestMessage stream into PtyChunk stream
+        let runner = self
+        let ptyId = id
+        return AsyncThrowingStream { cont in
+            let task = Task.detached {
+                for await guestMsg in stream {
+                    switch guestMsg {
+                    case .ptyOutput(_, let base64Data):
+                        guard let rawBytes = Data(base64Encoded: base64Data) else { continue }
+                        cont.yield(.output(rawBytes))
+                    case .exit(_, let code):
+                        cont.yield(.exit(code))
+                        cont.finish()
+                        runner.unregisterPtyHandler(ptyId)
+                        return
+                    case .heartbeat:
+                        continue
+                    default:
+                        continue
+                    }
+                }
+                // Stream ended without exit (connection lost)
+                cont.finish(throwing: LuminaError.connectionFailed)
+                runner.unregisterPtyHandler(ptyId)
+            }
+
+            cont.onTermination = { @Sendable _ in
+                task.cancel()
+                runner.unregisterPtyHandler(ptyId)
+            }
+        }
+    }
+
+    /// Unregister a PTY handler and finish its stream.
+    private func unregisterPtyHandler(_ id: String) {
+        ptyLock.lock()
+        let cont = ptyHandlers.removeValue(forKey: id)
+        ptyLock.unlock()
+        cont?.finish()
+    }
+
+    /// Send raw input bytes to a running PTY session.
+    func sendPtyInput(id: String, data: Data) throws(LuminaError) {
+        let base64 = data.base64EncodedString()
+        let msg = HostMessage.ptyInput(id: id, data: base64)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode pty_input message: \(error)")
+        }
+        try writeToOutput(msgData)
+    }
+
+    /// Send a window resize event to a running PTY session.
+    func sendWindowResize(id: String, cols: Int, rows: Int) throws(LuminaError) {
+        let msg = HostMessage.windowResize(id: id, cols: cols, rows: rows)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode window_resize message: \(error)")
+        }
+        try writeToOutput(msgData)
+    }
+
     // MARK: - Reconnect
 
     /// Max guest-side timeout across all in-flight execs.
@@ -357,8 +477,14 @@ final class CommandRunner: @unchecked Sendable {
         networkContinuation = nil
         lock.unlock()
 
+        ptyLock.lock()
+        let ptyHandlersCopy = ptyHandlers
+        ptyHandlers = [:]
+        ptyLock.unlock()
+
         // Finish all handlers — unblocks any waiting exec/stream/upload/download
         for (_, handler) in execHandlersCopy { handler.finish() }
+        for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))
@@ -594,17 +720,24 @@ final class CommandRunner: @unchecked Sendable {
             lock.unlock()
             handler?.yield(msg)
         case .ptyOutput(let id, _):
-            // Route PTY output to the exec handler registered for this id.
-            // Full PTY integration (dedicated handlers, chunk fan-out) lands in Task 5.
-            lock.lock()
-            let handler = execHandlers[id]
-            lock.unlock()
+            ptyLock.lock()
+            let handler = ptyHandlers[id]
+            ptyLock.unlock()
             handler?.yield(msg)
         case .exit(let id, _):
+            // Check exec handlers first (common case)
             lock.lock()
-            let handler = execHandlers[id]
+            let execHandler = execHandlers[id]
             lock.unlock()
-            handler?.yield(msg)
+            if let h = execHandler {
+                h.yield(msg)
+                break
+            }
+            // Fall through to PTY handlers — separate lock to avoid lock coupling
+            ptyLock.lock()
+            let ptyHandler = ptyHandlers[id]
+            ptyLock.unlock()
+            ptyHandler?.yield(msg)
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
             lock.lock()
@@ -648,8 +781,14 @@ final class CommandRunner: @unchecked Sendable {
         networkContinuation = nil
         lock.unlock()
 
+        ptyLock.lock()
+        let ptyHandlersCopy = ptyHandlers
+        ptyHandlers = [:]
+        ptyLock.unlock()
+
         // Finish all handlers so waiting callers get unblocked
         for (_, handler) in execHandlersCopy { handler.finish() }
+        for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))

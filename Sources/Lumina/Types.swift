@@ -220,6 +220,15 @@ public enum OutputChunk: Sendable, Equatable {
     case exit(Int32)
 }
 
+/// Chunks yielded by PTY exec streams. Distinct from OutputChunk because PTY
+/// has a single merged output stream (no stdout/stderr separation).
+public enum PtyChunk: Sendable, Equatable {
+    /// Raw bytes from PTY master fd (base64-decoded).
+    case output(Data)
+    /// Process exited with this code.
+    case exit(Int32)
+}
+
 // MARK: - VM State
 
 public enum VMState: Sendable, Equatable {
