@@ -756,6 +756,11 @@ final class CommandRunner: @unchecked Sendable {
             networkContinuation = nil
             lock.unlock()
             cont?.resume(returning: msg)
+        case .portForwardReady:
+            // Task 13: wire to CommandRunner.portForwardContinuations. For now,
+            // the message is acknowledged and dropped — keeps the switch exhaustive
+            // and prevents a compile error while Task 11 lands protocol-only changes.
+            break
         case .ready:
             // Unexpected ready during active connection — ignore
             break
