@@ -17,6 +17,33 @@ public final class SessionServer: @unchecked Sendable {
     private var serverFd: Int32 = -1
     private let lock = NSLock()
 
+    /// v0.6.0: One active PTY per session. The vsock protocol supports
+    /// concurrent PTYs (each keyed by unique id), but the session server
+    /// enforces single-PTY to keep client state simple. If a second
+    /// `pty_exec` arrives while one is active, an error is returned.
+    /// Guarded by `ptyLock` because it may be mutated from any connection
+    /// Task (handleConnection runs per-client in its own Task).
+    private let ptyLock = NSLock()
+    private var activePtyId: String?
+
+    private func claimPty(_ id: String) -> Bool {
+        ptyLock.withLock {
+            if activePtyId != nil { return false }
+            activePtyId = id
+            return true
+        }
+    }
+
+    private func releasePty(_ id: String) {
+        ptyLock.withLock {
+            if activePtyId == id { activePtyId = nil }
+        }
+    }
+
+    private func currentPtyId() -> String? {
+        ptyLock.withLock { activePtyId }
+    }
+
     public init(socketPath: URL) {
         self.socketPath = socketPath
     }
@@ -246,6 +273,25 @@ public final class SessionServer: @unchecked Sendable {
                 try? writeResponse(.exit(code: 0, durationMs: 0), to: handles.write)
                 close()
                 return
+
+            case .ptyExec(let cmd, let timeout, let env, let cols, let rows):
+                // Pass current read buffer so any pty_input/window_resize bytes
+                // already buffered (coalesced NDJSON) are not dropped — same
+                // pattern as the exec handler.
+                let bufSnapshot = readBuf
+                readBuf = Data()
+                await handlePtyExec(
+                    cmd: cmd, timeout: timeout, env: env, cols: cols, rows: rows,
+                    vm: vm, writeHandle: handles.write,
+                    readHandle: handles.read, initialBuffer: bufSnapshot
+                )
+
+            case .ptyInput, .windowResize:
+                // PTY frames outside of a pty_exec context are no-ops. During
+                // a PTY session, handlePtyExec reads them inline from the
+                // socket. Guard defensively in case a buggy client sends them
+                // outside that window.
+                break
             }
         }
     }
@@ -340,6 +386,105 @@ public final class SessionServer: @unchecked Sendable {
                 }
                 // Ensure channel is closed even if socket closed unexpectedly.
                 channel.close()
+            }
+        }
+    }
+
+    /// Execute an interactive PTY command and bridge raw bytes between the
+    /// client socket and the VM's PTY session.
+    ///
+    /// Mirrors `handleExec`:
+    ///  - Task 1 drives the VM's PTY stream and forwards `ptyOutput` +
+    ///    `exit` responses to the client.
+    ///  - Task 2 reads `pty_input`, `window_resize`, and `cancel` frames
+    ///    from the client socket and forwards them to the VM.
+    ///
+    /// Enforces single-active-PTY per session via `claimPty`. On completion,
+    /// shuts down the read side of the socket to unblock Task 2, then
+    /// releases the slot.
+    private func handlePtyExec(
+        cmd: String, timeout: Int, env: [String: String],
+        cols: Int, rows: Int,
+        vm: VM, writeHandle: FileHandle,
+        readHandle: FileHandle, initialBuffer: Data
+    ) async {
+        let id = UUID().uuidString
+        guard claimPty(id) else {
+            try? writeResponse(
+                .error(message: "PTY session already active. One PTY per session in v0.6.0."),
+                to: writeHandle
+            )
+            return
+        }
+        defer { releasePty(id) }
+
+        let stream: AsyncThrowingStream<PtyChunk, any Error>
+        do {
+            stream = try await vm.execPtyStream(
+                id: id, command: cmd, timeout: timeout, env: env, cols: cols, rows: rows
+            )
+        } catch {
+            try? writeResponse(.error(message: "PTY exec failed: \(error)"), to: writeHandle)
+            return
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            // Task 1: drive the PTY stream, forward output + exit to client.
+            // On completion, shuts down the read side of the socket to unblock
+            // Task 2 (blocked in availableData).
+            group.addTask { [weak self] in
+                guard let self else { return }
+                let start = ContinuousClock.now
+                do {
+                    for try await chunk in stream {
+                        switch chunk {
+                        case .output(let data):
+                            try? self.writeResponse(
+                                .ptyOutput(data: data.base64EncodedString()),
+                                to: writeHandle
+                            )
+                        case .exit(let code):
+                            let ms = (ContinuousClock.now - start).totalMilliseconds
+                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
+                        }
+                    }
+                } catch {
+                    try? self.writeResponse(
+                        .error(message: "PTY stream error: \(error)"),
+                        to: writeHandle
+                    )
+                }
+                Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
+            }
+
+            // Task 2: read pty_input / window_resize / cancel from the client
+            // and forward to the VM. Exits when the read side is shut down
+            // (by Task 1 on stream completion) or the client disconnects.
+            group.addTask { [weak self] in
+                guard let self else { return }
+                var buf = initialBuffer
+                while !Task.isCancelled {
+                    let msgData: Data
+                    do {
+                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                    } catch {
+                        break // socket closed or shut down
+                    }
+                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
+                    switch request {
+                    case .ptyInput(let b64):
+                        if let raw = Data(base64Encoded: b64) {
+                            try? await vm.sendPtyInput(id: id, data: raw)
+                        }
+                    case .windowResize(let cols, let rows):
+                        try? await vm.sendWindowResize(id: id, cols: cols, rows: rows)
+                    case .cancel(let signal, let gracePeriod):
+                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+                    default:
+                        // Other frames are not meaningful during a PTY session.
+                        break
+                    }
+                }
             }
         }
     }

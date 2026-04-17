@@ -148,3 +148,43 @@ import Testing
     let msg = try SessionProtocol.decodeResponse(raw)
     #expect(msg == .outputBytes(stream: .stdout, base64: b64))
 }
+
+// MARK: - PTY Session Codec Tests
+
+@Test func encodePtyExecRequest() throws {
+    let req = SessionRequest.ptyExec(cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40)
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_exec")
+    #expect(json["cmd"] as? String == "claude")
+    #expect(json["cols"] as? Int == 120)
+    #expect(json["rows"] as? Int == 40)
+}
+
+@Test func encodePtyInputRequest() throws {
+    let req = SessionRequest.ptyInput(data: "aGVsbG8=")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_input")
+    #expect(json["data"] as? String == "aGVsbG8=")
+}
+
+@Test func encodeWindowResizeRequest() throws {
+    let req = SessionRequest.windowResize(cols: 200, rows: 50)
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "window_resize")
+    #expect(json["cols"] as? Int == 200)
+}
+
+@Test func decodePtyOutputResponse() throws {
+    let data = Data("{\"type\":\"pty_output\",\"data\":\"aGVsbG8=\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .ptyOutput(data: "aGVsbG8="))
+}
+
+@Test func decodePtyExecRequest() throws {
+    let data = Data("{\"type\":\"pty_exec\",\"cmd\":\"claude\",\"timeout\":0,\"env\":{},\"cols\":120,\"rows\":40}\n".utf8)
+    let req = try SessionProtocol.decodeRequest(data)
+    #expect(req == .ptyExec(cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40))
+}

@@ -688,6 +688,38 @@ public actor VM {
         return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
     }
 
+    // MARK: - PTY Exec (v0.6.0)
+
+    /// Execute a command in a PTY on the guest. Returns a stream of PtyChunk
+    /// (raw terminal bytes + exit code). The caller supplies `id` and is
+    /// responsible for feeding input via `sendPtyInput(id:data:)` and resizing
+    /// via `sendWindowResize(id:cols:rows:)`.
+    public func execPtyStream(
+        id: String,
+        command: String,
+        timeout: Int,
+        env: [String: String] = [:],
+        cols: Int,
+        rows: Int
+    ) throws(LuminaError) -> AsyncThrowingStream<PtyChunk, any Error> {
+        guard _state == .ready, let runner = commandRunner else {
+            throw .bootFailed(underlying: VMError.invalidState("Cannot execPty from state: \(_state)"))
+        }
+        return try runner.execPty(id: id, command: command, timeout: timeout, env: env, cols: cols, rows: rows)
+    }
+
+    /// Send raw bytes to a running PTY session's master fd.
+    public func sendPtyInput(id: String, data: Data) throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        try runner.sendPtyInput(id: id, data: data)
+    }
+
+    /// Resize the window of a running PTY session (triggers SIGWINCH in guest).
+    public func sendWindowResize(id: String, cols: Int, rows: Int) throws(LuminaError) {
+        guard let runner = commandRunner else { throw .connectionFailed }
+        try runner.sendWindowResize(id: id, cols: cols, rows: rows)
+    }
+
     /// Attempt to reconnect to the guest agent after a connection drop.
     /// State is only set to `.ready` after the reconnect succeeds.
     public func reconnect() async throws(LuminaError) {
