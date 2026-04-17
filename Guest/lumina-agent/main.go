@@ -53,6 +53,23 @@ var (
 	runningCmds = make(map[string]*runningCmd)
 )
 
+// PTY tracking
+type runningPty struct {
+	masterFd int
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+var (
+	ptyMu       sync.Mutex
+	runningPtys = make(map[string]*runningPty)
+
+	// Pending window resizes for PTYs not yet allocated
+	pendingResizeMu sync.Mutex
+	pendingResizes  = make(map[string][2]int) // id -> [cols, rows]
+)
+
 // Protocol messages
 
 type ExecRequest struct {
@@ -128,6 +145,36 @@ type ConfigureNetworkMsg struct {
 type NetworkReadyMsg struct {
 	Type string `json:"type"`
 	IP   string `json:"ip"`
+}
+
+// PTY message types
+type PtyExecRequest struct {
+	Type    string            `json:"type"`
+	ID      string            `json:"id"`
+	Cmd     string            `json:"cmd"`
+	Timeout int               `json:"timeout"`
+	Env     map[string]string `json:"env"`
+	Cols    int               `json:"cols"`
+	Rows    int               `json:"rows"`
+}
+
+type PtyInputMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
+
+type WindowResizeMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Cols int    `json:"cols"`
+	Rows int    `json:"rows"`
+}
+
+type PtyOutputMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Data string `json:"data"`
 }
 
 // bootMark writes a boot-profile phase marker to /dev/kmsg (kernel log →
@@ -281,6 +328,61 @@ func serveConnection(conn net.Conn) {
 				continue
 			}
 			go handleConfigureNetwork(conn, msg)
+
+		case "pty_exec":
+			var req PtyExecRequest
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid pty_exec request: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			_, exists := runningPtys[req.ID]
+			ptyMu.Unlock()
+			if exists {
+				encoded := base64.StdEncoding.EncodeToString([]byte("pty session already active for this ID\r\n"))
+				sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: req.ID, Data: encoded})
+				sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 1})
+				continue
+			}
+			go executePtyCommand(conn, req)
+
+		case "pty_input":
+			var msg PtyInputMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid pty_input: %v\n", err)
+				continue
+			}
+			decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pty_input base64 decode failed: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			pty, ok := runningPtys[msg.ID]
+			ptyMu.Unlock()
+			if ok {
+				unix.Write(pty.masterFd, decoded)
+			}
+			// If PTY not found (already exited), silently drop
+
+		case "window_resize":
+			var msg WindowResizeMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid window_resize: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			pty, ok := runningPtys[msg.ID]
+			ptyMu.Unlock()
+			if ok {
+				ws := unix.Winsize{Row: uint16(msg.Rows), Col: uint16(msg.Cols)}
+				unix.IoctlSetWinsize(pty.masterFd, unix.TIOCSWINSZ, &ws)
+			} else {
+				// Buffer resize for PTY not yet allocated
+				pendingResizeMu.Lock()
+				pendingResizes[msg.ID] = [2]int{msg.Cols, msg.Rows}
+				pendingResizeMu.Unlock()
+			}
 
 		default:
 			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", header.Type)
@@ -477,6 +579,178 @@ func executeCommand(conn net.Conn, req ExecRequest, stdinR *os.File, stdinW *os.
 	}
 
 	sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: exitCode})
+}
+
+// openPty allocates a PTY master/slave pair via /dev/ptmx.
+// Returns the master fd, slave path, or an error.
+func openPty() (int, string, error) {
+	masterFd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		return 0, "", fmt.Errorf("open /dev/ptmx: %w", err)
+	}
+
+	// Unlock slave first — required before TIOCGPTN returns a usable pts
+	unlock := 0
+	if err := unix.IoctlSetPointerInt(masterFd, unix.TIOCSPTLCK, unlock); err != nil {
+		unix.Close(masterFd)
+		return 0, "", fmt.Errorf("TIOCSPTLCK: %w", err)
+	}
+
+	// Get slave pts number
+	ptsNum, err := unix.IoctlGetInt(masterFd, unix.TIOCGPTN)
+	if err != nil {
+		unix.Close(masterFd)
+		return 0, "", fmt.Errorf("TIOCGPTN: %w", err)
+	}
+	slavePath := fmt.Sprintf("/dev/pts/%d", ptsNum)
+
+	return masterFd, slavePath, nil
+}
+
+// executePtyCommand runs a command under a PTY, streaming master output as
+// pty_output messages. Input arrives via pty_input messages, resize via
+// window_resize. Exits via a standard exit message.
+func executePtyCommand(conn net.Conn, req PtyExecRequest) {
+	id := req.ID
+
+	// Open PTY master + slave
+	masterFd, slavePath, err := openPty()
+	if err != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("openpty failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+	defer unix.Close(masterFd)
+
+	// Open slave
+	slaveFd, err := unix.Open(slavePath, unix.O_RDWR, 0)
+	if err != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("open slave failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+
+	// Initial size: from request, unless a pending resize arrived before pty_exec completed
+	ws := unix.Winsize{Row: uint16(req.Rows), Col: uint16(req.Cols)}
+	pendingResizeMu.Lock()
+	if pending, ok := pendingResizes[id]; ok {
+		ws.Col = uint16(pending[0])
+		ws.Row = uint16(pending[1])
+		delete(pendingResizes, id)
+	}
+	pendingResizeMu.Unlock()
+	unix.IoctlSetWinsize(masterFd, unix.TIOCSWINSZ, &ws)
+
+	// Build command
+	ctx, cancel := context.WithCancel(context.Background())
+	shell := "/bin/sh"
+	cmd := exec.CommandContext(ctx, shell, "-c", req.Cmd)
+
+	// Environment
+	cmd.Env = os.Environ()
+	for k, v := range req.Env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+	cmd.Env = append(cmd.Env, fmt.Sprintf("COLUMNS=%d", int(ws.Col)))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("LINES=%d", int(ws.Row)))
+
+	// Slave as stdin/stdout/stderr
+	slaveFile := os.NewFile(uintptr(slaveFd), slavePath)
+	cmd.Stdin = slaveFile
+	cmd.Stdout = slaveFile
+	cmd.Stderr = slaveFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		// Ctty references the index in the child's fd table after fork.
+		// With Stdin/Stdout/Stderr all pointing at slaveFile (fds 0,1,2 in child),
+		// Ctty: 0 is the controlling terminal.
+		Ctty: 0,
+	}
+
+	done := make(chan struct{})
+	ptyMu.Lock()
+	runningPtys[id] = &runningPty{masterFd: masterFd, cmd: cmd, cancel: cancel, done: done}
+	ptyMu.Unlock()
+	defer func() {
+		cancel()
+		ptyMu.Lock()
+		delete(runningPtys, id)
+		ptyMu.Unlock()
+		close(done)
+	}()
+
+	if err := cmd.Start(); err != nil {
+		slaveFile.Close()
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("start failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+
+	// Close slave in parent — child inherits the fd
+	slaveFile.Close()
+
+	// Reader goroutine: 4KB chunks with 5ms drain window
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			n, err := unix.Read(masterFd, buf)
+			if n > 0 {
+				// 5ms drain window: coalesce bursts into a single message
+				accum := make([]byte, 0, 8192)
+				accum = append(accum, buf[:n]...)
+				drainDeadline := time.Now().Add(5 * time.Millisecond)
+				unix.SetNonblock(masterFd, true)
+				for time.Now().Before(drainDeadline) {
+					dn, derr := unix.Read(masterFd, buf)
+					if dn > 0 {
+						accum = append(accum, buf[:dn]...)
+					}
+					if derr != nil {
+						break
+					}
+					if dn == 0 {
+						break
+					}
+				}
+				unix.SetNonblock(masterFd, false)
+				encoded := base64.StdEncoding.EncodeToString(accum)
+				sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+			}
+			if err != nil {
+				// EIO = slave closed before process exit (normal PTY teardown).
+				// Other errors are also terminal (EBADF, etc.).
+				if err != unix.EIO {
+					fmt.Fprintf(os.Stderr, "pty master read error (id=%s): %v\n", id, err)
+				}
+				return
+			}
+			if n == 0 {
+				return
+			}
+		}
+	}()
+
+	// Wait for process to exit
+	exitCode := 0
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+
+	// Wait for reader goroutine to drain remaining output
+	<-readDone
+
+	sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: exitCode})
 }
 
 // gracefulKill sends SIGTERM to the process group, waits for the grace period,
