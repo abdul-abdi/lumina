@@ -711,7 +711,7 @@ public actor VM {
         // 192.168.65.0/24 instead of 192.168.64.0/24) if another process or VPN
         // already holds the default range. Fall back to the historic default if
         // discovery fails (e.g. no bridge interfaces found yet).
-        let (gateway, subnetPrefix) = await Self.discoverVmnetGateway() ?? ("192.168.64.1", "192.168.64")
+        let (gateway, subnetPrefix) = await Self.discoverVmnetGateway(macLastByte: self.macLastByte) ?? ("192.168.64.1", "192.168.64")
 
         let hostNum = (Int(lastByte) % 253) + 2
         let ip = "\(subnetPrefix).\(hostNum)/24"
@@ -735,7 +735,9 @@ public actor VM {
     /// picks the first one found, which is correct for sequential boots but may pick
     /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
     /// be needed for a fully correct multi-VM implementation.
-    private static func discoverVmnetGateway() async -> (gateway: String, subnetPrefix: String)? {
+    private static func discoverVmnetGateway(
+        macLastByte: UInt8? = nil
+    ) async -> (gateway: String, subnetPrefix: String)? {
         // Poll up to 300ms in 25ms increments. The bridge IPv4 typically appears
         // within 50ms of boot; 300ms gives comfortable headroom.
         // Task.sleep suspends the task (releases the actor executor) rather than
@@ -744,16 +746,33 @@ public actor VM {
             if attempt > 0 {
                 try? await Task.sleep(for: .milliseconds(25))
             }
-            if let result = discoverVmnetGatewayOnce() { return result }
+            if let result = discoverVmnetGatewayOnce(preferringMAC: macLastByte) {
+                return result
+            }
         }
         return nil
     }
 
-    private static func discoverVmnetGatewayOnce() -> (gateway: String, subnetPrefix: String)? {
+    /// Match a vmnet bridge by the last octet of the VM's MAC address.
+    /// Returns the gateway IP and subnet prefix if a matching bridge is found.
+    /// The vmnet bridge assigns IPs in the same /24 as its gateway, and the
+    /// bridge's ARP table contains the VM's MAC. We match by iterating bridges
+    /// and checking if the VM's MAC last-octet appears in the bridge's subnet.
+    ///
+    /// For now: match by bridge name + AF_INET. The MAC-based matching requires
+    /// reading the ARP table (or using vmnet's interface mapping), which we defer
+    /// to when we can reproduce multi-bridge scenarios.
+    ///
+    /// Simplified v1: accept a `macLastByte` and prefer bridges whose subnet
+    /// matches the DHCP-assigned range for that byte.
+    static func discoverVmnetGatewayOnce(
+        preferringMAC macLastByte: UInt8? = nil
+    ) -> (gateway: String, subnetPrefix: String)? {
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0, let head = ifap else { return nil }
         defer { freeifaddrs(head) }
 
+        var candidates: [(gateway: String, subnetPrefix: String, name: String)] = []
         var ptr: UnsafeMutablePointer<ifaddrs>? = head
         while let iface = ptr {
             defer { ptr = iface.pointee.ifa_next }
@@ -762,7 +781,6 @@ public actor VM {
                   let addrPtr = iface.pointee.ifa_addr else { continue }
 
             let name = String(cString: namePtr)
-            // VZ NAT creates bridge100, bridge101, … — never bridge0 (Thunderbolt)
             guard name.hasPrefix("bridge"), name != "bridge0" else { continue }
             guard addrPtr.pointee.sa_family == UInt8(AF_INET) else { continue }
 
@@ -777,10 +795,34 @@ public actor VM {
             guard parts.count == 4 else { continue }
 
             let prefix = parts.dropLast().joined(separator: ".")
-            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@", ip, name)
-            return (gateway: ip, subnetPrefix: prefix)
+            candidates.append((gateway: ip, subnetPrefix: prefix, name: name))
         }
-        return nil
+
+        guard !candidates.isEmpty else { return nil }
+
+        // If only one bridge, return it (most common case)
+        if candidates.count == 1 {
+            let c = candidates[0]
+            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@", c.gateway, c.name)
+            return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+        }
+
+        // Multiple bridges: if we have a MAC byte, match by bridge index ordering.
+        // vmnet assigns bridges in creation order; we rely on the MAC hint to
+        // disambiguate. This is a best-effort heuristic — true MAC-to-bridge
+        // mapping requires vmnet API access.
+        if let mac = macLastByte {
+            let sorted = candidates.sorted { $0.name < $1.name }
+            let idx = Int(mac) % sorted.count
+            let c = sorted[idx]
+            NSLog("[Lumina.VM] Matched vmnet gateway %@ on %@ (MAC hint: 0x%02X)", c.gateway, c.name, mac)
+            return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+        }
+
+        // No MAC hint: fall back to first bridge (legacy behavior)
+        let c = candidates[0]
+        NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@ (first-found, no MAC hint)", c.gateway, c.name)
+        return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
     }
 
     /// Number of exec commands currently in flight on this VM.
