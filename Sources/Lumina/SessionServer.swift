@@ -17,6 +17,14 @@ public final class SessionServer: @unchecked Sendable {
     private var serverFd: Int32 = -1
     private let lock = NSLock()
 
+    /// Wall-clock instant the server started. Used by `.status` responses to
+    /// compute uptime. Captured at init so it reflects session-process lifetime
+    /// independent of when `serve()` is called.
+    private let bootTime: Date
+    /// Image name this session was booted from — returned in `.status` so
+    /// `lumina ps` can display it without re-reading meta.json for every row.
+    private let imageName: String
+
     /// v0.6.0: One active PTY per session. The vsock protocol supports
     /// concurrent PTYs (each keyed by unique id), but the session server
     /// enforces single-PTY to keep client state simple. If a second
@@ -44,8 +52,10 @@ public final class SessionServer: @unchecked Sendable {
         ptyLock.withLock { activePtyId }
     }
 
-    public init(socketPath: URL) {
+    public init(socketPath: URL, imageName: String = "unknown", bootTime: Date = Date()) {
         self.socketPath = socketPath
+        self.imageName = imageName
+        self.bootTime = bootTime
     }
 
     /// Bind and listen on the Unix domain socket.
@@ -296,6 +306,14 @@ public final class SessionServer: @unchecked Sendable {
                 // socket. Guard defensively in case a buggy client sends them
                 // outside that window.
                 break
+
+            case .status:
+                let uptime = Date().timeIntervalSince(bootTime)
+                let activeExecs = await vm.activeExecCount
+                try? writeResponse(
+                    .status(uptime: uptime, activeExecs: activeExecs, image: imageName),
+                    to: handles.write
+                )
             }
         }
     }

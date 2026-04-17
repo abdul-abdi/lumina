@@ -188,3 +188,50 @@ import Testing
     let req = try SessionProtocol.decodeRequest(data)
     #expect(req == .ptyExec(cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40))
 }
+
+// MARK: - Status Codec Tests (v0.6.0, `lumina ps`)
+
+@Test func encodeStatusRequest() throws {
+    let req = SessionRequest.status
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "status")
+}
+
+@Test func decodeStatusRequestRoundtrip() throws {
+    let req = SessionRequest.status
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
+
+@Test func encodeStatusResponse() throws {
+    let resp = SessionResponse.status(uptime: 123.4, activeExecs: 2, image: "default")
+    let data = try SessionProtocol.encode(resp)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "status")
+    #expect(json["uptime"] as? Double == 123.4)
+    #expect(json["active_execs"] as? Int == 2)
+    #expect(json["image"] as? String == "default")
+}
+
+@Test func decodeStatusResponse() throws {
+    let data = Data("{\"type\":\"status\",\"uptime\":123.4,\"active_execs\":2,\"image\":\"default\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .status(uptime: 123.4, activeExecs: 2, image: "default"))
+}
+
+@Test func decodeStatusResponseMissingFieldsFallsBackToDefaults() throws {
+    // Forward-compatibility: future servers may omit fields; decoder should
+    // degrade gracefully rather than throw.
+    let data = Data("{\"type\":\"status\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .status(uptime: 0, activeExecs: 0, image: "unknown"))
+}
+
+@Test func statusResponseRoundtrip() throws {
+    let resp = SessionResponse.status(uptime: 9.5, activeExecs: 0, image: "python")
+    let data = try SessionProtocol.encode(resp)
+    let decoded = try SessionProtocol.decodeResponse(data)
+    #expect(decoded == resp)
+}

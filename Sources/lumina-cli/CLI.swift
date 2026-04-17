@@ -11,7 +11,7 @@ struct LuminaCLI: AsyncParsableCommand {
         version: "0.6.0",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
-                      Volume.self, NetworkCmd.self, PoolCmd.self]
+                      Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self]
     )
 }
 
@@ -818,6 +818,141 @@ struct SessionList: ParsableCommand {
                 }
             }
         }
+    }
+}
+
+// MARK: - Ps (session observability)
+
+/// `lumina ps` — walk the sessions directory, query each running session's
+/// server over its Unix socket for live status (uptime, active execs, image),
+/// and render a table (TTY) or JSON array (pipe). Failures on individual
+/// sessions are isolated — the whole command does not abort if one session
+/// is unreachable.
+struct Ps: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "List running sessions with live status"
+    )
+
+    func run() async throws {
+        let sessions = SessionPaths.listAll().filter { $0.status == .running }
+        let format = resolveOutputFormat()
+
+        // Gather a status row for each live session. Unreachable sessions
+        // produce a row with `error` so ps still reflects their presence on disk.
+        let rows = sessions.map { PsRowBuilder.build(for: $0) }
+
+        switch format {
+        case .text:
+            printPsTextTable(rows: rows)
+        case .json:
+            try printPsJson(rows: rows)
+        }
+    }
+
+    private func printPsTextTable(rows: [PsRow]) {
+        if rows.isEmpty {
+            print("No active sessions.")
+            return
+        }
+        // Fixed-width columns. Kept inline — formatting is pure and small.
+        print("SID                                  IMAGE           UPTIME     EXECS")
+        for row in rows {
+            let line = String(
+                format: "%-36s %-15s %-10s %s",
+                row.sid,
+                row.image.prefix(15).padding(toLength: 15, withPad: " ", startingAt: 0),
+                row.uptimeText.padding(toLength: 10, withPad: " ", startingAt: 0),
+                row.execsText
+            )
+            print(line)
+        }
+    }
+
+    private func printPsJson(rows: [PsRow]) throws {
+        let payload: [[String: Any]] = rows.map { row in
+            if let err = row.error {
+                return ["sid": row.sid, "error": err]
+            }
+            return [
+                "sid": row.sid,
+                "image": row.image,
+                "uptime_seconds": row.uptimeSeconds,
+                "active_execs": row.activeExecs,
+            ]
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.sortedKeys]
+        )
+        if let str = String(data: data, encoding: .utf8) {
+            print(str)
+        }
+    }
+}
+
+/// One row of `lumina ps` output. Constructed from a `SessionInfo` + a single
+/// `.status` round-trip. Unreachable sessions carry `error` instead of status.
+struct PsRow: Sendable {
+    let sid: String
+    let image: String
+    let uptimeSeconds: TimeInterval
+    let uptimeText: String
+    let activeExecs: Int
+    let execsText: String
+    let error: String?
+}
+
+/// Builds `PsRow`s from session metadata. Isolated as an enum namespace so the
+/// pure formatting (`formatUptime`, row construction) is easy to unit-test.
+enum PsRowBuilder {
+    /// Connect to the session, send `.status`, return a row. On connect or
+    /// RPC failure, the row carries `error` with a terse reason.
+    static func build(for info: SessionInfo) -> PsRow {
+        let client = SessionClient()
+        do {
+            try client.connect(sid: info.sid)
+            defer { client.disconnect() }
+            try client.send(.status)
+            let resp = try client.receive()
+            guard case .status(let uptime, let activeExecs, let image) = resp else {
+                return row(sid: info.sid, error: "unexpected response")
+            }
+            return PsRow(
+                sid: info.sid,
+                image: image,
+                uptimeSeconds: uptime,
+                uptimeText: formatUptime(uptime),
+                activeExecs: activeExecs,
+                execsText: activeExecs > 0 ? "\(activeExecs) active" : "idle",
+                error: nil
+            )
+        } catch {
+            return row(sid: info.sid, error: "unreachable")
+        }
+    }
+
+    /// Format seconds as a compact human-readable uptime ("42s", "3m 7s", "2h 15m").
+    /// Pure function — safe to unit-test.
+    static func formatUptime(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        let hours = total / 3600
+        let mins = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 { return "\(hours)h \(mins)m" }
+        if mins > 0 { return "\(mins)m \(secs)s" }
+        return "\(secs)s"
+    }
+
+    private static func row(sid: String, error: String) -> PsRow {
+        PsRow(
+            sid: sid,
+            image: "?",
+            uptimeSeconds: 0,
+            uptimeText: "?",
+            activeExecs: 0,
+            execsText: error,
+            error: error
+        )
     }
 }
 

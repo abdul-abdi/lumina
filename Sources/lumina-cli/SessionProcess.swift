@@ -139,8 +139,13 @@ struct SessionServe: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // Start session server
-        let server = SessionServer(socketPath: paths.socket)
+        // Start session server. Pass imageName + bootTime so `.status` replies
+        // (used by `lumina ps`) reflect this session's actual image and uptime.
+        let server = SessionServer(
+            socketPath: paths.socket,
+            imageName: image,
+            bootTime: info.created
+        )
         do {
             try server.bind()
         } catch {
