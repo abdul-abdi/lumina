@@ -1151,8 +1151,9 @@ enum VMError: Error, Sendable {
 
 /// Attach a `VZVirtioSoundDeviceConfiguration` with `sound.streamCount`
 /// output streams. Free function so it doesn't pull anything into the
-/// agent path until `options.sound` is non-nil.
-private func attachSoundDevice(
+/// agent path until `options.sound` is non-nil. `internal` so MacOSVM
+/// (same target) can reuse it.
+internal func attachSoundDevice(
     to config: VZVirtualMachineConfiguration,
     sound: SoundConfig
 ) {

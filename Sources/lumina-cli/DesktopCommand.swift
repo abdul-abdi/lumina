@@ -12,7 +12,8 @@ struct Desktop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "desktop",
         abstract: "Manage full-OS desktop VMs (Linux, Windows 11 ARM, macOS).",
-        subcommands: [DesktopCreate.self, DesktopBoot.self, DesktopList.self]
+        subcommands: [DesktopCreate.self, DesktopBoot.self, DesktopList.self,
+                      DesktopInstallMacOS.self]
     )
 }
 
@@ -375,4 +376,96 @@ private extension DateFormatter {
         f.timeStyle = .short
         return f
     }()
+}
+
+// MARK: - desktop install-macos (v0.7.0 M5)
+
+struct DesktopInstallMacOS: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install-macos",
+        abstract: "Restore a macOS guest from an IPSW into a .luminaVM bundle."
+    )
+
+    @Argument(help: "Path to the .luminaVM bundle (must already exist via 'desktop create').")
+    var bundlePath: String
+
+    @Option(name: .customLong("ipsw"), help: "Path to a macOS IPSW file (Apple's restore image).")
+    var ipswPath: String
+
+    @Option(name: .customLong("memory"), help: "Memory allocation for the install run (e.g. 8GB).")
+    var memory: String = "8GB"
+
+    @Option(name: .customLong("cpus"), help: "CPU cores for the install run.")
+    var cpus: Int = 4
+
+    mutating func run() async throws {
+        let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
+        let ipswURL = URL(fileURLWithPath: (ipswPath as NSString).expandingTildeInPath)
+
+        guard FileManager.default.fileExists(atPath: ipswURL.path) else {
+            FileHandle.standardError.write(Data("error: IPSW not found: \(ipswPath)\n".utf8))
+            throw ExitCode(2)
+        }
+
+        let cfg = MacOSBootConfig(
+            ipsw: ipswURL,
+            auxiliaryStorage: bundle.auxiliaryStorageURL,
+            primaryDisk: bundle.primaryDiskURL
+        )
+        let vm = MacOSVM(
+            bootConfig: cfg,
+            memoryBytes: DesktopHelpers.parseMemoryOrExit(memory),
+            cpuCount: cpus
+        )
+
+        print("Restoring macOS from \(ipswPath) into \(bundle.rootURL.path)")
+        print("This may take 30+ minutes; progress prints in 5% increments.")
+
+        // Print progress when it crosses 5% buckets.
+        let lastBucket = ProgressBucket()
+        do {
+            try await vm.install { fraction in
+                let bucket = Int(fraction * 20)  // 0..20 = 5% increments
+                if lastBucket.advanceTo(bucket) {
+                    print("  \(Int(fraction * 100))% complete")
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(Data("error: install failed: \(error)\n".utf8))
+            throw ExitCode(1)
+        }
+
+        await vm.shutdown()
+        print("Installation complete.")
+
+        // Persist the resolved hardware model + machine identifier into the
+        // bundle manifest so future boots know which IPSW lineage to use.
+        // (For v0.7.0 we stash them in a sidecar; M6 grows the manifest schema.)
+        let resolved = await vm.bootConfig
+        if let hw = resolved.hardwareModel {
+            try? hw.write(to: bundle.rootURL.appendingPathComponent("macos.hwmodel"), options: .atomic)
+        }
+        if let mid = resolved.machineIdentifier {
+            try? mid.write(to: bundle.rootURL.appendingPathComponent("macos.machineid"), options: .atomic)
+        }
+    }
+}
+
+/// Single-write tracker so progress callbacks don't flood stdout. Actor
+/// would be overkill — a class-with-NSLock matches the existing Lumina
+/// patterns (see CommandRunner) and avoids dragging an actor into a
+/// synchronous KVO callback.
+private final class ProgressBucket: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Int = -1
+
+    func advanceTo(_ next: Int) -> Bool {
+        lock.withLock {
+            if next > current {
+                current = next
+                return true
+            }
+            return false
+        }
+    }
 }
