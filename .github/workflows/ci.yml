@@ -57,14 +57,6 @@ jobs:
       # local dev. Nothing we ship depends on the gate running in default
       # CI; this is performance regression hygiene, not correctness.
       - name: Agent-boot regression gate
-        # Advisory step: performance regression hygiene, not correctness.
-        # Default GitHub-hosted macos-15 runners are themselves VMs and
-        # can't always nest Virtualization.framework reliably — a single
-        # boot often works but consecutive boots run into cleanup/clone
-        # exhaustion. On a self-hosted / larger runner this enforces the
-        # gate exactly as before. Letting a flaky runner block the PR
-        # isn't worth it given the gate has no correctness signal.
-        continue-on-error: true
         env:
           AGENT_BOOT_P50_MAX_MS: "2000"
         run: |
@@ -77,17 +69,45 @@ jobs:
 
           BIN="$(swift build --show-bin-path)/lumina"
 
-          # Probe VZ availability. One warm-up run with a short timeout —
-          # if it fails or produces no duration_ms, this runner can't nest
-          # VZ and the gate skips cleanly.
-          PROBE_OUT="$("$BIN" run "true" 2>&1 || true)"
-          PROBE_MS="$(printf '%s' "$PROBE_OUT" | jq -r '.duration_ms // empty' 2>/dev/null || true)"
-          if [ -z "$PROBE_MS" ] || [ "$PROBE_MS" = "null" ]; then
+          # Two-probe capability check. GitHub-hosted macos-15 runners are
+          # VMs themselves — some variants can nest Virtualization.framework
+          # enough for a single boot but fail on the second (APFS-clone
+          # cleanup or VZ resource limits). Probing twice catches both
+          # "no VZ at all" and "VZ works once" so we skip with an honest
+          # diagnostic instead of silently ignoring a flaky measurement.
+          # The gate runs normally when both probes succeed — i.e. on
+          # self-hosted, larger-runner, and local dev.
+
+          run_once() {
+            # Returns the output on stdout; non-zero exit if lumina failed.
+            "$BIN" run "true" 2>&1
+          }
+
+          extract_ms() {
+            printf '%s' "$1" | jq -r '.duration_ms // empty' 2>/dev/null || true
+          }
+
+          echo "Probe 1/2: verify runner can boot a VM..."
+          PROBE1_OUT="$(run_once || true)"
+          PROBE1_MS="$(extract_ms "$PROBE1_OUT")"
+          if [ -z "$PROBE1_MS" ] || [ "$PROBE1_MS" = "null" ]; then
             echo "::notice::Agent-boot gate skipped: Virtualization unavailable on this runner."
-            echo "First-attempt probe output (truncated):"
-            printf '%s\n' "$PROBE_OUT" | head -20
+            echo "Probe 1 output (truncated):"
+            printf '%s\n' "$PROBE1_OUT" | head -20
             exit 0
           fi
+          echo "  probe 1: ${PROBE1_MS}ms — VZ available."
+
+          echo "Probe 2/2: verify runner can sustain consecutive boots..."
+          PROBE2_OUT="$(run_once || true)"
+          PROBE2_MS="$(extract_ms "$PROBE2_OUT")"
+          if [ -z "$PROBE2_MS" ] || [ "$PROBE2_MS" = "null" ]; then
+            echo "::notice::Agent-boot gate skipped: runner booted once but can't sustain consecutive boots (clone cleanup or VZ resource limit)."
+            echo "Probe 2 output (truncated):"
+            printf '%s\n' "$PROBE2_OUT" | head -20
+            exit 0
+          fi
+          echo "  probe 2: ${PROBE2_MS}ms — runner can sustain consecutive boots."
 
           echo "Measuring cold-boot duration over 5 iterations..."
           MEASUREMENTS=()
