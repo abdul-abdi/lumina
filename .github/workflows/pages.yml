@@ -1,14 +1,21 @@
-name: Deploy lumina.run to GitHub Pages
+name: Pages
 
-# Publishes web/lumina.run/ to GitHub Pages. Once the lumina.run domain
-# is registered, add a CNAME in the Pages settings and the same assets
-# serve under the real domain.
+# Builds + deploys `web/lumina.run/` to GitHub Pages.
 #
 # Default URL: https://abdul-abdi.github.io/lumina/
 # With CNAME:  https://lumina.run/
+#
+# The `validate` job runs on every PR that touches web assets so HTML
+# typos never reach production. The `deploy` job only fires on pushes
+# to main — PRs validate without deploying.
 
 on:
   push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/pages.yml'
+  pull_request:
     branches: [main]
     paths:
       - 'web/**'
@@ -25,19 +32,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # ── Validate HTML/CSS before anything ships ───────────────────
+  validate:
+    name: Validate web assets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install html-tidy
+        run: sudo apt-get update && sudo apt-get install -y tidy
+
+      # `tidy` is noisy about cosmetic issues; we run with -q and only
+      # fail on actual parse/structural errors (-errors). This catches
+      # unclosed tags, missing attrs, malformed entities — things that
+      # would break the rendered page.
+      - name: Tidy check (errors only)
+        run: |
+          set -e
+          for f in $(find web -name '*.html'); do
+            echo "→ $f"
+            tidy -q -errors "$f" || {
+              echo "::error file=$f::HTML structural errors detected"
+              exit 1
+            }
+          done
+
+  # ── Build the Pages artifact ───────────────────────────────────
+  build:
+    name: Build Pages artifact
+    needs: validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: web/lumina.run
 
+  # ── Deploy to Pages (main only) ───────────────────────────────
   deploy:
+    name: Deploy to Pages
     needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

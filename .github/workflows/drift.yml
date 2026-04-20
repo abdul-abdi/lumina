@@ -1,0 +1,105 @@
+name: Drift Detection
+
+# Weekly sanity check for external URLs that rot over time.
+#
+# `DesktopOSCatalog.swift` pins per-distro ARM64 ISO URLs (Ubuntu,
+# Kali, Fedora, Debian). Point-release rotations (e.g. Ubuntu
+# 24.04.3 → 24.04.4) move the canonical URL and eventually delete
+# the old one. Without a scheduled probe, the rot silently ships to
+# users the first time they open the wizard after a distro cuts a
+# new point release.
+#
+# Scope:
+#   - HEAD each ISO URL
+#   - Fail (and auto-open an issue) if any return non-2xx
+#
+# Fix cadence: if this fails, bump the entry in DesktopOSCatalog.swift
+# to the current canonical URL and re-verify the SHA-256. The
+# verification UI in the wizard's file-pick step already enforces
+# that match; the schedule here is to catch the rot before a user
+# does.
+
+on:
+  schedule:
+    # Sundays 09:00 UTC — low traffic, gives weekday time to react.
+    - cron: '0 9 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: drift-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-iso-urls:
+    name: Check ISO URL liveness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Extract each `isoURL:` line from DesktopOSCatalog.swift and
+      # probe it. curl -fIL follows redirects and fails on 4xx/5xx.
+      - name: Probe ISO URLs
+        id: probe
+        run: |
+          set +e
+          FAILURES=""
+          URLS=$(grep -oE 'https://[^"]+\.iso' Sources/LuminaBootable/DesktopOSCatalog.swift | sort -u)
+          if [ -z "$URLS" ]; then
+            echo "::error::No ISO URLs found in DesktopOSCatalog.swift — parser changed?"
+            exit 1
+          fi
+          echo "Checking $(printf '%s\n' "$URLS" | wc -l | tr -d ' ') URLs..."
+          for URL in $URLS; do
+            CODE=$(curl -fIL -s -o /dev/null -w '%{http_code}' --max-time 30 "$URL" 2>&1 || echo "curl-fail")
+            if [[ "$CODE" =~ ^2 ]]; then
+              echo "  ✓ $CODE  $URL"
+            else
+              echo "  ✗ $CODE  $URL"
+              FAILURES="${FAILURES}- \`${URL}\` → ${CODE}\n"
+            fi
+          done
+          if [ -n "$FAILURES" ]; then
+            {
+              echo "failures<<EOF"
+              printf '%b' "$FAILURES"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "has_failures=false" >> "$GITHUB_OUTPUT"
+
+      # Auto-open a tracking issue on failure so the rot surfaces as a
+      # todo, not just a red workflow badge nobody notices.
+      - name: Open issue on failure
+        if: failure() && steps.probe.outputs.has_failures == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failures = `${{ steps.probe.outputs.failures }}`;
+            const body = [
+              '### ISO URL rot detected',
+              '',
+              'The weekly drift check found one or more stale URLs in `Sources/LuminaBootable/DesktopOSCatalog.swift`:',
+              '',
+              failures,
+              '',
+              '**To fix**:',
+              '1. Visit each vendor\'s download page and find the current canonical ARM64 ISO URL.',
+              '2. Update the `isoURL` field in `DesktopOSCatalog.swift`.',
+              '3. Fetch the current SHA-256 from the vendor\'s signed SHA256SUMS and update the `sha256` field.',
+              '4. Close this issue when the PR merges.',
+              '',
+              '_Opened automatically by the `drift.yml` workflow._',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'ISO URL rot detected — DesktopOSCatalog.swift needs refresh',
+              body,
+              labels: ['bug', 'automation', 'drift'],
+            });

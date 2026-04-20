@@ -1,23 +1,49 @@
-name: Build VM Image
+name: Guest Image
+
+# Builds the baked Linux ARM64 VM image (custom kernel + rootfs + agent).
+# Runs on:
+#   - manual dispatch (workflow_dispatch) for ad-hoc verification
+#   - any PR/push that touches guest bits, so breakage is caught at
+#     review time rather than at release tag time
+#
+# The output artifact is uploaded on every run; `release.yml` has its
+# own copy of this logic for tag-driven releases. We duplicate rather
+# than extract-to-reusable because the release path needs specific
+# naming conventions that drift from the CI path.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Guest/**'
+      - '.github/workflows/guest-image.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Guest/**'
+      - '.github/workflows/guest-image.yml'
+
+concurrency:
+  group: guest-image-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build-image:
-    runs-on: ubuntu-24.04-arm  # ARM64 runner — matches Apple Silicon guest architecture
+    name: Build baked image
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+          cache-dependency-path: Guest/lumina-agent/go.sum
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs build-essential flex bison bc \
@@ -26,6 +52,7 @@ jobs:
       - name: Build guest agent
         run: |
           cd Guest/lumina-agent
+          go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
           file lumina-agent
 
@@ -35,7 +62,7 @@ jobs:
       - name: Build VM image (baked)
         run: LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh /tmp/lumina-image
 
-      - name: Package image
+      - name: Package + digest
         run: |
           cd /tmp/lumina-image
           chmod 644 vmlinuz rootfs.img
@@ -45,6 +72,7 @@ jobs:
           [ -d modules ] && chmod 644 modules/* && FILES="$FILES modules/"
           ls -lhR
           tar czf /tmp/lumina-image-default.tar.gz $FILES
+          echo ""
           echo "--- Package ---"
           ls -lh /tmp/lumina-image-default.tar.gz
           echo "--- SHA256 ---"
@@ -55,4 +83,4 @@ jobs:
         with:
           name: lumina-image-default
           path: /tmp/lumina-image-default.tar.gz
-
+          retention-days: 14

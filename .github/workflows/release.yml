@@ -10,11 +10,27 @@ permissions:
 
 jobs:
   # ── Job 1: Build Swift CLI binary (requires macOS) ──────────
+  #
+  # Unit tests are NOT re-run here. The tag must already point at a
+  # commit that passed CI (`ci.yml` runs on every push to main and
+  # on every PR), which covers build + tests + agent-boot gate. This
+  # job only produces the release artifact; the pass signal is
+  # upstream in CI.
   build-cli:
     name: Build CLI (macOS)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            .build
+          key: spm-release-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            spm-release-${{ runner.os }}-
 
       - name: Build release binary
         run: swift build -c release
@@ -27,9 +43,6 @@ jobs:
 
       - name: Smoke test
         run: ./lumina --help
-
-      - name: Run unit tests
-        run: swift test
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -55,9 +68,10 @@ jobs:
           sudo apt-get install -y e2fsprogs build-essential flex bison bc \
             libelf-dev libssl-dev curl xz-utils cpio
 
-      - name: Build guest agent
+      - name: Vet & build guest agent
         run: |
           cd Guest/lumina-agent
+          go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
       - name: Build custom kernel (CONFIG_MODULES=n)

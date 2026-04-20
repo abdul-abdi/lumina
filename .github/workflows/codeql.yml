@@ -1,0 +1,73 @@
+name: CodeQL
+
+# Static security analysis for the two languages we actually ship:
+#   - Swift (host + library + CLI + SwiftUI app)
+#   - Go    (guest agent)
+#
+# Runs on PR, main, and a weekly schedule so drift in upstream
+# databases surfaces even during quiet weeks. Failures don't block
+# merges by default; CodeQL findings are visible in the Security tab
+# and should be triaged, not auto-gated, because false positives in
+# systems code are common.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Tuesdays 08:00 UTC — out of band from drift.yml (Sundays) so
+    # a red week doesn't dogpile.
+    - cron: '0 8 * * 2'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: swift
+            os: macos-15
+          - language: go
+            os: ubuntu-latest
+            build-path: Guest/lumina-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Use `security-extended` — includes rules that catch subtle
+          # issues beyond the default set. Worth the extra runtime for
+          # a systems codebase touching virtualization APIs.
+          queries: security-extended
+
+      # Swift: CodeQL autobuild invokes `swift build`. For the Go
+      # agent we explicitly build so CodeQL can trace the full module
+      # (its autobuild picks the wrong module on multi-module repos).
+      - name: Autobuild (Swift)
+        if: matrix.language == 'swift'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Build guest agent (Go)
+        if: matrix.language == 'go'
+        run: |
+          cd Guest/lumina-agent
+          go build ./...
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

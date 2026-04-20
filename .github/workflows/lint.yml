@@ -1,0 +1,107 @@
+name: Lint
+
+# Style + workflow-syntax + warning-budget checks. These run in parallel
+# with ci.yml so lint failures are visible without blocking the build.
+# swift-format and actionlint are blocking (pure static checks, no
+# environmental flakiness); the warning budget is advisory until we
+# establish a baseline (see job-level `continue-on-error`).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Swift style ────────────────────────────────────────────────
+  # Advisory initially. The repo has no `.swift-format` config file
+  # yet, so the default ruleset is used — expect some findings on
+  # first runs. Flip `continue-on-error` off and add `--strict` once
+  # a baseline + config land.
+  swift-format:
+    name: swift-format lint
+    runs-on: macos-15
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # swift-format ships with the Xcode toolchain since Xcode 16.
+      # Fall back to Homebrew install if it's not on PATH (pre-16 runners).
+      - name: Install swift-format
+        run: |
+          if ! command -v swift-format >/dev/null 2>&1; then
+            echo "swift-format not in PATH; installing via Homebrew"
+            brew install swift-format
+          fi
+          swift-format --version
+
+      - name: Lint Sources/ and Tests/
+        run: |
+          swift-format lint --recursive Sources Tests
+
+  # ── Workflow YAML syntax ───────────────────────────────────────
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download actionlint
+        id: get_actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "path=$(pwd)/actionlint" >> "$GITHUB_OUTPUT"
+
+      - name: Lint all workflows
+        run: |
+          ${{ steps.get_actionlint.outputs.path }} -color
+
+  # ── Warning count budget ───────────────────────────────────────
+  # Advisory during bootstrap. Once a baseline is agreed, flip
+  # `continue-on-error` off and fail on regression.
+  warning-budget:
+    name: Warning budget
+    runs-on: macos-15
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      # Bump deliberately when new warnings are introduced and justified;
+      # ratchet down when warnings are fixed. Start loose, tighten over
+      # time. The goal is monotonic non-regression.
+      MAX_WARNINGS: "50"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Count warnings
+        run: |
+          set -euo pipefail
+          LOG=$(swift build 2>&1 || true)
+          COUNT=$(printf '%s' "$LOG" | grep -Ec 'warning: ' || true)
+          echo "Current warning count: ${COUNT}"
+          echo "Allowed maximum:       ${MAX_WARNINGS}"
+          if [ "$COUNT" -gt "$MAX_WARNINGS" ]; then
+            echo "::warning::Warning count ${COUNT} exceeds budget ${MAX_WARNINGS}."
+            echo "Recent warnings:"
+            printf '%s' "$LOG" | grep 'warning: ' | head -30
+            exit 1
+          fi
+          echo "::notice::Warning budget OK (${COUNT}/${MAX_WARNINGS})."
