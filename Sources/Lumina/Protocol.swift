@@ -16,6 +16,20 @@ public enum HostMessage: Sendable {
     case stdinClose(id: String)
     /// Configure guest network (host-driven, Apple-style).
     case configureNetwork(ip: String, gateway: String, dns: String)
+    /// Start a PTY-backed interactive command. Output flows back as `.ptyOutput`
+    /// and the process exits via the shared `.exit(id:code:)` message.
+    case ptyExec(id: String, cmd: String, timeout: Int, env: [String: String], cols: Int, rows: Int)
+    /// Write base64-encoded bytes to a running PTY's master side (keyboard input).
+    case ptyInput(id: String, data: String)
+    /// Resize the window of a running PTY (sends TIOCSWINSZ on the guest).
+    case windowResize(id: String, cols: Int, rows: Int)
+    /// Tell the guest agent to start forwarding a TCP port. The guest listens on
+    /// `guestPort`, picks an available vsock port for the reverse channel, and
+    /// replies with `.portForwardReady(guestPort:vsockPort:)`. Each new TCP
+    /// connection on the guest side opens a fresh vsock connection back to host.
+    case portForwardStart(guestPort: Int)
+    /// Tell the guest agent to stop forwarding a TCP port. Idempotent.
+    case portForwardStop(guestPort: Int)
 }
 
 // MARK: - Guest Messages (received from guest)
@@ -36,6 +50,13 @@ public enum GuestMessage: Sendable, Equatable {
     case downloadData(path: String, data: String, seq: Int, eof: Bool)
     case downloadError(path: String, error: String)
     case networkReady(ip: String)
+    /// PTY-backed output (merged stdout+stderr). `data` is the base64-encoded raw bytes
+    /// read from the PTY master. Exit is delivered via the shared `.exit(id:code:)` case.
+    case ptyOutput(id: String, data: String)
+    /// Acknowledge that the guest-side TCP listener is up for a port forward.
+    /// `vsockPort` is the reverse-channel port the host should connect to for
+    /// each new proxied TCP connection.
+    case portForwardReady(guestPort: Int, vsockPort: Int)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -70,6 +91,16 @@ enum LuminaProtocol {
             dict = ["type": "stdin_close", "id": id]
         case .configureNetwork(let ip, let gateway, let dns):
             dict = ["type": "configure_network", "ip": ip, "gateway": gateway, "dns": dns]
+        case .ptyExec(let id, let cmd, let timeout, let env, let cols, let rows):
+            dict = ["type": "pty_exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env, "cols": cols, "rows": rows]
+        case .ptyInput(let id, let data):
+            dict = ["type": "pty_input", "id": id, "data": data]
+        case .windowResize(let id, let cols, let rows):
+            dict = ["type": "window_resize", "id": id, "cols": cols, "rows": rows]
+        case .portForwardStart(let guestPort):
+            dict = ["type": "port_forward_start", "guest_port": guestPort]
+        case .portForwardStop(let guestPort):
+            dict = ["type": "port_forward_stop", "guest_port": guestPort]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -147,6 +178,18 @@ enum LuminaProtocol {
         case "network_ready":
             let ip = json["ip"] as? String ?? ""
             return .networkReady(ip: ip)
+        case "pty_output":
+            guard let id = json["id"] as? String,
+                  let outputData = json["data"] as? String else {
+                throw LuminaError.protocolError("Malformed pty_output: missing id or data")
+            }
+            return .ptyOutput(id: id, data: outputData)
+        case "port_forward_ready":
+            guard let guestPort = json["guest_port"] as? Int,
+                  let vsockPort = json["vsock_port"] as? Int else {
+                throw LuminaError.protocolError("port_forward_ready missing fields")
+            }
+            return .portForwardReady(guestPort: guestPort, vsockPort: vsockPort)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }

@@ -148,3 +148,90 @@ import Testing
     let msg = try SessionProtocol.decodeResponse(raw)
     #expect(msg == .outputBytes(stream: .stdout, base64: b64))
 }
+
+// MARK: - PTY Session Codec Tests
+
+@Test func encodePtyExecRequest() throws {
+    let req = SessionRequest.ptyExec(cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40)
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_exec")
+    #expect(json["cmd"] as? String == "claude")
+    #expect(json["cols"] as? Int == 120)
+    #expect(json["rows"] as? Int == 40)
+}
+
+@Test func encodePtyInputRequest() throws {
+    let req = SessionRequest.ptyInput(data: "aGVsbG8=")
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_input")
+    #expect(json["data"] as? String == "aGVsbG8=")
+}
+
+@Test func encodeWindowResizeRequest() throws {
+    let req = SessionRequest.windowResize(cols: 200, rows: 50)
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "window_resize")
+    #expect(json["cols"] as? Int == 200)
+}
+
+@Test func decodePtyOutputResponse() throws {
+    let data = Data("{\"type\":\"pty_output\",\"data\":\"aGVsbG8=\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .ptyOutput(data: "aGVsbG8="))
+}
+
+@Test func decodePtyExecRequest() throws {
+    let data = Data("{\"type\":\"pty_exec\",\"cmd\":\"claude\",\"timeout\":0,\"env\":{},\"cols\":120,\"rows\":40}\n".utf8)
+    let req = try SessionProtocol.decodeRequest(data)
+    #expect(req == .ptyExec(cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40))
+}
+
+// MARK: - Status Codec Tests (v0.6.0, `lumina ps`)
+
+@Test func encodeStatusRequest() throws {
+    let req = SessionRequest.status
+    let data = try SessionProtocol.encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "status")
+}
+
+@Test func decodeStatusRequestRoundtrip() throws {
+    let req = SessionRequest.status
+    let data = try SessionProtocol.encode(req)
+    let decoded = try SessionProtocol.decodeRequest(data)
+    #expect(decoded == req)
+}
+
+@Test func encodeStatusResponse() throws {
+    let resp = SessionResponse.status(uptime: 123.4, activeExecs: 2, image: "default")
+    let data = try SessionProtocol.encode(resp)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "status")
+    #expect(json["uptime"] as? Double == 123.4)
+    #expect(json["active_execs"] as? Int == 2)
+    #expect(json["image"] as? String == "default")
+}
+
+@Test func decodeStatusResponse() throws {
+    let data = Data("{\"type\":\"status\",\"uptime\":123.4,\"active_execs\":2,\"image\":\"default\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .status(uptime: 123.4, activeExecs: 2, image: "default"))
+}
+
+@Test func decodeStatusResponseMissingFieldsFallsBackToDefaults() throws {
+    // Forward-compatibility: future servers may omit fields; decoder should
+    // degrade gracefully rather than throw.
+    let data = Data("{\"type\":\"status\"}\n".utf8)
+    let resp = try SessionProtocol.decodeResponse(data)
+    #expect(resp == .status(uptime: 0, activeExecs: 0, image: "unknown"))
+}
+
+@Test func statusResponseRoundtrip() throws {
+    let resp = SessionResponse.status(uptime: 9.5, activeExecs: 0, image: "python")
+    let data = try SessionProtocol.encode(resp)
+    let decoded = try SessionProtocol.decodeResponse(data)
+    #expect(decoded == resp)
+}

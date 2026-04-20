@@ -53,6 +53,23 @@ var (
 	runningCmds = make(map[string]*runningCmd)
 )
 
+// PTY tracking
+type runningPty struct {
+	masterFd int
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+var (
+	ptyMu       sync.Mutex
+	runningPtys = make(map[string]*runningPty)
+
+	// Pending window resizes for PTYs not yet allocated
+	pendingResizeMu sync.Mutex
+	pendingResizes  = make(map[string][2]int) // id -> [cols, rows]
+)
+
 // Protocol messages
 
 type ExecRequest struct {
@@ -129,6 +146,68 @@ type NetworkReadyMsg struct {
 	Type string `json:"type"`
 	IP   string `json:"ip"`
 }
+
+// PTY message types
+type PtyExecRequest struct {
+	Type    string            `json:"type"`
+	ID      string            `json:"id"`
+	Cmd     string            `json:"cmd"`
+	Timeout int               `json:"timeout"`
+	Env     map[string]string `json:"env"`
+	Cols    int               `json:"cols"`
+	Rows    int               `json:"rows"`
+}
+
+type PtyInputMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
+
+type WindowResizeMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Cols int    `json:"cols"`
+	Rows int    `json:"rows"`
+}
+
+type PtyOutputMsg struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
+
+// Port forwarding messages
+
+type PortForwardStartMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+}
+
+type PortForwardStopMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+}
+
+type PortForwardReadyMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+	VsockPort int    `json:"vsock_port"`
+}
+
+// portFwdState tracks a single active port forward: the vsock listener the
+// guest exposes for this mapping, plus a cancellation context so we can stop
+// the accept loop and abort in-flight proxy connections on port_forward_stop.
+type portFwdState struct {
+	ln     net.Listener
+	cancel context.CancelFunc
+}
+
+var (
+	portFwdMu      sync.Mutex
+	nextVsockPort  = uint32(1025)
+	activeForwards = make(map[int]*portFwdState) // guest_port -> state
+)
 
 // bootMark writes a boot-profile phase marker to /dev/kmsg (kernel log →
 // serial console). The host parses these from the SerialConsole buffer to
@@ -281,6 +360,80 @@ func serveConnection(conn net.Conn) {
 				continue
 			}
 			go handleConfigureNetwork(conn, msg)
+
+		case "pty_exec":
+			var req PtyExecRequest
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid pty_exec request: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			_, exists := runningPtys[req.ID]
+			ptyMu.Unlock()
+			if exists {
+				encoded := base64.StdEncoding.EncodeToString([]byte("pty session already active for this ID\r\n"))
+				sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: req.ID, Data: encoded})
+				sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: 1})
+				continue
+			}
+			go executePtyCommand(conn, req)
+
+		case "pty_input":
+			var msg PtyInputMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid pty_input: %v\n", err)
+				continue
+			}
+			decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pty_input base64 decode failed: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			pty, ok := runningPtys[msg.ID]
+			ptyMu.Unlock()
+			if ok {
+				unix.Write(pty.masterFd, decoded)
+			}
+			// If PTY not found (already exited), silently drop
+
+		case "port_forward_start":
+			var msg PortForwardStartMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid port_forward_start: %v\n", err)
+				continue
+			}
+			// Dispatch to a goroutine — listenVsock + sendJSON should be
+			// fast, but we never want to block the message loop on a new
+			// listener creation.
+			go handlePortForwardStart(conn, msg.GuestPort)
+
+		case "port_forward_stop":
+			var msg PortForwardStopMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid port_forward_stop: %v\n", err)
+				continue
+			}
+			handlePortForwardStop(msg.GuestPort)
+
+		case "window_resize":
+			var msg WindowResizeMsg
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid window_resize: %v\n", err)
+				continue
+			}
+			ptyMu.Lock()
+			pty, ok := runningPtys[msg.ID]
+			ptyMu.Unlock()
+			if ok {
+				ws := unix.Winsize{Row: uint16(msg.Rows), Col: uint16(msg.Cols)}
+				unix.IoctlSetWinsize(pty.masterFd, unix.TIOCSWINSZ, &ws)
+			} else {
+				// Buffer resize for PTY not yet allocated
+				pendingResizeMu.Lock()
+				pendingResizes[msg.ID] = [2]int{msg.Cols, msg.Rows}
+				pendingResizeMu.Unlock()
+			}
 
 		default:
 			fmt.Fprintf(os.Stderr, "unexpected message type: %s\n", header.Type)
@@ -479,6 +632,178 @@ func executeCommand(conn net.Conn, req ExecRequest, stdinR *os.File, stdinW *os.
 	sendJSON(conn, ExitMsg{Type: "exit", ID: req.ID, Code: exitCode})
 }
 
+// openPty allocates a PTY master/slave pair via /dev/ptmx.
+// Returns the master fd, slave path, or an error.
+func openPty() (int, string, error) {
+	masterFd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		return 0, "", fmt.Errorf("open /dev/ptmx: %w", err)
+	}
+
+	// Unlock slave first — required before TIOCGPTN returns a usable pts
+	unlock := 0
+	if err := unix.IoctlSetPointerInt(masterFd, unix.TIOCSPTLCK, unlock); err != nil {
+		unix.Close(masterFd)
+		return 0, "", fmt.Errorf("TIOCSPTLCK: %w", err)
+	}
+
+	// Get slave pts number
+	ptsNum, err := unix.IoctlGetInt(masterFd, unix.TIOCGPTN)
+	if err != nil {
+		unix.Close(masterFd)
+		return 0, "", fmt.Errorf("TIOCGPTN: %w", err)
+	}
+	slavePath := fmt.Sprintf("/dev/pts/%d", ptsNum)
+
+	return masterFd, slavePath, nil
+}
+
+// executePtyCommand runs a command under a PTY, streaming master output as
+// pty_output messages. Input arrives via pty_input messages, resize via
+// window_resize. Exits via a standard exit message.
+func executePtyCommand(conn net.Conn, req PtyExecRequest) {
+	id := req.ID
+
+	// Open PTY master + slave
+	masterFd, slavePath, err := openPty()
+	if err != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("openpty failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+	defer unix.Close(masterFd)
+
+	// Open slave
+	slaveFd, err := unix.Open(slavePath, unix.O_RDWR, 0)
+	if err != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("open slave failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+
+	// Initial size: from request, unless a pending resize arrived before pty_exec completed
+	ws := unix.Winsize{Row: uint16(req.Rows), Col: uint16(req.Cols)}
+	pendingResizeMu.Lock()
+	if pending, ok := pendingResizes[id]; ok {
+		ws.Col = uint16(pending[0])
+		ws.Row = uint16(pending[1])
+		delete(pendingResizes, id)
+	}
+	pendingResizeMu.Unlock()
+	unix.IoctlSetWinsize(masterFd, unix.TIOCSWINSZ, &ws)
+
+	// Build command
+	ctx, cancel := context.WithCancel(context.Background())
+	shell := "/bin/sh"
+	cmd := exec.CommandContext(ctx, shell, "-c", req.Cmd)
+
+	// Environment
+	cmd.Env = os.Environ()
+	for k, v := range req.Env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+	cmd.Env = append(cmd.Env, fmt.Sprintf("COLUMNS=%d", int(ws.Col)))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("LINES=%d", int(ws.Row)))
+
+	// Slave as stdin/stdout/stderr
+	slaveFile := os.NewFile(uintptr(slaveFd), slavePath)
+	cmd.Stdin = slaveFile
+	cmd.Stdout = slaveFile
+	cmd.Stderr = slaveFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		// Ctty references the index in the child's fd table after fork.
+		// With Stdin/Stdout/Stderr all pointing at slaveFile (fds 0,1,2 in child),
+		// Ctty: 0 is the controlling terminal.
+		Ctty: 0,
+	}
+
+	done := make(chan struct{})
+	ptyMu.Lock()
+	runningPtys[id] = &runningPty{masterFd: masterFd, cmd: cmd, cancel: cancel, done: done}
+	ptyMu.Unlock()
+	defer func() {
+		cancel()
+		ptyMu.Lock()
+		delete(runningPtys, id)
+		ptyMu.Unlock()
+		close(done)
+	}()
+
+	if err := cmd.Start(); err != nil {
+		slaveFile.Close()
+		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("start failed: %v\r\n", err)))
+		sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+		sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: 127})
+		return
+	}
+
+	// Close slave in parent — child inherits the fd
+	slaveFile.Close()
+
+	// Reader goroutine: 4KB chunks with 5ms drain window
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			n, err := unix.Read(masterFd, buf)
+			if n > 0 {
+				// 5ms drain window: coalesce bursts into a single message
+				accum := make([]byte, 0, 8192)
+				accum = append(accum, buf[:n]...)
+				drainDeadline := time.Now().Add(5 * time.Millisecond)
+				unix.SetNonblock(masterFd, true)
+				for time.Now().Before(drainDeadline) {
+					dn, derr := unix.Read(masterFd, buf)
+					if dn > 0 {
+						accum = append(accum, buf[:dn]...)
+					}
+					if derr != nil {
+						break
+					}
+					if dn == 0 {
+						break
+					}
+				}
+				unix.SetNonblock(masterFd, false)
+				encoded := base64.StdEncoding.EncodeToString(accum)
+				sendJSON(conn, PtyOutputMsg{Type: "pty_output", ID: id, Data: encoded})
+			}
+			if err != nil {
+				// EIO = slave closed before process exit (normal PTY teardown).
+				// Other errors are also terminal (EBADF, etc.).
+				if err != unix.EIO {
+					fmt.Fprintf(os.Stderr, "pty master read error (id=%s): %v\n", id, err)
+				}
+				return
+			}
+			if n == 0 {
+				return
+			}
+		}
+	}()
+
+	// Wait for process to exit
+	exitCode := 0
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+
+	// Wait for reader goroutine to drain remaining output
+	<-readDone
+
+	sendJSON(conn, ExitMsg{Type: "exit", ID: id, Code: exitCode})
+}
+
 // gracefulKill sends SIGTERM to the process group, waits for the grace period,
 // then sends SIGKILL if the process hasn't exited.
 func gracefulKill(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
@@ -638,6 +963,136 @@ func handleConfigureNetwork(conn net.Conn, msg ConfigureNetworkMsg) {
 	// Timeout — send ready anyway, config is applied and network likely works
 	fmt.Fprintln(os.Stderr, "network readiness timeout, sending network_ready anyway")
 	sendJSON(conn, NetworkReadyMsg{Type: "network_ready", IP: bareIP})
+}
+
+// handlePortForwardStart opens a vsock listener on a dynamically-chosen port,
+// replies with port_forward_ready so the host learns the mapping, and then
+// accepts incoming vsock connections. Each accepted connection is proxied to
+// localhost:<guest_port> inside the VM. All accept-loop / proxy goroutines
+// honour the per-forward context so port_forward_stop can tear them down
+// cleanly.
+func handlePortForwardStart(conn net.Conn, guestPort int) {
+	portFwdMu.Lock()
+	// Reject duplicate forward for the same guest_port — the host shouldn't
+	// start the same forward twice, and if it does we'd leak the previous
+	// listener. The host is expected to send port_forward_stop first.
+	if _, exists := activeForwards[guestPort]; exists {
+		portFwdMu.Unlock()
+		fmt.Fprintf(os.Stderr, "port_forward: already active for guest_port=%d\n", guestPort)
+		return
+	}
+	vsockPort := nextVsockPort
+	nextVsockPort++
+	portFwdMu.Unlock()
+
+	ln, err := listenVsock(int(vsockPort))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "port_forward: vsock listen on %d failed: %v\n", vsockPort, err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	portFwdMu.Lock()
+	activeForwards[guestPort] = &portFwdState{ln: ln, cancel: cancel}
+	portFwdMu.Unlock()
+
+	// Notify host of the negotiated vsock port BEFORE the accept goroutine
+	// starts — otherwise the host could connect before we've finished
+	// listening, though listenVsock's unix.Listen() has already succeeded so
+	// accept is safe immediately.
+	sendJSON(conn, PortForwardReadyMsg{
+		Type:      "port_forward_ready",
+		GuestPort: guestPort,
+		VsockPort: int(vsockPort),
+	})
+
+	go func() {
+		defer func() {
+			ln.Close()
+			portFwdMu.Lock()
+			// Only delete if the map entry still points at this listener —
+			// guard against a stop+restart race where a later forward on the
+			// same guest_port replaced the entry.
+			if cur, ok := activeForwards[guestPort]; ok && cur.ln == ln {
+				delete(activeForwards, guestPort)
+			}
+			portFwdMu.Unlock()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			vsockConn, err := ln.Accept()
+			if err != nil {
+				// If cancelled, ln.Close() unblocks Accept with an error —
+				// that's the normal teardown path.
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "port_forward: accept on vsock %d failed: %v\n", vsockPort, err)
+				return
+			}
+			go proxyPortForwardConn(ctx, vsockConn, guestPort)
+		}
+	}()
+}
+
+// proxyPortForwardConn bridges a vsock connection (from the host) to a local
+// TCP connection at 127.0.0.1:<guest_port>. Closes both ends on ctx.Done() or
+// when either side of the stream finishes, so port_forward_stop aborts
+// in-flight transfers.
+func proxyPortForwardConn(ctx context.Context, vsockConn net.Conn, guestPort int) {
+	defer vsockConn.Close()
+
+	tcpConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", guestPort), 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "port_forward: connect to 127.0.0.1:%d failed: %v\n", guestPort, err)
+		return
+	}
+	defer tcpConn.Close()
+
+	// Bidirectional copy. When either side closes, signal done so the other
+	// goroutine's blocked Read unblocks via the deferred Close calls above.
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(tcpConn, vsockConn)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(vsockConn, tcpConn)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+		// One side closed. Defers close both; the other goroutine's io.Copy
+		// will return and push to the buffered channel, but we don't block
+		// waiting for it — the channel has capacity 2 so it won't leak.
+	case <-ctx.Done():
+		// Forward torn down; defers close both ends.
+	}
+}
+
+// handlePortForwardStop closes the vsock listener and cancels the context for
+// a previously-started forward. In-flight proxy goroutines unblock via the
+// deferred Close calls in proxyPortForwardConn once ctx is cancelled.
+func handlePortForwardStop(guestPort int) {
+	portFwdMu.Lock()
+	state, ok := activeForwards[guestPort]
+	if ok {
+		delete(activeForwards, guestPort)
+	}
+	portFwdMu.Unlock()
+	if !ok {
+		return
+	}
+	// Close the listener first so Accept returns; then cancel so in-flight
+	// proxy connections observe ctx.Done() and tear down.
+	state.ln.Close()
+	state.cancel()
 }
 
 // run executes a command silently, logging errors to stderr.

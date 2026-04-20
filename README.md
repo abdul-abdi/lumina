@@ -4,7 +4,7 @@
 
 **Native Apple Workload Runtime for Agents**
 
-`subprocess.run()` for virtual machines.
+`subprocess.run()` for virtual machines — with interactive PTYs, port forwarding, and live observability.
 
 [![CI](https://github.com/abdul-abdi/lumina/actions/workflows/ci.yml/badge.svg)](https://github.com/abdul-abdi/lumina/actions/workflows/ci.yml)
 [![Swift 6](https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white)](https://swift.org)
@@ -34,6 +34,8 @@ lumina run "echo hello world"       # image auto-pulls on first run
 >
 > For a system-wide install: `sudo make install PREFIX=/usr/local`
 
+**New in v0.6.0:** interactive PTY via `lumina exec --pty`, host-to-guest TCP port forwarding via `lumina session start --forward`, live session inventory via `lumina ps`, and a **unified JSON envelope** for `lumina run` / `lumina exec` output. See [AGENT.md](AGENT.md) for the agent-facing API surface.
+
 ## Why Lumina?
 
 AI agents need to run untrusted code. The question is where.
@@ -47,7 +49,9 @@ AI agents need to run untrusted code. The question is where.
 | **Cleanup** | Automatic — COW clone deleted on exit | Manual — images/volumes linger | Manual — VM persists |
 | **Dependencies** | Zero — ships as one binary | Docker daemon | Cloud account + SSH keys |
 | **macOS native** | Yes — `VZVirtualMachine` | Linux-first (Docker Desktop is a VM) | N/A |
-| **Agent-friendly** | JSON when piped, text on TTY — zero config | Text only (needs parsing) | Text only |
+| **Agent-friendly** | Unified JSON envelope when piped, text on TTY — zero config | Text only (needs parsing) | Text only |
+| **Interactive REPL / TUI** | `lumina exec --pty` | `docker exec -it` | `ssh -t` |
+| **Host-to-guest TCP** | `--forward 3000:3000` | `-p 3000:3000` | SSH tunnel |
 | **Persistent sessions** | Built-in | N/A | SSH sessions |
 
 Boot time is paid once. Exec latency is paid every iteration. Lumina sessions give you both: hardware-isolated VMs with subprocess-fast execution. No daemon, no container registry, no cloud credentials.
@@ -64,11 +68,11 @@ Benchmarked on M3 Pro, macOS 26.4, release build with the default baked image (A
 | Daemon idle memory | **0 MB** | — | ~54 MB | — |
 | Sustained session exec rate | **100/s** | — | — | — |
 
-Lumina's zero-daemon in-process model is 2–3× faster across every workload and 10× more consistent on warm exec. File transfer sustains 75 MB/s upload / 35 MB/s download. Stdout streaming delivers 33 MB/s to the host at bit-perfect fidelity up to 10M+ lines.
+Lumina's zero-daemon in-process model is 2–3× faster across every workload and 10× more consistent on warm exec. File transfer sustains 75 MB/s upload / 35 MB/s download. Stdout streaming delivers 33 MB/s to the host at bit-perfect fidelity up to 10M+ lines. The stress suite validates 8 concurrent VMs on an 18GB M3 Pro, 100K-line stdout round-trip in ~1s, and a 3-minute sustained session running 171 periodic execs without degradation.
 
 ## Scaling
 
-macOS's Virtualization framework soft-limits concurrent VMs per process to roughly 4–6. Beyond that, new boots fail fast (~1-6ms) with `bootFailed: VM limit reached` — a hypervisor-level rejection, not OOM.
+macOS's Virtualization framework memory-bounds concurrent VMs to roughly 2/3 of host RAM. On an 18GB M3 Pro, 10 concurrent 512MB VMs boot cleanly; 8 concurrent 1GB VMs (the `lumina run` default) is the validated ceiling. Beyond the RAM threshold, new boots fail fast with `bootFailed` — a hypervisor-level rejection, not OOM.
 
 For higher throughput:
 
@@ -86,18 +90,21 @@ For higher throughput:
    # Boots 4 VMs once, runs the command 20 times, 4 concurrent
    ```
 
-3. **Parallel `lumina run`** — works up to the ~4 concurrent-VM ceiling. Beyond that, use a session or pool.
+3. **Parallel `lumina run`** — works up to the host RAM ceiling. Beyond that, use a session or pool.
 
-4. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` with `value: 4` to stay under the ceiling.
+4. **Library-level semaphore** — if you're calling `Lumina.run()` directly from Swift, wrap it in a `DispatchSemaphore` or `AsyncSemaphore` sized to stay under the host's VM ceiling.
 
 ## Usage
 
 ### One-shot (Disposable VMs)
 
 ```bash
-# Run a command — streams output on terminal, returns JSON when piped
+# Run a command — streams output on terminal, returns a single JSON envelope when piped
 lumina run "echo hello"
 lumina run "make build"
+
+# Pipe and parse — unified envelope: { stdout, stderr, exit_code, duration_ms }
+lumina run "uname -a" | jq -r .stdout
 
 # Environment variables
 lumina run -e API_KEY=sk-123 -e DEBUG=1 "env | grep API"
@@ -113,9 +120,6 @@ lumina run --volume mydata:/data "cat /data/file.txt"   # still there
 
 # Host directory mount
 lumina run --volume ./src:/mnt/src "cat /mnt/src/README.md"
-
-# Pipe-friendly — JSON output by default when not a TTY
-lumina run "uname -a" | jq .stdout
 ```
 
 `lumina run` has 7 flags. Everything else (memory, CPUs, streaming, output format) is auto-detected or configurable via environment variables. See [Environment Variables](#environment-variables).
@@ -125,9 +129,10 @@ lumina run "uname -a" | jq .stdout
 Boot once, exec many. Pay ~300ms boot once, then run commands at ~30ms each.
 
 ```bash
-# Start a session — configure resources at creation time
+# Start a session — configure resources + forwarded ports at creation time
 SID=$(lumina session start)
 SID=$(lumina session start --memory 4GB --cpus 4 --disk-size 8GB)
+SID=$(lumina session start --forward 3000:3000 --forward 8080:80)
 
 # Execute commands — ~30ms each (VM already running)
 lumina exec $SID "apk add python3"
@@ -160,6 +165,62 @@ lumina session stop $SID
 # Data survives — read from a brand new VM
 lumina run --volume workspace:/data "cat /data/output.txt"
 ```
+
+### Interactive Sessions (PTY)
+
+`lumina exec --pty` allocates a pseudo-terminal for the command, so REPLs, TUIs, and anything that probes `isatty(3)` Just Work. CR-overwrite, ANSI colour codes, and window resizes all pass through byte-perfect.
+
+```bash
+SID=$(lumina session start)
+
+# Drop into a shell inside the VM
+lumina exec --pty $SID "sh"
+
+# REPLs
+lumina exec --pty $SID "python3"
+lumina exec --pty $SID "node"
+
+# TUIs — `htop`, `vim`, `claude`, anything that draws to the terminal
+lumina exec --pty $SID "htop"
+
+lumina session stop $SID
+```
+
+**Constraints in v0.6.0:** one active PTY per session (non-PTY `exec` still runs concurrently alongside); `--pty` requires a session (not `lumina run`); stdin must be a real TTY. Ctrl-C and SIGTERM restore your terminal cleanly — signal handling uses `DispatchSourceSignal`, installed before entering raw mode.
+
+See [AGENT.md](AGENT.md) for the wire protocol (`pty_exec` / `pty_input` / `pty_output` / `window_resize`) if you're driving PTY sessions from code.
+
+### Port Forwarding (`--forward`)
+
+Expose a guest TCP port on the host's `127.0.0.1` — for hitting dev servers, databases, or anything listening inside the VM.
+
+```bash
+SID=$(lumina session start --forward 3000:3000)
+lumina exec $SID "python3 -m http.server 3000" &
+curl http://127.0.0.1:3000/
+
+lumina session stop $SID   # host listener is released automatically
+```
+
+Multiple forwards per session are supported; the host side always binds to loopback only (never `0.0.0.0`). The guest agent allocates a vsock port from its pool and replies with `port_forward_ready` before the host starts accepting — no race.
+
+### Observability (`lumina ps`)
+
+List live sessions in one command. Agents can pipe this through `jq` to find their own sessions, count in-flight execs, or reap stale ones.
+
+```bash
+$ lumina ps | jq .
+[
+  {
+    "sid": "9985A5F9-F630-4C8B-B58C-5EB6A2AC60C7",
+    "image": "default",
+    "uptime_seconds": 42.6,
+    "active_execs": 1
+  }
+]
+```
+
+Sessions that have gone unresponsive still appear with an `error: "unreachable"` field so they're visible for cleanup via `lumina session stop`.
 
 ### Custom Images
 
@@ -219,6 +280,35 @@ lumina network run network.json
 
 ---
 
+## Output Contract
+
+Lumina auto-detects output format. Piped: one JSON object. TTY: human-readable text.
+
+**Unified envelope** (piped JSON, default for both `lumina run` and `lumina exec`):
+
+```json
+{"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 668}
+```
+
+**Error envelope** — `error` is set, `exit_code` is absent, and `partial_stdout` / `partial_stderr` are included where the command actually ran:
+
+```json
+{"error": "timeout", "duration_ms": 3910, "partial_stdout": "begin\n", "partial_stderr": ""}
+```
+
+The four error states are exhaustive and mutually exclusive:
+
+| `error` | Meaning | Partials? |
+|---------|---------|-----------|
+| `timeout` | Command's `--timeout` fired | yes |
+| `vm_crashed` | Guest kernel or agent died mid-exec | yes |
+| `session_disconnected` | Session IPC socket dropped mid-exec | yes |
+| `connection_failed` | VM/session couldn't be reached at all — command never started | no |
+
+**Legacy NDJSON** streaming (pre-v0.6.0 per-chunk format) is preserved behind `LUMINA_OUTPUT=ndjson` for migration, and removed in v0.8.0.
+
+---
+
 ## Environment Variables
 
 Resource configuration, output format, and streaming are controlled via environment variables. Set once, forget forever.
@@ -230,13 +320,14 @@ Resource configuration, output format, and streaming are controlled via environm
 | `LUMINA_TIMEOUT` | Command timeout | `60s` | `LUMINA_TIMEOUT=300s` |
 | `LUMINA_DISK_SIZE` | Rootfs size | image default | `LUMINA_DISK_SIZE=4GB` |
 | `LUMINA_FORMAT` | Output format | auto (JSON piped, text TTY) | `LUMINA_FORMAT=text` |
-| `LUMINA_STREAM` | Streaming mode | auto (stream TTY, buffer piped) | `LUMINA_STREAM=1` |
+| `LUMINA_STREAM` | Text-mode streaming | auto (stream TTY, buffer piped) | `LUMINA_STREAM=1` |
+| `LUMINA_OUTPUT` | Legacy per-chunk NDJSON (removed v0.8.0) | unset = unified envelope | `LUMINA_OUTPUT=ndjson` |
 
 **Priority:** `session start` flags > env var > built-in default.
 
 For `lumina run`, resource settings come from env vars only (no flags). This keeps the common case clean — agents set env vars once in their environment, every `run` command inherits them.
 
-For `lumina session start`, resource flags (`--memory`, `--cpus`, `--disk-size`) override env vars. This lets you provision different sessions with different resources in the same workflow.
+For `lumina session start`, resource flags (`--memory`, `--cpus`, `--disk-size`, `--forward`) override env vars. This lets you provision different sessions with different resources in the same workflow.
 
 ---
 
@@ -247,7 +338,8 @@ Lumina auto-detects everything it can so you type less:
 | Feature | How it works |
 |---------|-------------|
 | **Output format** | JSON when piped (for agents), text on TTY (for humans) |
-| **Streaming** | Streams on TTY (real-time output), buffers when piped (complete JSON result) |
+| **Streaming (text)** | Streams on TTY (real-time output), buffers when piped |
+| **Output envelope (JSON)** | Single unified envelope when piped; `LUMINA_OUTPUT=ndjson` for legacy per-chunk streaming |
 | **`--copy` file/dir** | Stats the local path — routes to file upload or directory tar+upload |
 | **`--download` file/dir** | Execs `test -d` on the guest — routes to file download or directory tar+download |
 | **`--volume` mount/volume** | Path prefix (`/` or `.`) = host directory mount, otherwise = named volume lookup |
@@ -264,7 +356,7 @@ Lumina auto-detects everything it can so you type less:
 ### `lumina run` (7 flags)
 
 ```bash
-lumina run <command>                          # run, stream on TTY, JSON when piped
+lumina run <command>                          # run, stream on TTY, unified JSON when piped
 lumina run --image python <command>           # use a custom image
 lumina run --timeout 5m <command>             # command timeout (default: 60s)
 lumina run -e KEY=VAL <command>               # env vars (repeatable)
@@ -274,10 +366,11 @@ lumina run --volume path_or_name:guest <cmd>  # mount host dir or named volume
 lumina run --workdir /code <command>          # working directory inside VM
 ```
 
-### `lumina exec` (3 flags)
+### `lumina exec` (4 flags)
 
 ```bash
-lumina exec <sid> <command>                   # always streams
+lumina exec <sid> <command>                   # unified JSON when piped, streams on TTY
+lumina exec <sid> --pty <command>             # allocate a PTY (REPLs / TUIs / interactive shells)
 lumina exec <sid> --timeout 5m <command>      # timeout
 lumina exec <sid> -e KEY=VAL <command>        # env vars (repeatable)
 lumina exec <sid> --workdir /code <command>   # working directory
@@ -290,7 +383,7 @@ lumina cp ./local.txt <sid>:/remote.txt       # upload to session
 lumina cp <sid>:/remote.txt ./local.txt       # download from session
 ```
 
-### `lumina session` (5 flags on start)
+### `lumina session` (6 flags on start)
 
 ```bash
 lumina session start                          # start with defaults
@@ -298,8 +391,15 @@ lumina session start --image python           # custom image
 lumina session start --memory 4GB --cpus 4    # configure resources
 lumina session start --disk-size 8GB          # larger rootfs
 lumina session start --volume data:/mnt       # mount volume at boot
+lumina session start --forward 3000:3000      # forward host port to guest (repeatable)
 lumina session list                           # list active sessions
-lumina session stop <sid>                     # stop session
+lumina session stop <sid>                     # stop session (also releases forwarded ports)
+```
+
+### `lumina ps`
+
+```bash
+lumina ps                                     # JSON array: sid, image, uptime_seconds, active_execs
 ```
 
 ### `lumina images` (4 flags on create)
@@ -342,8 +442,6 @@ lumina pull --force                           # re-download even if exists
 lumina clean                                  # remove orphaned COW clones
 lumina network run manifest.json              # boot VMs from manifest
 ```
-
-**26 flags total across 18 commands.**
 
 </details>
 
@@ -446,7 +544,7 @@ sequenceDiagram
 ```
 
 <details>
-<summary><strong>Session Architecture</strong></summary>
+<summary><strong>Session Architecture (incl. PTY + port forwarding)</strong></summary>
 
 ```mermaid
 sequenceDiagram
@@ -454,38 +552,50 @@ sequenceDiagram
     participant SP as SessionProcess
     participant SS as SessionServer
     participant VM as VM Actor
-    participant EC as lumina exec
-    participant CP as lumina cp
+    participant EC as lumina exec / exec --pty
+    participant PF as Port-forward proxy
+    participant HC as Host TCP client
 
     CLI->>SP: spawn background process
     SP->>VM: boot VM + configure network
     SP->>SS: bind Unix socket
+    Note over SP,SS: If --forward given:<br/>allocate guest vsock ports,<br/>start loopback TCP listeners
     SS-->>CLI: socket ready
     CLI-->>CLI: return SID
 
     EC->>SS: connect to socket
-    EC->>SS: {"type":"exec","cmd":"..."}
-    par concurrent during exec
-        EC->>SS: {"type":"stdin","data":"..."}
-        SS->>VM: sendStdin via StdinChannel
-        EC->>SS: {"type":"stdin_close"}
+    alt regular exec
+        EC->>SS: {"type":"exec","cmd":"..."}
+        SS->>VM: exec(cmd, stdin: StdinChannel)
+        VM-->>SS: output chunks + exit
+        SS-->>EC: stream responses
+    else PTY exec
+        EC->>SS: {"type":"ptyExec","cols":120,"rows":40}
+        SS->>VM: pty_exec (guest forkptys)
+        loop raw bytes
+            EC->>SS: {"type":"ptyInput"}  (base64 stdin)
+            SS->>VM: pty_input
+            VM-->>SS: pty_output (base64 stdout)
+            SS-->>EC: pty_output
+        end
+        EC->>SS: {"type":"windowResize"}
+        SS->>VM: window_resize (TIOCSWINSZ)
     end
-    SS->>VM: exec(cmd, stdin: StdinChannel)
-    VM-->>SS: output chunks + exit
-    SS-->>EC: stream responses
-    Note over EC,VM: ~30ms per exec (stdin-piped or not)
 
-    CP->>SS: connect to socket
-    CP->>SS: {"type":"upload","localPath":"..."}
-    SS->>VM: upload via vsock
-    SS-->>CP: {"type":"uploadDone"}
+    HC->>PF: TCP connect 127.0.0.1:HOST_PORT
+    PF->>VM: vsock to guest pool port
+    VM->>VM: guest agent dials localhost:GUEST_PORT
 
     EC->>SS: {"type":"shutdown"}
     SS->>VM: shutdown()
-    SS->>SP: cleanup session directory
+    SS->>SP: cleanup session directory + release host listeners
 ```
 
-Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts concurrent connections, and dispatches to the VM actor. Stdin piping uses a `StdinChannel` bridge — the server reads `stdin`/`stdin_close` messages from the socket concurrently with forwarding exec output. File transfers go through `lumina cp` — a separate command with scp-style syntax.
+Sessions use Unix domain sockets at `~/.lumina/sessions/<sid>/control.sock` for IPC. The session server runs as a background process, accepts concurrent connections, and dispatches to the VM actor.
+
+- **Regular `exec`** streams through the concurrent dispatcher — multiple execs share one VM via an ID-keyed map under `execLock`.
+- **PTY exec** is a distinct path with its own handler map under `ptyLock`. One active PTY per session (`activePtyId`); regular `exec` still runs alongside.
+- **Port forwarding** lifecycle: host sends `port_forward_start { guest_port }`, guest agent replies `port_forward_ready { guest_port, vsock_port }`, then the host opens a loopback TCP listener. `session stop` releases the listener and sends `port_forward_stop`.
 
 </details>
 
@@ -530,6 +640,23 @@ sequenceDiagram
 | `{"type":"stdin","id":"uuid","data":"..."}` | host -> guest | Pipe data to running command |
 | `{"type":"stdin_close","id":"uuid"}` | host -> guest | Close stdin pipe (triggers EOF) |
 
+**PTY (v0.6.0, distinct from `exec`):**
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `{"type":"pty_exec","id":"uuid","cols":120,"rows":40,...}` | host -> guest | Fork with a new PTY |
+| `{"type":"pty_input","id":"uuid","data":"<base64>"}` | host -> guest | Raw bytes into the PTY master |
+| `{"type":"window_resize","id":"uuid","cols":120,"rows":40}` | host -> guest | `TIOCSWINSZ` (buffered if PTY not yet allocated) |
+| `{"type":"pty_output","id":"uuid","data":"<base64>"}` | guest -> host | 4KB chunked reads from master (merged stdout+stderr) |
+
+**Port forwarding (v0.6.0):**
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `{"type":"port_forward_start","guest_port":3000}` | host -> guest | Request forwarding |
+| `{"type":"port_forward_ready","guest_port":3000,"vsock_port":1025}` | guest -> host | Guest allocated vsock port; host begins accepting on loopback |
+| `{"type":"port_forward_stop","guest_port":3000}` | host -> guest | Tear down |
+
 **Cancellation:**
 
 | Message | Direction | Purpose |
@@ -553,12 +680,13 @@ sequenceDiagram
                          +----------------v------------------+
   Session API            |  session start / exec / cp / stop |
   (persistent)           |  Unix socket IPC, ~30ms exec      |
+                         |  + exec --pty / --forward         |
                          +----------------+------------------+
                                           |
                          +----------------v------------------+
   Lifecycle API          |           VM actor                |
-  (multi-command)        |  boot() -> exec() -> exec() -> .. |
-                         |  uploadFiles() / downloadFiles()  |
+  (multi-command)        |  boot() -> exec() -> execPty() -> |
+                         |  connectVsock() / uploadFiles() / |
                          |  shutdown()                       |
                          +-----------------------------------+
 ```
@@ -567,12 +695,12 @@ sequenceDiagram
 
 | Component | Role | Key Detail |
 |-----------|------|------------|
-| **VM** | Actor wrapping `VZVirtualMachine` | Custom `VMExecutor` (SerialExecutor) pins all VZ calls to a dedicated DispatchQueue |
-| **CommandRunner** | vsock protocol + dispatcher | Per-exec `AsyncStream` handlers keyed by ID for concurrent multiplexing |
+| **VM** | Actor wrapping `VZVirtualMachine` | Custom `VMExecutor` (SerialExecutor) pins all VZ calls to a dedicated DispatchQueue; `connectVsock(port:)` returns `Int32` fd (no `VZVirtioSocketConnection` across actor boundary) |
+| **CommandRunner** | vsock protocol + dispatcher | Separate handler maps for regular `exec` (`execLock`) and `pty_exec` (`ptyLock`); per-request `AsyncStream` handlers keyed by ID for concurrent multiplexing |
 | **DiskClone** | Per-run ephemeral COW clones | PID file-based orphan detection; `cleanOrphans()` via `atexit` + signal handlers |
 | **ImageStore** | Image cache + custom creation | Staging-dir atomicity for crash-safe builds. Rosetta stored in `ImageMeta`. |
 | **VolumeStore** | Named persistent volumes | Host directories at `~/.lumina/volumes/<name>/data/`, mounted via virtio-fs |
-| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, Task-per-connection, concurrent exec stdin via `StdinChannel` |
+| **SessionServer** | Unix socket IPC server | Listens at `~/.lumina/sessions/<sid>/control.sock`, Task-per-connection; enforces one active PTY per session via `activePtyId`; backs `lumina ps` via `SessionRequest.status` |
 | **SessionClient** | Unix socket IPC client | Validates session liveness, sends requests, receives streamed responses |
 | **NetworkSwitch** | Ethernet frame relay | SOCK_DGRAM socketpairs, poll-based broadcast, dynamic port addition |
 | **Network** | VM group manager | Actor coordinating multiple VMs on a shared virtual switch with IP assignment |
@@ -584,7 +712,7 @@ sequenceDiagram
 |---|---|---|
 | **Contents** | `vmlinuz` + `rootfs.img` | `vmlinuz` + `initrd` + `rootfs.img` + `lumina-agent` + `modules/` |
 | **Boot path** | kernel -> mount root -> `/sbin/init` -> agent | kernel -> initrd -> load modules -> switch_root -> agent |
-| **Network config** | Kernel cmdline params | Initrd overlay |
+| **Network config** | Kernel cmdline params | Initrd overlay (plus `devpts` mount for PTY support since v0.6.0) |
 | **Boot time** | ~200-300ms | ~570ms |
 
 Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is absent, else `.legacyWithInitrd`).
@@ -594,10 +722,11 @@ Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is ab
 - **No shared mutable state** — each `Lumina.run()` creates its own VM, COW clone, and vsock connection
 - **Zero external Swift dependencies** — library links only `Virtualization.framework` (CLI adds `swift-argument-parser`)
 - **All public types are `Sendable`** — safe to use across concurrency domains
-- **Concurrent exec** — multiple commands run on the same VM via ID-keyed dispatcher
+- **Concurrent exec + exclusive PTY** — regular `exec` is fully concurrent; PTY is one-at-a-time per session, tracked under `ptyLock`
 - **Configuration vs invocation** — image-level settings (rosetta) in metadata, environment-level (memory/cpus) in env vars, per-invocation (timeout/env/workdir) as CLI flags
 - **Network always on** — host-driven config, `network_ready` awaited before exec, no flags needed
-- **Clean error messages** — `LuminaError` conforms to `LocalizedError`; agents see `"image 'x' not found"` not `imageNotFound("x")`
+- **Port forwards are loopback-only** — the host side never binds `0.0.0.0`
+- **Clean error messages** — `LuminaError` conforms to `LocalizedError`; agents see `"timeout"` or `"connection_failed"` in the unified envelope, not Swift enum names
 
 </details>
 
@@ -607,12 +736,19 @@ Detection is automatic via `ImagePaths.bootContract` (`.baked` when initrd is ab
 
 ```bash
 make build               # debug build + codesign (entitlements required)
-make test                # unit + integration tests (163 tests)
-make test-integration    # e2e tests (requires VM image + jq)
+make test                # unit + integration tests (193 unit + 36 integration)
+make test-integration    # e2e tests via tests/e2e.sh (81 tests, requires VM image + jq)
 make release             # optimized build + codesign
 make install             # release build -> ~/.local/bin/lumina
 make run ARGS="echo hi"  # build, sign, and run in one step
 make clean               # remove .build/
+```
+
+Additional validation (not in CI):
+
+```bash
+bash tests/stress.sh     # stress suite: concurrent VMs, throughput, sustained session,
+                         # port-forward lifecycle churn — ~12 min on an M3 Pro
 ```
 
 <details>
@@ -640,6 +776,10 @@ LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh
 - macOS 14+ (Sonoma)
 - Apple Silicon (M1, M2, M3, M4)
 - Go 1.21+ (guest agent build only — not needed for CLI usage)
+
+## For Agent Authors
+
+If you're driving Lumina from an AI agent loop, start with [**AGENT.md**](AGENT.md) — it's the compact, agent-facing reference: wire protocol, unified envelope, error states, PTY, port forwarding, and the minimum set of flags you actually need.
 
 ## License
 

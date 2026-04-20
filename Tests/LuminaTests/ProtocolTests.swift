@@ -282,3 +282,82 @@ import Testing
     #expect(vmOpts.mounts.count == 1)
     #expect(vmOpts.mounts[0].guestPath == "/mnt")
 }
+
+// MARK: - PTY Message Tests
+
+@Test func encodePtyExecMessage() throws {
+    let msg = HostMessage.ptyExec(id: "pty-1", cmd: "claude", timeout: 0, env: [:], cols: 120, rows: 40)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_exec")
+    #expect(json["id"] as? String == "pty-1")
+    #expect(json["cmd"] as? String == "claude")
+    #expect(json["cols"] as? Int == 120)
+    #expect(json["rows"] as? Int == 40)
+}
+
+@Test func encodePtyInputMessage() throws {
+    let msg = HostMessage.ptyInput(id: "pty-1", data: "aGVsbG8=")
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "pty_input")
+    #expect(json["id"] as? String == "pty-1")
+    #expect(json["data"] as? String == "aGVsbG8=")
+}
+
+@Test func encodeWindowResizeMessage() throws {
+    let msg = HostMessage.windowResize(id: "pty-1", cols: 200, rows: 50)
+    let data = try Protocol.encode(msg)
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "window_resize")
+    #expect(json["cols"] as? Int == 200)
+    #expect(json["rows"] as? Int == 50)
+}
+
+@Test func decodePtyOutputMessage() throws {
+    let raw = Data("{\"type\":\"pty_output\",\"id\":\"pty-1\",\"data\":\"aGVsbG8=\"}\n".utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .ptyOutput(id: "pty-1", data: "aGVsbG8="))
+}
+
+@Test func decodePtyExitMessage() throws {
+    // PTY uses the same exit message type as regular exec
+    let raw = Data("{\"type\":\"exit\",\"id\":\"pty-1\",\"code\":0}\n".utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .exit(id: "pty-1", code: 0))
+}
+
+// MARK: - Port Forward Message Tests
+
+@Test func encodePortForwardStartMessage() throws {
+    let msg = HostMessage.portForwardStart(guestPort: 3000)
+    let data = try Protocol.encode(msg)
+    let str = String(data: data, encoding: .utf8)!
+    #expect(str.hasSuffix("\n"))
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "port_forward_start")
+    #expect(json["guest_port"] as? Int == 3000)
+}
+
+@Test func encodePortForwardStopMessage() throws {
+    let msg = HostMessage.portForwardStop(guestPort: 3000)
+    let data = try Protocol.encode(msg)
+    let str = String(data: data, encoding: .utf8)!
+    #expect(str.hasSuffix("\n"))
+    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    #expect(json["type"] as? String == "port_forward_stop")
+    #expect(json["guest_port"] as? Int == 3000)
+}
+
+@Test func decodePortForwardReadyMessage() throws {
+    let raw = Data("{\"type\":\"port_forward_ready\",\"guest_port\":3000,\"vsock_port\":1025}\n".utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .portForwardReady(guestPort: 3000, vsockPort: 1025))
+}
+
+@Test func decodePortForwardReadyMissingFields() {
+    let raw = Data("{\"type\":\"port_forward_ready\",\"guest_port\":3000}\n".utf8)
+    #expect(throws: LuminaError.self) {
+        try Protocol.decodeGuest(raw)
+    }
+}

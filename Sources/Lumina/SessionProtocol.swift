@@ -11,6 +11,16 @@ public enum SessionRequest: Sendable, Equatable {
     case stdin(data: String)
     case stdinClose
     case shutdown
+    /// v0.6.0: Start an interactive PTY-backed command. `data` frames flow in
+    /// `ptyInput` requests and `ptyOutput` responses (base64-encoded raw bytes).
+    case ptyExec(cmd: String, timeout: Int, env: [String: String], cols: Int, rows: Int)
+    /// v0.6.0: Raw base64-encoded bytes to write to the active PTY master fd.
+    case ptyInput(data: String)
+    /// v0.6.0: Window size change for the active PTY (triggers SIGWINCH in guest).
+    case windowResize(cols: Int, rows: Int)
+    /// v0.6.0: Query the server for live session status (uptime + active execs).
+    /// Used by `lumina ps` for observability.
+    case status
 }
 
 // MARK: - Session Response (session server → host)
@@ -25,6 +35,12 @@ public enum SessionResponse: Sendable, Equatable {
     case error(message: String)
     case uploadDone(path: String)
     case downloadDone(path: String)
+    /// v0.6.0: Base64-encoded raw bytes from the active PTY master fd.
+    /// PTY merges stdout+stderr — no stream tag.
+    case ptyOutput(data: String)
+    /// v0.6.0: Live session status returned in response to `.status` request.
+    /// `uptime` is seconds since the session server started accepting connections.
+    case status(uptime: TimeInterval, activeExecs: Int, image: String)
 }
 
 // MARK: - Codec
@@ -51,6 +67,14 @@ public enum SessionProtocol {
             dict = ["type": "stdin_close"]
         case .shutdown:
             dict = ["type": "shutdown"]
+        case .ptyExec(let cmd, let timeout, let env, let cols, let rows):
+            dict = ["type": "pty_exec", "cmd": cmd, "timeout": timeout, "env": env, "cols": cols, "rows": rows]
+        case .ptyInput(let data):
+            dict = ["type": "pty_input", "data": data]
+        case .windowResize(let cols, let rows):
+            dict = ["type": "window_resize", "cols": cols, "rows": rows]
+        case .status:
+            dict = ["type": "status"]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -72,6 +96,15 @@ public enum SessionProtocol {
             dict = ["type": "upload_done", "path": path]
         case .downloadDone(let path):
             dict = ["type": "download_done", "path": path]
+        case .ptyOutput(let data):
+            dict = ["type": "pty_output", "data": data]
+        case .status(let uptime, let activeExecs, let image):
+            dict = [
+                "type": "status",
+                "uptime": uptime,
+                "active_execs": activeExecs,
+                "image": image,
+            ]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -120,6 +153,28 @@ public enum SessionProtocol {
             return .stdinClose
         case "shutdown":
             return .shutdown
+        case "pty_exec":
+            guard let cmd = json["cmd"] as? String,
+                  let timeout = json["timeout"] as? Int,
+                  let cols = json["cols"] as? Int,
+                  let rows = json["rows"] as? Int else {
+                throw LuminaError.protocolError("Malformed pty_exec request")
+            }
+            let env = json["env"] as? [String: String] ?? [:]
+            return .ptyExec(cmd: cmd, timeout: timeout, env: env, cols: cols, rows: rows)
+        case "pty_input":
+            guard let data = json["data"] as? String else {
+                throw LuminaError.protocolError("Malformed pty_input request")
+            }
+            return .ptyInput(data: data)
+        case "window_resize":
+            guard let cols = json["cols"] as? Int,
+                  let rows = json["rows"] as? Int else {
+                throw LuminaError.protocolError("Malformed window_resize request")
+            }
+            return .windowResize(cols: cols, rows: rows)
+        case "status":
+            return .status
         default:
             throw LuminaError.protocolError("Unknown session request type: \(type)")
         }
@@ -169,6 +224,20 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed download_done response")
             }
             return .downloadDone(path: path)
+        case "pty_output":
+            guard let data = json["data"] as? String else {
+                throw LuminaError.protocolError("Malformed pty_output response")
+            }
+            return .ptyOutput(data: data)
+        case "status":
+            // Tolerant decode — any missing field degrades to a sensible default
+            // so a future server that adds fields stays parseable here.
+            let uptime = (json["uptime"] as? TimeInterval)
+                ?? (json["uptime"] as? Double)
+                ?? Double(json["uptime"] as? Int ?? 0)
+            let activeExecs = json["active_execs"] as? Int ?? 0
+            let image = json["image"] as? String ?? "unknown"
+            return .status(uptime: uptime, activeExecs: activeExecs, image: image)
         default:
             throw LuminaError.protocolError("Unknown session response type: \(type)")
         }

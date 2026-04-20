@@ -30,6 +30,13 @@ final class CommandRunner: @unchecked Sendable {
     /// retry duration as max(all in-flight timeouts).
     private var execTimeouts: [String: Int] = [:]
 
+    // ── PTY handlers: separate lock + map (PTY and exec are distinct I/O models) ──
+    // PTY has its own lock to avoid contending with exec on high-frequency
+    // resize/input traffic. Hickey review: shared locks across independent
+    // concerns is accidental complexity.
+    private let ptyLock = NSLock()
+    private var ptyHandlers: [String: AsyncStream<GuestMessage>.Continuation] = [:]
+
     // ── Transfer handler: at most ONE transfer at a time ──
     // Upload and download are sequential, ACK-driven protocols — different
     // from the multiplexed exec protocol. They get a dedicated handler slot
@@ -38,6 +45,12 @@ final class CommandRunner: @unchecked Sendable {
 
     // ── Network readiness: one-shot continuation for configure_network flow ──
     private var networkContinuation: CheckedContinuation<GuestMessage, Never>?
+
+    // ── Port forward continuations: one per in-flight port_forward_start ──
+    // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
+    // surface `.connectionFailed` to the caller instead of silently succeeding
+    // with a bogus vsock port.
+    private var portForwardContinuations: [Int: CheckedContinuation<Int, any Error>] = [:]
 
     /// Background task that reads all messages from the vsock and dispatches
     /// them to registered handlers.
@@ -309,6 +322,119 @@ final class CommandRunner: @unchecked Sendable {
         try writeToOutput(msgData)
     }
 
+    // MARK: - PTY Exec
+
+    /// Execute a command in a PTY on the guest. Returns an AsyncThrowingStream of PtyChunk.
+    /// The caller reads raw terminal output and receives an exit code when the process ends.
+    func execPty(
+        id: String,
+        command: String,
+        timeout: Int,
+        env: [String: String] = [:],
+        cols: Int,
+        rows: Int
+    ) throws(LuminaError) -> AsyncThrowingStream<PtyChunk, any Error> {
+        lock.lock()
+        let currentState = _state
+        lock.unlock()
+        guard currentState == .ready else {
+            throw .connectionFailed
+        }
+
+        let (stream, continuation) = AsyncStream<GuestMessage>.makeStream()
+
+        ptyLock.lock()
+        ptyHandlers[id] = continuation
+        ptyLock.unlock()
+
+        // Send pty_exec message
+        let msg = HostMessage.ptyExec(id: id, cmd: command, timeout: timeout, env: env, cols: cols, rows: rows)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            ptyLock.lock()
+            ptyHandlers.removeValue(forKey: id)
+            ptyLock.unlock()
+            continuation.finish()
+            throw .protocolError("Failed to encode pty_exec message: \(error)")
+        }
+        do {
+            try writeToOutput(msgData)
+        } catch {
+            ptyLock.lock()
+            ptyHandlers.removeValue(forKey: id)
+            ptyLock.unlock()
+            continuation.finish()
+            throw error
+        }
+
+        // Transform GuestMessage stream into PtyChunk stream
+        let runner = self
+        let ptyId = id
+        return AsyncThrowingStream { cont in
+            let task = Task.detached {
+                for await guestMsg in stream {
+                    switch guestMsg {
+                    case .ptyOutput(_, let base64Data):
+                        guard let rawBytes = Data(base64Encoded: base64Data) else { continue }
+                        cont.yield(.output(rawBytes))
+                    case .exit(_, let code):
+                        cont.yield(.exit(code))
+                        cont.finish()
+                        runner.unregisterPtyHandler(ptyId)
+                        return
+                    case .heartbeat:
+                        continue
+                    default:
+                        continue
+                    }
+                }
+                // Stream ended without exit (connection lost)
+                cont.finish(throwing: LuminaError.connectionFailed)
+                runner.unregisterPtyHandler(ptyId)
+            }
+
+            cont.onTermination = { @Sendable _ in
+                task.cancel()
+                runner.unregisterPtyHandler(ptyId)
+            }
+        }
+    }
+
+    /// Unregister a PTY handler and finish its stream.
+    private func unregisterPtyHandler(_ id: String) {
+        ptyLock.lock()
+        let cont = ptyHandlers.removeValue(forKey: id)
+        ptyLock.unlock()
+        cont?.finish()
+    }
+
+    /// Send raw input bytes to a running PTY session.
+    func sendPtyInput(id: String, data: Data) throws(LuminaError) {
+        let base64 = data.base64EncodedString()
+        let msg = HostMessage.ptyInput(id: id, data: base64)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode pty_input message: \(error)")
+        }
+        try writeToOutput(msgData)
+    }
+
+    /// Send a window resize event to a running PTY session.
+    func sendWindowResize(id: String, cols: Int, rows: Int) throws(LuminaError) {
+        let msg = HostMessage.windowResize(id: id, cols: cols, rows: rows)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode window_resize message: \(error)")
+        }
+        try writeToOutput(msgData)
+    }
+
     // MARK: - Reconnect
 
     /// Max guest-side timeout across all in-flight execs.
@@ -355,13 +481,24 @@ final class CommandRunner: @unchecked Sendable {
 
         let networkCont = networkContinuation
         networkContinuation = nil
+
+        let pfConts = portForwardContinuations
+        portForwardContinuations = [:]
         lock.unlock()
+
+        ptyLock.lock()
+        let ptyHandlersCopy = ptyHandlers
+        ptyHandlers = [:]
+        ptyLock.unlock()
 
         // Finish all handlers — unblocks any waiting exec/stream/upload/download
         for (_, handler) in execHandlersCopy { handler.finish() }
+        for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending requestPortForward() callers with connectionFailed.
+        for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
 
         // Best-effort cancel: tell the guest agent to kill running commands
         if let fd = fd {
@@ -431,6 +568,73 @@ final class CommandRunner: @unchecked Sendable {
             }
         }
         // network_ready received; DNS, route, and IP are now live on the guest.
+    }
+
+    // MARK: - Port Forwarding (host-driven)
+
+    /// Ask the guest agent to open a TCP listener on `guestPort` and allocate a
+    /// reverse-channel vsock port. Suspends until the guest responds with
+    /// `port_forward_ready` carrying the vsock port, or until the connection
+    /// tears down (in which case the continuation is resumed with
+    /// `.connectionFailed`).
+    func requestPortForward(guestPort: Int) async throws(LuminaError) -> Int {
+        let msg = HostMessage.portForwardStart(guestPort: guestPort)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode port_forward_start: \(error)")
+        }
+
+        // Register continuation BEFORE sending so a fast guest reply cannot
+        // arrive before the map entry exists. All lock operations happen inside
+        // this synchronous closure — NSLock is async-unavailable in Swift 6.
+        do {
+            return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, any Error>) in
+                lock.lock()
+                guard _state == .ready else {
+                    lock.unlock()
+                    cont.resume(throwing: LuminaError.connectionFailed)
+                    return
+                }
+                if portForwardContinuations[guestPort] != nil {
+                    lock.unlock()
+                    cont.resume(throwing: LuminaError.protocolError(
+                        "port_forward_start already in flight for guest port \(guestPort)"
+                    ))
+                    return
+                }
+                portForwardContinuations[guestPort] = cont
+                lock.unlock()
+
+                do {
+                    try writeToOutput(msgData)
+                } catch {
+                    // writeToOutput failed — remove entry and resume before
+                    // the dispatcher has any chance of finding it.
+                    lock.lock()
+                    let pending = portForwardContinuations.removeValue(forKey: guestPort)
+                    lock.unlock()
+                    pending?.resume(throwing: LuminaError.connectionFailed)
+                }
+            }
+        } catch let luminaError as LuminaError {
+            throw luminaError
+        } catch {
+            throw .connectionFailed
+        }
+    }
+
+    /// Tell the guest to stop forwarding `guestPort`. Idempotent on the guest.
+    func stopPortForward(guestPort: Int) throws(LuminaError) {
+        let msg = HostMessage.portForwardStop(guestPort: guestPort)
+        let msgData: Data
+        do {
+            msgData = try LuminaProtocol.encode(msg)
+        } catch {
+            throw .protocolError("Failed to encode port_forward_stop: \(error)")
+        }
+        try writeToOutput(msgData)
     }
 
     // MARK: - File Upload (async, through dispatcher)
@@ -593,11 +797,25 @@ final class CommandRunner: @unchecked Sendable {
             let handler = execHandlers[id]
             lock.unlock()
             handler?.yield(msg)
-        case .exit(let id, _):
-            lock.lock()
-            let handler = execHandlers[id]
-            lock.unlock()
+        case .ptyOutput(let id, _):
+            ptyLock.lock()
+            let handler = ptyHandlers[id]
+            ptyLock.unlock()
             handler?.yield(msg)
+        case .exit(let id, _):
+            // Check exec handlers first (common case)
+            lock.lock()
+            let execHandler = execHandlers[id]
+            lock.unlock()
+            if let h = execHandler {
+                h.yield(msg)
+                break
+            }
+            // Fall through to PTY handlers — separate lock to avoid lock coupling
+            ptyLock.lock()
+            let ptyHandler = ptyHandlers[id]
+            ptyLock.unlock()
+            ptyHandler?.yield(msg)
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
             lock.lock()
@@ -616,6 +834,11 @@ final class CommandRunner: @unchecked Sendable {
             networkContinuation = nil
             lock.unlock()
             cont?.resume(returning: msg)
+        case .portForwardReady(let guestPort, let vsockPort):
+            lock.lock()
+            let cont = portForwardContinuations.removeValue(forKey: guestPort)
+            lock.unlock()
+            cont?.resume(returning: vsockPort)
         case .ready:
             // Unexpected ready during active connection — ignore
             break
@@ -639,13 +862,24 @@ final class CommandRunner: @unchecked Sendable {
 
         let networkCont = networkContinuation
         networkContinuation = nil
+
+        let pfConts = portForwardContinuations
+        portForwardContinuations = [:]
         lock.unlock()
+
+        ptyLock.lock()
+        let ptyHandlersCopy = ptyHandlers
+        ptyHandlers = [:]
+        ptyLock.unlock()
 
         // Finish all handlers so waiting callers get unblocked
         for (_, handler) in execHandlersCopy { handler.finish() }
+        for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
         // Resume any pending configureNetwork() caller so it doesn't hang forever.
         networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending requestPortForward() callers with connectionFailed.
+        for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
     }
 
     // MARK: - Private: Exec Handler Registration

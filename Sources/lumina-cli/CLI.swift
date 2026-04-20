@@ -8,10 +8,10 @@ struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.5.0",
+        version: "0.6.0",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
-                      Volume.self, NetworkCmd.self, PoolCmd.self]
+                      Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self]
     )
 }
 
@@ -44,12 +44,25 @@ struct Run: AsyncParsableCommand {
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
 
+    @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
+    var pty: Bool = false
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
 
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             FileHandle.standardError.write(Data("lumina: command cannot be empty\n".utf8))
+            throw ExitCode.failure
+        }
+
+        // PTY on disposable `run` is not supported in v0.6.0. Interactive mode
+        // requires a persistent session (Unix-socket IPC + bidirectional
+        // streaming), so we redirect users to `session start` + `exec --pty`.
+        if pty {
+            FileHandle.standardError.write(Data(
+                "lumina: --pty on `run` requires a session. Use `lumina session start` then `lumina exec --pty <sid> \"<cmd>\"`.\n".utf8
+            ))
             throw ExitCode.failure
         }
 
@@ -189,11 +202,127 @@ struct Run: AsyncParsableCommand {
 
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()
+        let legacyNDJSON = useLegacyExecOutput()
 
-        if shouldUseStreaming(format: format, streaming: shouldStream) {
-            try await runStreaming(options: options, format: format)
-        } else {
-            try await runBuffered(options: options, format: format)
+        switch (format, legacyNDJSON) {
+        case (.json, false):
+            try await runUnifiedJSON(options: options)
+        case (.json, true):
+            try await runStreaming(options: options, format: .json)
+        case (.text, _):
+            if shouldStream {
+                try await runStreaming(options: options, format: .text)
+            } else {
+                try await runBuffered(options: options, format: .text)
+            }
+        }
+    }
+
+    // MARK: - Unified JSON Envelope (v0.6.0)
+
+    /// Stream internally, accumulate stdout/stderr, emit a single ResultJSON.
+    /// On error: emit envelope with `error` = one of {timeout, vm_crashed, connection_failed}
+    /// and `partial_stdout` / `partial_stderr` when the command actually ran.
+    private func runUnifiedJSON(options: RunOptions) async throws {
+        let start = ContinuousClock.now
+        var stdoutBuf = ""
+        var stderrBuf = ""
+        var stdoutBytes: [UInt8] = []
+        var stderrBytes: [UInt8] = []
+        var sawBinaryStdout = false
+        var sawBinaryStderr = false
+        var exitCode: Int32? = nil
+
+        do {
+            let chunks = Lumina.stream(command, options: options)
+            for try await chunk in chunks {
+                switch chunk {
+                case .stdout(let s):
+                    stdoutBuf += s
+                case .stderr(let s):
+                    stderrBuf += s
+                case .stdoutBytes(let bytes):
+                    sawBinaryStdout = true
+                    stdoutBytes.append(contentsOf: bytes)
+                    stdoutBuf += String(decoding: bytes, as: UTF8.self)
+                case .stderrBytes(let bytes):
+                    sawBinaryStderr = true
+                    stderrBytes.append(contentsOf: bytes)
+                    stderrBuf += String(decoding: bytes, as: UTF8.self)
+                case .exit(let code):
+                    exitCode = code
+                }
+            }
+        } catch {
+            // If the command already completed (we captured an exit chunk) and the
+            // error is a post-exit download/transfer failure, surface the successful
+            // exit but log the transfer error to stderr.
+            if let code = exitCode {
+                FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
+                let ms = millisSince(start)
+                var r = ResultJSON(
+                    stdout: stdoutBuf,
+                    stderr: stderrBuf,
+                    exit_code: Int(code),
+                    duration_ms: ms
+                )
+                if sawBinaryStdout { r.stdout_bytes = Data(stdoutBytes).base64EncodedString() }
+                if sawBinaryStderr { r.stderr_bytes = Data(stderrBytes).base64EncodedString() }
+                encodeAndPrint(r)
+                if code != 0 { throw ExitCode(code) }
+                throw ExitCode.failure
+            }
+
+            let ms = millisSince(start)
+            let (state, commandRan) = errorStateForRun(error)
+            var r = ResultJSON(error: state, duration_ms: ms)
+            if commandRan {
+                if !stdoutBuf.isEmpty { r.partial_stdout = stdoutBuf }
+                if !stderrBuf.isEmpty { r.partial_stderr = stderrBuf }
+            }
+            encodeAndPrint(r)
+            throw ExitCode.failure
+        }
+
+        let ms = millisSince(start)
+        var r = ResultJSON(
+            stdout: stdoutBuf,
+            stderr: stderrBuf,
+            exit_code: Int(exitCode ?? 0),
+            duration_ms: ms
+        )
+        if sawBinaryStdout {
+            r.stdout_bytes = Data(stdoutBytes).base64EncodedString()
+        }
+        if sawBinaryStderr {
+            r.stderr_bytes = Data(stderrBytes).base64EncodedString()
+        }
+        encodeAndPrint(r)
+        if let code = exitCode, code != 0 {
+            throw ExitCode(code)
+        }
+    }
+
+    /// Classify a `Lumina.stream` error into a v0.6.0 error state for `run`.
+    /// Returns (errorState, commandRan). `commandRan=false` → no partials emitted
+    /// (the command never started executing in the guest).
+    private func errorStateForRun(_ error: any Error) -> (String, Bool) {
+        guard let le = error as? LuminaError else {
+            return ("connection_failed", false)
+        }
+        switch le {
+        case .timeout:
+            return ("timeout", true)
+        case .guestCrashed:
+            return ("vm_crashed", true)
+        case .bootFailed, .connectionFailed, .imageNotFound, .cloneFailed, .uploadFailed:
+            return ("connection_failed", false)
+        case .protocolError:
+            return ("connection_failed", true)
+        case .downloadFailed:
+            return ("connection_failed", true)
+        case .sessionNotFound, .sessionDead, .sessionFailed:
+            return ("connection_failed", false)
         }
     }
 
@@ -326,6 +455,9 @@ private struct ResultJSON: Encodable {
     var exit_code: Int?
     var error: String?
     var duration_ms: Int
+    // v0.6.0: partial data on error
+    var partial_stdout: String?
+    var partial_stderr: String?
 }
 
 private func printResultJSON(_ result: RunResult, durationMs: Int) {
@@ -340,9 +472,37 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
     encodeAndPrint(r)
 }
 
-private func printErrorJSON(_ error: any Error, durationMs: Int, friendly: Bool = false) {
+/// Map a session server's `.error(message:)` payload to a v0.6.0 error state.
+/// The message is produced by `String(describing: error)` on the server side,
+/// so we match the canonical LuminaError case descriptions.
+func errorStateForExecMessage(_ message: String) -> String {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if trimmed == "timeout" || trimmed.hasPrefix("timeout:") {
+        return "timeout"
+    }
+    if trimmed.hasPrefix("guest crashed") || trimmed.hasPrefix("guestcrashed") {
+        return "vm_crashed"
+    }
+    // Anything else from the session server means the session is still alive
+    // but the exec could not complete cleanly. Treat as session_disconnected.
+    return "session_disconnected"
+}
+
+private func printErrorJSON(
+    _ error: any Error,
+    durationMs: Int,
+    friendly: Bool = false,
+    errorState: String? = nil,
+    partialStdout: String? = nil,
+    partialStderr: String? = nil
+) {
     let msg = friendly ? friendlyError(error) : String(describing: error)
-    let r = ResultJSON(error: msg, duration_ms: durationMs)
+    var r = ResultJSON(error: msg, duration_ms: durationMs)
+    if let state = errorState {
+        r.error = state
+    }
+    if let ps = partialStdout { r.partial_stdout = ps }
+    if let pe = partialStderr { r.partial_stderr = pe }
     encodeAndPrint(r)
 }
 
@@ -567,6 +727,9 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Disk size (e.g. 2GB, 4GB). Grows rootfs beyond image default. Env: LUMINA_DISK_SIZE")
     var diskSize: String? = nil
 
+    @Option(name: .long, help: "Forward port (host:guest, repeatable). Host side binds 127.0.0.1 only.")
+    var forward: [String] = []
+
     func run() async throws {
         // Check if requested image exists before spawning background process
         let puller = ImagePuller()
@@ -628,6 +791,16 @@ struct SessionStart: AsyncParsableCommand {
             }
         }
 
+        // Parse --forward early so invalid specs fail before spawning the child.
+        // Forwarded specs are passed verbatim to _session-serve, which re-parses
+        // them after VM boot.
+        for spec in forward {
+            guard parseForwardSpec(spec) != nil else {
+                FileHandle.standardError.write(Data("lumina: invalid --forward '\(spec)'. Use host:guest\n".utf8))
+                throw ExitCode.failure
+            }
+        }
+
         let sid = UUID().uuidString
         let execPath = ProcessInfo.processInfo.arguments[0]
 
@@ -646,6 +819,9 @@ struct SessionStart: AsyncParsableCommand {
         }
         if let ds = resolveDiskSize(flag: diskSize) {
             process.arguments! += ["--disk-size", ds]
+        }
+        for spec in forward {
+            process.arguments! += ["--forward", spec]
         }
 
         // Capture stderr from child process so boot failures are surfaced
@@ -777,6 +953,141 @@ struct SessionList: ParsableCommand {
     }
 }
 
+// MARK: - Ps (session observability)
+
+/// `lumina ps` — walk the sessions directory, query each running session's
+/// server over its Unix socket for live status (uptime, active execs, image),
+/// and render a table (TTY) or JSON array (pipe). Failures on individual
+/// sessions are isolated — the whole command does not abort if one session
+/// is unreachable.
+struct Ps: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "List running sessions with live status"
+    )
+
+    func run() async throws {
+        let sessions = SessionPaths.listAll().filter { $0.status == .running }
+        let format = resolveOutputFormat()
+
+        // Gather a status row for each live session. Unreachable sessions
+        // produce a row with `error` so ps still reflects their presence on disk.
+        let rows = sessions.map { PsRowBuilder.build(for: $0) }
+
+        switch format {
+        case .text:
+            printPsTextTable(rows: rows)
+        case .json:
+            try printPsJson(rows: rows)
+        }
+    }
+
+    private func printPsTextTable(rows: [PsRow]) {
+        if rows.isEmpty {
+            print("No active sessions.")
+            return
+        }
+        // Fixed-width columns. Kept inline — formatting is pure and small.
+        print("SID                                  IMAGE           UPTIME     EXECS")
+        for row in rows {
+            let line = String(
+                format: "%-36s %-15s %-10s %s",
+                row.sid,
+                row.image.prefix(15).padding(toLength: 15, withPad: " ", startingAt: 0),
+                row.uptimeText.padding(toLength: 10, withPad: " ", startingAt: 0),
+                row.execsText
+            )
+            print(line)
+        }
+    }
+
+    private func printPsJson(rows: [PsRow]) throws {
+        let payload: [[String: Any]] = rows.map { row in
+            if let err = row.error {
+                return ["sid": row.sid, "error": err]
+            }
+            return [
+                "sid": row.sid,
+                "image": row.image,
+                "uptime_seconds": row.uptimeSeconds,
+                "active_execs": row.activeExecs,
+            ]
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.sortedKeys]
+        )
+        if let str = String(data: data, encoding: .utf8) {
+            print(str)
+        }
+    }
+}
+
+/// One row of `lumina ps` output. Constructed from a `SessionInfo` + a single
+/// `.status` round-trip. Unreachable sessions carry `error` instead of status.
+struct PsRow: Sendable {
+    let sid: String
+    let image: String
+    let uptimeSeconds: TimeInterval
+    let uptimeText: String
+    let activeExecs: Int
+    let execsText: String
+    let error: String?
+}
+
+/// Builds `PsRow`s from session metadata. Isolated as an enum namespace so the
+/// pure formatting (`formatUptime`, row construction) is easy to unit-test.
+enum PsRowBuilder {
+    /// Connect to the session, send `.status`, return a row. On connect or
+    /// RPC failure, the row carries `error` with a terse reason.
+    static func build(for info: SessionInfo) -> PsRow {
+        let client = SessionClient()
+        do {
+            try client.connect(sid: info.sid)
+            defer { client.disconnect() }
+            try client.send(.status)
+            let resp = try client.receive()
+            guard case .status(let uptime, let activeExecs, let image) = resp else {
+                return row(sid: info.sid, error: "unexpected response")
+            }
+            return PsRow(
+                sid: info.sid,
+                image: image,
+                uptimeSeconds: uptime,
+                uptimeText: formatUptime(uptime),
+                activeExecs: activeExecs,
+                execsText: activeExecs > 0 ? "\(activeExecs) active" : "idle",
+                error: nil
+            )
+        } catch {
+            return row(sid: info.sid, error: "unreachable")
+        }
+    }
+
+    /// Format seconds as a compact human-readable uptime ("42s", "3m 7s", "2h 15m").
+    /// Pure function — safe to unit-test.
+    static func formatUptime(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        let hours = total / 3600
+        let mins = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 { return "\(hours)h \(mins)m" }
+        if mins > 0 { return "\(mins)m \(secs)s" }
+        return "\(secs)s"
+    }
+
+    private static func row(sid: String, error: String) -> PsRow {
+        PsRow(
+            sid: sid,
+            image: "?",
+            uptimeSeconds: 0,
+            uptimeText: "?",
+            activeExecs: 0,
+            execsText: error,
+            error: error
+        )
+    }
+}
+
 // MARK: - Exec
 
 struct Exec: AsyncParsableCommand {
@@ -796,6 +1107,9 @@ struct Exec: AsyncParsableCommand {
 
     @Option(name: .long, help: "Working directory inside the VM")
     var workdir: String? = nil
+
+    @Flag(name: .long, help: "Run in PTY mode (interactive terminal)")
+    var pty: Bool = false
 
     func run() async throws {
         let sid = parseSID(self.sid)
@@ -831,6 +1145,19 @@ struct Exec: AsyncParsableCommand {
         }
         defer { client.disconnect() }
 
+        // PTY mode: interactive, raw-byte bidirectional streaming.
+        // Bypasses the non-PTY output/stdin loops entirely — signal handling,
+        // stdin pumping, and output decoding all differ.
+        if pty {
+            try runPtyExec(
+                client: client,
+                command: command,
+                timeoutSecs: timeoutSecs,
+                env: parsedEnv
+            )
+            return
+        }
+
         // Forward SIGINT/SIGTERM to the guest command via cancel message
         let cleanupSignals = installSignalForwarding(client: client)
         defer { cleanupSignals() }
@@ -862,44 +1189,210 @@ struct Exec: AsyncParsableCommand {
         }
         defer { stdinTask?.cancel() }
 
-        while true {
-            let response = try client.receive()
-            switch response {
-            case .output(let outputStream, let data):
-                switch format {
-                case .json:
-                    printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
-                case .text:
-                    if outputStream == .stdout {
-                        print(data, terminator: "")
-                    } else {
-                        FileHandle.standardError.write(Data(data.utf8))
+        // Output routing: v0.6.0 unifies JSON output for exec with run (single envelope).
+        // Legacy NDJSON streaming is preserved behind LUMINA_OUTPUT=ndjson.
+        let legacyNDJSON = useLegacyExecOutput()
+        let start = ContinuousClock.now
+
+        if format == .json && !legacyNDJSON {
+            // Unified envelope: buffer output, emit single JSON object (matches `run`)
+            var stdoutBuf = ""
+            var stderrBuf = ""
+
+            while true {
+                let response: SessionResponse
+                do {
+                    response = try client.receive()
+                } catch {
+                    stdinTask?.cancel()
+                    let ms = millisSince(start)
+                    printErrorJSON(
+                        error,
+                        durationMs: ms,
+                        friendly: true,
+                        errorState: "session_disconnected",
+                        partialStdout: stdoutBuf,
+                        partialStderr: stderrBuf
+                    )
+                    throw ExitCode.failure
+                }
+
+                switch response {
+                case .output(let outputStream, let data):
+                    if outputStream == .stdout { stdoutBuf += data } else { stderrBuf += data }
+                case .outputBytes(let outputStream, let base64):
+                    guard let rawBytes = Data(base64Encoded: base64) else {
+                        stderrBuf += "lumina: malformed base64 in outputBytes\n"
+                        continue
                     }
+                    let text = String(decoding: rawBytes, as: UTF8.self)
+                    if outputStream == .stdout { stdoutBuf += text } else { stderrBuf += text }
+                case .exit(let code, let durationMs):
+                    stdinTask?.cancel()
+                    let r = ResultJSON(
+                        stdout: stdoutBuf,
+                        stderr: stderrBuf,
+                        exit_code: Int(code),
+                        duration_ms: durationMs
+                    )
+                    encodeAndPrint(r)
+                    if code != 0 { throw ExitCode(code) }
+                    return
+                case .error(let message):
+                    stdinTask?.cancel()
+                    let ms = millisSince(start)
+                    let state = errorStateForExecMessage(message)
+                    printErrorJSON(
+                        LuminaError.sessionFailed(message),
+                        durationMs: ms,
+                        friendly: true,
+                        errorState: state,
+                        partialStdout: stdoutBuf,
+                        partialStderr: stderrBuf
+                    )
+                    throw ExitCode.failure
+                default:
+                    continue
                 }
-            case .exit(let code, let durationMs):
-                stdinTask?.cancel()
-                switch format {
-                case .json:
-                    printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
-                case .text:
-                    break
+            }
+        } else {
+            // Legacy NDJSON (LUMINA_OUTPUT=ndjson) or text mode: existing streaming behavior.
+            while true {
+                let response = try client.receive()
+                switch response {
+                case .output(let outputStream, let data):
+                    switch format {
+                    case .json:
+                        printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
+                    case .text:
+                        if outputStream == .stdout {
+                            print(data, terminator: "")
+                        } else {
+                            FileHandle.standardError.write(Data(data.utf8))
+                        }
+                    }
+                case .exit(let code, let durationMs):
+                    stdinTask?.cancel()
+                    switch format {
+                    case .json:
+                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
+                    case .text:
+                        break
+                    }
+                    if code != 0 { throw ExitCode(code) }
+                    return
+                case .outputBytes(let outputStream, let base64):
+                    guard let rawBytes = Data(base64Encoded: base64) else {
+                        FileHandle.standardError.write(Data("lumina: malformed base64 in outputBytes\n".utf8))
+                        break
+                    }
+                    let fd = outputStream == .stdout
+                        ? FileHandle.standardOutput
+                        : FileHandle.standardError
+                    fd.write(rawBytes)
+                case .error(let message):
+                    stdinTask?.cancel()
+                    FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
+                    throw ExitCode.failure
+                default:
+                    continue
                 }
+            }
+        }
+    }
+
+    // MARK: - PTY Exec
+
+    /// Drive an interactive PTY-backed command over a session client.
+    ///
+    /// Flow:
+    ///   1. Require stdin to be a TTY; capture window size.
+    ///   2. Switch stdin into raw mode (restored on every exit path).
+    ///   3. Install SIGINT/SIGTERM + SIGWINCH dispatch sources.
+    ///      - SIGINT is swallowed by the dispatch source; the raw 0x03 byte from
+    ///        the terminal is what actually reaches the guest as pty_input.
+    ///      - SIGWINCH reads the new size and forwards it as `window_resize`.
+    ///   4. Send `pty_exec` with the initial cols/rows.
+    ///   5. Pump stdin: read raw bytes from fd 0, forward as base64 `pty_input`.
+    ///   6. Consume responses: `pty_output` → raw bytes to stdout, `exit` → done,
+    ///      `error` → print to stderr and fail.
+    private func runPtyExec(
+        client: SessionClient,
+        command: String,
+        timeoutSecs: Int,
+        env: [String: String]
+    ) throws {
+        guard isatty(STDIN_FILENO) != 0 else {
+            FileHandle.standardError.write(Data("lumina: --pty requires stdin to be a TTY\n".utf8))
+            throw ExitCode.failure
+        }
+        guard let termSize = getTerminalSize() else {
+            FileHandle.standardError.write(Data("lumina: cannot determine terminal size (not a TTY?)\n".utf8))
+            throw ExitCode.failure
+        }
+        guard let originalTermios = enableRawMode() else {
+            FileHandle.standardError.write(Data("lumina: failed to set raw mode\n".utf8))
+            throw ExitCode.failure
+        }
+        defer { restoreTerminal(originalTermios) }
+
+        // SIGWINCH forwards resize events; SIGINT/SIGTERM restore the terminal.
+        // `client` is Sendable (@unchecked), so capturing it in the @Sendable
+        // closure is fine.
+        let cleanupPtySignals = installPtySignalHandlers { [client] cols, rows in
+            try? client.send(.windowResize(cols: cols, rows: rows))
+        }
+        defer { cleanupPtySignals() }
+
+        // Send pty_exec request
+        try client.send(.ptyExec(
+            cmd: command,
+            timeout: timeoutSecs,
+            env: env,
+            cols: termSize.cols,
+            rows: termSize.rows
+        ))
+
+        // Stdin pump: raw bytes from fd 0 → base64 pty_input frames.
+        // `availableData` blocks until data is ready or EOF; on EOF we stop.
+        let stdinPtyTask = Task.detached { [client] in
+            let handle = FileHandle.standardInput
+            while !Task.isCancelled {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break } // EOF — host-side stdin closed
+                let base64 = chunk.base64EncodedString()
+                try? client.send(.ptyInput(data: base64))
+            }
+        }
+        defer { stdinPtyTask.cancel() }
+
+        // Output pump: pty_output → raw bytes to stdout, exit → done.
+        while true {
+            let response: SessionResponse
+            do {
+                response = try client.receive()
+            } catch {
+                // Connection dropped mid-session — best effort restore and exit.
+                stdinPtyTask.cancel()
+                FileHandle.standardError.write(Data("\r\nlumina: session disconnected\r\n".utf8))
+                throw ExitCode.failure
+            }
+            switch response {
+            case .ptyOutput(let base64Data):
+                if let rawBytes = Data(base64Encoded: base64Data) {
+                    FileHandle.standardOutput.write(rawBytes)
+                    fflush(stdout)
+                }
+            case .exit(let code, _):
+                stdinPtyTask.cancel()
                 if code != 0 { throw ExitCode(code) }
                 return
-            case .outputBytes(let outputStream, let base64):
-                guard let rawBytes = Data(base64Encoded: base64) else {
-                    FileHandle.standardError.write(Data("lumina: malformed base64 in outputBytes\n".utf8))
-                    break
-                }
-                let fd = outputStream == .stdout
-                    ? FileHandle.standardOutput
-                    : FileHandle.standardError
-                fd.write(rawBytes)
             case .error(let message):
-                stdinTask?.cancel()
-                FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
+                stdinPtyTask.cancel()
+                FileHandle.standardError.write(Data("\r\nlumina: \(message)\r\n".utf8))
                 throw ExitCode.failure
             default:
+                // Ignore any non-PTY responses (shouldn't occur during a PTY session).
                 continue
             }
         }

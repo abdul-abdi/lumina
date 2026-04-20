@@ -147,26 +147,19 @@ func resolveDiskSize(flag: String?) -> String? {
     return ProcessInfo.processInfo.environment["LUMINA_DISK_SIZE"]
 }
 
-// MARK: - Streaming Mode
+// MARK: - Streaming Mode (text format only)
 //
-// Default: TTY = stream (humans want real-time), pipe = NDJSON stream (agents parse line-by-line).
-// JSON mode always streams to keep the output schema consistent with `exec`.
-// Override: LUMINA_STREAM=0|1 env var (only affects text mode).
+// Default: TTY = stream (humans want real-time), pipe = buffer.
+// Override: LUMINA_STREAM=0|1 env var.
+// JSON format uses the unified envelope (buffered) by default; set
+// LUMINA_OUTPUT=ndjson for legacy per-chunk NDJSON streaming.
 
-/// Resolve streaming mode: LUMINA_STREAM env > isatty auto-detect.
+/// Resolve streaming mode for text output: LUMINA_STREAM env > isatty auto-detect.
 func resolveStreaming() -> Bool {
-    // 1. LUMINA_STREAM env var
     if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
         return envVal == "1" || envVal == "true"
     }
-    // 2. Auto-detect: TTY = stream, pipe = buffer (JSON mode overrides this in shouldUseStreaming)
     return isatty(STDOUT_FILENO) != 0
-}
-
-/// Whether to use streaming output. JSON format always streams (NDJSON, consistent with `exec`).
-/// Text format follows isatty / LUMINA_STREAM — streaming for TTYs, buffered for pipes.
-func shouldUseStreaming(format: OutputFormat, streaming: Bool) -> Bool {
-    return streaming || format == .json
 }
 
 // MARK: - Session ID Parsing
@@ -206,6 +199,15 @@ func resolveStdin() -> Stdin {
     }
 }
 
+// MARK: - Legacy Output Mode
+
+/// Check if legacy NDJSON output is requested for exec.
+/// `LUMINA_OUTPUT=ndjson` preserves pre-v0.6.0 streaming behavior for exec when piped.
+/// Default (absent or any other value) = unified envelope. Removed in v0.8.0.
+func useLegacyExecOutput() -> Bool {
+    ProcessInfo.processInfo.environment["LUMINA_OUTPUT"]?.lowercased() == "ndjson"
+}
+
 // MARK: - NDJSON Output Types (streaming / session exec)
 
 /// Stream chunk: stdout or stderr data.
@@ -235,5 +237,103 @@ func printNDJSONLine<T: Encodable>(_ value: T) {
        let str = String(data: data, encoding: .utf8) {
         print(str)
         fflush(stdout)
+    }
+}
+
+// MARK: - Raw Terminal Mode (PTY support)
+
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Module-level saved termios used by PTY signal handlers. Signal handlers run on
+/// a dispatch queue and need access to the original termios to restore the
+/// terminal before re-raising the signal. Safe because at most one PTY session
+/// is active per CLI process.
+nonisolated(unsafe) private var savedTermios: termios?
+
+/// Switch the terminal (stdin) into raw mode, returning the original termios so
+/// the caller can restore it. Returns nil if stdin is not a TTY or the ioctl fails.
+///
+/// Caller contract: always pair with `restoreTerminal(_:)` via `defer` to
+/// guarantee the terminal is reset on exit — including error paths.
+func enableRawMode() -> termios? {
+    var original = termios()
+    guard tcgetattr(STDIN_FILENO, &original) == 0 else { return nil }
+    savedTermios = original
+
+    var raw = original
+    cfmakeraw(&raw)
+    // Keep ISIG so Ctrl-C still generates SIGINT on the host side — the PTY
+    // code translates that into a pty_input(0x03) sent to the guest.
+    raw.c_lflag |= UInt(ISIG)
+    guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else {
+        savedTermios = nil
+        return nil
+    }
+    return original
+}
+
+/// Restore the terminal (stdin) to the original termios captured by `enableRawMode`.
+func restoreTerminal(_ original: termios) {
+    var t = original
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)
+    savedTermios = nil
+}
+
+/// Return the current terminal window size (cols, rows) from stdout, or nil if
+/// stdout is not attached to a TTY.
+func getTerminalSize() -> (cols: Int, rows: Int)? {
+    var ws = winsize()
+    // `TIOCGWINSZ` type varies by SDK (UInt on some, UInt32 on others); force to UInt.
+    guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &ws) == 0 else { return nil }
+    return (cols: Int(ws.ws_col), rows: Int(ws.ws_row))
+}
+
+/// Install PTY signal handlers using DispatchSource (C `signal()` callbacks
+/// cannot capture state). SIGINT/SIGTERM restore termios then re-raise with
+/// default disposition so the parent process observes the correct wait status.
+/// SIGWINCH invokes `onResize` with the fresh terminal size.
+///
+/// The caller MUST retain the returned cleanup closure and invoke it on exit
+/// (typically via `defer`) so the DispatchSources are cancelled and the signal
+/// dispositions are restored.
+func installPtySignalHandlers(
+    onResize: @escaping @Sendable (Int, Int) -> Void
+) -> () -> Void {
+    let queue = DispatchQueue(label: "com.lumina.pty-signals")
+
+    // SIGINT/SIGTERM: restore terminal, then re-raise with default disposition
+    let termSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+        Foundation.signal(sig, SIG_IGN) // Let the dispatch source deliver it
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+        source.setEventHandler {
+            if var saved = savedTermios {
+                tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved)
+                savedTermios = nil
+            }
+            Foundation.signal(sig, SIG_DFL)
+            raise(sig)
+        }
+        source.resume()
+        return source
+    }
+
+    // SIGWINCH: report new size to caller
+    Foundation.signal(SIGWINCH, SIG_IGN)
+    let winchSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: queue)
+    winchSource.setEventHandler {
+        if let size = getTerminalSize() {
+            onResize(size.cols, size.rows)
+        }
+    }
+    winchSource.resume()
+
+    return {
+        for source in termSources { source.cancel() }
+        winchSource.cancel()
+        Foundation.signal(SIGINT, SIG_DFL)
+        Foundation.signal(SIGTERM, SIG_DFL)
+        Foundation.signal(SIGWINCH, SIG_DFL)
     }
 }
