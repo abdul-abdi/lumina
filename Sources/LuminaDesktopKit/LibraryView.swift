@@ -252,6 +252,7 @@ public struct LibraryView: View {
                     case .list:
                         VMListView(model: model, bundles: filteredForSection)
                     }
+                    AggregatesFooter(model: model)
                 }
             }
         }
@@ -272,6 +273,95 @@ public struct LibraryView: View {
             base = []
         }
         return base
+    }
+}
+
+// ── AGGREGATES FOOTER ─────────────────────────────────────────────
+/// Roll-up metrics at the bottom of the detail pane. Makes the pane
+/// about the user's VM activity, not just a card grid — per Victor's
+/// "detail pane as workbench" critique.
+@MainActor
+public struct AggregatesFooter: View {
+    @Bindable var model: AppModel
+
+    public var body: some View {
+        let totalDisk = model.bundles.reduce(0) { $0 + $1.actualDiskBytes }
+        let totalSnaps = model.bundles.reduce(0) { $0 + $1.snapshotCount }
+        let running = model.sessions.values.filter { $0.status.isLive }.count
+        let mostRecent = model.bundles
+            .compactMap { $0.manifest.lastBootedAt }
+            .max()
+        let mostRecentStr: String = {
+            guard let d = mostRecent else { return "never" }
+            let secs = Int(Date().timeIntervalSince(d))
+            if secs < 60 { return "just now" }
+            if secs < 3600 { return "\(secs / 60)m ago" }
+            if secs < 86400 { return "\(secs / 3600)h ago" }
+            return "\(secs / 86400)d ago"
+        }()
+
+        HStack(spacing: 22) {
+            footerMetric(icon: "square.stack.3d.up.fill",
+                         label: "USED",
+                         value: formatBytesHuman(totalDisk))
+            footerMetric(icon: "camera.fill",
+                         label: "SNAPSHOTS",
+                         value: "\(totalSnaps)")
+            footerMetric(icon: "bolt.horizontal.fill",
+                         label: "LAST BOOT",
+                         value: mostRecentStr)
+            Spacer()
+            if running > 0 {
+                HStack(spacing: 6) {
+                    Heartbeat(color: LuminaTheme.ok)
+                    Text("\(running) RUNNING")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .tracking(1.2)
+                        .foregroundStyle(LuminaTheme.ok)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule().fill(LuminaTheme.ok.opacity(0.1))
+                )
+                .overlay(
+                    Capsule().stroke(LuminaTheme.ok.opacity(0.3), lineWidth: 0.5)
+                )
+            } else {
+                Text("ALL IDLE")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .tracking(1.2)
+                    .foregroundStyle(LuminaTheme.inkMute)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(
+            Rectangle().fill(LuminaTheme.bg2.opacity(0.5))
+        )
+        .overlay(
+            Rectangle().fill(LuminaTheme.rule).frame(height: 1),
+            alignment: .top
+        )
+    }
+
+    @ViewBuilder
+    private func footerMetric(icon: String, label: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(LuminaTheme.inkMute)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(label)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .tracking(1.1)
+                    .foregroundStyle(LuminaTheme.inkMute)
+                Text(value)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(LuminaTheme.ink)
+                    .monospacedDigit()
+            }
+        }
     }
 }
 

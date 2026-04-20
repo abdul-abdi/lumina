@@ -313,8 +313,10 @@ struct FullscreenObserver: NSViewRepresentable {
 }
 
 /// Fullscreen chrome — auto-hiding overlay with VM name + exit button.
-/// Appears when the mouse moves near the top of the screen, fades out
-/// after 2 seconds of inactivity. ESC or ⌘⌃F also exits.
+/// First-time users see the chrome for 4 seconds with a 'press ESC to
+/// exit' hint so the fullscreen doesn't feel like a trap. After that
+/// it auto-hides 2.5s after mouse inactivity and re-appears when the
+/// cursor approaches the top 60pt of the view.
 @MainActor
 struct FullscreenChrome: View {
     @Binding var visible: Bool
@@ -322,25 +324,56 @@ struct FullscreenChrome: View {
     let onExit: () -> Void
     let onShutdown: () -> Void
     @State private var hideTimer: Task<Void, Never>?
+    @State private var showFirstTimeHint: Bool = {
+        !UserDefaults.standard.bool(forKey: "lumina.fullscreen.hintSeen")
+    }()
 
     var body: some View {
-        VStack {
+        VStack(spacing: 10) {
             if visible {
                 chrome
                     .transition(.opacity.combined(with: .move(edge: .top)))
+                if showFirstTimeHint {
+                    firstTimeHint
+                        .transition(.opacity)
+                }
             }
             Spacer()
         }
-        .onAppear { scheduleHide() }
-        // Track mouse moves to re-reveal the chrome near the top edge.
+        .onAppear {
+            scheduleHide()
+            if showFirstTimeHint {
+                // Mark seen after the first reveal; hide the hint alongside.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(4))
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        showFirstTimeHint = false
+                    }
+                    UserDefaults.standard.set(true, forKey: "lumina.fullscreen.hintSeen")
+                }
+            }
+        }
         .background(
             MouseHoverDetector { point in
-                if point.y < 60 {
-                    showChrome()
-                }
+                if point.y < 60 { showChrome() }
             }
         )
         .animation(.easeInOut(duration: 0.25), value: visible)
+    }
+
+    private var firstTimeHint: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "escape")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            Text("press ESC or ⌘⌃F to exit")
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .tracking(0.3)
+        }
+        .foregroundStyle(LuminaTheme.inkDim)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(LuminaTheme.bg2.opacity(0.85)))
+        .overlay(Capsule().stroke(LuminaTheme.rule2, lineWidth: 0.5))
     }
 
     private var chrome: some View {
