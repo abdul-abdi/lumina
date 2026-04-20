@@ -71,9 +71,13 @@ jobs:
           cache-dependency-path: Guest/lumina-agent/go.sum
 
       - name: Vet & compile guest agent
+        # The guest agent is linux/arm64-only. `go vet` defaults to the
+        # host platform — on macOS that's darwin/arm64, where
+        # Linux-specific constants like `unix.TIOCSPTLCK` don't exist.
+        # Pin vet to the actual target so it checks the code we ship.
         run: |
           cd Guest/lumina-agent
-          go vet ./...
+          GOOS=linux GOARCH=arm64 go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
           echo "Guest agent: vet OK, build OK"
 

@@ -94,29 +94,69 @@ public final class LuminaDesktopSession: Identifiable {
         )
         opts.sound = SoundConfig(enabled: true)
 
-        let newVM = VM(options: opts)
-        self.vm = newVM
-        do {
-            try await newVM.boot()
-            self.status = .running
-            self.bootDuration = ContinuousClock.now - start
-            // Persist lastBootedAt. On the very first successful boot we
-            // also detach the installer ISO sidecar — the install has
-            // completed and EFI now prefers the HDD, so keeping the CD-ROM
-            // mounted just clutters every card with "installer attached"
-            // forever. Both writes are non-fatal: the FS watcher on
-            // ~/.lumina/desktop-vms will pick the new manifest up; if the
-            // write fails, last-used sort is just slightly stale.
-            persistBootRecord()
-            // Attach stop observer so guest-initiated `poweroff`, external
-            // crashes, and any other VZ-side termination flip status back
-            // to .stopped / .crashed. Without this the menu bar (and the
-            // rest of the UI) keeps a dead VM in the RUNNING list.
-            await attachStopObserver(to: newVM)
-        } catch {
-            self.status = .crashed(reason: "\(error)")
-            self.lastError = "\(error)"
+        // Retry transient VZ Code 2 (invalid storage device attachment).
+        // VZ fails validate()/start() with this error when macOS hasn't
+        // released a previous process's fd to the same disk.img, while
+        // Spotlight is indexing, or immediately after an APFS clone
+        // settles. All three clear within a few hundred milliseconds —
+        // users hit this as "first Boot fails, Try Again works." We
+        // automate the Try Again so it never surfaces as a crash.
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let newVM = VM(options: opts)
+            self.vm = newVM
+            do {
+                try await newVM.boot()
+                self.status = .running
+                self.bootDuration = ContinuousClock.now - start
+                // Persist lastBootedAt. On the very first successful boot we
+                // also detach the installer ISO sidecar — the install has
+                // completed and EFI now prefers the HDD, so keeping the CD-ROM
+                // mounted just clutters every card with "installer attached"
+                // forever. Both writes are non-fatal: the FS watcher on
+                // ~/.lumina/desktop-vms will pick the new manifest up; if the
+                // write fails, last-used sort is just slightly stale.
+                persistBootRecord()
+                // Attach stop observer so guest-initiated `poweroff`, external
+                // crashes, and any other VZ-side termination flip status back
+                // to .stopped / .crashed. Without this the menu bar (and the
+                // rest of the UI) keeps a dead VM in the RUNNING list.
+                await attachStopObserver(to: newVM)
+                return
+            } catch {
+                if Self.isTransientVZStorageError(error), attempt < maxAttempts {
+                    self.vm = nil
+                    // 150ms → 400ms backoff. Empirically enough for
+                    // Spotlight / fd-reclaim / clone-settle to clear.
+                    let delayMs = attempt == 1 ? 150 : 400
+                    try? await Task.sleep(for: .milliseconds(delayMs))
+                    continue
+                }
+                self.status = .crashed(reason: "\(error)")
+                self.lastError = "\(error)"
+                return
+            }
         }
+    }
+
+    /// Identify VZ's "invalid storage device attachment" error
+    /// (`VZErrorDomain` code 2). This specific code is transient when it
+    /// appears on first boot — the attachment construction already
+    /// succeeded, so the file exists and is accessible, and VZ's own
+    /// later validation pass happens to fail on a state that resolves
+    /// itself. We retry only on this exact signature to avoid masking
+    /// real configuration bugs (wrong disk format, missing file, etc.)
+    /// which produce different codes.
+    private static func isTransientVZStorageError(_ error: any Error) -> Bool {
+        // Unwrap LuminaError.bootFailed(underlying:) once — VM.swift
+        // wraps every boot-time failure in this envelope.
+        if let lumina = error as? LuminaError,
+           case .bootFailed(let underlying) = lumina {
+            let ns = underlying as NSError
+            return ns.domain == "VZErrorDomain" && ns.code == 2
+        }
+        let ns = error as NSError
+        return ns.domain == "VZErrorDomain" && ns.code == 2
     }
 
     private func persistBootRecord() {
