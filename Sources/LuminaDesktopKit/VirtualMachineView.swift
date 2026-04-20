@@ -36,11 +36,13 @@ public struct LuminaVirtualMachineView: NSViewRepresentable {
         let view = VZVirtualMachineView()
         view.virtualMachine = virtualMachine
         view.capturesSystemKeys = capturesSystemKeys
+        view.automaticallyReconfiguresDisplay = true
         return view
     }
 
     public func updateNSView(_ nsView: VZVirtualMachineView, context: Context) {
         nsView.virtualMachine = virtualMachine
         nsView.capturesSystemKeys = capturesSystemKeys
+        nsView.automaticallyReconfiguresDisplay = true
     }
 }

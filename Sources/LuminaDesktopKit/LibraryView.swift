@@ -718,19 +718,23 @@ struct VMActionButton: View {
     @Bindable var session: LuminaDesktopSession
     let compact: Bool
 
+    @Environment(\.openWindow) private var openWindow
     @State private var hovering = false
 
     var body: some View {
         Button {
-            Task {
-                switch session.status {
-                case .stopped, .crashed:
-                    await session.boot()
-                case .running, .paused:
-                    await session.shutdown()
-                case .booting, .shuttingDown:
-                    break
-                }
+            switch session.status {
+            case .stopped, .crashed:
+                // Open the VM window immediately so the user sees the
+                // booting screen → framebuffer handoff, then kick off
+                // the boot. Without this the VM boots headless and the
+                // user has to click the card to see anything.
+                openWindow(id: "vm-window", value: session.bundle.manifest.id)
+                Task { await session.boot() }
+            case .running, .paused:
+                Task { await session.shutdown() }
+            case .booting, .shuttingDown:
+                break
             }
         } label: {
             HStack(spacing: 5) {

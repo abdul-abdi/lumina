@@ -65,57 +65,24 @@ struct MenuBarLabel: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        let running = model.sessions.values.filter { $0.status.isLive }.count
+        // Read status on every iterated session so @Observable tracking
+        // fires when any individual session's status flips — not just
+        // when the sessions dict itself mutates. Without this the label
+        // goes stale when a VM transitions stopped↔running and the
+        // dict's identity hasn't changed.
+        let running = model.sessions.values.reduce(into: 0) { count, session in
+            if session.status.isLive { count += 1 }
+        }
         HStack(spacing: 3) {
-            // Lumina brand mark — double-square offset, matching the
-            // app icon + the website's .brand-mark. Rendered as a
-            // template image so macOS auto-tints it dark/light
-            // depending on menu-bar appearance.
-            LuminaMenuBarMark()
-                .frame(width: 14, height: 14)
+            // SF Symbol `square.on.square` — two offset squares,
+            // shape-identical to the app icon's brand mark. Template
+            // rendering so macOS auto-tints it for the menu-bar
+            // appearance (dark on light bar, white on dark bar).
+            Image(systemName: "square.on.square")
             if running > 0 {
                 Text("\(running)")
                     .monospacedDigit()
             }
-        }
-    }
-}
-
-/// Template-image Lumina brand mark for the menu bar. Two offset
-/// hollow squares drawn with `Path` — macOS system will tint them
-/// monochrome to match the menu-bar appearance (black on light,
-/// white on dark). The app's own `AppIcon.icns` has the amber+cream
-/// colouring; in the menu bar, the template image convention is to
-/// provide shape only.
-@MainActor
-struct LuminaMenuBarMark: View {
-    var body: some View {
-        Canvas { ctx, size in
-            // macOS menu-bar template semantics: draw in any color,
-            // the system will replace it with the menu-bar-appropriate
-            // tint. We use primary foregroundStyle which is already
-            // the right hook for dynamic tinting in SwiftUI.
-            let squareSize = size.width * 0.65
-            let stroke = max(1, size.width * 0.08)
-            // Back square (offset down-right)
-            let backRect = CGRect(
-                x: size.width - squareSize,
-                y: size.height - squareSize,
-                width: squareSize - stroke,
-                height: squareSize - stroke
-            )
-            ctx.stroke(Path(backRect),
-                       with: .color(.primary.opacity(0.5)),
-                       lineWidth: stroke)
-            // Front square (top-left)
-            let frontRect = CGRect(
-                x: 0, y: 0,
-                width: squareSize - stroke,
-                height: squareSize - stroke
-            )
-            ctx.stroke(Path(frontRect),
-                       with: .color(.primary),
-                       lineWidth: stroke)
         }
     }
 }

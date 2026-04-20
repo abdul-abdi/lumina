@@ -129,6 +129,7 @@ public struct RunningVMView: View {
         case .running, .paused:
             if let vm = vzMachine {
                 LuminaVirtualMachineView(virtualMachine: vm, capturesSystemKeys: true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black)
             } else {
                 connectingScreen

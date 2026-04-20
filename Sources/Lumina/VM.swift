@@ -1121,6 +1121,13 @@ public actor VM {
         VZMachineHandle(machine: virtualMachine)
     }
 
+    /// Install a `VZVirtualMachineDelegate` on the underlying VM so
+    /// callers can be notified of guest-initiated stops and errors.
+    /// The delegate is weakly held by VZ; the caller owns retention.
+    public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
+        virtualMachine?.delegate = delegate
+    }
+
     // MARK: - Private
 
     private func shutdownVM() async {

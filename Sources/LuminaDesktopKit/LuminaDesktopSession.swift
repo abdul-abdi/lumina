@@ -63,6 +63,11 @@ public final class LuminaDesktopSession: Identifiable {
     /// goes through the helper methods below which await it.
     private nonisolated(unsafe) var vm: VM?
 
+    /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
+    /// VZ holds the delegate weakly, so we retain it here until the
+    /// session is torn down.
+    private var vmDelegate: VMStopForwarder?
+
     public init(bundle: VMBundle) {
         self.id = bundle.manifest.id
         self.bundle = bundle
@@ -95,15 +100,51 @@ public final class LuminaDesktopSession: Identifiable {
             try await newVM.boot()
             self.status = .running
             self.bootDuration = ContinuousClock.now - start
+            // Attach stop observer so guest-initiated `poweroff`, external
+            // crashes, and any other VZ-side termination flip status back
+            // to .stopped / .crashed. Without this the menu bar (and the
+            // rest of the UI) keeps a dead VM in the RUNNING list.
+            await attachStopObserver(to: newVM)
         } catch {
             self.status = .crashed(reason: "\(error)")
             self.lastError = "\(error)"
         }
     }
 
+    private func attachStopObserver(to vm: VM) async {
+        let forwarder = VMStopForwarder(
+            onGuestStop: { [weak self] in
+                Task { @MainActor in self?.handleExternalStop(reason: nil) }
+            },
+            onError: { [weak self] err in
+                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
+            }
+        )
+        self.vmDelegate = forwarder
+        await vm.setDelegate(forwarder)
+    }
+
+    private func handleExternalStop(reason: String?) {
+        // Guard: if we're already in a controlled shutdown, the explicit
+        // shutdown() path owns the transition — don't double-update.
+        if case .shuttingDown = status { return }
+        if case .stopped = status { return }
+
+        vmDelegate = nil
+        vm = nil
+        if let reason {
+            status = .crashed(reason: reason)
+            lastError = reason
+        } else {
+            status = .stopped
+        }
+    }
+
     public func shutdown() async {
         status = .shuttingDown
+        vmDelegate = nil
         if let vm = self.vm {
+            await vm.setDelegate(nil)
             await vm.shutdown()
         }
         self.vm = nil
@@ -135,5 +176,31 @@ public final class LuminaDesktopSession: Identifiable {
         // Stale sidecar — remove it so subsequent boots don't hit this path.
         try? FileManager.default.removeItem(at: sidecar)
         return nil
+    }
+}
+
+/// NSObject-backed forwarder for `VZVirtualMachineDelegate`. VZ calls the
+/// delegate methods on the queue it owns, so we capture `@Sendable`
+/// closures and trampoline back to the main actor where the session's
+/// `@Observable` state lives. Marked `@unchecked Sendable` because its
+/// only state is the closures themselves (which are Sendable).
+final class VMStopForwarder: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
+    private let onGuestStop: @Sendable () -> Void
+    private let onError: @Sendable (any Error) -> Void
+
+    init(
+        onGuestStop: @escaping @Sendable () -> Void,
+        onError: @escaping @Sendable (any Error) -> Void
+    ) {
+        self.onGuestStop = onGuestStop
+        self.onError = onError
+    }
+
+    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        onGuestStop()
+    }
+
+    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
+        onError(error)
     }
 }
