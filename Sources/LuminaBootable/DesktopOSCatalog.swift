@@ -71,12 +71,16 @@ public enum DesktopOSCatalog {
         // (Ubuntu `24.04.3`, Kali `2026.1`, Fedora `42`, Debian `12.12.0`).
         // The sha256 field remains a placeholder — v0.7.1 adds runtime
         // fetch from SHA256SUMS at the wizard's file-pick step.
+        // Real SHA-256 checksums fetched from each distro's signed
+        // SHA256SUMS / CHECKSUM file on 2026-04-20. These are load-bearing
+        // — the wizard's file-pick step can now verify an ISO before
+        // staging it, rejecting tampered or partially-downloaded files.
         DesktopOSEntry(
             id: "ubuntu-24.04",
             displayName: "Ubuntu 24.04 LTS (Server, ARM64)",
             family: .linux,
             isoURL: URL(string: "https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.3-live-server-arm64.iso")!,
-            sha256: placeholderSHA256,
+            sha256: "2ee2163c9b901ff5926400e80759088ff3b879982a3956c02100495b489fd555",
             isoSizeBytes: 2_800_000_000,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
             recommendedCPUs: 2,
@@ -87,7 +91,7 @@ public enum DesktopOSCatalog {
             displayName: "Kali Linux 2026.1 (installer, ARM64)",
             family: .linux,
             isoURL: URL(string: "https://cdimage.kali.org/kali-2026.1/kali-linux-2026.1-installer-arm64.iso")!,
-            sha256: placeholderSHA256,
+            sha256: "c92c79d7267c93245962cf696c9da8105bf40855744513fbaaec41db17d307e1",
             isoSizeBytes: 4_200_000_000,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
             recommendedCPUs: 2,
@@ -98,7 +102,7 @@ public enum DesktopOSCatalog {
             displayName: "Fedora Workstation 42 (aarch64 Live)",
             family: .linux,
             isoURL: URL(string: "https://download.fedoraproject.org/pub/fedora/linux/releases/42/Workstation/aarch64/iso/Fedora-Workstation-Live-42-1.1.aarch64.iso")!,
-            sha256: placeholderSHA256,
+            sha256: "954a0d7d6553fdf2b6bcf7f393a2e41f9265a0a81de8c8e4f712f5924e40577f",
             isoSizeBytes: 2_200_000_000,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
             recommendedCPUs: 2,
@@ -109,7 +113,7 @@ public enum DesktopOSCatalog {
             displayName: "Debian 12.12 bookworm (ARM64 netinst)",
             family: .linux,
             isoURL: URL(string: "https://cdimage.debian.org/cdimage/archive/12.12.0/arm64/iso-cd/debian-12.12.0-arm64-netinst.iso")!,
-            sha256: placeholderSHA256,
+            sha256: "0dd2f82a5dd53cb9c6abd92d30070d23bcbfd7dfb55309be4ac07245df3999b9",
             isoSizeBytes: 500_000_000,
             recommendedMemoryBytes: 2 * 1024 * 1024 * 1024,
             recommendedCPUs: 2,

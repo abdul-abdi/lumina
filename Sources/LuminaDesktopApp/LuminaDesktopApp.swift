@@ -43,8 +43,108 @@ struct LuminaDesktopApp: App {
         Settings {
             PreferencesView(model: model)
         }
+
+        // ── MENU BAR EXTRA ──────────────────────────────────────
+        // Always-visible status item in the system menu bar. Shows the
+        // number of running VMs next to a Lumina glyph; click to reveal
+        // a dropdown with quick actions. Works even when the main
+        // window is hidden or the app is in fullscreen.
+        MenuBarExtra {
+            MenuBarContent(model: model)
+        } label: {
+            MenuBarLabel(model: model)
+        }
+        .menuBarExtraStyle(.menu)
     }
 
+}
+
+// ── MENU BAR GLYPH + COUNT ────────────────────────────────────────
+@MainActor
+struct MenuBarLabel: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        let running = model.sessions.values.filter { $0.status.isLive }.count
+        HStack(spacing: 3) {
+            Image(systemName: running > 0 ? "sparkles" : "sparkle")
+            if running > 0 {
+                Text("\(running)")
+                    .monospacedDigit()
+            }
+        }
+    }
+}
+
+@MainActor
+struct MenuBarContent: View {
+    @Bindable var model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        let running = model.bundles.filter {
+            model.sessions[$0.manifest.id]?.status.isLive == true
+        }
+        let recent = model.bundles
+            .sorted { ($0.manifest.lastBootedAt ?? .distantPast)
+                     > ($1.manifest.lastBootedAt ?? .distantPast) }
+            .prefix(5)
+
+        Button("Open Lumina") {
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: "library")
+        }
+
+        Divider()
+
+        if running.isEmpty {
+            Text("No running VMs").foregroundStyle(.secondary)
+        } else {
+            Section("RUNNING") {
+                ForEach(running, id: \.manifest.id) { b in
+                    Button("■ Stop \(b.manifest.name)") {
+                        Task { await model.session(for: b).shutdown() }
+                    }
+                }
+            }
+        }
+
+        if !recent.isEmpty {
+            Divider()
+            Section("RECENT") {
+                ForEach(recent, id: \.manifest.id) { b in
+                    Button("▶ \(b.manifest.name)") {
+                        Task { await model.session(for: b).boot() }
+                        NSApp.activate(ignoringOtherApps: true)
+                        openWindow(id: "vm-window", value: b.manifest.id)
+                    }
+                    .disabled(model.sessions[b.manifest.id]?.status.isLive == true)
+                }
+            }
+        }
+
+        Divider()
+
+        Button("New VM…") {
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: "library")
+            NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+        }
+        .keyboardShortcut("n", modifiers: .command)
+
+        Button("Command Launcher (⌘K)") {
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: "library")
+            NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+        }
+
+        Divider()
+
+        Button("Quit Lumina") {
+            NSApp.terminate(nil)
+        }
+        .keyboardShortcut("q", modifiers: .command)
+    }
 }
 
 // ── MENU BAR ──────────────────────────────────────────────────────
