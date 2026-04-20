@@ -2,7 +2,7 @@
 //
 // v0.7.0 M6 — per-VM running window. Embeds LuminaVirtualMachineView,
 // adds toolbar (pause/restart/snapshot/shutdown/fullscreen), and the
-// pointer-release toast.
+// pointer-release toast. Aligned to lumina.run phosphor-amber theme.
 
 import SwiftUI
 @preconcurrency import Virtualization
@@ -13,6 +13,7 @@ public struct RunningVMView: View {
     @Bindable var session: LuminaDesktopSession
     @State private var vzMachine: VZVirtualMachine?
     @State private var showReleaseToast = false
+    @State private var bootingDots = 0
 
     public init(session: LuminaDesktopSession) {
         self.session = session
@@ -20,32 +21,31 @@ public struct RunningVMView: View {
 
     public var body: some View {
         ZStack(alignment: .top) {
+            LuminaTheme.bgInset.ignoresSafeArea()
             framebuffer
             if showReleaseToast {
                 releaseToast
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                     .padding(.top, 16)
             }
         }
+        .preferredColorScheme(.dark)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button {
+                toolbarButton("⏻ STOP", color: LuminaTheme.err) {
                     Task { await session.shutdown() }
-                } label: {
-                    Label("Shut down", systemImage: "power")
                 }
                 .disabled(!session.status.isLive)
 
-                Button {
-                    Task { await session.shutdown(); await session.boot() }
-                } label: {
-                    Label("Restart", systemImage: "arrow.counterclockwise")
+                toolbarButton("↻ RESTART") {
+                    Task {
+                        await session.shutdown()
+                        await session.boot()
+                    }
                 }
 
-                Button {
-                    // Snapshot — v0.7.0 wires up basic save state.
-                } label: {
-                    Label("Snapshot", systemImage: "camera")
+                toolbarButton("⌘ SNAPSHOT") {
+                    // wired in M8
                 }
                 .keyboardShortcut("t", modifiers: .command)
                 .disabled(!session.status.isLive)
@@ -57,71 +57,174 @@ public struct RunningVMView: View {
                 await session.boot()
             }
             vzMachine = await session.virtualMachine()
-            // Show toast on first 3 sessions per UserDefaults (simplified).
-            withAnimation { showReleaseToast = true }
+            withAnimation(.easeIn(duration: 0.2)) { showReleaseToast = true }
             try? await Task.sleep(for: .seconds(3))
-            withAnimation { showReleaseToast = false }
+            withAnimation(.easeOut(duration: 0.3)) { showReleaseToast = false }
         }
         .onChange(of: session.status) { _, _ in
             Task { vzMachine = await session.virtualMachine() }
         }
     }
 
+    private func toolbarButton(_ label: String, color: Color = LuminaTheme.ink, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(LuminaTheme.label)
+                .tracking(1.5)
+                .foregroundStyle(color)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
     @ViewBuilder
     private var framebuffer: some View {
         switch session.status {
         case .booting:
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Booting \(session.bundle.manifest.name)…")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            bootingScreen
         case .running, .paused:
             if let vm = vzMachine {
                 LuminaVirtualMachineView(virtualMachine: vm, capturesSystemKeys: true)
                     .background(Color.black)
             } else {
-                Text("Connecting to display…")
-                    .foregroundStyle(.secondary)
+                connectingScreen
             }
         case .crashed(let reason):
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 48))
-                    .foregroundStyle(LuminaTheme.crashedRed)
-                Text("VM crashed")
-                    .font(.title3.weight(.semibold))
-                Text(reason)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: 480)
-                Button("Try again") {
-                    Task { await session.shutdown(); await session.boot() }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            crashedScreen(reason: reason)
         case .stopped, .shuttingDown:
-            VStack(spacing: 12) {
-                Image(systemName: "stop.circle")
-                    .font(.system(size: 48))
-                    .foregroundStyle(.secondary)
-                Text("VM stopped")
-                    .foregroundStyle(.secondary)
-                Button("Boot") {
-                    Task { await session.boot() }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            stoppedScreen
         }
     }
 
+    private var bootingScreen: some View {
+        VStack(spacing: 16) {
+            // ASCII brand mark, big
+            VStack(alignment: .leading, spacing: 0) {
+                Text("[ BOOTING ]")
+                    .font(LuminaTheme.label)
+                    .tracking(2.5)
+                    .foregroundStyle(LuminaTheme.accent)
+                Text(session.bundle.manifest.name)
+                    .font(LuminaTheme.title)
+                    .foregroundStyle(LuminaTheme.ink)
+                Text(session.bundle.manifest.osVariant)
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
+            }
+            .padding(.bottom, 12)
+            HStack(spacing: 10) {
+                Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
+                Text("vm.boot() — initializing virtio devices, EFI variable store…")
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(LuminaTheme.bgInset)
+    }
+
+    private var connectingScreen: some View {
+        VStack {
+            Text("CONNECTING TO DISPLAY…")
+                .font(LuminaTheme.label)
+                .tracking(2)
+                .foregroundStyle(LuminaTheme.inkMute)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func crashedScreen(reason: String) -> some View {
+        VStack(spacing: 12) {
+            Text("[ CRASHED ]")
+                .font(LuminaTheme.label)
+                .tracking(2.5)
+                .foregroundStyle(LuminaTheme.err)
+            Text("VM stopped unexpectedly")
+                .font(LuminaTheme.title)
+                .foregroundStyle(LuminaTheme.ink)
+            ScrollView {
+                Text(reason)
+                    .font(LuminaTheme.monoSmall)
+                    .foregroundStyle(LuminaTheme.inkDim)
+                    .frame(maxWidth: 520)
+                    .padding(12)
+                    .background(LuminaTheme.bg1)
+                    .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+            }
+            .frame(maxHeight: 200)
+
+            HStack(spacing: 12) {
+                Button(action: {
+                    Task { await session.shutdown(); await session.boot() }
+                }) {
+                    Text("↻ TRY AGAIN")
+                        .font(LuminaTheme.label)
+                        .tracking(1.5)
+                        .foregroundStyle(Color.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(LuminaTheme.accent)
+                }
+                .buttonStyle(.plain)
+                Button(action: {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(reason, forType: .string)
+                }) {
+                    Text("[ COPY DIAGNOSTICS ]")
+                        .font(LuminaTheme.label)
+                        .tracking(1.5)
+                        .foregroundStyle(LuminaTheme.ink)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var stoppedScreen: some View {
+        VStack(spacing: 16) {
+            Text("[ STOPPED ]")
+                .font(LuminaTheme.label)
+                .tracking(2.5)
+                .foregroundStyle(LuminaTheme.inkMute)
+            Button(action: { Task { await session.boot() } }) {
+                Text("▶ BOOT")
+                    .font(LuminaTheme.label)
+                    .tracking(2)
+                    .foregroundStyle(Color.black)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(LuminaTheme.accent)
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     private var releaseToast: some View {
-        Text("Press ⌘⌥ to release pointer")
-            .font(.callout)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: Capsule())
-            .shadow(radius: 4)
+        HStack(spacing: 8) {
+            Text("⌘⌥")
+                .font(LuminaTheme.label)
+                .tracking(2)
+                .foregroundStyle(LuminaTheme.accent)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .overlay(Rectangle().stroke(LuminaTheme.accent, lineWidth: 1))
+            Text("RELEASE POINTER")
+                .font(LuminaTheme.label)
+                .tracking(2)
+                .foregroundStyle(LuminaTheme.ink)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(LuminaTheme.bg2.opacity(0.95))
+        .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
     }
 }

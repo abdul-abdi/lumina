@@ -28,7 +28,7 @@ public struct NewVMWizard: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            Rectangle().fill(LuminaTheme.rule).frame(height: 1)
             Group {
                 switch step {
                 case .chooseOS: chooseOSStep
@@ -38,38 +38,98 @@ public struct NewVMWizard: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
+            .background(LuminaTheme.bg)
+            .transition(.opacity.combined(with: .move(edge: .leading)))
+            Rectangle().fill(LuminaTheme.rule).frame(height: 1)
             footer
         }
-        .frame(width: 720, height: 540)
+        .frame(width: 760, height: 560)
+        .background(LuminaTheme.bg)
+        .preferredColorScheme(.dark)
+        .animation(.easeInOut(duration: 0.18), value: step)
     }
 
     private var header: some View {
-        HStack {
-            Text("New Virtual Machine")
-                .font(.title3.weight(.semibold))
+        HStack(spacing: 16) {
+            Text("§ \(String(format: "%02d", step.rawValue + 1))")
+                .font(LuminaTheme.label)
+                .tracking(1.5)
+                .foregroundStyle(LuminaTheme.accent)
+            Text(stepTitle)
+                .font(LuminaTheme.title)
+                .foregroundStyle(LuminaTheme.ink)
+            HStack(spacing: 4) {
+                Text("of 4")
+                    .font(LuminaTheme.label)
+                    .tracking(1.5)
+                    .foregroundStyle(LuminaTheme.inkMute)
+                    .textCase(.uppercase)
+            }
             Spacer()
-            Text("Step \(step.rawValue + 1) of 4")
-                .foregroundStyle(.secondary)
+            stepIndicator
         }
-        .padding(20)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 18)
+        .background(LuminaTheme.bg2)
+    }
+
+    private var stepTitle: String {
+        switch step {
+        case .chooseOS: "CHOOSE AN OS"
+        case .variant: "PICK A VARIANT"
+        case .resources: "RESOURCES"
+        case .review: "REVIEW + CREATE"
+        }
+    }
+
+    private var stepIndicator: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<4) { i in
+                Rectangle()
+                    .fill(i <= step.rawValue ? LuminaTheme.accent : LuminaTheme.rule2)
+                    .frame(width: 24, height: 2)
+            }
+        }
     }
 
     private var footer: some View {
-        HStack {
-            Button("Cancel") { isPresented = false }
-            Spacer()
-            if step != .chooseOS {
-                Button("Back") { back() }
+        HStack(spacing: 12) {
+            Button(action: { isPresented = false }) {
+                Text("[ ESC ] CANCEL")
+                    .font(LuminaTheme.label)
+                    .tracking(1.5)
+                    .foregroundStyle(LuminaTheme.inkMute)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
             }
-            Button(step == .review ? "Create VM" : "Next") {
+            .buttonStyle(.plain)
+            .keyboardShortcut(.escape, modifiers: [])
+
+            Spacer()
+
+            if step != .chooseOS {
+                Button(action: { back() }) {
+                    Text("← BACK")
+                        .font(LuminaTheme.label)
+                        .tracking(1.5)
+                        .foregroundStyle(LuminaTheme.ink)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+
+            LuminaPrimaryButton(label: step == .review ? "CREATE VM →" : "NEXT →") {
                 next()
             }
             .keyboardShortcut(.return, modifiers: .command)
-            .buttonStyle(.borderedProminent)
+            .opacity(canAdvance ? 1 : 0.4)
             .disabled(!canAdvance)
         }
-        .padding(20)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .background(LuminaTheme.bg2)
     }
 
     private var chooseOSStep: some View {
@@ -338,36 +398,53 @@ struct OSTileButton: View {
     let tile: OSWizardTile
     let isSelected: Bool
     let onTap: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: onTap) {
-            VStack(alignment: .leading, spacing: 8) {
-                Image(systemName: tile.glyph)
-                    .font(.system(size: 32))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .foregroundStyle(LuminaTheme.accent)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: tile.glyph)
+                        .font(.system(size: 24, weight: .light))
+                        .foregroundStyle(isSelected ? LuminaTheme.accent : LuminaTheme.ink)
+                    Spacer()
+                    if isSelected {
+                        Text("●")
+                            .font(LuminaTheme.label)
+                            .foregroundStyle(LuminaTheme.accent)
+                    }
+                }
                 Text(tile.displayName)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
+                    .font(LuminaTheme.headline)
+                    .foregroundStyle(LuminaTheme.ink)
+                    .lineLimit(1)
                 Text(tile.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
                     .lineLimit(2)
+                    .multilineTextAlignment(.leading)
                 if let constraint = tile.constraint {
-                    Text(constraint)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.tertiary)
+                    Text(constraint.uppercased())
+                        .font(LuminaTheme.label)
+                        .tracking(1.5)
+                        .foregroundStyle(LuminaTheme.inkMute)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(isSelected ? LuminaTheme.accent.opacity(0.18) : Color.clear)
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(isSelected ? LuminaTheme.accent : Color.gray.opacity(0.3), lineWidth: isSelected ? 2 : 1)
+            .padding(16)
+            .background(
+                isSelected ? LuminaTheme.accent.opacity(0.08) :
+                hovering ? LuminaTheme.bg1 : Color.clear
             )
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                Rectangle()
+                    .stroke(isSelected ? LuminaTheme.accent : (hovering ? LuminaTheme.accent.opacity(0.5) : LuminaTheme.rule2),
+                            lineWidth: isSelected ? 2 : 1)
+            )
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeInOut(duration: 0.12), value: hovering)
+        .animation(.easeInOut(duration: 0.18), value: isSelected)
     }
 }

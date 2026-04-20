@@ -1,6 +1,7 @@
 // Sources/LuminaDesktopKit/LibraryView.swift
 //
-// v0.7.0 M6 — main app window: sidebar + library detail.
+// v0.7.0 M6 — main app window matching lumina.run's phosphor-amber aesthetic.
+// Sharp corners, hairline rules, mono type, dashed sub-dividers.
 
 import SwiftUI
 import LuminaBootable
@@ -9,23 +10,33 @@ import LuminaBootable
 public struct LibraryView: View {
     @Bindable public var model: AppModel
     @State private var showingWizard = false
+    @State private var hoverID: UUID?
 
     public init(model: AppModel) {
         self.model = model
     }
 
     public var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            detail
+        ZStack {
+            LuminaTheme.bg.ignoresSafeArea()
+            VStack(spacing: 0) {
+                metaStrip
+                Divider().background(LuminaTheme.rule).frame(height: 1)
+                content
+            }
         }
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 980, minHeight: 600)
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                BrandMark()
+            }
+            ToolbarItem(placement: .principal) {
+                LuminaSearchField(text: $model.search)
+            }
             ToolbarItem(placement: .primaryAction) {
-                Button {
+                LuminaPrimaryButton(label: "+ NEW VM", systemImage: nil) {
                     showingWizard = true
-                } label: {
-                    Label("New VM", systemImage: "plus")
                 }
                 .keyboardShortcut("n", modifiers: .command)
             }
@@ -33,40 +44,135 @@ public struct LibraryView: View {
         .sheet(isPresented: $showingWizard) {
             NewVMWizard(model: model, isPresented: $showingWizard)
         }
-        .frame(minWidth: 880, minHeight: 560)
     }
 
-    private var sidebar: some View {
-        List(selection: Binding(
-            get: { SidebarSection.library },
-            set: { _ in /* fixed for v0.7.0 */ }
-        )) {
-            Label("Library", systemImage: "square.grid.2x2.fill")
-                .tag(SidebarSection.library)
-            Label("Running", systemImage: "play.circle")
-                .tag(SidebarSection.running)
-                .badge(model.sessions.values.filter { $0.status.isLive }.count)
-            Label("Snapshots", systemImage: "clock.arrow.circlepath")
-                .tag(SidebarSection.snapshots)
-            Label("Downloads", systemImage: "arrow.down.circle")
-                .tag(SidebarSection.downloads)
+    private var metaStrip: some View {
+        HStack(spacing: 24) {
+            metaItem(label: "LUMINA", value: "DESKTOP")
+            metaItem(label: "VMS", value: "\(model.bundles.count)")
+            metaItem(label: "RUNNING", value: "\(model.sessions.values.filter { $0.status.isLive }.count)")
+            Spacer()
+            statusDotView
+            Text("v0.7.0 · stable")
+                .font(LuminaTheme.label)
+                .tracking(1)
+                .textCase(.uppercase)
+                .foregroundStyle(LuminaTheme.inkDim)
         }
-        .navigationTitle("Lumina")
-        .frame(minWidth: 200)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 12)
+        .background(LuminaTheme.bg)
     }
 
-    private var detail: some View {
-        Group {
-            if model.bundles.isEmpty {
-                EmptyStateView(showingWizard: $showingWizard)
-            } else {
-                VMGridView(model: model)
+    private func metaItem(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).foregroundStyle(LuminaTheme.inkMute)
+            Text(value).foregroundStyle(LuminaTheme.inkDim).fontWeight(.medium)
+        }
+        .font(LuminaTheme.label)
+        .tracking(1.5)
+        .textCase(.uppercase)
+    }
+
+    private var statusDotView: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(LuminaTheme.ok)
+                .frame(width: 6, height: 6)
+            Text("LIVE")
+                .font(LuminaTheme.label)
+                .tracking(1.5)
+                .foregroundStyle(LuminaTheme.inkDim)
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if model.bundles.isEmpty {
+            EmptyStateView(showingWizard: $showingWizard)
+        } else {
+            VMGridView(model: model, hoverID: $hoverID)
+        }
+    }
+}
+
+@MainActor
+public struct BrandMark: View {
+    public init() {}
+    public var body: some View {
+        HStack(spacing: 8) {
+            ZStack {
+                Rectangle()
+                    .stroke(LuminaTheme.accent, lineWidth: 1)
+                    .frame(width: 14, height: 14)
+                Rectangle()
+                    .stroke(LuminaTheme.ink.opacity(0.5), lineWidth: 1)
+                    .frame(width: 14, height: 14)
+                    .offset(x: 3, y: 3)
             }
+            .frame(width: 18, height: 18)
+            HStack(spacing: 0) {
+                Text("lumina")
+                    .foregroundStyle(LuminaTheme.ink)
+                Text(".run")
+                    .foregroundStyle(LuminaTheme.inkMute)
+            }
+            .font(LuminaTheme.headline)
         }
-        .navigationTitle(model.bundles.isEmpty ? "Welcome" : "Library")
+    }
+}
+
+@MainActor
+public struct LuminaSearchField: View {
+    @Binding var text: String
+    public init(text: Binding<String>) { _text = text }
+    public var body: some View {
+        HStack(spacing: 6) {
+            Text("$")
+                .font(LuminaTheme.body)
+                .foregroundStyle(LuminaTheme.accent)
+            TextField("filter --name", text: $text)
+                .textFieldStyle(.plain)
+                .font(LuminaTheme.body)
+                .foregroundStyle(LuminaTheme.ink)
+                .frame(minWidth: 240)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(LuminaTheme.bg1)
+        .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+    }
+}
+
+@MainActor
+public struct LuminaPrimaryButton: View {
+    let label: String
+    let systemImage: String?
+    let action: () -> Void
+    @State private var hovering = false
+
+    public init(label: String, systemImage: String? = nil, action: @escaping () -> Void) {
+        self.label = label
+        self.systemImage = systemImage
+        self.action = action
     }
 
-    enum SidebarSection: Hashable { case library, running, snapshots, downloads }
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if let s = systemImage { Image(systemName: s) }
+                Text(label)
+                    .font(LuminaTheme.label)
+                    .tracking(1.5)
+            }
+            .foregroundStyle(hovering ? LuminaTheme.bg : Color.black)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(hovering ? LuminaTheme.ink : LuminaTheme.accent)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
 }
 
 @MainActor
@@ -74,66 +180,138 @@ public struct EmptyStateView: View {
     @Binding var showingWizard: Bool
 
     public var body: some View {
-        VStack(spacing: 24) {
-            Image(systemName: "sparkles")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 96)
-                .foregroundStyle(LuminaTheme.accent)
-
-            Text("No virtual machines yet.")
-                .font(LuminaTheme.title)
-
-            Text("Spin up Ubuntu, Kali, Windows 11 ARM, or macOS — all from one place.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
-
-            HStack(spacing: 12) {
-                Button {
-                    showingWizard = true
-                } label: {
-                    Label("Try Ubuntu", systemImage: "circle.hexagongrid.fill")
-                        .frame(minWidth: 140)
+        ZStack {
+            LuminaTheme.bg
+            VStack(alignment: .leading, spacing: 0) {
+                kicker
+                Text("subprocess.run()")
+                    .font(LuminaTheme.hero)
+                    .foregroundStyle(LuminaTheme.accent)
+                    .tracking(-2)
+                HStack(spacing: 8) {
+                    Text("for")
+                        .font(LuminaTheme.hero)
+                        .foregroundStyle(LuminaTheme.ink)
+                        .tracking(-2)
+                    Text("virtual machines.")
+                        .font(LuminaTheme.serifLargeItalic)
+                        .foregroundStyle(LuminaTheme.inkDim)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .padding(.bottom, 24)
 
-                Button {
-                    showingWizard = true
-                } label: {
-                    Label("Use my own ISO/IPSW…", systemImage: "doc.badge.plus")
-                        .frame(minWidth: 180)
-                }
-                .controlSize(.large)
+                Text("Boot any OS. Run it. Throw it away. v0.7.0 ships full-OS guests with a SwiftUI face — Linux, Windows 11 ARM, macOS, all from one Library.")
+                    .font(.system(size: 14))
+                    .foregroundStyle(LuminaTheme.inkDim)
+                    .frame(maxWidth: 560, alignment: .leading)
+                    .padding(.bottom, 32)
+
+                actionRow
+
+                Spacer().frame(height: 40)
+
+                installLine
             }
-
-            Spacer()
-
-            Text("Drop an ISO / IPSW anywhere on this window to get started.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+            .frame(maxWidth: 740, alignment: .leading)
+            .padding(.horizontal, 56)
+            .padding(.vertical, 80)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var kicker: some View {
+        HStack(spacing: 8) {
+            Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
+            Text("§ 01 — WELCOME")
+                .font(LuminaTheme.label)
+                .tracking(2)
+                .textCase(.uppercase)
+        }
+        .foregroundStyle(LuminaTheme.accent)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .overlay(Rectangle().stroke(LuminaTheme.accent, lineWidth: 1))
+        .background(LuminaTheme.accent.opacity(0.06))
+        .padding(.bottom, 28)
+    }
+
+    private var actionRow: some View {
+        HStack(spacing: 12) {
+            LuminaPrimaryButton(label: "TRY UBUNTU →") { showingWizard = true }
+            QuickTileButton(label: "INSTALL WINDOWS 11", glyph: "macwindow") { showingWizard = true }
+            QuickTileButton(label: "INSTALL macOS", glyph: "apple.logo") { showingWizard = true }
+            QuickTileButton(label: "USE MY OWN ISO/IPSW…", glyph: "doc.badge.plus") { showingWizard = true }
+        }
+    }
+
+    private var installLine: some View {
+        HStack(spacing: 14) {
+            Text("$").foregroundStyle(LuminaTheme.accent)
+            Text("brew install lumina-run/tap/lumina")
+                .foregroundStyle(LuminaTheme.ink)
+            Spacer()
+            Text("[ copy ]")
+                .foregroundStyle(LuminaTheme.inkMute)
+        }
+        .font(LuminaTheme.body)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(LuminaTheme.bg1)
+        .overlay(
+            Rectangle()
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                .foregroundStyle(LuminaTheme.rule2)
+        )
+        .frame(maxWidth: 560, alignment: .leading)
+    }
+}
+
+@MainActor
+public struct QuickTileButton: View {
+    let label: String
+    let glyph: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: glyph)
+                    .font(.system(size: 12))
+                Text(label)
+                    .font(LuminaTheme.label)
+                    .tracking(1.5)
+            }
+            .foregroundStyle(hovering ? LuminaTheme.accent : LuminaTheme.ink)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(LuminaTheme.bg1)
+            .overlay(
+                Rectangle()
+                    .stroke(hovering ? LuminaTheme.accent : LuminaTheme.rule2, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
 @MainActor
 public struct VMGridView: View {
     @Bindable var model: AppModel
+    @Binding var hoverID: UUID?
 
-    private let columns = [GridItem(.adaptive(minimum: 240, maximum: 320), spacing: 16)]
+    private let columns = [GridItem(.adaptive(minimum: 260, maximum: 320), spacing: 0)]
 
     public var body: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
+            LazyVGrid(columns: columns, spacing: 0) {
                 ForEach(model.filteredBundles, id: \.manifest.id) { bundle in
-                    VMCard(model: model, bundle: bundle)
+                    VMCard(model: model, bundle: bundle, isHovering: hoverID == bundle.manifest.id)
+                        .onHover { hovering in
+                            hoverID = hovering ? bundle.manifest.id : nil
+                        }
                         .onTapGesture {
                             model.selection = bundle.manifest.id
-                            // The Running window is opened via a separate
-                            // WindowGroup in LuminaDesktopApp via openWindow().
                             NotificationCenter.default.post(
                                 name: .luminaOpenVMWindow,
                                 object: bundle.manifest.id
@@ -141,19 +319,9 @@ public struct VMGridView: View {
                         }
                 }
             }
-            .padding(20)
+            .background(LuminaTheme.rule)  // grid lines via parent bg + cell margins
         }
-        .searchable(text: $model.search, prompt: "Search VMs")
-        .toolbar {
-            ToolbarItem {
-                Picker("Sort", selection: $model.sortOrder) {
-                    ForEach(AppModel.SortOrder.allCases, id: \.rawValue) { order in
-                        Text(order.rawValue).tag(order)
-                    }
-                }
-                .pickerStyle(.menu)
-            }
-        }
+        .background(LuminaTheme.bg)
     }
 }
 
@@ -161,54 +329,67 @@ public struct VMGridView: View {
 public struct VMCard: View {
     @Bindable var model: AppModel
     let bundle: VMBundle
+    let isHovering: Bool
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(LuminaTheme.osAccent(bundle.manifest.osFamily.rawValue).opacity(0.18))
-                Image(systemName: glyphForFamily(bundle.manifest.osFamily))
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 56)
-                    .foregroundStyle(LuminaTheme.osAccent(bundle.manifest.osFamily.rawValue))
-            }
-            .aspectRatio(16.0/9.0, contentMode: .fit)
-
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header strip with state + sid prefix
+            HStack(spacing: 8) {
                 statusDot
-                Text(bundle.manifest.name)
-                    .font(LuminaTheme.headline)
-                    .lineLimit(1)
+                Text(stateLabel)
+                    .font(LuminaTheme.label)
+                    .tracking(1.5)
+                    .foregroundStyle(stateColor)
+                Spacer()
+                Text(bundle.manifest.id.uuidString.prefix(8).lowercased())
+                    .font(LuminaTheme.monoTiny)
+                    .foregroundStyle(LuminaTheme.inkMute)
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(LuminaTheme.bg2)
+            .overlay(Rectangle().fill(LuminaTheme.rule).frame(height: 1), alignment: .bottom)
 
-            Text(bundle.manifest.osVariant)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            // Body
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: glyphForFamily(bundle.manifest.osFamily))
+                        .font(.system(size: 14))
+                        .foregroundStyle(LuminaTheme.osAccent(bundle.manifest.osFamily.rawValue))
+                    Text(bundle.manifest.name)
+                        .font(LuminaTheme.headline)
+                        .foregroundStyle(LuminaTheme.ink)
+                        .lineLimit(1)
+                }
+                .padding(.bottom, 2)
 
-            HStack(spacing: 4) {
-                Text("\(formatGB(bundle.manifest.memoryBytes))")
-                Text("·")
-                Text("\(bundle.manifest.cpuCount) CPU")
-                Text("·")
-                Text(formatGB(bundle.manifest.diskBytes))
+                Text(bundle.manifest.osVariant)
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
+
+                Spacer().frame(height: 12)
+
+                statRow("MEMORY", formatGB(bundle.manifest.memoryBytes))
+                statRow("CPUS", "\(bundle.manifest.cpuCount)")
+                statRow("DISK", formatGB(bundle.manifest.diskBytes))
             }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 16)
         }
-        .padding(12)
-        .background(.background.secondary)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(isHovering ? LuminaTheme.bg1 : LuminaTheme.bg)
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(Color.gray.opacity(0.3))
+            Rectangle()
+                .stroke(isHovering ? LuminaTheme.accent.opacity(0.6) : LuminaTheme.rule, lineWidth: 1)
         )
+        .padding(.trailing, 1)
+        .padding(.bottom, 1)
+        .contentShape(Rectangle())
         .contextMenu {
-            Button("Open in Window") {
+            Button("Open") {
                 NotificationCenter.default.post(name: .luminaOpenVMWindow, object: bundle.manifest.id)
             }
             Button("Reveal in Finder") {
@@ -223,17 +404,45 @@ public struct VMCard: View {
 
     private var statusDot: some View {
         Circle()
-            .fill(statusColor)
-            .frame(width: 8, height: 8)
+            .fill(stateColor)
+            .frame(width: 6, height: 6)
+            .shadow(color: session.status == .running ? stateColor.opacity(0.6) : .clear, radius: 4)
     }
 
-    private var statusColor: Color {
+    private var stateColor: Color {
         switch session.status {
-        case .running: LuminaTheme.runningGreen
-        case .booting, .shuttingDown: LuminaTheme.pausedYellow
-        case .crashed: LuminaTheme.crashedRed
-        default: .secondary
+        case .running: LuminaTheme.ok
+        case .booting, .shuttingDown: LuminaTheme.warn
+        case .crashed: LuminaTheme.err
+        case .paused: LuminaTheme.warn
+        case .stopped: LuminaTheme.inkMute
         }
+    }
+
+    private var stateLabel: String {
+        switch session.status {
+        case .running: "RUNNING"
+        case .booting: "BOOTING"
+        case .paused: "PAUSED"
+        case .crashed: "CRASHED"
+        case .shuttingDown: "STOPPING"
+        case .stopped: "IDLE"
+        }
+    }
+
+    private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(LuminaTheme.label)
+                .tracking(1.5)
+                .foregroundStyle(LuminaTheme.inkMute)
+            Spacer()
+            Text(value)
+                .font(LuminaTheme.caption)
+                .foregroundStyle(LuminaTheme.inkDim)
+                .monospacedDigit()
+        }
+        .padding(.vertical, 3)
     }
 
     private func glyphForFamily(_ family: OSFamily) -> String {
@@ -250,8 +459,5 @@ public struct VMCard: View {
 }
 
 public extension Notification.Name {
-    /// Posted with the bundle UUID as the object when the user wants to
-    /// open a VM in its own window. Handled by LuminaDesktopApp's main
-    /// scene which spawns a RunningVMWindow for that bundle.
     static let luminaOpenVMWindow = Notification.Name("LuminaOpenVMWindow")
 }

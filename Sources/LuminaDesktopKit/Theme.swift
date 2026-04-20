@@ -1,48 +1,88 @@
 // Sources/LuminaDesktopKit/Theme.swift
 //
-// v0.7.0 M6 — Catppuccin-aligned palette + typography helpers.
+// v0.7.0 M6 — phosphor-amber dark palette aligned to lumina.run web design.
+// Forced dark-mode inside the app for consistent typography contrast and to
+// match the marketing site. macOS dark-mode users get the system look;
+// light-mode users get the same dark palette anyway (it's the brand).
 
 import SwiftUI
 
 public enum LuminaTheme {
-    /// Brand accent — lavender. WCAG AA against system backgrounds.
-    public static let accent = Color(light: hex("#8839EF"), dark: hex("#CBA6F7"))
+    // ── Surfaces ────────────────────────────────────────────────────
+    public static let bg       = hex("#0A0A0A")  // page background
+    public static let bg1      = hex("#0F0F0F")  // panel
+    public static let bg2      = hex("#141414")  // header chrome
+    public static let bgInset  = hex("#050505")  // terminal-deep
 
-    /// Status colors.
-    public static let runningGreen  = Color(light: hex("#40A02B"), dark: hex("#A6E3A1"))
-    public static let pausedYellow  = Color(light: hex("#DF8E1D"), dark: hex("#F9E2AF"))
-    public static let crashedRed    = Color(light: hex("#D20F39"), dark: hex("#F38BA8"))
-    public static let surfaceMuted  = Color(light: hex("#EFF1F5"), dark: hex("#1E1E2E"))
+    // ── Ink (text) ─────────────────────────────────────────────────
+    public static let ink      = hex("#E8E4D8")  // primary text — warm cream
+    public static let inkDim   = hex("#9A9384")
+    public static let inkMute  = hex("#6B6558")
 
-    /// Per-OS accent for VM cards (matches OSCatalog tile accents).
+    // ── Rules / dividers ───────────────────────────────────────────
+    public static let rule     = hex("#1F1D18")  // solid hairline
+    public static let rule2    = hex("#2A2620")  // dashed sub-divider
+
+    // ── Accent + status ────────────────────────────────────────────
+    public static let accent   = hex("#FFB347")  // phosphor amber
+    public static let accent2  = hex("#FF7A3D")  // amber 2 (hover, accents)
+    public static let ok       = hex("#8FC97A")  // running green
+    public static let warn     = hex("#E5C96A")  // paused yellow
+    public static let err      = hex("#E87272")  // crashed red
+
+    // ── Per-OS chip colors (for VM cards) ──────────────────────────
     public static func osAccent(_ family: String) -> Color {
         switch family {
-        case "linux": hex("#E95420")
-        case "windows": hex("#0078D4")
-        case "macOS": hex("#1D1D1F")
+        case "linux": hex("#E95420")    // Ubuntu orange
+        case "windows": hex("#0078D4")  // Windows blue
+        case "macOS": hex("#A5B4C7")    // macOS silver
         default: hex("#9CA3AF")
         }
     }
 
-    /// SF Mono for terminal / log panels.
+    // ── Type ───────────────────────────────────────────────────────
+    /// SF Mono — closest system substitute for JetBrains Mono.
     public static let mono = Font.system(.body, design: .monospaced)
-    /// SF Pro Title for hero headers.
-    public static let title = Font.system(.title, design: .default).weight(.semibold)
-    /// SF Pro headline.
-    public static let headline = Font.system(.headline, design: .default)
+    public static let monoSmall = Font.system(size: 11, design: .monospaced)
+    public static let monoTiny = Font.system(size: 10, design: .monospaced)
+
+    /// New York italic — closest system substitute for Fraunces.
+    public static let serifItalic = Font.system(.title3, design: .serif).italic()
+    public static let serifLargeItalic = Font.system(.largeTitle, design: .serif).italic()
+
+    /// Hero display — mono, heavy weight, tight tracking.
+    public static let hero = Font.system(size: 56, weight: .medium, design: .monospaced)
+    public static let title = Font.system(size: 24, weight: .medium, design: .monospaced)
+    public static let headline = Font.system(size: 14, weight: .medium, design: .monospaced)
+    public static let body = Font.system(size: 13, weight: .regular, design: .monospaced)
+    public static let caption = Font.system(size: 11, weight: .regular, design: .monospaced)
+    public static let label = Font.system(size: 10, weight: .medium, design: .monospaced)
 }
 
-private extension Color {
-    init(light: Color, dark: Color) {
-        self.init(NSColor(name: nil, dynamicProvider: { appearance in
-            switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
-            case .darkAqua: NSColor(dark)
-            default: NSColor(light)
-            }
-        }))
+// ── ViewModifier helpers ───────────────────────────────────────────
+public extension View {
+    /// Apply Lumina's panel chrome: dark bg + 1px hairline border.
+    func luminaPanel(padding: CGFloat = 0) -> some View {
+        self
+            .padding(padding)
+            .background(LuminaTheme.bg1)
+            .overlay(
+                Rectangle()
+                    .stroke(LuminaTheme.rule, lineWidth: 1)
+            )
+    }
+
+    /// Tracked uppercase label (eyebrow) — used for section headers + cap text.
+    func luminaEyebrow() -> some View {
+        self
+            .font(LuminaTheme.label)
+            .tracking(2)
+            .textCase(.uppercase)
+            .foregroundStyle(LuminaTheme.inkMute)
     }
 }
 
+// ── Color helpers ──────────────────────────────────────────────────
 private func hex(_ s: String) -> Color {
     var trimmed = s
     if trimmed.hasPrefix("#") { trimmed.removeFirst() }
