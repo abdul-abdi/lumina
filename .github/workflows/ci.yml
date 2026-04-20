@@ -38,3 +38,49 @@ jobs:
           cd Guest/lumina-agent
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
           echo "Guest agent: OK"
+
+      # Agent-boot regression gate — v0.7.0 discipline.
+      #
+      # Desktop-stack changes (graphics, input devices, new boot loaders)
+      # must NOT regress the agent path. This job boots a real VM via the
+      # v0.6.0 image and asserts median cold-boot duration stays under the
+      # threshold. Change the threshold only after a deliberate decision,
+      # recorded in ROADMAP.md.
+      #
+      # Baseline (M3 Pro local, release build): ~390ms P50, ~470ms P95.
+      # CI runners are ~2–3× slower; threshold set conservatively.
+      - name: Agent-boot regression gate
+        env:
+          AGENT_BOOT_P50_MAX_MS: "2000"
+        run: |
+          set -euo pipefail
+          echo "Downloading v0.6.0 default image..."
+          curl -fsSL -o /tmp/lumina-image.tar.gz \
+            https://github.com/abdul-abdi/lumina/releases/download/lumina-v0.6.0/lumina-image-default.tar.gz
+          mkdir -p "$HOME/.lumina/images/default"
+          tar xzf /tmp/lumina-image.tar.gz -C "$HOME/.lumina/images/default"
+
+          BIN="$(swift build --show-bin-path)/lumina"
+
+          # Warm the Swift runtime + dyld cache + APFS clone machinery.
+          "$BIN" run "true" >/dev/null 2>&1 || true
+
+          echo "Measuring cold-boot duration over 5 iterations..."
+          MEASUREMENTS=()
+          for i in 1 2 3 4 5; do
+            MS=$("$BIN" run "true" 2>/dev/null | jq -r '.duration_ms')
+            echo "  iter $i: ${MS}ms"
+            MEASUREMENTS+=("$MS")
+          done
+
+          # Median of 5 = 3rd-smallest.
+          MEDIAN=$(printf '%s\n' "${MEASUREMENTS[@]}" | sort -n | sed -n '3p')
+          echo ""
+          echo "Agent boot P50: ${MEDIAN}ms (max allowed: ${AGENT_BOOT_P50_MAX_MS}ms)"
+
+          if [ "$MEDIAN" -gt "$AGENT_BOOT_P50_MAX_MS" ]; then
+            echo "::error::Agent-boot regression: median ${MEDIAN}ms exceeds ${AGENT_BOOT_P50_MAX_MS}ms threshold."
+            echo "::error::If intentional, update AGENT_BOOT_P50_MAX_MS in .github/workflows/ci.yml and document in ROADMAP.md."
+            exit 1
+          fi
+          echo "::notice::Agent-boot gate passed (${MEDIAN}ms / ${AGENT_BOOT_P50_MAX_MS}ms budget)."
