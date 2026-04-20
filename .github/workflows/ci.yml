@@ -83,15 +83,24 @@ jobs:
             "$BIN" run "true" 2>&1
           }
 
-          extract_ms() {
-            printf '%s' "$1" | jq -r '.duration_ms // empty' 2>/dev/null || true
+          # Extract duration_ms ONLY when the envelope shows a successful
+          # boot + command. lumina's unified output shape always includes
+          # `duration_ms` — even for error responses (timeout, vm_crashed,
+          # connection_failed) — so a naive .duration_ms check accepts
+          # errored runs and reports impossibly-small measurements. The
+          # authoritative signal is `error == null && exit_code == 0`.
+          extract_success_ms() {
+            printf '%s' "$1" | jq -r '
+              select((.error // null) == null and (.exit_code // -1) == 0)
+              | .duration_ms // empty
+            ' 2>/dev/null || true
           }
 
-          echo "Probe 1/2: verify runner can boot a VM..."
+          echo "Probe 1/2: verify runner can boot a VM successfully..."
           PROBE1_OUT="$(run_once || true)"
-          PROBE1_MS="$(extract_ms "$PROBE1_OUT")"
-          if [ -z "$PROBE1_MS" ] || [ "$PROBE1_MS" = "null" ]; then
-            echo "::notice::Agent-boot gate skipped: Virtualization unavailable on this runner."
+          PROBE1_MS="$(extract_success_ms "$PROBE1_OUT")"
+          if [ -z "$PROBE1_MS" ]; then
+            echo "::notice::Agent-boot gate skipped: Virtualization unavailable on this runner (no successful boot envelope)."
             echo "Probe 1 output (truncated):"
             printf '%s\n' "$PROBE1_OUT" | head -20
             exit 0
@@ -100,9 +109,9 @@ jobs:
 
           echo "Probe 2/2: verify runner can sustain consecutive boots..."
           PROBE2_OUT="$(run_once || true)"
-          PROBE2_MS="$(extract_ms "$PROBE2_OUT")"
-          if [ -z "$PROBE2_MS" ] || [ "$PROBE2_MS" = "null" ]; then
-            echo "::notice::Agent-boot gate skipped: runner booted once but can't sustain consecutive boots (clone cleanup or VZ resource limit)."
+          PROBE2_MS="$(extract_success_ms "$PROBE2_OUT")"
+          if [ -z "$PROBE2_MS" ]; then
+            echo "::notice::Agent-boot gate skipped: runner booted once but failed the second boot (clone cleanup or VZ resource limit)."
             echo "Probe 2 output (truncated):"
             printf '%s\n' "$PROBE2_OUT" | head -20
             exit 0
@@ -112,7 +121,14 @@ jobs:
           echo "Measuring cold-boot duration over 5 iterations..."
           MEASUREMENTS=()
           for i in 1 2 3 4 5; do
-            MS=$("$BIN" run "true" 2>/dev/null | jq -r '.duration_ms')
+            OUT="$(run_once || true)"
+            MS="$(extract_success_ms "$OUT")"
+            if [ -z "$MS" ]; then
+              echo "::error::Iteration $i failed to produce a successful boot envelope."
+              echo "Iteration output (truncated):"
+              printf '%s\n' "$OUT" | head -20
+              exit 1
+            fi
             echo "  iter $i: ${MS}ms"
             MEASUREMENTS+=("$MS")
           done
