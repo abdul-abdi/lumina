@@ -151,6 +151,26 @@ Bundles live at `~/.lumina/desktop-vms/<uuid>/` and are visible to both
 CLI and the Lumina Desktop app (v0.7.0 M6). Agents that don't need
 graphical interaction should continue to use `session start` + `exec`.
 
+#### ARM64-only
+
+Lumina only boots aarch64 guests. `lumina desktop create` runs an
+architecture pre-flight on the supplied `--iso` and rejects x86_64 / RISC-V
+ISOs with a clear error. Pass `--force` to skip the check (intended for
+ISOs whose EFI bootloader filename is non-standard; you'll find out very
+quickly if it doesn't actually boot).
+
+#### Windows 11 ARM caveats
+
+- The ISO must be Microsoft's "Windows 11 (multi-edition) ARM64" retail
+  ISO. Microsoft requires a Microsoft Account to download; Lumina cannot
+  redistribute. Drop the downloaded ISO on `desktop create --iso`.
+- A few keys hit a translation gap between macOS HID and Windows 11 ARM's
+  inbox keyboard driver — most visibly the backslash and the F-key row.
+  v0.7.0 ships the remap table at `Sources/LuminaBootable/WindowsSupport.swift`
+  (`WindowsInputQuirks`); the Desktop app (M6) applies it at the input
+  layer when the focused VM is `osFamily == .windows`. Headless `lumina
+  desktop boot` users won't notice — there's no keyboard input over serial.
+
 ## Output Envelope Contract
 
 When stdout is a pipe, `lumina run` and `lumina exec` emit a single JSON

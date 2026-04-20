@@ -91,9 +91,48 @@ struct DesktopCreate: AsyncParsableCommand {
     @Flag(name: .customLong("json"), help: "Emit the resulting manifest as JSON.")
     var emitJSON = false
 
+    @Flag(name: .customLong("force"), help: "Skip ARM64 architecture pre-flight check on the ISO.")
+    var force = false
+
     mutating func run() async throws {
         let memBytes = DesktopHelpers.parseMemoryOrExit(memory)
         let diskBytes = DesktopHelpers.parseDiskOrExit(diskSize)
+
+        // v0.7.0 M4: ARM64 pre-flight check on the ISO. Catches "downloaded
+        // the x86 ISO by accident" before allocating disk + booting.
+        if let iso = isoPath, !force {
+            let isoURL = URL(fileURLWithPath: (iso as NSString).expandingTildeInPath)
+            let arch: ISOInspector.Architecture
+            do {
+                arch = try ISOInspector.detectArchitecture(at: isoURL)
+            } catch ISOInspector.Error.fileNotFound {
+                FileHandle.standardError.write(Data("error: ISO not found: \(iso)\n".utf8))
+                throw ExitCode(2)
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "warning: could not inspect ISO \(iso) (\(error)); proceeding.\n".utf8
+                ))
+                arch = .unknown
+            }
+            switch arch {
+            case .arm64:
+                break
+            case .x86_64:
+                FileHandle.standardError.write(Data(
+                    "error: \(iso) is an x86_64 ISO. Lumina only boots ARM64 (aarch64) guests on Apple Silicon. Use --force to override.\n".utf8
+                ))
+                throw ExitCode(2)
+            case .riscv64:
+                FileHandle.standardError.write(Data(
+                    "error: \(iso) is a RISC-V ISO. Lumina only boots ARM64 (aarch64) guests. Use --force to override.\n".utf8
+                ))
+                throw ExitCode(2)
+            case .unknown:
+                FileHandle.standardError.write(Data(
+                    "warning: could not detect ISO architecture for \(iso); proceeding anyway. Pass --force to silence this warning.\n".utf8
+                ))
+            }
+        }
 
         let osFamily: OSFamily
         switch osVariant.lowercased() {
