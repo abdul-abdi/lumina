@@ -17,6 +17,8 @@ One function call. ~390ms cold start. ~31ms warm exec. Zero host access.
 
 ![demo](demo.gif)
 
+**🤖 Building with an AI agent?** → [`AGENTS.md`](AGENTS.md) is the agent-facing reference — wire protocol, unified JSON envelope, error states, PTY, port forwarding. Drop it into your agent's context as-is.
+
 </div>
 
 ---
@@ -173,7 +175,7 @@ For `lumina run`, resources come from env vars only. For `lumina session start`,
 
 ## Learn More
 
-- **[AGENT.md](AGENT.md)** — compact agent-facing reference: protocol, envelope, error states, PTY, port forwarding
+- **[AGENTS.md](AGENTS.md)** — compact agent-facing reference: protocol, envelope, error states, PTY, port forwarding
 - **[Architecture](https://github.com/abdul-abdi/lumina/wiki/Architecture)** — VM actor, executor pinning, CommandRunner dispatcher, session IPC, PTY + port-forward paths
 - **[Protocol Reference](https://github.com/abdul-abdi/lumina/wiki/Protocol-Reference)** — full vsock + session IPC wire formats
 - **[CLI Reference](https://github.com/abdul-abdi/lumina/wiki/CLI-Reference)** — every command and flag

@@ -1,8 +1,12 @@
 # Lumina — Agent Guide
 
-This file describes Lumina from the perspective of an AI coding agent driving it.
-If you are Claude Code (or any other agent) and you have been told to use Lumina,
-read this page first. Everything here reflects what ships in v0.6.0.
+> This file follows the [agents.md](https://agents.md) open standard — stewarded by the
+> Agentic AI Foundation under the Linux Foundation and read by Claude Code, Codex, Jules,
+> Cursor, Aider, Copilot, and other AI coding tools.
+
+This file describes Lumina from the perspective of an AI coding agent driving it. If you
+are any such agent and you have been told to use Lumina, read this page first. Everything
+here reflects what ships in v0.6.0.
 
 ## What Lumina Is
 
