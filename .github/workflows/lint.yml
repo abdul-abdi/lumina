@@ -65,19 +65,24 @@ jobs:
           ${{ steps.get_actionlint.outputs.path }} -color
 
   # ── Warning count budget ───────────────────────────────────────
-  # Advisory during bootstrap. Once a baseline is agreed, flip
-  # `continue-on-error` off and fail on regression.
+  # Baseline pinned to current CI count so any new warning fails the
+  # check. Ratchet DOWN as warnings are fixed; never UP without a
+  # deliberate decision documented in the commit message. The goal is
+  # monotonic non-regression — we don't pretend the codebase is
+  # warning-free, we just commit to not adding more.
   warning-budget:
     name: Warning budget
     runs-on: macos-15
-    continue-on-error: true
     permissions:
       contents: read
     env:
-      # Bump deliberately when new warnings are introduced and justified;
-      # ratchet down when warnings are fixed. Start loose, tighten over
-      # time. The goal is monotonic non-regression.
-      MAX_WARNINGS: "50"
+      # Current baseline on macos-15 + Swift 6 toolchain. Dominant
+      # sources: `nonisolated(unsafe)` no-op warnings on non-Sendable
+      # properties held on @MainActor classes (LuminaDesktopSession,
+      # AppModel), and `init(cString:)` deprecations in HostInfo +
+      # VM.swift. All three categories are mechanical to fix; this
+      # budget should drop as they do.
+      MAX_WARNINGS: "70"
     steps:
       - uses: actions/checkout@v4
 
