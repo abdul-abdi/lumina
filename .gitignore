@@ -35,3 +35,6 @@ docs/
 
 # Demo recording tooling (GIF is generated output; tape is dev-only)
 demo.tape
+
+# Git worktrees for parallel feature development
+.worktrees/
