@@ -31,6 +31,14 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/Lumina"
 
+# Embed app icon. Generate it on the fly if missing.
+ICON_SRC="scripts/AppIcon.icns"
+if [ ! -f "$ICON_SRC" ]; then
+    echo "→ Icon not found; running scripts/generate-icon.swift"
+    swift scripts/generate-icon.swift > /dev/null
+fi
+cp "$ICON_SRC" "$APP_DIR/Contents/Resources/AppIcon.icns"
+
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49,6 +57,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

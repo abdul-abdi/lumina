@@ -14,22 +14,35 @@ struct LuminaDesktopApp: App {
     @State private var openVMID: UUID?
 
     var body: some Scene {
-        WindowGroup("Lumina") {
+        WindowGroup("Lumina", id: "library") {
             LibraryView(model: model)
                 .onReceive(NotificationCenter.default.publisher(for: .luminaOpenVMWindow)) { note in
                     if let id = note.object as? UUID {
                         openVMID = id
-                        // The WindowGroup below opens for `openVMID` via .openWindow.
-                        openVMWindow(for: id)
                     }
                 }
         }
+        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 1200, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("New VM") {
+                Button("New VM…") {
                     NotificationCenter.default.post(name: Notification.Name("LuminaShowWizard"), object: nil)
                 }
                 .keyboardShortcut("n", modifiers: .command)
+            }
+            CommandGroup(replacing: .appInfo) {
+                Button("About Lumina") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .applicationName: "Lumina",
+                        .applicationVersion: "0.7.0",
+                        .credits: NSAttributedString(
+                            string: "Native Apple Workload Runtime for Agents.\nBoot a VM. Run a command. Parse the JSON.",
+                            attributes: [.foregroundColor: NSColor.secondaryLabelColor]
+                        )
+                    ])
+                }
             }
         }
 
@@ -41,21 +54,14 @@ struct LuminaDesktopApp: App {
                 Text("VM not found").padding()
             }
         }
+        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: true))
 
         Settings {
             PreferencesView(model: model)
         }
     }
 
-    @MainActor
-    private func openVMWindow(for id: UUID) {
-        // SwiftUI's openWindow(id:value:) is the correct API; this helper
-        // keeps the call site minimal. See the WindowGroup(id:for:) above.
-        // Implementation detail: SwiftUI doesn't expose openWindow from
-        // outside an EnvironmentValues-bearing view, so views call openWindow
-        // themselves via @Environment(\.openWindow). The notification path
-        // is a fallback for now.
-    }
 }
 
 @MainActor

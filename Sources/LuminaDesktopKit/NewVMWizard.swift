@@ -120,7 +120,11 @@ public struct NewVMWizard: View {
                 .buttonStyle(.plain)
             }
 
-            LuminaPrimaryButton(label: step == .review ? "CREATE VM →" : "NEXT →") {
+            PrimaryAction(
+                label: step == .review ? "Create VM" : "Next",
+                systemImage: step == .review ? "checkmark" : "arrow.right",
+                isPrimary: true
+            ) {
                 next()
             }
             .keyboardShortcut(.return, modifiers: .command)
