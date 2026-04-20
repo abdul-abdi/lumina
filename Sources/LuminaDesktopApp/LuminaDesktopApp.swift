@@ -26,24 +26,7 @@ struct LuminaDesktopApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1200, height: 720)
         .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("New VM…") {
-                    NotificationCenter.default.post(name: Notification.Name("LuminaShowWizard"), object: nil)
-                }
-                .keyboardShortcut("n", modifiers: .command)
-            }
-            CommandGroup(replacing: .appInfo) {
-                Button("About Lumina") {
-                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
-                        .applicationName: "Lumina",
-                        .applicationVersion: "0.7.0",
-                        .credits: NSAttributedString(
-                            string: "Native Apple Workload Runtime for Agents.\nBoot a VM. Run a command. Parse the JSON.",
-                            attributes: [.foregroundColor: NSColor.secondaryLabelColor]
-                        )
-                    ])
-                }
-            }
+            LuminaCommands(model: model)
         }
 
         WindowGroup(id: "vm-window", for: UUID.self) { $vmID in
@@ -62,6 +45,193 @@ struct LuminaDesktopApp: App {
         }
     }
 
+}
+
+// ── MENU BAR ──────────────────────────────────────────────────────
+/// Full macOS menu bar. The native place for every verb. Fullscreen
+/// users get a menu at the top of the screen via the OS's automatic
+/// menu-reveal-on-hover. First-time discovery happens here, not in a
+/// floating toast.
+@MainActor
+struct LuminaCommands: Commands {
+    @Bindable var model: AppModel
+
+    var body: some Commands {
+        // ── Lumina menu (app menu) ──
+        CommandGroup(replacing: .appInfo) {
+            Button("About Lumina") {
+                NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                    .applicationName: "Lumina",
+                    .applicationVersion: "0.7.0",
+                    .credits: NSAttributedString(
+                        string: "Native Apple Workload Runtime for Agents.\nBoot a VM. Run a command. Parse the JSON.",
+                        attributes: [.foregroundColor: NSColor.secondaryLabelColor]
+                    )
+                ])
+            }
+        }
+
+        // ── File menu ──
+        CommandGroup(replacing: .newItem) {
+            Button("New VM…") {
+                NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+            }
+            .keyboardShortcut("n", modifiers: .command)
+
+            Menu("New VM from OS") {
+                Button("Ubuntu 24.04 LTS") { openWizard(tile: "ubuntu-24.04") }
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
+                Button("Kali (rolling)") { openWizard(tile: "kali-rolling") }
+                Button("Fedora Workstation 41") { openWizard(tile: "fedora-41") }
+                Button("Debian 12") { openWizard(tile: "debian-12") }
+                Divider()
+                Button("Windows 11 on ARM") { openWizard(tile: "windows-11-arm") }
+                    .keyboardShortcut("w", modifiers: [.command, .shift])
+                Button("macOS (latest)") { openWizard(tile: "macos-latest") }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
+                Divider()
+                Button("From ISO or IPSW file…") { openWizard(tile: "byo-file") }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+            }
+
+            Divider()
+
+            Button("Open Bundle…") {
+                let panel = NSOpenPanel()
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = true
+                panel.canChooseFiles = false
+                panel.title = "Open .luminaVM bundle"
+                if panel.runModal() == .OK, let _ = panel.url {
+                    model.refresh()
+                }
+            }
+            .keyboardShortcut("o", modifiers: .command)
+        }
+
+        // ── VM menu ──
+        CommandMenu("VM") {
+            Button("Boot Selected") { runSelected(.boot) }
+                .keyboardShortcut("b", modifiers: .command)
+                .disabled(model.selection == nil)
+            Button("Stop Selected") { runSelected(.stop) }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(model.selection == nil)
+            Button("Restart Selected") { runSelected(.restart) }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(model.selection == nil)
+            Divider()
+            Button("Take Snapshot") { runSelected(.snapshot) }
+                .keyboardShortcut("t", modifiers: .command)
+                .disabled(model.selection == nil)
+            Button("Clone VM…") { runSelected(.clone) }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(model.selection == nil)
+            Divider()
+            Button("Reveal in Finder") { runSelected(.reveal) }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(model.selection == nil)
+            Button("Delete…") { runSelected(.delete) }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(model.selection == nil)
+            Divider()
+            Button("Enter Full Screen") { enterFullscreen() }
+                .keyboardShortcut("f", modifiers: [.command, .control])
+        }
+
+        // ── View menu ──
+        CommandGroup(after: .toolbar) {
+            Button("Open Command Launcher") {
+                NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+            }
+            .keyboardShortcut("k", modifiers: .command)
+            Divider()
+            Button("Grid Layout") {
+                UserDefaults.standard.set("grid", forKey: "lumina.layout")
+            }
+            .keyboardShortcut("1", modifiers: .command)
+            Button("List Layout") {
+                UserDefaults.standard.set("list", forKey: "lumina.layout")
+            }
+            .keyboardShortcut("2", modifiers: .command)
+            Divider()
+            Menu("Appearance") {
+                Button("System") { setAppearance("system") }
+                Button("Light") { setAppearance("light") }
+                Button("Dark") { setAppearance("dark") }
+            }
+        }
+
+        // ── Help menu ──
+        CommandGroup(replacing: .help) {
+            Button("Lumina Documentation") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki")!)
+            }
+            Button("Keyboard Shortcuts") {
+                NotificationCenter.default.post(name: .luminaShowShortcuts, object: nil)
+            }
+            .keyboardShortcut("/", modifiers: .command)
+            Divider()
+            Button("Report an Issue…") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/issues/new")!)
+            }
+            Button("Release Notes") {
+                NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/releases")!)
+            }
+        }
+    }
+
+    // ── Helpers ──
+
+    private enum VMAction {
+        case boot, stop, restart, snapshot, clone, reveal, delete
+    }
+
+    private func runSelected(_ action: VMAction) {
+        guard let id = model.selection,
+              let bundle = model.bundles.first(where: { $0.manifest.id == id }) else { return }
+        let session = model.session(for: bundle)
+        switch action {
+        case .boot: Task { await session.boot() }
+        case .stop: Task { await session.shutdown() }
+        case .restart: Task {
+            await session.shutdown()
+            await session.boot()
+        }
+        case .snapshot: break  // wired in M8
+        case .clone: break
+        case .reveal: NSWorkspace.shared.activateFileViewerSelecting([bundle.rootURL])
+        case .delete:
+            let alert = NSAlert()
+            alert.messageText = "Move '\(bundle.manifest.name)' to Trash?"
+            alert.informativeText = "The bundle disk image and snapshots will be moved. You can restore from Trash."
+            alert.addButton(withTitle: "Move to Trash")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            if alert.runModal() == .alertFirstButtonReturn {
+                model.deleteBundle(bundle)
+            }
+        }
+    }
+
+    private func openWizard(tile: String) {
+        NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: tile)
+    }
+
+    private func setAppearance(_ raw: String) {
+        UserDefaults.standard.set(raw, forKey: "lumina.appearance")
+    }
+
+    private func enterFullscreen() {
+        if let w = NSApp.keyWindow {
+            w.toggleFullScreen(nil)
+        }
+    }
+}
+
+public extension Notification.Name {
+    static let luminaShowLauncher = Notification.Name("LuminaShowLauncher")
+    static let luminaShowShortcuts = Notification.Name("LuminaShowShortcuts")
 }
 
 @MainActor
