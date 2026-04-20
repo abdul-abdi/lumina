@@ -52,6 +52,7 @@ let package = Package(
             name: "lumina-cli",
             dependencies: [
                 "Lumina",
+                "LuminaBootable",  // v0.7.0 M3+: lumina desktop subcommand tree
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
