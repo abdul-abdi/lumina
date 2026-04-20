@@ -106,6 +106,51 @@ Unreachable sessions (stale socket, crashed process) appear as
 
 Clean teardown. Idempotent — stopping an already-stopped SID is not an error.
 
+### `lumina desktop` (v0.7.0+, experimental)
+
+Desktop VMs are a different primitive from agent sessions: they boot a
+full installer ISO (Ubuntu, Kali, Fedora, Debian, Windows 11 ARM, macOS)
+into a persistent `.luminaVM` bundle. They have NO `lumina-agent` inside —
+you cannot `exec` commands in them. Use them when you want the graphical
+OS for interactive work; use agent sessions when you want scripted
+execution.
+
+```bash
+# Create an empty .luminaVM bundle + stage an installer ISO.
+lumina desktop create \
+    --name "Ubuntu 24.04" \
+    --os-variant ubuntu-24.04 \
+    --memory 4GB --cpus 2 --disk-size 32GB \
+    --iso ~/Downloads/ubuntu-24.04-arm64.iso
+
+# Boot the bundle (blocks until Ctrl-C).
+lumina desktop boot ~/.lumina/desktop-vms/<id>/ --serial /tmp/ubuntu.log
+
+# List desktop bundles.
+lumina desktop ls           # human-readable on TTY
+lumina desktop ls --json    # machine-readable
+
+# JSON shape from `desktop ls`:
+# [
+#   {
+#     "id": "<uuid>",
+#     "name": "Ubuntu 24.04",
+#     "osFamily": "linux",
+#     "osVariant": "ubuntu-24.04",
+#     "memoryBytes": 4294967296,
+#     "cpuCount": 2,
+#     "diskBytes": 34359738368,
+#     "createdAt": "2026-04-20T...Z",
+#     "lastBootedAt": null,
+#     "schemaVersion": 1
+#   }
+# ]
+```
+
+Bundles live at `~/.lumina/desktop-vms/<uuid>/` and are visible to both
+CLI and the Lumina Desktop app (v0.7.0 M6). Agents that don't need
+graphical interaction should continue to use `session start` + `exec`.
+
 ## Output Envelope Contract
 
 When stdout is a pipe, `lumina run` and `lumina exec` emit a single JSON
