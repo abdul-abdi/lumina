@@ -57,7 +57,7 @@ public struct LibraryView: View {
     @State private var section: SidebarSection = .all
     @State private var showingWizard = false
     @State private var wizardInitialTile: String? = nil
-    @State private var hoveringID: UUID?
+    @State private var showingLauncher = false
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
     @AppStorage("lumina.layout") private var layoutRaw: String = LibraryLayout.list.rawValue
 
@@ -112,6 +112,40 @@ public struct LibraryView: View {
             NewVMWizard(model: model, isPresented: $showingWizard,
                         initialTileID: wizardInitialTile)
                 .onDisappear { wizardInitialTile = nil }
+        }
+        .sheet(isPresented: $showingLauncher) {
+            CommandLauncher(model: model, isPresented: $showingLauncher)
+        }
+        .background(
+            // Global ⌘K / ⌘P shortcut even when focus is on sidebar
+            Button("") { showingLauncher = true }
+                .keyboardShortcut("k", modifiers: .command)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+        )
+        .onReceive(NotificationCenter.default.publisher(for: .luminaLauncherOpenWizard)) { note in
+            if let tileID = note.object as? String {
+                showWizard(preselect: tileID)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            Task { await handleDrop(providers) }
+            return true
+        }
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) async {
+        for provider in providers {
+            if let url = try? await provider.loadItem(forTypeIdentifier: "public.file-url") as? URL {
+                let ext = url.pathExtension.lowercased()
+                guard ["iso", "img", "ipsw"].contains(ext) else { continue }
+                // Stage the file as a BYO-flavored wizard launch.
+                wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
+                showingWizard = true
+                // Persist the chosen file path for the wizard to pick up.
+                UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
+                break
+            }
         }
     }
 
@@ -182,17 +216,9 @@ public struct LibraryView: View {
             } else {
                 switch layout {
                 case .grid:
-                    VMGridView(
-                        model: model,
-                        bundles: filteredForSection,
-                        hoveringID: $hoveringID
-                    )
+                    VMGridView(model: model, bundles: filteredForSection)
                 case .list:
-                    VMListView(
-                        model: model,
-                        bundles: filteredForSection,
-                        hoveringID: $hoveringID
-                    )
+                    VMListView(model: model, bundles: filteredForSection)
                 }
             }
         }
@@ -245,25 +271,24 @@ public struct AppearanceMenu: View {
     }
 
     public var body: some View {
-        Menu {
+        // Picker-in-menu-style handles "current selection" natively with a
+        // checkmark. The conditional-checkmark inside a Button label that
+        // the old code used was silently broken — the Button only renders
+        // its first child, so the checkmark never appeared and the user
+        // couldn't tell which mode was active.
+        Picker(selection: $appearanceRaw) {
             ForEach(AppearancePreference.allCases, id: \.rawValue) { pref in
-                Button {
-                    appearanceRaw = pref.rawValue
-                } label: {
-                    Label(pref.label, systemImage: pref.glyph)
-                    if current == pref {
-                        Image(systemName: "checkmark")
-                    }
-                }
+                Label(pref.label, systemImage: pref.glyph).tag(pref.rawValue)
             }
         } label: {
             Image(systemName: current.glyph)
-                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(LuminaTheme.accent)
-                .frame(width: 22, height: 22)
         }
+        .pickerStyle(.menu)
         .menuStyle(.borderlessButton)
-        .help("Appearance — currently \(current.label)")
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Appearance — \(current.label)")
     }
 }
 
@@ -695,7 +720,6 @@ struct OSStripe: View {
 public struct VMGridView: View {
     @Bindable var model: AppModel
     let bundles: [VMBundle]
-    @Binding var hoveringID: UUID?
     @Environment(\.openWindow) private var openWindow
 
     private let columns = [
@@ -707,9 +731,7 @@ public struct VMGridView: View {
             LazyVGrid(columns: columns, spacing: 14) {
                 ForEach(bundles, id: \.manifest.id) { bundle in
                     VMCard(model: model, bundle: bundle,
-                           isHovering: hoveringID == bundle.manifest.id,
                            openWindow: { openWindow(id: "vm-window", value: bundle.manifest.id) })
-                        .onHover { h in hoveringID = h ? bundle.manifest.id : nil }
                 }
             }
             .padding(20)
@@ -721,8 +743,8 @@ public struct VMGridView: View {
 public struct VMCard: View {
     @Bindable var model: AppModel
     let bundle: VMBundle
-    let isHovering: Bool
     let openWindow: () -> Void
+    @State private var isHovering = false
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)
@@ -744,6 +766,7 @@ public struct VMCard: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .animation(.easeOut(duration: 0.12), value: isHovering)
+        .onHover { isHovering = $0 }
         .onTapGesture { openWindow() }
         .contextMenu {
             Button("Open") { openWindow() }
@@ -793,7 +816,6 @@ public struct VMCard: View {
 public struct VMListView: View {
     @Bindable var model: AppModel
     let bundles: [VMBundle]
-    @Binding var hoveringID: UUID?
     @Environment(\.openWindow) private var openWindow
 
     public var body: some View {
@@ -820,9 +842,7 @@ public struct VMListView: View {
 
                 LazyVStack(spacing: 1) {
                     ForEach(bundles, id: \.manifest.id) { bundle in
-                        VMRow(model: model, bundle: bundle,
-                              isHovering: hoveringID == bundle.manifest.id)
-                            .onHover { h in hoveringID = h ? bundle.manifest.id : nil }
+                        VMRow(model: model, bundle: bundle)
                             .onTapGesture {
                                 openWindow(id: "vm-window", value: bundle.manifest.id)
                             }
@@ -849,7 +869,7 @@ public struct VMListView: View {
 public struct VMRow: View {
     @Bindable var model: AppModel
     let bundle: VMBundle
-    let isHovering: Bool
+    @State private var isHovering = false
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)
@@ -917,6 +937,7 @@ public struct VMRow: View {
             alignment: .bottom
         )
         .animation(.easeOut(duration: 0.08), value: isHovering)
+        .onHover { isHovering = $0 }
         .contextMenu {
             Button("Open") {
                 NotificationCenter.default.post(name: .luminaOpenVMWindow, object: bundle.manifest.id)
