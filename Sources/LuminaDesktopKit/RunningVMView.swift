@@ -14,6 +14,11 @@ public struct RunningVMView: View {
     @State private var vzMachine: VZVirtualMachine?
     @State private var showReleaseToast = false
     @State private var bootingDots = 0
+    @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
+
+    private var appearance: AppearancePreference {
+        AppearancePreference(rawValue: appearanceRaw) ?? .system
+    }
 
     public init(session: LuminaDesktopSession) {
         self.session = session
@@ -29,7 +34,7 @@ public struct RunningVMView: View {
                     .padding(.top, 16)
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(appearance.colorScheme)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 toolbarButton("⏻ STOP", color: LuminaTheme.err) {

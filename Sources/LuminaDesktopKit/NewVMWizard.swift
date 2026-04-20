@@ -45,7 +45,7 @@ public struct NewVMWizard: View {
         }
         .frame(width: 760, height: 560)
         .background(LuminaTheme.bg)
-        .preferredColorScheme(.dark)
+        // Inherit from parent — respects AppearancePreference toggle.
         .animation(.easeInOut(duration: 0.18), value: step)
     }
 
