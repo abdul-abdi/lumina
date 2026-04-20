@@ -112,6 +112,100 @@ import Testing
     takeSendable(AgentImageRef(image: "x"))
 }
 
+@Test func efiBootConfig_allFieldsRoundTrip() {
+    let tmp = FileManager.default.temporaryDirectory
+    let cfg = EFIBootConfig(
+        variableStoreURL: tmp.appendingPathComponent("efi.vars"),
+        primaryDisk: tmp.appendingPathComponent("disk.img"),
+        cdromISO: tmp.appendingPathComponent("cd.iso"),
+        extraDisks: [tmp.appendingPathComponent("data.img")]
+    )
+    #expect(cfg.variableStoreURL.lastPathComponent == "efi.vars")
+    #expect(cfg.primaryDisk.lastPathComponent == "disk.img")
+    #expect(cfg.cdromISO?.lastPathComponent == "cd.iso")
+    #expect(cfg.extraDisks.count == 1)
+}
+
+@Test func efiBootConfig_optionalCdromNil() {
+    let tmp = FileManager.default.temporaryDirectory
+    let cfg = EFIBootConfig(
+        variableStoreURL: tmp.appendingPathComponent("v"),
+        primaryDisk: tmp.appendingPathComponent("d")
+    )
+    #expect(cfg.cdromISO == nil)
+    #expect(cfg.extraDisks.isEmpty)
+}
+
+@Test func macOSBootConfig_storesPaths() {
+    let tmp = FileManager.default.temporaryDirectory
+    let cfg = MacOSBootConfig(
+        ipsw: tmp.appendingPathComponent("UniversalMac.ipsw"),
+        auxiliaryStorage: tmp.appendingPathComponent("aux.img"),
+        primaryDisk: tmp.appendingPathComponent("disk.img")
+    )
+    #expect(cfg.ipsw.lastPathComponent == "UniversalMac.ipsw")
+    #expect(cfg.auxiliaryStorage.lastPathComponent == "aux.img")
+    #expect(cfg.primaryDisk.lastPathComponent == "disk.img")
+    #expect(cfg.hardwareModel == nil)
+    #expect(cfg.machineIdentifier == nil)
+}
+
+@Test func bootableProfile_agentCase() {
+    let p = BootableProfile.agent(AgentImageRef(image: "default"))
+    if case .agent(let ref) = p {
+        #expect(ref.image == "default")
+    } else {
+        Issue.record("expected .agent case")
+    }
+}
+
+@Test func bootableProfile_efiCase() {
+    let tmp = FileManager.default.temporaryDirectory
+    let p = BootableProfile.efi(EFIBootConfig(
+        variableStoreURL: tmp.appendingPathComponent("v"),
+        primaryDisk: tmp.appendingPathComponent("d")
+    ))
+    if case .efi = p {} else { Issue.record("expected .efi case") }
+}
+
+@Test func bootableProfile_macOSCase() {
+    let tmp = FileManager.default.temporaryDirectory
+    let p = BootableProfile.macOS(MacOSBootConfig(
+        ipsw: tmp.appendingPathComponent("i"),
+        auxiliaryStorage: tmp.appendingPathComponent("a"),
+        primaryDisk: tmp.appendingPathComponent("d")
+    ))
+    if case .macOS = p {} else { Issue.record("expected .macOS case") }
+}
+
+@Test func vmOptions_defaultBootableIsNil() {
+    let opts = VMOptions.default
+    #expect(opts.bootable == nil)
+}
+
+@Test func vmOptions_effectiveBootable_derivesAgentFromImage() {
+    var opts = VMOptions.default
+    opts.image = "my-custom"
+    let effective = opts.effectiveBootable
+    if case .agent(let ref) = effective {
+        #expect(ref.image == "my-custom")
+    } else {
+        Issue.record("expected derived .agent profile")
+    }
+}
+
+@Test func vmOptions_effectiveBootable_preservesExplicitEFI() {
+    let tmp = FileManager.default.temporaryDirectory
+    var opts = VMOptions.default
+    opts.bootable = .efi(EFIBootConfig(
+        variableStoreURL: tmp.appendingPathComponent("v"),
+        primaryDisk: tmp.appendingPathComponent("d")
+    ))
+    if case .efi = opts.effectiveBootable {} else {
+        Issue.record("explicit .efi should survive")
+    }
+}
+
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
     // Create a temp image with rosetta metadata
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-types-\(UUID().uuidString)")

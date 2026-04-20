@@ -185,6 +185,73 @@ public struct AgentImageRef: Sendable, Equatable {
     }
 }
 
+/// Configuration for a VZEFIBootLoader-based guest (Linux ISO boot, Windows 11 ARM).
+///
+/// The caller supplies URLs for the EFI variable store, primary read-write disk,
+/// optional CD-ROM ISO for installer boots, and any extra virtio block devices.
+/// `LuminaBootable.EFIBootable` (M3) consumes this to configure a
+/// `VZVirtualMachineConfiguration`.
+public struct EFIBootConfig: Sendable, Equatable {
+    public var variableStoreURL: URL
+    public var primaryDisk: URL
+    public var cdromISO: URL?
+    public var extraDisks: [URL]
+
+    public init(
+        variableStoreURL: URL,
+        primaryDisk: URL,
+        cdromISO: URL? = nil,
+        extraDisks: [URL] = []
+    ) {
+        self.variableStoreURL = variableStoreURL
+        self.primaryDisk = primaryDisk
+        self.cdromISO = cdromISO
+        self.extraDisks = extraDisks
+    }
+}
+
+/// Configuration for a VZMacOSVirtualMachine-based guest (M5).
+///
+/// Hardware model + machine identifier are persisted as raw `Data` because
+/// `VZMacHardwareModel` / `VZMacMachineIdentifier` are not `Sendable` and
+/// their canonical representation is `dataRepresentation`. Nil values mean
+/// "pick a reasonable default at install time" — the installer fills them in
+/// and the final values persist in the VM bundle.
+public struct MacOSBootConfig: Sendable, Equatable {
+    public var ipsw: URL
+    public var auxiliaryStorage: URL
+    public var primaryDisk: URL
+    public var hardwareModel: Data?
+    public var machineIdentifier: Data?
+
+    public init(
+        ipsw: URL,
+        auxiliaryStorage: URL,
+        primaryDisk: URL,
+        hardwareModel: Data? = nil,
+        machineIdentifier: Data? = nil
+    ) {
+        self.ipsw = ipsw
+        self.auxiliaryStorage = auxiliaryStorage
+        self.primaryDisk = primaryDisk
+        self.hardwareModel = hardwareModel
+        self.machineIdentifier = machineIdentifier
+    }
+}
+
+/// Describes how a VM should boot.
+///
+/// `.agent` preserves the v0.6.0 headless contract (Linux kernel + initrd +
+/// lumina-agent + vsock). `.efi` and `.macOS` are the v0.7.0 full-OS paths.
+/// When `VMOptions.bootable` is nil, `effectiveBootable` derives
+/// `.agent(AgentImageRef(image: options.image))` so agent callers never have
+/// to populate this field.
+public enum BootableProfile: Sendable, Equatable {
+    case agent(AgentImageRef)
+    case efi(EFIBootConfig)
+    case macOS(MacOSBootConfig)
+}
+
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {
@@ -202,6 +269,24 @@ public struct VMOptions: Sendable {
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
     public var graphics: GraphicsConfig?
+    /// v0.7.0 M3: optional override for how this VM boots. `nil` means "use
+    /// the headless agent path with `image`." Non-nil wins over `image`.
+    ///
+    /// Regression-gate invariant: the agent cold-boot path cannot read any
+    /// `.efi` / `.macOS` code. The VM actor consults this property only when
+    /// building the VZ configuration — never on the agent fast path.
+    public var bootable: BootableProfile?
+
+    /// Resolves `bootable` to a concrete profile.
+    ///
+    /// Returns `bootable` if set; otherwise falls back to
+    /// `.agent(AgentImageRef(image: self.image))`. Call sites that dispatch
+    /// on the profile (e.g. `VM.boot()`) use this to keep the agent path
+    /// implicit.
+    public var effectiveBootable: BootableProfile {
+        if let b = bootable { return b }
+        return .agent(AgentImageRef(image: image))
+    }
 
     public static let `default` = VMOptions()
 
@@ -216,7 +301,8 @@ public struct VMOptions: Sendable {
         networkIP: String? = nil,
         rosetta: Bool = false,
         diskSize: UInt64? = nil,
-        graphics: GraphicsConfig? = nil
+        graphics: GraphicsConfig? = nil,
+        bootable: BootableProfile? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -229,6 +315,7 @@ public struct VMOptions: Sendable {
         self.rosetta = rosetta
         self.diskSize = diskSize
         self.graphics = graphics
+        self.bootable = bootable
     }
 
     public init(from runOptions: RunOptions) {
@@ -245,6 +332,9 @@ public struct VMOptions: Sendable {
         self.rosetta = ImageStore().readMeta(name: runOptions.image)?.rosetta ?? false
         // Disposable `run` is never a desktop workload.
         self.graphics = nil
+        // Disposable `run` always takes the agent path — the CLI has no way
+        // to build a .luminaVM bundle in one shot today.
+        self.bootable = nil
     }
 }
 
