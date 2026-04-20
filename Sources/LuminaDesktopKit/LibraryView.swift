@@ -88,9 +88,6 @@ public struct LibraryView: View {
         .background(MaterialBackground(material: .underWindowBackground))
         .luminaWindowChrome()
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Color.clear.frame(width: 12, height: 1)
-            }
             ToolbarItem(placement: .principal) {
                 LuminaSearchField(text: $model.search)
                     .frame(width: 320)
@@ -178,7 +175,7 @@ public struct LibraryView: View {
             sidebarRow(.snapshots, count: 0)
         }
         .listStyle(.sidebar)
-        .frame(minWidth: 220, idealWidth: 240, maxWidth: 300)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 300)
         .scrollContentBackground(.hidden)
         .background {
             if #available(macOS 26.0, *) {
@@ -865,6 +862,14 @@ public struct VMCard: View {
     let bundle: VMBundle
     let openWindow: () -> Void
     @State private var isHovering = false
+    @State private var stats: VMLiveStats
+
+    init(model: AppModel, bundle: VMBundle, openWindow: @escaping () -> Void) {
+        self.model = model
+        self.bundle = bundle
+        self.openWindow = openWindow
+        _stats = State(initialValue: VMLiveStats(bundle: bundle))
+    }
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)
@@ -903,6 +908,9 @@ public struct VMCard: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                if session.status == .running {
+                    Heartbeat(color: LuminaTheme.ok)
+                }
                 Text(bundle.manifest.name)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(LuminaTheme.ink)
@@ -913,6 +921,13 @@ public struct VMCard: View {
             VMStatePreview(bundle: bundle, status: session.status,
                            bootedAt: bundle.manifest.lastBootedAt,
                            density: .card)
+            // Live sparkline — the category shift. Disk growth over the
+            // last ~2 minutes; a flat line is idle, a rising line is
+            // the guest writing. You SEE the VM working.
+            DiskSparkline(stats: stats,
+                          tint: LuminaTheme.accent,
+                          running: session.status == .running)
+                .frame(height: 24)
             HStack {
                 Text(bundle.manifest.osVariant)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -990,6 +1005,13 @@ public struct VMRow: View {
     @Bindable var model: AppModel
     let bundle: VMBundle
     @State private var isHovering = false
+    @State private var stats: VMLiveStats
+
+    init(model: AppModel, bundle: VMBundle) {
+        self.model = model
+        self.bundle = bundle
+        _stats = State(initialValue: VMLiveStats(bundle: bundle))
+    }
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)
@@ -999,12 +1021,17 @@ public struct VMRow: View {
         HStack(spacing: 0) {
             OSStripe(family: bundle.manifest.osFamily, height: 44)
             HStack(spacing: 12) {
-                // NAME
+                // NAME + live heartbeat when running
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(bundle.manifest.name)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(LuminaTheme.ink)
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        if session.status == .running {
+                            Heartbeat(color: LuminaTheme.ok)
+                        }
+                        Text(bundle.manifest.name)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(LuminaTheme.ink)
+                            .lineLimit(1)
+                    }
                     Text(bundle.manifest.osVariant)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(LuminaTheme.inkMute)
@@ -1025,12 +1052,18 @@ public struct VMRow: View {
                     .foregroundStyle(LuminaTheme.inkDim)
                     .frame(width: 100, alignment: .leading)
 
-                // DISK
-                Text("\(bundle.diskUsedFormatted) / \(bundle.diskCapFormatted)")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(LuminaTheme.inkDim)
-                    .frame(width: 120, alignment: .leading)
-                    .monospacedDigit()
+                // DISK — text + live sparkline
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(bundle.diskUsedFormatted) / \(bundle.diskCapFormatted)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(LuminaTheme.inkDim)
+                        .monospacedDigit()
+                    DiskSparkline(stats: stats,
+                                  tint: LuminaTheme.accent,
+                                  running: session.status == .running)
+                        .frame(height: 12)
+                }
+                .frame(width: 120, alignment: .leading)
 
                 // SNAPS
                 Text("\(bundle.snapshotCount)")
