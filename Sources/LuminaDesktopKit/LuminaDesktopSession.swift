@@ -100,6 +100,14 @@ public final class LuminaDesktopSession: Identifiable {
             try await newVM.boot()
             self.status = .running
             self.bootDuration = ContinuousClock.now - start
+            // Persist lastBootedAt. On the very first successful boot we
+            // also detach the installer ISO sidecar — the install has
+            // completed and EFI now prefers the HDD, so keeping the CD-ROM
+            // mounted just clutters every card with "installer attached"
+            // forever. Both writes are non-fatal: the FS watcher on
+            // ~/.lumina/desktop-vms will pick the new manifest up; if the
+            // write fails, last-used sort is just slightly stale.
+            persistBootRecord()
             // Attach stop observer so guest-initiated `poweroff`, external
             // crashes, and any other VZ-side termination flip status back
             // to .stopped / .crashed. Without this the menu bar (and the
@@ -109,6 +117,17 @@ public final class LuminaDesktopSession: Identifiable {
             self.status = .crashed(reason: "\(error)")
             self.lastError = "\(error)"
         }
+    }
+
+    private func persistBootRecord() {
+        let isFirstBoot = bundle.manifest.lastBootedAt == nil
+        if isFirstBoot {
+            let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
+            try? FileManager.default.removeItem(at: sidecar)
+        }
+        var updated = bundle
+        updated.manifest.lastBootedAt = Date()
+        try? updated.save()
     }
 
     private func attachStopObserver(to vm: VM) async {

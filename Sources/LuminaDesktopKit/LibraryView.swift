@@ -1063,6 +1063,7 @@ public struct VMListView: View {
 public struct VMRow: View {
     @Bindable var model: AppModel
     let bundle: VMBundle
+    @Environment(\.openWindow) private var openWindow
     @State private var isHovering = false
     @State private var stats: VMLiveStats
 
@@ -1163,7 +1164,7 @@ public struct VMRow: View {
         .onHover { isHovering = $0 }
         .contextMenu {
             Button("Open") {
-                NotificationCenter.default.post(name: .luminaOpenVMWindow, object: bundle.manifest.id)
+                openWindow(id: "vm-window", value: bundle.manifest.id)
             }
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([bundle.rootURL])
@@ -1174,8 +1175,4 @@ public struct VMRow: View {
             }
         }
     }
-}
-
-public extension Notification.Name {
-    static let luminaOpenVMWindow = Notification.Name("LuminaOpenVMWindow")
 }

@@ -11,16 +11,10 @@ import LuminaBootable
 @main
 struct LuminaDesktopApp: App {
     @State private var model = AppModel()
-    @State private var openVMID: UUID?
 
     var body: some Scene {
         WindowGroup("Lumina", id: "library") {
             LibraryView(model: model)
-                .onReceive(NotificationCenter.default.publisher(for: .luminaOpenVMWindow)) { note in
-                    if let id = note.object as? UUID {
-                        openVMID = id
-                    }
-                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))

@@ -30,13 +30,14 @@ public enum OSCatalog {
     public static let allTiles: [OSWizardTile] = [
         // Linux from DesktopOSCatalog
         tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill", accentHex: "#E95420",
-             desc: "Stable LTS release. Server installer with optional desktop environment."),
+             desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
+             constraint: "Server ISO · GUI is a one-liner post-install"),
         tile(for: "kali-rolling", glyph: "shield.lefthalf.filled", accentHex: "#367BF0",
-             desc: "Penetration-testing distribution; rolling release."),
+             desc: "Penetration-testing distribution; rolling release. Installer offers XFCE desktop out of the box."),
         tile(for: "fedora-42", glyph: "circle.grid.cross.fill", accentHex: "#3C6EB4",
-             desc: "Bleeding-edge GNOME experience from Red Hat."),
+             desc: "Bleeding-edge GNOME experience from Red Hat. Live ISO boots straight into the desktop — no post-install steps."),
         tile(for: "debian-12", glyph: "leaf.fill", accentHex: "#A80030",
-             desc: "Conservative, dependable; the foundation many other distros build on."),
+             desc: "Conservative, dependable; the foundation many other distros build on. Netinst lets you pick GNOME/KDE/XFCE during setup."),
 
         // Windows
         OSWizardTile(
@@ -75,7 +76,13 @@ public enum OSCatalog {
         ),
     ]
 
-    private static func tile(for catalogID: String, glyph: String, accentHex: String, desc: String) -> OSWizardTile {
+    private static func tile(
+        for catalogID: String,
+        glyph: String,
+        accentHex: String,
+        desc: String,
+        constraint: String? = nil
+    ) -> OSWizardTile {
         let entry = DesktopOSCatalog.entry(for: catalogID)!
         return OSWizardTile(
             id: catalogID,
@@ -84,7 +91,7 @@ public enum OSCatalog {
             glyph: glyph,
             accentHex: accentHex,
             description: desc,
-            constraint: nil,
+            constraint: constraint,
             acquisition: .catalogISO(entry)
         )
     }

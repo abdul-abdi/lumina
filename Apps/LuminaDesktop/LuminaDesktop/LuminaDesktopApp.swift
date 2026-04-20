@@ -11,18 +11,10 @@ import LuminaBootable
 @main
 struct LuminaDesktopApp: App {
     @State private var model = AppModel()
-    @State private var openVMID: UUID?
 
     var body: some Scene {
         WindowGroup("Lumina") {
             LibraryView(model: model)
-                .onReceive(NotificationCenter.default.publisher(for: .luminaOpenVMWindow)) { note in
-                    if let id = note.object as? UUID {
-                        openVMID = id
-                        // The WindowGroup below opens for `openVMID` via .openWindow.
-                        openVMWindow(for: id)
-                    }
-                }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -45,16 +37,6 @@ struct LuminaDesktopApp: App {
         Settings {
             PreferencesView(model: model)
         }
-    }
-
-    @MainActor
-    private func openVMWindow(for id: UUID) {
-        // SwiftUI's openWindow(id:value:) is the correct API; this helper
-        // keeps the call site minimal. See the WindowGroup(id:for:) above.
-        // Implementation detail: SwiftUI doesn't expose openWindow from
-        // outside an EnvironmentValues-bearing view, so views call openWindow
-        // themselves via @Environment(\.openWindow). The notification path
-        // is a fallback for now.
     }
 }
 
