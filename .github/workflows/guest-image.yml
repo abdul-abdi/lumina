@@ -66,12 +66,12 @@ jobs:
         run: |
           cd /tmp/lumina-image
           chmod 644 vmlinuz rootfs.img
-          FILES="vmlinuz rootfs.img"
-          [ -f initrd ] && chmod 644 initrd && FILES="$FILES initrd"
-          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES="$FILES lumina-agent"
-          [ -d modules ] && chmod 644 modules/* && FILES="$FILES modules/"
+          FILES=(vmlinuz rootfs.img)
+          [ -f initrd ] && chmod 644 initrd && FILES+=(initrd)
+          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES+=(lumina-agent)
+          [ -d modules ] && chmod 644 modules/* && FILES+=(modules/)
           ls -lhR
-          tar czf /tmp/lumina-image-default.tar.gz $FILES
+          tar czf /tmp/lumina-image-default.tar.gz "${FILES[@]}"
           echo ""
           echo "--- Package ---"
           ls -lh /tmp/lumina-image-default.tar.gz

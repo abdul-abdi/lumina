@@ -42,20 +42,27 @@ jobs:
       - name: Install html-tidy
         run: sudo apt-get update && sudo apt-get install -y tidy
 
-      # `tidy` is noisy about cosmetic issues; we run with -q and only
-      # fail on actual parse/structural errors (-errors). This catches
-      # unclosed tags, missing attrs, malformed entities — things that
-      # would break the rendered page.
+      # tidy exit codes: 0 = clean, 1 = warnings only, 2+ = real errors.
+      # Cosmetic warnings (empty tags, optional whitespace) are noisy
+      # and common in generated HTML; we only fail on rc >= 2 so
+      # parse/structural issues block deploy while warnings don't.
       - name: Tidy check (errors only)
         run: |
           set -e
-          for f in $(find web -name '*.html'); do
+          FAILED=0
+          while IFS= read -r -d '' f; do
             echo "→ $f"
-            tidy -q -errors "$f" || {
-              echo "::error file=$f::HTML structural errors detected"
-              exit 1
-            }
-          done
+            set +e
+            OUT=$(tidy -q -errors "$f" 2>&1)
+            RC=$?
+            set -e
+            if [ "$RC" -ge 2 ]; then
+              echo "::error file=$f::HTML structural errors (tidy rc=$RC)"
+              printf '%s\n' "$OUT"
+              FAILED=1
+            fi
+          done < <(find web -name '*.html' -print0)
+          exit "$FAILED"
 
   # ── Build the Pages artifact ───────────────────────────────────
   build:

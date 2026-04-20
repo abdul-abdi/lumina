@@ -86,11 +86,11 @@ jobs:
           chmod 644 vmlinuz rootfs.img
           # Baked images: only vmlinuz + rootfs.img
           # Legacy images: also include initrd, lumina-agent, modules/
-          FILES="vmlinuz rootfs.img"
-          [ -f initrd ] && chmod 644 initrd && FILES="$FILES initrd"
-          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES="$FILES lumina-agent"
-          [ -d modules ] && chmod 644 modules/* && FILES="$FILES modules/"
-          tar czf /tmp/lumina-image-default.tar.gz $FILES
+          FILES=(vmlinuz rootfs.img)
+          [ -f initrd ] && chmod 644 initrd && FILES+=(initrd)
+          [ -f lumina-agent ] && chmod 755 lumina-agent && FILES+=(lumina-agent)
+          [ -d modules ] && chmod 644 modules/* && FILES+=(modules/)
+          tar czf /tmp/lumina-image-default.tar.gz "${FILES[@]}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
