@@ -14,6 +14,8 @@ public struct RunningVMView: View {
     @State private var vzMachine: VZVirtualMachine?
     @State private var showReleaseToast = false
     @State private var bootingDots = 0
+    @State private var isFullscreen = false
+    @State private var showFullscreenChrome = true
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
 
     private var appearance: AppearancePreference {
@@ -28,13 +30,26 @@ public struct RunningVMView: View {
         ZStack(alignment: .top) {
             LuminaTheme.bgInset.ignoresSafeArea()
             framebuffer
+                .ignoresSafeArea(.all, edges: isFullscreen ? .all : [])
             if showReleaseToast {
                 releaseToast
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .padding(.top, 16)
             }
+            if isFullscreen {
+                FullscreenChrome(
+                    visible: $showFullscreenChrome,
+                    sessionName: session.bundle.manifest.name,
+                    onExit: { toggleFullscreen() },
+                    onShutdown: { Task { await session.shutdown() } }
+                )
+            }
         }
         .preferredColorScheme(appearance.colorScheme)
+        .background(
+            FullscreenObserver(isFullscreen: $isFullscreen)
+        )
+        .toolbar(isFullscreen ? .hidden : .automatic, for: .windowToolbar)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 toolbarButton("⏻ STOP", color: LuminaTheme.err) {
@@ -54,6 +69,12 @@ public struct RunningVMView: View {
                 }
                 .keyboardShortcut("t", modifiers: .command)
                 .disabled(!session.status.isLive)
+
+                toolbarButton("⛶ FULLSCREEN") {
+                    toggleFullscreen()
+                }
+                .keyboardShortcut("f", modifiers: [.command, .control])
+                .help("Enter full screen (⌘⌃F). The VM takes over your display.")
             }
         }
         .navigationTitle(session.bundle.manifest.name)
@@ -78,6 +99,12 @@ public struct RunningVMView: View {
                     vzMachine = await session.virtualMachine()
                 }
             }
+        }
+    }
+
+    private func toggleFullscreen() {
+        if let window = NSApp.keyWindow {
+            window.toggleFullScreen(nil)
         }
     }
 
@@ -250,5 +277,154 @@ public struct RunningVMView: View {
         .padding(.vertical, 10)
         .background(LuminaTheme.bg2.opacity(0.95))
         .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+    }
+}
+
+// ── FULLSCREEN — immersive, auto-hiding chrome ────────────────────
+
+/// Observes NSWindow fullscreen transitions and mirrors them into a
+/// SwiftUI @State. Required because SwiftUI doesn't expose fullscreen
+/// state directly — we need the AppKit notification.
+@MainActor
+struct FullscreenObserver: NSViewRepresentable {
+    @Binding var isFullscreen: Bool
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async {
+            guard let window = v.window else { return }
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didEnterFullScreenNotification,
+                object: window, queue: .main
+            ) { _ in
+                self.isFullscreen = true
+            }
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didExitFullScreenNotification,
+                object: window, queue: .main
+            ) { _ in
+                self.isFullscreen = false
+            }
+        }
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+/// Fullscreen chrome — auto-hiding overlay with VM name + exit button.
+/// Appears when the mouse moves near the top of the screen, fades out
+/// after 2 seconds of inactivity. ESC or ⌘⌃F also exits.
+@MainActor
+struct FullscreenChrome: View {
+    @Binding var visible: Bool
+    let sessionName: String
+    let onExit: () -> Void
+    let onShutdown: () -> Void
+    @State private var hideTimer: Task<Void, Never>?
+
+    var body: some View {
+        VStack {
+            if visible {
+                chrome
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+            Spacer()
+        }
+        .onAppear { scheduleHide() }
+        // Track mouse moves to re-reveal the chrome near the top edge.
+        .background(
+            MouseHoverDetector { point in
+                if point.y < 60 {
+                    showChrome()
+                }
+            }
+        )
+        .animation(.easeInOut(duration: 0.25), value: visible)
+    }
+
+    private var chrome: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Circle().fill(LuminaTheme.ok).frame(width: 6, height: 6)
+                Text(sessionName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(LuminaTheme.ink)
+            }
+            Spacer()
+            Button {
+                onShutdown()
+            } label: {
+                Label("STOP", systemImage: "power")
+                    .font(LuminaTheme.label).tracking(1.5)
+                    .foregroundStyle(LuminaTheme.err)
+            }
+            .buttonStyle(.plain)
+            Button {
+                onExit()
+            } label: {
+                Label("EXIT FULL SCREEN", systemImage: "arrow.down.right.and.arrow.up.left")
+                    .font(LuminaTheme.label).tracking(1.5)
+                    .foregroundStyle(LuminaTheme.ink)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.escape, modifiers: [])
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(
+            Capsule().fill(LuminaTheme.bg2.opacity(0.92))
+        )
+        .overlay(
+            Capsule().stroke(LuminaTheme.rule2, lineWidth: 0.5)
+        )
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+    }
+
+    private func showChrome() {
+        withAnimation(.easeInOut(duration: 0.2)) { visible = true }
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTimer?.cancel()
+        hideTimer = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.3)) { visible = false }
+        }
+    }
+}
+
+/// Track mouse position (global coords relative to this view) and fire
+/// a callback. Used by FullscreenChrome to reveal when cursor nears top.
+@MainActor
+struct MouseHoverDetector: NSViewRepresentable {
+    let onMove: (CGPoint) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let v = HoverNSView()
+        v.onMove = onMove
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private class HoverNSView: NSView {
+        var onMove: ((CGPoint) -> Void)?
+        override func updateTrackingAreas() {
+            trackingAreas.forEach { removeTrackingArea($0) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseMoved, .activeAlways, .inVisibleRect],
+                owner: self, userInfo: nil
+            )
+            addTrackingArea(area)
+        }
+        override func mouseMoved(with event: NSEvent) {
+            let p = convert(event.locationInWindow, from: nil)
+            onMove?(CGPoint(x: p.x, y: bounds.height - p.y))  // flip Y
+        }
     }
 }

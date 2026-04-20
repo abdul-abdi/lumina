@@ -58,18 +58,21 @@ public struct LibraryView: View {
     @State private var showingWizard = false
     @State private var wizardInitialTile: String? = nil
     @State private var showingLauncher = false
+    @State private var appearanceState: AppearancePreference
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
     @AppStorage("lumina.layout") private var layoutRaw: String = LibraryLayout.list.rawValue
 
-    private var appearance: AppearancePreference {
-        AppearancePreference(rawValue: appearanceRaw) ?? .system
-    }
     private var layout: LibraryLayout {
         LibraryLayout(rawValue: layoutRaw) ?? .list
     }
 
     public init(model: AppModel) {
         self.model = model
+        // Seed local @State from whatever AppStorage held last session so
+        // the initial render matches the persisted choice without an
+        // extra propagation cycle.
+        let raw = UserDefaults.standard.string(forKey: "lumina.appearance") ?? "system"
+        self._appearanceState = State(initialValue: AppearancePreference(rawValue: raw) ?? .system)
     }
 
     public var body: some View {
@@ -79,7 +82,8 @@ public struct LibraryView: View {
             detail
         }
         .navigationSplitViewStyle(.balanced)
-        .preferredColorScheme(appearance.colorScheme)
+        .preferredColorScheme(appearanceState.colorScheme)
+        .animation(.easeInOut(duration: 0.18), value: appearanceState)
         .frame(minWidth: 1080, minHeight: 660)
         .background(MaterialBackground(material: .underWindowBackground))
         .luminaWindowChrome()
@@ -95,7 +99,7 @@ public struct LibraryView: View {
                 LayoutPicker(layoutRaw: $layoutRaw)
             }
             ToolbarItem(placement: .primaryAction) {
-                AppearanceMenu(appearanceRaw: $appearanceRaw)
+                AppearanceMenu(current: $appearanceState, persistedRaw: $appearanceRaw)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -157,23 +161,24 @@ public struct LibraryView: View {
     // ── SIDEBAR ──────────────────────────────────────────────────
     private var sidebar: some View {
         List(selection: $section) {
-            Section("LIBRARY") {
-                sidebarRow(.all, count: model.bundles.count)
-                sidebarRow(.running, count: model.sessions.values.filter { $0.status.isLive }.count, accent: .green)
-            }
-            Section("BY OS") {
-                let byFamily = Dictionary(grouping: model.bundles, by: { $0.manifest.osFamily })
-                sidebarRow(.linux, count: byFamily[.linux]?.count ?? 0)
-                sidebarRow(.windows, count: byFamily[.windows]?.count ?? 0)
-                sidebarRow(.macOS, count: byFamily[.macOS]?.count ?? 0)
-            }
-            Section("ACTIVITY") {
-                sidebarRow(.downloads, count: 0)
-                sidebarRow(.snapshots, count: 0)
-            }
+            sectionHeader("LIBRARY")
+            sidebarRow(.all, count: model.bundles.count)
+            sidebarRow(.running,
+                       count: model.sessions.values.filter { $0.status.isLive }.count,
+                       accent: LuminaTheme.ok)
+
+            sectionHeader("BY OS")
+            let byFamily = Dictionary(grouping: model.bundles, by: { $0.manifest.osFamily })
+            sidebarRow(.linux, count: byFamily[.linux]?.count ?? 0)
+            sidebarRow(.windows, count: byFamily[.windows]?.count ?? 0)
+            sidebarRow(.macOS, count: byFamily[.macOS]?.count ?? 0)
+
+            sectionHeader("ACTIVITY")
+            sidebarRow(.downloads, count: 0)
+            sidebarRow(.snapshots, count: 0)
         }
         .listStyle(.sidebar)
-        .frame(minWidth: 200, idealWidth: 220, maxWidth: 280)
+        .frame(minWidth: 220, idealWidth: 240, maxWidth: 300)
         .scrollContentBackground(.hidden)
         .background {
             if #available(macOS 26.0, *) {
@@ -182,25 +187,53 @@ public struct LibraryView: View {
                 MaterialBackground(material: .sidebar)
             }
         }
+        .environment(\.defaultMinListRowHeight, 30)
+        // Force the selection tint to our brand amber. .tint() at the
+        // NavigationSplitView level doesn't always cascade into List row
+        // selection — needs to be set on the List/row itself.
+        .accentColor(LuminaTheme.accent)
         .navigationTitle("Lumina")
     }
 
+    /// Section header with proper breathing room. macOS default section
+    /// rendering in sidebar lists is 10pt text jammed against the
+    /// preceding row with ~2pt padding; it reads "squished". This adds
+    /// 14pt top + 4pt bottom + clearer tracking.
+    @ViewBuilder
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 10, weight: .semibold, design: .default))
+            .tracking(1.2)
+            .foregroundStyle(LuminaTheme.inkMute)
+            .padding(.top, 14)
+            .padding(.bottom, 2)
+            .listRowInsets(EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 0))
+            .listRowBackground(Color.clear)
+            .selectionDisabled()
+    }
+
     private func sidebarRow(_ s: SidebarSection, count: Int, accent: Color? = nil) -> some View {
-        Label {
-            HStack {
-                Text(s.rawValue)
-                Spacer()
-                if count > 0 {
-                    Text("\(count)")
-                        .monospacedDigit()
-                        .foregroundStyle(accent ?? LuminaTheme.inkMute)
-                        .font(.caption)
-                }
-            }
-        } icon: {
+        HStack(spacing: 10) {
             Image(systemName: s.systemImage)
+                .font(.system(size: 13, weight: .regular))
                 .foregroundStyle(accent ?? LuminaTheme.accent)
+                .frame(width: 18)
+            Text(s.rawValue)
+                .font(.system(size: 13))
+            Spacer()
+            if count > 0 {
+                Text("\(count)")
+                    .monospacedDigit()
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(accent ?? LuminaTheme.inkMute)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(
+                        Capsule().fill(LuminaTheme.rule.opacity(0.7))
+                    )
+            }
         }
+        .padding(.vertical, 2)
         .tag(s)
     }
 
@@ -214,11 +247,14 @@ public struct LibraryView: View {
             } else if filteredForSection.isEmpty {
                 EmptyFilterView(section: section)
             } else {
-                switch layout {
-                case .grid:
-                    VMGridView(model: model, bundles: filteredForSection)
-                case .list:
-                    VMListView(model: model, bundles: filteredForSection)
+                VStack(spacing: 0) {
+                    HostStatusRibbon(model: model)
+                    switch layout {
+                    case .grid:
+                        VMGridView(model: model, bundles: filteredForSection)
+                    case .list:
+                        VMListView(model: model, bundles: filteredForSection)
+                    }
                 }
             }
         }
@@ -239,6 +275,69 @@ public struct LibraryView: View {
             base = []
         }
         return base
+    }
+}
+
+// ── HOST STATUS RIBBON ────────────────────────────────────────────
+/// Thin strip at the top of the detail pane. Always shows host
+/// constraints (model / RAM / free disk) + running-VM count. This fills
+/// the library's breathing room with *useful* information — Victor's
+/// "make the invisible visible" applied to the host/guest contract.
+@MainActor
+public struct HostStatusRibbon: View {
+    @Bindable var model: AppModel
+
+    public var body: some View {
+        let host = HostInfo.current
+        let freeDisk = HostInfo.freeDiskBytes(at: model.store.rootURL) ?? 0
+        let running = model.sessions.values.filter { $0.status.isLive }.count
+        let totalUsed = model.bundles.reduce(0) { $0 + $1.actualDiskBytes }
+
+        HStack(spacing: 16) {
+            metric(label: "HOST", value: host.modelName.uppercased())
+            divider
+            metric(label: "RAM", value: formatBytesHuman(host.physicalMemoryBytes))
+            metric(label: "CORES", value: "\(host.processorCount)")
+            metric(label: "LIBRARY FREE", value: formatBytesHuman(freeDisk),
+                   warn: freeDisk < 16 * 1024 * 1024 * 1024)
+            divider
+            metric(label: "VMS", value: "\(model.bundles.count)")
+            metric(label: "USED", value: formatBytesHuman(totalUsed))
+            metric(label: "RUNNING", value: "\(running)",
+                   accent: running > 0 ? LuminaTheme.ok : LuminaTheme.inkDim)
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(
+            Rectangle().fill(LuminaTheme.bg2.opacity(0.5))
+        )
+        .overlay(
+            Rectangle().fill(LuminaTheme.rule).frame(height: 1),
+            alignment: .bottom
+        )
+    }
+
+    @ViewBuilder
+    private func metric(label: String, value: String,
+                        accent: Color = LuminaTheme.ink,
+                        warn: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .tracking(1.2)
+                .foregroundStyle(LuminaTheme.inkMute)
+            Text(value)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(warn ? LuminaTheme.warn : accent)
+                .monospacedDigit()
+        }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(LuminaTheme.rule2)
+            .frame(width: 1, height: 14)
     }
 }
 
@@ -264,31 +363,52 @@ public struct LayoutPicker: View {
 // ── APPEARANCE TOGGLE ─────────────────────────────────────────────
 @MainActor
 public struct AppearanceMenu: View {
-    @Binding var appearanceRaw: String
-
-    private var current: AppearancePreference {
-        AppearancePreference(rawValue: appearanceRaw) ?? .system
-    }
+    @Binding var current: AppearancePreference
+    @Binding var persistedRaw: String
 
     public var body: some View {
-        // Picker-in-menu-style handles "current selection" natively with a
-        // checkmark. The conditional-checkmark inside a Button label that
-        // the old code used was silently broken — the Button only renders
-        // its first child, so the checkmark never appeared and the user
-        // couldn't tell which mode was active.
-        Picker(selection: $appearanceRaw) {
+        // Fast path: flip the @State (triggers instant redraw) + persist
+        // UserDefaults in parallel. The old AppStorage-only path added
+        // ~700ms — AppStorage wraps UserDefaults in a willSet that fires
+        // synchronously through the whole view graph before the picker
+        // menu even dismisses.
+        Menu {
             ForEach(AppearancePreference.allCases, id: \.rawValue) { pref in
-                Label(pref.label, systemImage: pref.glyph).tag(pref.rawValue)
+                Button {
+                    setAppearance(pref)
+                } label: {
+                    HStack {
+                        Label(pref.label, systemImage: pref.glyph)
+                        Spacer()
+                        if current == pref {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
             }
         } label: {
             Image(systemName: current.glyph)
+                .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(LuminaTheme.accent)
+                .frame(width: 28, height: 22)
+                .contentShape(Rectangle())
         }
-        .pickerStyle(.menu)
-        .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Appearance — \(current.label)")
+    }
+
+    private func setAppearance(_ next: AppearancePreference) {
+        guard current != next else { return }
+        // Flip @State first — this is what drives the visible redraw.
+        withAnimation(.easeInOut(duration: 0.14)) {
+            current = next
+        }
+        // Persist in the next runloop tick so UserDefaults' synchronous
+        // willSet chain doesn't block the paint.
+        DispatchQueue.main.async {
+            persistedRaw = next.rawValue
+        }
     }
 }
 

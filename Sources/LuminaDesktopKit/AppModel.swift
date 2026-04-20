@@ -7,6 +7,7 @@
 
 import Foundation
 import Observation
+import Darwin
 import LuminaBootable
 
 @MainActor
@@ -22,9 +23,59 @@ public final class AppModel {
 
     public let store: VMStore
 
+    // FS watcher for ~/.lumina/desktop-vms/ — VMs created via CLI or other
+    // processes show up in the library within ~100ms of landing on disk.
+    // No poll, no "refresh" button. The file system IS the model.
+    // nonisolated(unsafe): the AppModel lives for the app's lifetime, so
+    // deinit cleanup isn't practically reachable. The watcher resources
+    // are released when the process exits.
+    private nonisolated(unsafe) var fsWatcher: DispatchSourceFileSystemObject?
+    private nonisolated(unsafe) var fsWatcherFd: Int32 = -1
+
     public init(store: VMStore = VMStore()) {
         self.store = store
         refresh()
+        installFilesystemWatcher()
+    }
+
+    private func installFilesystemWatcher() {
+        let path = store.rootURL.path
+        // Ensure the directory exists so we can open it.
+        try? FileManager.default.createDirectory(
+            at: store.rootURL, withIntermediateDirectories: true
+        )
+        let fd = path.withCString { Darwin.open($0, O_EVTONLY) }
+        guard fd >= 0 else { return }
+        fsWatcherFd = fd
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete, .attrib],
+            queue: .main
+        )
+        src.setEventHandler { [weak self] in
+            // Coalesce bursts — if 3 files are created in rapid succession,
+            // we still only do one scan per 80ms.
+            guard let self else { return }
+            self.scheduleCoalescedRefresh()
+        }
+        src.setCancelHandler { [weak self] in
+            if let fd = self?.fsWatcherFd, fd >= 0 {
+                Darwin.close(fd)
+                self?.fsWatcherFd = -1
+            }
+        }
+        src.resume()
+        fsWatcher = src
+    }
+
+    private var refreshTask: Task<Void, Never>?
+    private func scheduleCoalescedRefresh() {
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            self.refresh()
+        }
     }
 
     public enum SortOrder: String, CaseIterable, Sendable {

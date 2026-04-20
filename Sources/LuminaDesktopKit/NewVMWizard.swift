@@ -234,13 +234,40 @@ public struct NewVMWizard: View {
     }
 
     private var resourcesStep: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            sliderRow(label: "Memory", value: $memoryGB, range: 1...32, step: 1, suffix: "GB")
-            sliderRow(label: "CPU cores", valueInt: $cpus, range: 1...8)
-            sliderRow(label: "Disk size", value: $diskGB, range: 4...256, step: 4, suffix: "GB")
-            Text("Defaults match the OS you picked. Tweak if you know what you need.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        let host = HostInfo.current
+        let freeDisk = HostInfo.freeDiskBytes(at: model.store.rootURL) ?? 0
+        let hostRAMGB = Double(host.physicalMemoryBytes) / (1024 * 1024 * 1024)
+        let freeGB = Double(freeDisk) / (1024 * 1024 * 1024)
+        let maxMemory = max(1.0, Double(host.safeMemoryCeilingBytes) / (1024 * 1024 * 1024))
+        let overMemory = memoryGB > hostRAMGB * 0.66
+        let overDisk = diskGB > freeGB * 0.90
+
+        return VStack(alignment: .leading, spacing: 18) {
+            // Host chip bar — numbers that constrain the choices below.
+            HostChipBar(host: host, freeDisk: freeDisk)
+
+            sliderRow(label: "Memory", value: $memoryGB,
+                      range: 1...max(4, hostRAMGB),
+                      step: 1, suffix: "GB",
+                      warn: overMemory,
+                      caption: overMemory
+                        ? "⚠ above recommended ceiling (\(Int(maxMemory)) GB)"
+                        : nil)
+
+            sliderRow(label: "CPU cores", valueInt: $cpus,
+                      range: 1...max(2, host.processorCount))
+
+            sliderRow(label: "Disk size", value: $diskGB,
+                      range: 8...max(32, freeGB),
+                      step: 4, suffix: "GB",
+                      warn: overDisk,
+                      caption: overDisk
+                        ? "⚠ only \(String(format: "%.0f", freeGB)) GB free on library volume"
+                        : "sparse — uses ~0 B until guest writes")
+
+            Text("Defaults match \(selectedTile?.displayName ?? "your OS"). Host limits shown above.")
+                .font(.system(size: 11))
+                .foregroundStyle(LuminaTheme.inkMute)
             Spacer()
         }
         .padding(20)
@@ -277,33 +304,50 @@ public struct NewVMWizard: View {
         .font(.body)
     }
 
-    private func sliderRow(label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, suffix: String) -> some View {
-        VStack(alignment: .leading) {
+    private func sliderRow(label: String, value: Binding<Double>, range: ClosedRange<Double>,
+                           step: Double, suffix: String,
+                           warn: Bool = false, caption: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(label)
+                    .font(.system(size: 12))
+                    .foregroundStyle(LuminaTheme.ink)
                 Spacer()
                 Text("\(Int(value.wrappedValue)) \(suffix)")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(warn ? LuminaTheme.err : LuminaTheme.ink)
                     .monospacedDigit()
             }
             Slider(value: value, in: range, step: step)
+                .tint(warn ? LuminaTheme.err : LuminaTheme.accent)
+            if let caption {
+                Text(caption)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(warn ? LuminaTheme.err : LuminaTheme.inkMute)
+            }
         }
     }
 
     private func sliderRow(label: String, valueInt: Binding<Int>, range: ClosedRange<Int>) -> some View {
-        VStack(alignment: .leading) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(label)
+                    .font(.system(size: 12))
+                    .foregroundStyle(LuminaTheme.ink)
                 Spacer()
                 Text("\(valueInt.wrappedValue)")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(LuminaTheme.ink)
                     .monospacedDigit()
             }
             let doubleBinding = Binding<Double>(
                 get: { Double(valueInt.wrappedValue) },
                 set: { valueInt.wrappedValue = Int($0) }
             )
-            Slider(value: doubleBinding, in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+            Slider(value: doubleBinding,
+                   in: Double(range.lowerBound)...Double(range.upperBound),
+                   step: 1)
+                .tint(LuminaTheme.accent)
         }
     }
 
@@ -447,6 +491,40 @@ public struct NewVMWizard: View {
 
     private func formatGB(_ bytes: UInt64) -> String {
         String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))
+    }
+}
+
+/// Thin bar showing host constraints above the resource sliders.
+/// Host RAM / core count / free disk — the numbers that should shape
+/// the user's choices are made visible.
+@MainActor
+struct HostChipBar: View {
+    let host: HostInfo
+    let freeDisk: UInt64
+
+    var body: some View {
+        HStack(spacing: 10) {
+            chip("HOST", host.modelName.uppercased())
+            chip("RAM", formatBytesHuman(host.physicalMemoryBytes))
+            chip("CORES", "\(host.processorCount)")
+            chip("FREE", formatBytesHuman(freeDisk), accent: freeDisk < 16 * 1024 * 1024 * 1024)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(LuminaTheme.bg1)
+        .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private func chip(_ label: String, _ value: String, accent: Bool = false) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(LuminaTheme.label).tracking(1.3)
+                .foregroundStyle(LuminaTheme.inkMute)
+            Text(value)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(accent ? LuminaTheme.warn : LuminaTheme.ink)
+        }
     }
 }
 
