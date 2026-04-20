@@ -102,17 +102,17 @@ fi
 section "3. STREAMING EDGE CASES"
 # ═══════════════════════════════════════════════════════════════
 
-# Stream + download (was P1 bug: VM stuck in executing after stream)
+# Legacy NDJSON streaming + download (was P1 bug: VM stuck in executing after stream)
 rm -f /tmp/lumina-e2e-sdl.txt
-OUT=$($LUMINA run --stream --download "/tmp/sd.txt:/tmp/lumina-e2e-sdl.txt" "echo payload > /tmp/sd.txt && echo done" 2>/dev/null)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run --download "/tmp/sd.txt:/tmp/lumina-e2e-sdl.txt" "echo payload > /tmp/sd.txt && echo done" 2>/dev/null)
 if echo "$OUT" | grep -q '"exit_code":0' && [ -f /tmp/lumina-e2e-sdl.txt ] && grep -q "payload" /tmp/lumina-e2e-sdl.txt; then
-  pass "3.1 stream + download (P1 regression)"
+  pass "3.1 ndjson stream + download (P1 regression)"
 else
   fail "3.1 stream + download" "exit or file missing"
 fi
 
 # Every NDJSON line must be valid JSON — no raw newlines or broken escaping
-OUT=$($LUMINA run --stream "echo 'line with \"quotes\"'; echo 'tab\there'; echo done" 2>/dev/null)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "echo 'line with \"quotes\"'; echo 'tab\there'; echo done" 2>/dev/null)
 BAD=0; TOTAL=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -121,8 +121,8 @@ while IFS= read -r line; do
 done <<< "$OUT"
 [ "$BAD" -eq 0 ] && pass "3.2 NDJSON validity ($TOTAL lines)" || fail "3.2 NDJSON" "$BAD/$TOTAL invalid"
 
-# Stream large output — tests backpressure and buffer handling
-OUT=$($LUMINA run --stream "seq 1 5000" --timeout 30s 2>/dev/null)
+# Stream large output — tests backpressure and buffer handling (NDJSON legacy path)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "seq 1 5000" --timeout 30s 2>/dev/null)
 EXIT_LINE=$(echo "$OUT" | tail -1)
 if echo "$EXIT_LINE" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
   pass "3.3 stream 5K lines"
@@ -130,14 +130,14 @@ else
   fail "3.3 stream large" "no clean exit"
 fi
 
-# Stream with timeout — verify the stream terminates, doesn't hang
+# Run timeout emits unified envelope with error="timeout" (v0.6.0 contract)
 START=$(date +%s)
-OUT=$($LUMINA run --stream --timeout 3s "echo started; sleep 60" 2>/dev/null) || true
+OUT=$($LUMINA run --timeout 3s "echo started; sleep 60" 2>/dev/null) || true
 ELAPSED=$(( $(date +%s) - START ))
-if [ "$ELAPSED" -lt 25 ]; then
-  pass "3.4 stream timeout terminates (${ELAPSED}s)"
+if [ "$ELAPSED" -lt 25 ] && echo "$OUT" | jq -e '.error == "timeout"' >/dev/null 2>&1; then
+  pass "3.4 run timeout envelope (${ELAPSED}s, error=timeout)"
 else
-  fail "3.4 stream timeout" "took ${ELAPSED}s, expected <25"
+  fail "3.4 run timeout" "elapsed=${ELAPSED}s out=$OUT"
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -169,13 +169,13 @@ echo "special" > "/tmp/lumina-e2e-file with spaces.txt"
 OUT=$($LUMINA run --copy "/tmp/lumina-e2e-file with spaces.txt:/tmp/spaced file.txt" "cat '/tmp/spaced file.txt'" 2>/dev/null)
 echo "$OUT" | jq -e '.stdout | test("special")' >/dev/null 2>&1 && pass "4.3 filename with spaces" || fail "4.3 spaces" "$OUT"
 
-# Directory upload with nested structure
+# Directory upload with nested structure — `--copy` auto-detects dir vs file
 rm -rf /tmp/lumina-e2e-deep
 mkdir -p /tmp/lumina-e2e-deep/a/b/c
 echo "level0" > /tmp/lumina-e2e-deep/root.txt
 echo "level3" > /tmp/lumina-e2e-deep/a/b/c/deep.txt
 echo "mid" > /tmp/lumina-e2e-deep/a/mid.txt
-OUT=$($LUMINA run --copy-dir "/tmp/lumina-e2e-deep:/data" "cat /data/root.txt && cat /data/a/b/c/deep.txt && cat /data/a/mid.txt" 2>/dev/null)
+OUT=$($LUMINA run --copy "/tmp/lumina-e2e-deep:/data" "cat /data/root.txt && cat /data/a/b/c/deep.txt && cat /data/a/mid.txt" 2>/dev/null)
 STDOUT=$(echo "$OUT" | jq -r '.stdout')
 if echo "$STDOUT" | grep -q "level0" && echo "$STDOUT" | grep -q "level3" && echo "$STDOUT" | grep -q "mid"; then
   pass "4.4 directory upload (3 levels deep)"
@@ -183,9 +183,9 @@ else
   fail "4.4 deep dir upload" "got: $STDOUT"
 fi
 
-# Directory download with nested structure
+# Directory download with nested structure — `--download` auto-detects on guest
 rm -rf /tmp/lumina-e2e-dir-dl
-$LUMINA run --download-dir "/out:/tmp/lumina-e2e-dir-dl" "mkdir -p /out/x/y && echo a > /out/1.txt && echo b > /out/x/2.txt && echo c > /out/x/y/3.txt" >/dev/null 2>&1
+$LUMINA run --download "/out:/tmp/lumina-e2e-dir-dl" "mkdir -p /out/x/y && echo a > /out/1.txt && echo b > /out/x/2.txt && echo c > /out/x/y/3.txt" >/dev/null 2>&1
 if [ -f /tmp/lumina-e2e-dir-dl/1.txt ] && [ -f /tmp/lumina-e2e-dir-dl/x/2.txt ] && [ -f /tmp/lumina-e2e-dir-dl/x/y/3.txt ]; then
   pass "4.5 directory download (3 levels)"
 else
@@ -196,10 +196,9 @@ fi
 ERR=$($LUMINA run --copy "/nonexistent/phantom.txt:/tmp/x" "echo fail" 2>&1) || true
 echo "$ERR" | grep -qi "not found\|no such" && pass "4.6 upload nonexistent file error" || fail "4.6 nonexistent upload" "$ERR"
 
-# --copy-dir on a regular file — must reject
-echo "notdir" > /tmp/lumina-e2e-notdir.txt
-ERR=$($LUMINA run --copy-dir "/tmp/lumina-e2e-notdir.txt:/data" "echo fail" 2>&1) || true
-echo "$ERR" | grep -qi "not a directory\|directory" && pass "4.7 --copy-dir rejects regular file" || fail "4.7 copy-dir file" "$ERR"
+# --copy without colon — must reject (format validation)
+ERR=$($LUMINA run --copy "no_colon" "echo fail" 2>&1) || true
+echo "$ERR" | grep -qi "invalid\|format" && pass "4.7 --copy rejects missing colon" || fail "4.7 copy format" "$ERR"
 
 # ═══════════════════════════════════════════════════════════════
 section "5. SESSION LIFECYCLE"
@@ -220,11 +219,11 @@ if [ -n "$SID" ]; then
   done
   $OK && pass "5.2 three sequential execs" || fail "5.2 sequential execs" "failed at $i"
 
-  # Two streamed execs back-to-back (THE P1 regression test)
-  OUT1=$($LUMINA exec "$SID" "echo stream_one" --stream 2>/dev/null)
-  OUT2=$($LUMINA exec "$SID" "echo stream_two" --stream 2>/dev/null)
+  # Two NDJSON-legacy execs back-to-back (THE P1 regression test)
+  OUT1=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo stream_one" 2>/dev/null)
+  OUT2=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo stream_two" 2>/dev/null)
   if echo "$OUT1" | grep -q "stream_one" && echo "$OUT2" | grep -q "stream_two"; then
-    pass "5.3 two streamed execs (P1 state reset)"
+    pass "5.3 two legacy-ndjson execs (P1 state reset)"
   else
     fail "5.3 streamed execs" "s1=$(echo "$OUT1" | head -1) s2=$(echo "$OUT2" | head -1)"
   fi
@@ -242,16 +241,16 @@ if [ -n "$SID" ]; then
   OUT=$($LUMINA exec "$SID" "echo \$MY_VAR" -e MY_VAR=works 2>/dev/null)
   echo "$OUT" | grep -q "works" && pass "5.6 session env vars" || fail "5.6 env" "$OUT"
 
-  # Session file upload/download
+  # Session file upload via `lumina cp` (v0.6.0: exec has no --copy)
   echo "sess_upload_payload" > /tmp/lumina-e2e-sup.txt
-  $LUMINA exec "$SID" "true" --copy "/tmp/lumina-e2e-sup.txt:/tmp/up.txt" 2>/dev/null
+  $LUMINA cp "/tmp/lumina-e2e-sup.txt" "$SID:/tmp/up.txt" 2>/dev/null
   OUT=$($LUMINA exec "$SID" "cat /tmp/up.txt" 2>/dev/null)
-  echo "$OUT" | grep -q "sess_upload_payload" && pass "5.7 session upload" || fail "5.7 sess upload" "$OUT"
+  echo "$OUT" | grep -q "sess_upload_payload" && pass "5.7 session upload (lumina cp)" || fail "5.7 sess upload" "$OUT"
 
   rm -f /tmp/lumina-e2e-sdl2.txt
   $LUMINA exec "$SID" "echo dl_data > /tmp/dl.txt" 2>/dev/null
-  $LUMINA exec "$SID" "true" --download "/tmp/dl.txt:/tmp/lumina-e2e-sdl2.txt" 2>/dev/null
-  [ -f /tmp/lumina-e2e-sdl2.txt ] && grep -q "dl_data" /tmp/lumina-e2e-sdl2.txt && pass "5.8 session download" || fail "5.8 sess download" "missing"
+  $LUMINA cp "$SID:/tmp/dl.txt" "/tmp/lumina-e2e-sdl2.txt" 2>/dev/null
+  [ -f /tmp/lumina-e2e-sdl2.txt ] && grep -q "dl_data" /tmp/lumina-e2e-sdl2.txt && pass "5.8 session download (lumina cp)" || fail "5.8 sess download" "missing"
 
   # Session timeout + recovery
   START=$(date +%s)
@@ -338,26 +337,25 @@ for i in $(seq 1 10); do
 done
 $OK && pass "7.1 10 rapid sequential execs" || fail "7.1 rapid" "failed at $i"
 
-# Alternating stream/buffered — stresses state machine transitions
+# Alternating legacy-ndjson/unified-envelope — stresses state machine transitions
 OK=true
 for i in $(seq 1 5); do
-  O1=$($LUMINA exec "$SID" "echo st_$i" --stream 2>/dev/null)
+  O1=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo st_$i" 2>/dev/null)
   O2=$($LUMINA exec "$SID" "echo bf_$i" 2>/dev/null)
   if ! echo "$O1" | grep -q "st_$i" || ! echo "$O2" | grep -q "bf_$i"; then
     OK=false; break
   fi
 done
-$OK && pass "7.2 5 alternating stream/buffered pairs" || fail "7.2 alternating" "pair $i"
+$OK && pass "7.2 5 alternating ndjson/envelope pairs" || fail "7.2 alternating" "pair $i"
 
-# Large stream through session (tests NDJSON doesn't drop frames)
-OUT=$($LUMINA exec "$SID" "seq 1 3000" --stream --timeout 30s 2>/dev/null)
+# Large stream through session (legacy NDJSON path, tests no dropped frames)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "seq 1 3000" --timeout 30s 2>/dev/null)
 EXIT_LINE=$(echo "$OUT" | grep '"exit_code"' | head -1)
 if echo "$EXIT_LINE" | grep -q '"exit_code":0'; then
-  # Verify the last number arrived
   if echo "$OUT" | grep -q '"data":"3000'; then
-    pass "7.3 3K line session stream (no dropped frames)"
+    pass "7.3 3K line ndjson session stream (no dropped frames)"
   else
-    pass "7.3 3K line session stream (exit ok, last line may be batched)"
+    pass "7.3 3K line ndjson session stream (exit ok, last line may be batched)"
   fi
 else
   fail "7.3 large session stream" "no clean exit"
@@ -416,7 +414,7 @@ sleep 18
 OK=true
 CYCLE_ERR=""
 for i in $(seq 1 3); do
-  START_OUT=$($LUMINA session start --boot-timeout 30s 2>&1)
+  START_OUT=$($LUMINA session start 2>&1)
   S=$(echo "$START_OUT" | jq -r '.sid' 2>/dev/null)
   if [ -z "$S" ] || [ "$S" = "null" ]; then
     OK=false; CYCLE_ERR="start failed at $i: $START_OUT"; break
@@ -457,8 +455,9 @@ section "10. ERROR HANDLING"
 # Invalid flags — errors go to stderr, capture both streams
 ERR=$($LUMINA run --timeout "abc" "echo fail" 2>&1) || true
 echo "$ERR" | grep -qi "invalid" && pass "10.1 invalid timeout" || fail "10.1 invalid timeout" "$ERR"
-ERR=$($LUMINA run --memory "abc" "echo fail" 2>&1) || true
-echo "$ERR" | grep -qi "invalid" && pass "10.2 invalid memory" || fail "10.2 invalid memory" "$ERR"
+# v0.6.0: memory is a `session start` flag, not a `run` flag. Validate it there.
+ERR=$($LUMINA session start --memory "abc" 2>&1) || true
+echo "$ERR" | grep -qi "invalid" && pass "10.2 invalid memory (session start)" || fail "10.2 invalid memory" "$ERR"
 ERR=$($LUMINA run --copy "no_colon" "echo fail" 2>&1) || true
 echo "$ERR" | grep -qi "invalid\|format" && pass "10.3 invalid --copy" || fail "10.3 invalid copy" "$ERR"
 
@@ -478,9 +477,9 @@ echo "$OUT" | jq . >/dev/null 2>&1 && pass "11.1 JSON when piped" || fail "11.1"
 OUT=$(LUMINA_FORMAT=json $LUMINA run "echo fmt" 2>/dev/null)
 echo "$OUT" | jq -e '.stdout | test("fmt")' >/dev/null 2>&1 && pass "11.2 LUMINA_FORMAT=json" || fail "11.2" "$OUT"
 
-# Session NDJSON — every line must be valid JSON
+# Session NDJSON legacy — every line must be valid JSON
 SID=$($LUMINA session start 2>/dev/null | jq -r '.sid')
-OUT=$($LUMINA exec "$SID" "echo a; echo b >&2; echo c" --stream 2>/dev/null)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo a; echo b >&2; echo c" 2>/dev/null)
 BAD=0; TOTAL=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -587,11 +586,10 @@ else
   fail "13.1 interleaved 1K" "stdout=$STDOUT_COUNT stderr=$STDERR_COUNT"
 fi
 
-# Stream 10K lines — tests chunking + buffering
-OUT=$($LUMINA run --stream "seq 1 10000" --timeout 60s 2>/dev/null)
+# Stream 10K lines — tests chunking + buffering (legacy NDJSON path)
+OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "seq 1 10000" --timeout 60s 2>/dev/null)
 EXIT_LINE=$(echo "$OUT" | grep '"exit_code"' | head -1)
 if echo "$EXIT_LINE" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-  # Count how many data lines we got
   DATA_LINES=$(echo "$OUT" | grep '"data"' | wc -l | tr -d ' ')
   pass "13.2 stream 10K lines ($DATA_LINES chunks, exit ok)"
 else
@@ -636,6 +634,227 @@ done
 echo "$OUT" | grep -q "bounce_2" && pass "14.3 2 timeout+recovery cycles" || true
 
 $LUMINA session stop "$SID" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════
+section "15. UNIFIED ENVELOPE ERROR STATES (v0.6.0 contract)"
+# ═══════════════════════════════════════════════════════════════
+
+# Run timeout — error="timeout", no exit_code, partials may be present
+OUT=$($LUMINA run --timeout 2s "echo begin; sleep 30" 2>/dev/null) || true
+if echo "$OUT" | jq -e '.error == "timeout" and (.exit_code // null) == null' >/dev/null 2>&1; then
+  pass "15.1 run timeout envelope (error=timeout, no exit_code)"
+else
+  fail "15.1 run timeout envelope" "$OUT"
+fi
+
+# Session exec timeout — error="timeout" (not "session failed: timeout")
+SID=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+OUT=$($LUMINA exec "$SID" "sleep 30" --timeout 2s 2>/dev/null) || true
+if echo "$OUT" | jq -e '.error == "timeout"' >/dev/null 2>&1; then
+  pass "15.2 exec timeout envelope (error=timeout)"
+else
+  fail "15.2 exec timeout envelope" "$OUT"
+fi
+sleep 10
+$LUMINA session stop "$SID" 2>/dev/null
+
+# Success envelope has NO error field
+OUT=$($LUMINA run "echo ok" 2>/dev/null)
+if echo "$OUT" | jq -e '.exit_code == 0 and (.error // null) == null' >/dev/null 2>&1; then
+  pass "15.3 success envelope has no error field"
+else
+  fail "15.3 success has no error" "$OUT"
+fi
+
+# Nonexistent image — error="connection_failed" (command never ran → no partials)
+OUT=$($LUMINA run --image "nope_nonexistent_$(date +%s)" "echo fail" 2>/dev/null) || true
+if echo "$OUT" | jq -e '.error == "connection_failed" and (.partial_stdout // null) == null' >/dev/null 2>&1; then
+  pass "15.4 missing image → connection_failed (no partials)"
+else
+  # Lumina emits a text error to stderr for missing images before JSON; accept exit!=0
+  echo "$OUT" | jq -e '.error != null' >/dev/null 2>&1 && pass "15.4 missing image returns error envelope" || fail "15.4 missing image" "$OUT"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+section "16. OBSERVABILITY — lumina ps"
+# ═══════════════════════════════════════════════════════════════
+
+# No sessions: ps returns []
+for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
+  $LUMINA session stop "$sid" 2>/dev/null || true
+done
+sleep 3
+pkill -f "_session-serve" 2>/dev/null || true
+rm -rf ~/.lumina/sessions/* 2>/dev/null || true
+sleep 5
+
+OUT=$($LUMINA ps 2>/dev/null)
+if echo "$OUT" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  pass "16.1 ps returns a JSON array"
+else
+  fail "16.1 ps array" "$OUT"
+fi
+
+# With sessions: ps reports sid, uptime, activeExecs, image
+SID_P1=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+SID_P2=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+sleep 2
+OUT=$($LUMINA ps 2>/dev/null)
+COUNT=$(echo "$OUT" | jq 'length')
+if [ "$COUNT" = "2" ]; then
+  pass "16.2 ps reports 2 live sessions"
+else
+  fail "16.2 ps count" "expected 2, got $COUNT: $OUT"
+fi
+
+if echo "$OUT" | jq -e '[.[] | select(.sid != null and .image != null and .uptime_seconds != null)] | length == 2' >/dev/null 2>&1; then
+  pass "16.3 ps rows have sid, image, uptime_seconds"
+else
+  fail "16.3 ps schema" "$OUT"
+fi
+
+# active_execs counts an in-flight exec
+$LUMINA exec "$SID_P1" "sleep 4" --timeout 10s >/dev/null 2>&1 &
+PX=$!
+sleep 1
+OUT=$($LUMINA ps 2>/dev/null)
+ACTIVE=$(echo "$OUT" | jq -r "[.[] | select(.sid == \"$SID_P1\") | .active_execs // 0] | .[0] // 0")
+wait $PX 2>/dev/null || true
+if [ "$ACTIVE" -ge 1 ]; then
+  pass "16.4 ps shows active_execs during in-flight exec (active=$ACTIVE)"
+else
+  fail "16.4 active_execs" "active=$ACTIVE out=$OUT"
+fi
+
+$LUMINA session stop "$SID_P1" 2>/dev/null
+$LUMINA session stop "$SID_P2" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════
+section "17. PORT FORWARDING (--forward)"
+# ═══════════════════════════════════════════════════════════════
+
+# Clean up before port forward tests — prior sections leave VM descriptors/processes
+# that can exhaust resources. Port forward tests need a fresh VM.
+for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
+  $LUMINA session stop "$sid" 2>/dev/null || true
+done
+pkill -f "_session-serve" 2>/dev/null || true
+rm -rf ~/.lumina/sessions/* 2>/dev/null || true
+sleep 15
+
+# Host port: pick a high port to avoid collisions with anything running locally.
+HOST_PORT=34321
+GUEST_PORT=3000
+
+SID_F=$($LUMINA session start --forward "${HOST_PORT}:${GUEST_PORT}" 2>/dev/null | jq -r '.sid')
+if [ -z "$SID_F" ] || [ "$SID_F" = "null" ]; then
+  fail "17.0 session with --forward" "could not start"
+else
+  pass "17.0 session start --forward"
+
+  # Guest: one-shot nc listener that sends a known payload and exits on client disconnect.
+  # Backgrounded so the host can connect while nc is blocked in accept().
+  rm -f /tmp/lumina-e2e-pf.out
+  $LUMINA exec "$SID_F" "echo FORWARDED_OK | nc -l -p $GUEST_PORT" --timeout 25s > /tmp/lumina-e2e-pf.out 2>&1 &
+  GUEST_EXEC_PID=$!
+
+  # Poll the host side — first attempt may race the guest listener.
+  RESPONSE=""
+  for attempt in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    RESPONSE=$(nc -w 4 127.0.0.1 $HOST_PORT 2>/dev/null || true)
+    if echo "$RESPONSE" | grep -q "FORWARDED_OK"; then
+      break
+    fi
+  done
+  wait $GUEST_EXEC_PID 2>/dev/null || true
+
+  if echo "$RESPONSE" | grep -q "FORWARDED_OK"; then
+    pass "17.1 --forward delivers TCP bytes host→guest"
+  else
+    fail "17.1 port forward" "response='$RESPONSE' guest=$(cat /tmp/lumina-e2e-pf.out 2>/dev/null)"
+  fi
+
+  # After stopping the session, the host TCP listener must be released.
+  $LUMINA session stop "$SID_F" 2>/dev/null
+  sleep 3
+  if nc -z -w 2 127.0.0.1 $HOST_PORT 2>/dev/null; then
+    fail "17.2 port forward teardown" "listener still accepting after session stop"
+  else
+    pass "17.2 --forward teardown releases host listener"
+  fi
+fi
+
+# Invalid forward spec: must reject at parse
+ERR=$($LUMINA session start --forward "badspec" 2>&1) || true
+echo "$ERR" | grep -qi "invalid\|forward" && pass "17.3 invalid --forward spec rejected" || fail "17.3 invalid forward" "$ERR"
+
+# ═══════════════════════════════════════════════════════════════
+section "18. PTY (--pty)"
+# ═══════════════════════════════════════════════════════════════
+
+# Fresh state for PTY — the prior port-forward session already torn down,
+# but make sure no stragglers remain.
+pkill -f "_session-serve" 2>/dev/null || true
+rm -rf ~/.lumina/sessions/* 2>/dev/null || true
+sleep 10
+
+# --pty on `run` must be rejected (requires a session)
+ERR=$($LUMINA run --pty "echo hi" 2>&1) || true
+echo "$ERR" | grep -qi "session" && pass "18.1 --pty on run rejected (wants session)" || fail "18.1 pty on run" "$ERR"
+
+# --pty with non-TTY stdin must give a clean error (e2e.sh runs piped)
+SID_T=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+ERR=$($LUMINA exec --pty "$SID_T" "echo hi" < /dev/null 2>&1) || true
+echo "$ERR" | grep -qi "tty\|terminal" && pass "18.2 --pty without TTY stdin errors cleanly" || fail "18.2 pty no-tty" "$ERR"
+
+# Drive a real PTY end-to-end via python3's pty.spawn (works without a host TTY).
+if command -v python3 >/dev/null 2>&1; then
+  # Tiny helper: spawns a child in a new PTY, forwards stdin EOF, captures combined output.
+  PTY_HELPER=$(mktemp /tmp/lumina-e2e-pty.XXXXXX.py)
+  cat > "$PTY_HELPER" <<'PYEOF'
+import os, sys, pty, select
+argv = sys.argv[1:]
+# Open a PTY, fork, parent reads from master until EOF.
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+# Parent: drain master fd, write to stdout. Child inherits PTY as stdin/out/err.
+out = b""
+while True:
+    try:
+        r, _, _ = select.select([fd], [], [], 10.0)
+        if not r:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        out += chunk
+    except OSError:
+        break
+os.waitpid(pid, 0)
+sys.stdout.buffer.write(out)
+PYEOF
+  OUT=$(python3 "$PTY_HELPER" $LUMINA exec --pty "$SID_T" "echo pty_basic && exit 0" 2>/dev/null | tr -d '\r' || true)
+  echo "$OUT" | grep -q "pty_basic" && pass "18.3 PTY exec delivers output" || fail "18.3 pty output" "$OUT"
+
+  # CR-heavy spec gate (plan integration checklist condition 3): \r overwrites, ANSI codes render.
+  PTY_SCRIPT='for i in 1 2 3 4 5; do printf "\r[%d/5] progress..." $i; sleep 0.05; done; echo; printf "\033[1;32mDONE\033[0m\n"'
+  OUT=$(python3 "$PTY_HELPER" $LUMINA exec --pty "$SID_T" "$PTY_SCRIPT" 2>/dev/null || true)
+  # The \r means last "[N/5] progress..." overwrites the earlier ones on the same line.
+  # We check both that the final counter arrived AND the ANSI-DONE made it through byte-perfect.
+  if echo "$OUT" | grep -q "\[5/5\]" && echo "$OUT" | grep -q $'\033\[1;32mDONE\033\[0m'; then
+    pass "18.4 PTY CR-heavy render (last CR wins, ANSI codes byte-perfect)"
+  else
+    fail "18.4 PTY CR-heavy" "$(echo "$OUT" | od -c | head -6)"
+  fi
+  rm -f "$PTY_HELPER"
+else
+  skip "18.3 PTY exec delivers output" "no python3"
+  skip "18.4 PTY CR-heavy render" "no python3"
+fi
+
+$LUMINA session stop "$SID_T" 2>/dev/null
 
 # ═══════════════════════════════════════════════════════════════
 # RESULTS
