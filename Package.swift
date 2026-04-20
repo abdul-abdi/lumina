@@ -34,6 +34,7 @@ let package = Package(
         .library(name: "LuminaBootable", targets: ["LuminaBootable"]),
         .library(name: "LuminaDesktopKit", targets: ["LuminaDesktopKit"]),
         .executable(name: "lumina", targets: ["lumina-cli"]),
+        .executable(name: "LuminaDesktopApp", targets: ["LuminaDesktopApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
@@ -54,6 +55,25 @@ let package = Package(
                 "Lumina",
                 "LuminaBootable",  // v0.7.0 M3+: lumina desktop subcommand tree
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
+
+        // v0.7.0 M6: SwiftUI app entry point. Built with SPM so it runs
+        // without Xcode. The Apps/LuminaDesktop/ Xcode project exists for
+        // contributors who want to use Xcode, but is not required.
+        // The build script wraps the executable in an .app bundle.
+        .executableTarget(
+            name: "LuminaDesktopApp",
+            dependencies: [
+                "Lumina",
+                "LuminaGraphics",
+                "LuminaBootable",
+                "LuminaDesktopKit",
+            ],
+            linkerSettings: [
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("Virtualization"),
             ]
         ),
 
