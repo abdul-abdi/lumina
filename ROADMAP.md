@@ -4,11 +4,22 @@ Forward-looking plan. Shipped milestones move to [the release history](https://g
 
 ## Shipped
 
+- **v0.7.0** (2026-04-20) — Lumina Desktop: full-OS guests (Linux ISO, Windows 11 ARM, macOS IPSW) + SwiftUI app + clipboard scaffolding + ARM64 ISO pre-flight + virtio sound + Rosetta-at-runtime for desktop guests. Ad-hoc signed; notarization deferred to v0.7.1.
 - **v0.6.0** (2026-04-20) — Interactive agent sessions: PTY, port forwarding, unified JSON envelope, `lumina ps`, typed exec errors.
 - v0.5.0 — Agent-grade VM execution: concurrent exec, stdin piping, pre-warmed pools, unified NDJSON (pre-unified-envelope).
 - v0.4.x and earlier — initial runtime, sessions, images, volumes.
 
-## In progress — v0.7.0 "Lumina Desktop"
+## v0.7.1 candidates (post-v0.7 follow-ups)
+
+- **Notarization** — once Apple Developer Program account is set up, swap ad-hoc signing for Developer ID + notarytool.
+- **Lumina Guest Additions repo** — publish .deb/.rpm packages at https://guest.lumina.app/ so the cloud-init seed actually finishes the clipboard install. M7 ships the host-side scaffolding; this completes the loop.
+- **Real ISO checksum verification** — replace placeholder SHA-256s in `DesktopOSCatalog` with values from each distro's signed SHA256SUMS file.
+- **Windows scancode remap at runtime** — apply `WindowsInputQuirks` table inside the running-VM input layer for Windows guests.
+- **Multi-display per VM** — `VZGraphicsDeviceConfiguration.displays` accepts arrays.
+
+## In progress (none — v0.7.0 was the last in-progress release)
+
+_Originally written when v0.7.0 was the upcoming release. Kept here for context — see "Shipped" above for the actual outcome._
 
 **The entire desktop VM stack, shipped together.** Linux desktop guests · Windows 11 on ARM · macOS guests · SwiftUI app · shared clipboard · drag-and-drop · USB. One big release, not six small ones.
 

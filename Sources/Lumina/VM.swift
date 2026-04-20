@@ -458,6 +458,21 @@ public actor VM {
             attachSoundDevice(to: config, sound: sound)
         }
 
+        // v0.7.0 M8: optional Rosetta directory share — Linux guests can
+        // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
+        // as the agent path; gated behind options.rosetta.
+        if options.rosetta {
+            if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
+                if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
+                    let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                    device.share = rosettaShare
+                    var sharing = config.directorySharingDevices
+                    sharing.append(device)
+                    config.directorySharingDevices = sharing
+                }
+            }
+        }
+
         // Validate + start.
         do {
             try config.validate()

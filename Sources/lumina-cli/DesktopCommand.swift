@@ -236,6 +236,9 @@ struct DesktopBoot: AsyncParsableCommand {
     @Option(name: .customLong("timeout"), help: "Shut the VM down after this many seconds (0 = no limit).")
     var timeoutSec: Int = 0
 
+    @Flag(name: .customLong("rosetta"), help: "Mount Rosetta as /run/lumina-rosetta inside Linux guests for x86_64 binary translation.")
+    var rosetta = false
+
     mutating func run() async throws {
         var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
 
@@ -263,6 +266,7 @@ struct DesktopBoot: AsyncParsableCommand {
                 pointingDeviceKind: .usbScreenCoordinate
             )
         }
+        opts.rosetta = rosetta
 
         let vm = VM(options: opts)
 
