@@ -124,6 +124,52 @@ public struct RunOptions: Sendable {
     }
 }
 
+// MARK: - Graphics (v0.7.0 desktop stack, opt-in)
+
+/// Keyboard device kind attached to a VM with a display.
+///
+/// `.usb` is the right default for Linux and Windows guests. `.mac` requires
+/// a macOS guest (VZMacOSVirtualMachine) and is ignored otherwise.
+public enum KeyboardKind: Sendable {
+    case usb
+    case mac
+}
+
+/// Pointing device kind attached to a VM with a display.
+///
+/// `.usbScreenCoordinate` is a standard USB mouse — works with every guest OS.
+/// `.trackpad` requires a macOS guest and falls back to USB mouse otherwise.
+public enum PointingDeviceKind: Sendable {
+    case usbScreenCoordinate
+    case trackpad
+}
+
+/// Display + input configuration for a VM. Presence triggers the desktop
+/// code path in `VM.boot()`; absence (the default) leaves the agent path
+/// untouched.
+///
+/// For agent workloads, leave `VMOptions.graphics` as `nil`. For desktop
+/// workloads, pass a `GraphicsConfig`. See `LuminaGraphics` for convenience
+/// factories (`.defaultDesktop`, `.retina`, etc.).
+public struct GraphicsConfig: Sendable {
+    public var widthInPixels: Int
+    public var heightInPixels: Int
+    public var keyboardKind: KeyboardKind
+    public var pointingDeviceKind: PointingDeviceKind
+
+    public init(
+        widthInPixels: Int = 1920,
+        heightInPixels: Int = 1080,
+        keyboardKind: KeyboardKind = .usb,
+        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate
+    ) {
+        self.widthInPixels = widthInPixels
+        self.heightInPixels = heightInPixels
+        self.keyboardKind = keyboardKind
+        self.pointingDeviceKind = pointingDeviceKind
+    }
+}
+
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {
@@ -137,6 +183,10 @@ public struct VMOptions: Sendable {
     public var networkIP: String?
     public var rosetta: Bool
     public var diskSize: UInt64?
+    /// v0.7.0: optional display + input for the desktop use case.
+    /// `nil` is the agent path — zero overhead. Non-nil wires
+    /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
+    public var graphics: GraphicsConfig?
 
     public static let `default` = VMOptions()
 
@@ -150,7 +200,8 @@ public struct VMOptions: Sendable {
         networkHosts: [String: String]? = nil,
         networkIP: String? = nil,
         rosetta: Bool = false,
-        diskSize: UInt64? = nil
+        diskSize: UInt64? = nil,
+        graphics: GraphicsConfig? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -162,6 +213,7 @@ public struct VMOptions: Sendable {
         self.networkIP = networkIP
         self.rosetta = rosetta
         self.diskSize = diskSize
+        self.graphics = graphics
     }
 
     public init(from runOptions: RunOptions) {
@@ -176,6 +228,8 @@ public struct VMOptions: Sendable {
         self.diskSize = runOptions.diskSize
         // Auto-detect rosetta from image metadata
         self.rosetta = ImageStore().readMeta(name: runOptions.image)?.rosetta ?? false
+        // Disposable `run` is never a desktop workload.
+        self.graphics = nil
     }
 }
 

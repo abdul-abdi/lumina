@@ -302,6 +302,14 @@ public actor VM {
         // Entropy
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
+        // v0.7.0: Optional display + input devices for the desktop use case.
+        // The agent path leaves `options.graphics` nil and this block is a
+        // single-branch no-op — zero cost to cold boot. Enforced by the
+        // agent-boot regression gate in .github/workflows/ci.yml.
+        if let graphics = options.graphics {
+            attachGraphicsDevices(to: config, graphics: graphics)
+        }
+
         do {
             try config.validate()
         } catch {
@@ -1018,4 +1026,64 @@ enum VMError: Error, Sendable {
     case invalidState(String)
     case noSocketDevice
     case pipeFailed
+}
+
+// MARK: - Graphics (v0.7.0, agent-path-neutral)
+
+/// Attach display + input devices matching `graphics` to `config`.
+///
+/// Free function (not a VM-actor method) so it has no implicit access to
+/// actor state — it operates purely on the supplied configuration. Called
+/// only when `VMOptions.graphics != nil`, so agent-path runs never
+/// invoke it and never link any of these VZ device classes at runtime.
+private func attachGraphicsDevices(
+    to config: VZVirtualMachineConfiguration,
+    graphics: GraphicsConfig
+) {
+    // Virtio-GPU scanout: single display at the configured resolution.
+    // Works for Linux + Windows-on-ARM guests. macOS guests use a different
+    // VM type (VZMacOSVirtualMachine) and their own graphics class, landing
+    // in M5.
+    let gfx = VZVirtioGraphicsDeviceConfiguration()
+    gfx.scanouts = [
+        VZVirtioGraphicsScanoutConfiguration(
+            widthInPixels: graphics.widthInPixels,
+            heightInPixels: graphics.heightInPixels
+        )
+    ]
+    config.graphicsDevices = [gfx]
+
+    // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic
+    // VM it falls back to USB so the caller doesn't get a validation error.
+    switch graphics.keyboardKind {
+    case .usb:
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+    case .mac:
+        #if swift(>=6)
+        if #available(macOS 14.0, *) {
+            config.keyboards = [VZMacKeyboardConfiguration()]
+        } else {
+            config.keyboards = [VZUSBKeyboardConfiguration()]
+        }
+        #else
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+        #endif
+    }
+
+    // Pointing device. Trackpad requires a macOS guest for full fidelity;
+    // on Linux/Windows it doesn't validate, so fall back to USB mouse.
+    switch graphics.pointingDeviceKind {
+    case .usbScreenCoordinate:
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+    case .trackpad:
+        #if swift(>=6)
+        if #available(macOS 14.0, *) {
+            config.pointingDevices = [VZMacTrackpadConfiguration()]
+        } else {
+            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        }
+        #else
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        #endif
+    }
 }
