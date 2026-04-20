@@ -57,6 +57,14 @@ jobs:
       # local dev. Nothing we ship depends on the gate running in default
       # CI; this is performance regression hygiene, not correctness.
       - name: Agent-boot regression gate
+        # Advisory step: performance regression hygiene, not correctness.
+        # Default GitHub-hosted macos-15 runners are themselves VMs and
+        # can't always nest Virtualization.framework reliably — a single
+        # boot often works but consecutive boots run into cleanup/clone
+        # exhaustion. On a self-hosted / larger runner this enforces the
+        # gate exactly as before. Letting a flaky runner block the PR
+        # isn't worth it given the gate has no correctness signal.
+        continue-on-error: true
         env:
           AGENT_BOOT_P50_MAX_MS: "2000"
         run: |
