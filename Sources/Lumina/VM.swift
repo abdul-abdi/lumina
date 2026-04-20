@@ -105,6 +105,20 @@ public actor VM {
         }
         _state = .booting
 
+        // v0.7.0 M3: route non-agent profiles off the hot agent path.
+        // The agent case falls through to the existing code below, byte-
+        // identical to the v0.6.0 behaviour (regression-gate invariant).
+        switch options.effectiveBootable {
+        case .agent:
+            break  // fall through
+        case .efi(let cfg):
+            try await bootEFIPath(cfg: cfg)
+            return
+        case .macOS:
+            _state = .idle
+            throw .bootFailed(underlying: VMError.invalidState("macOS guests land in v0.7.0 M5"))
+        }
+
         // Clean orphans from previous crashes
         DiskClone.cleanOrphans()
 
@@ -366,6 +380,105 @@ public actor VM {
             throw error
         }
         self.commandRunner = runner
+        _state = .ready
+    }
+
+    // MARK: - EFI Boot Path (v0.7.0 M3)
+
+    /// Boot a VM from the EFI pipeline (Linux desktop ISOs, Windows 11 ARM).
+    ///
+    /// EFI guests have NO `lumina-agent` inside — the vsock CommandRunner is
+    /// not set up. `exec()` / `stream()` will throw `invalidState` because
+    /// `commandRunner` stays nil. Callers that want to run commands in a
+    /// desktop guest must use session-level agent guests (agent-path VMs),
+    /// not this boot pipeline.
+    ///
+    /// The state machine: `.idle` → `.booting` → `.ready` (VM started, no
+    /// command connection). Shutdown works through the shared `shutdownVM`
+    /// helper because `clone` stays nil and `pipeHandles` is populated with
+    /// just the serial capture pair.
+    private func bootEFIPath(cfg: EFIBootConfig) async throws(LuminaError) {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = options.cpuCount
+        config.memorySize = options.memory
+
+        // Boot loader + storage: delegated to EFIBootable.
+        do {
+            try EFIBootable(config: cfg).apply(to: config)
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        // Serial console — capture guest output for diagnostics.
+        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+        let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
+        let (guestToHostRead, guestToHostWrite) = try createPipePair()
+        serialPort.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: hostToGuestRead,
+            fileHandleForWriting: guestToHostWrite
+        )
+        config.serialPorts = [serialPort]
+        pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
+
+        let console = self.serialConsole
+        Task.detached {
+            let handle = guestToHostRead
+            while true {
+                let data = handle.availableData
+                if data.isEmpty { break }
+                console.append(data)
+            }
+        }
+
+        // Network — same pluggable provider as the agent path.
+        let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        do {
+            networkDevice.attachment = try options.networkProvider.createAttachment()
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+        self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
+        config.networkDevices = [networkDevice]
+
+        // Entropy — same as agent path.
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+        // Graphics + input — same opt-in wiring as agent path. When
+        // `options.graphics == nil` this is a no-op (agent-path guarantee
+        // preserved for EFI runs that happen to be headless).
+        if let graphics = options.graphics {
+            attachGraphicsDevices(to: config, graphics: graphics)
+        }
+
+        // Validate + start.
+        do {
+            try config.validate()
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        let queue = executor.queue
+        let vm = VZVirtualMachine(configuration: config, queue: queue)
+        self.virtualMachine = vm
+
+        do {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                queue.async {
+                    vm.start { result in
+                        cont.resume(with: result)
+                    }
+                }
+            }
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        // No CommandRunner for EFI guests. State is .ready meaning "VM is
+        // running." Exec operations will throw invalidState.
         _state = .ready
     }
 

@@ -15,6 +15,13 @@ private func integrationEnabled() -> Bool {
     return (try? store.resolve(name: "default")) != nil
 }
 
+/// EFI integration gate — same env flag, no image-store requirement since
+/// EFI boot bypasses the agent image cache. The test still needs the
+/// Virtualization entitlement on the signed test binary.
+private func efiIntegrationEnabled() -> Bool {
+    ProcessInfo.processInfo.environment["LUMINA_INTEGRATION_TESTS"] == "1"
+}
+
 @Test(.enabled(if: integrationEnabled()))
 func integrationRunEcho() async throws {
     let result = try await Lumina.run("echo hello", options: RunOptions(timeout: .seconds(30)))
@@ -1043,4 +1050,51 @@ func integrationSessionExecStdinViaIPC() async throws {
 
     #expect(output.contains("hello from IPC"), "Expected stdin echoed by cat, got: \(output)")
     #expect(exitCode == 0, "Expected cat to exit 0 after stdinClose, got: \(String(describing: exitCode))")
+}
+
+// MARK: - v0.7.0 M3 — EFI boot routing
+
+/// Smoke test that `.efi` profiles dispatch to the EFI path in VM.boot().
+///
+/// Evidence: the EFI variable store file gets created on disk. We don't
+/// expect the VM to actually boot — the primary disk is empty, so the VM
+/// will fail to start or fail post-start, but the variable-store side-effect
+/// proves the branch was taken and EFIBootable.apply() ran.
+///
+/// Requires the integration gate + VZ entitlement on the signed test binary.
+@Test(.enabled(if: efiIntegrationEnabled()))
+func bootWithEFIProfile_createsVariableStore() async throws {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("efi-routing-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let varsURL = tmp.appendingPathComponent("efi.vars")
+    let diskURL = tmp.appendingPathComponent("disk.img")
+    // 64 MB empty sparse disk — no bootable content.
+    let fd = open(diskURL.path, O_CREAT | O_EXCL | O_RDWR, 0o644)
+    #expect(fd >= 0)
+    _ = ftruncate(fd, 64 * 1024 * 1024)
+    close(fd)
+
+    var opts = VMOptions.default
+    opts.bootable = .efi(EFIBootConfig(
+        variableStoreURL: varsURL,
+        primaryDisk: diskURL
+    ))
+    opts.memory = 1024 * 1024 * 1024
+    opts.cpuCount = 2
+
+    let vm = VM(options: opts)
+    // Boot may fail (no bootable medium) but must take the EFI branch first.
+    do {
+        try await vm.boot()
+    } catch {
+        // Expected: boot fails because disk is empty. We just want the side effect.
+    }
+    #expect(
+        FileManager.default.fileExists(atPath: varsURL.path),
+        "EFIBootable should have created the variable store; branch was not taken"
+    )
+    await vm.shutdown()
 }
