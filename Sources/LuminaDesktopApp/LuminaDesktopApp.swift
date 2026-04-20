@@ -82,7 +82,7 @@ struct LuminaCommands: Commands {
                 Button("Ubuntu 24.04 LTS") { openWizard(tile: "ubuntu-24.04") }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Kali (rolling)") { openWizard(tile: "kali-rolling") }
-                Button("Fedora Workstation 41") { openWizard(tile: "fedora-41") }
+                Button("Fedora Workstation 42") { openWizard(tile: "fedora-42") }
                 Button("Debian 12") { openWizard(tile: "debian-12") }
                 Divider()
                 Button("Windows 11 on ARM") { openWizard(tile: "windows-11-arm") }

@@ -214,7 +214,7 @@ public struct CommandLauncher: View {
             || q.contains("debian") || q.contains("windows") || q.contains("mac") {
             out.append(.newVM(tileID: "ubuntu-24.04", label: "Ubuntu 24.04 LTS"))
             out.append(.newVM(tileID: "kali-rolling", label: "Kali (rolling)"))
-            out.append(.newVM(tileID: "fedora-41", label: "Fedora 41"))
+            out.append(.newVM(tileID: "fedora-42", label: "Fedora 42"))
             out.append(.newVM(tileID: "debian-12", label: "Debian 12"))
             out.append(.newVM(tileID: "windows-11-arm", label: "Windows 11 on ARM"))
             out.append(.newVM(tileID: "macos-latest", label: "macOS"))

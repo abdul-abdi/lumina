@@ -33,7 +33,7 @@ public enum OSCatalog {
              desc: "Stable LTS release. Server installer with optional desktop environment."),
         tile(for: "kali-rolling", glyph: "shield.lefthalf.filled", accentHex: "#367BF0",
              desc: "Penetration-testing distribution; rolling release."),
-        tile(for: "fedora-41", glyph: "circle.grid.cross.fill", accentHex: "#3C6EB4",
+        tile(for: "fedora-42", glyph: "circle.grid.cross.fill", accentHex: "#3C6EB4",
              desc: "Bleeding-edge GNOME experience from Red Hat."),
         tile(for: "debian-12", glyph: "leaf.fill", accentHex: "#A80030",
              desc: "Conservative, dependable; the foundation many other distros build on."),

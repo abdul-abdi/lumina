@@ -69,7 +69,7 @@ import Testing
         let ids = Set(OSCatalog.allTiles.map { $0.id })
         #expect(ids.contains("ubuntu-24.04"))
         #expect(ids.contains("kali-rolling"))
-        #expect(ids.contains("fedora-41"))
+        #expect(ids.contains("fedora-42"))
         #expect(ids.contains("debian-12"))
         #expect(ids.contains("windows-11-arm"))
         #expect(ids.contains("macos-latest"))

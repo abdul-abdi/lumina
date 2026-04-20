@@ -20,7 +20,7 @@ import Testing
     }
 
     @Test func fedoraEntryPresent() throws {
-        let entry = try #require(DesktopOSCatalog.entry(for: "fedora-41"))
+        let entry = try #require(DesktopOSCatalog.entry(for: "fedora-42"))
         #expect(entry.family == .linux)
         #expect(entry.isoURL.scheme == "https")
     }
@@ -45,7 +45,7 @@ import Testing
         let ids = Set(DesktopOSCatalog.all.map { $0.id })
         #expect(ids.contains("ubuntu-24.04"))
         #expect(ids.contains("kali-rolling"))
-        #expect(ids.contains("fedora-41"))
+        #expect(ids.contains("fedora-42"))
         #expect(ids.contains("debian-12"))
     }
 

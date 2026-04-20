@@ -879,21 +879,40 @@ public struct VMCard: View {
     }
 
     public var body: some View {
+        let brand = OSBranding.brand(for: bundle.manifest.osVariant,
+                                     family: bundle.manifest.osFamily)
         HStack(spacing: 0) {
-            OSStripe(family: bundle.manifest.osFamily, height: 0)
-            content
+            // Per-OS brand stripe (thicker than the default 3pt for impact)
+            Rectangle()
+                .fill(brand.accent)
+                .frame(width: 4)
+                .shadow(color: isHovering ? brand.accent.opacity(0.4) : .clear,
+                        radius: isHovering ? 4 : 0)
+            content(brand: brand)
         }
         .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(LuminaTheme.bg1.opacity(isHovering ? 0.78 : 0.58))
+            ZStack {
+                // Base plate
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(LuminaTheme.bg1.opacity(isHovering ? 0.82 : 0.62))
+                // Per-OS subtle tint gradient top→bottom
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(
+                        LinearGradient(
+                            colors: brand.bodyGradient,
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                    .opacity(isHovering ? 1.0 : 0.7)
+            }
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(isHovering ? LuminaTheme.accent.opacity(0.55) : LuminaTheme.rule,
-                        lineWidth: 1)
+                .stroke(isHovering ? brand.accent.opacity(0.7) : LuminaTheme.rule,
+                        lineWidth: isHovering ? 1 : 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .animation(.easeOut(duration: 0.14), value: isHovering)
         .onHover { isHovering = $0 }
         .onTapGesture { openWindow() }
         .contextMenu {
@@ -908,8 +927,9 @@ public struct VMCard: View {
         }
     }
 
-    private var content: some View {
+    private func content(brand: OSBrand) -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            // Header: distro chip + VM name + state pill
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 if session.status == .running {
                     Heartbeat(color: LuminaTheme.ok)
@@ -921,14 +941,15 @@ public struct VMCard: View {
                 Spacer()
                 StateChip(status: session.status)
             }
+
+            // Distro chip — distinctive brand badge
+            DistroChip(brand: brand)
+
             VMStatePreview(bundle: bundle, status: session.status,
                            bootedAt: bundle.manifest.lastBootedAt,
                            density: .card)
-            // Live sparkline — the category shift. Disk growth over the
-            // last ~2 minutes; a flat line is idle, a rising line is
-            // the guest writing. You SEE the VM working.
             DiskSparkline(stats: stats,
-                          tint: LuminaTheme.accent,
+                          tint: brand.accent,
                           running: session.status == .running)
                 .frame(height: 24)
             HStack {
@@ -946,6 +967,30 @@ public struct VMCard: View {
             .animation(.easeOut(duration: 0.15), value: isHovering)
         }
         .padding(14)
+    }
+}
+
+/// Distro badge — small pill with the OS's glyph + its own brand name
+/// in its own typographic style. Ubuntu's lowercase serif, Kali's bold
+/// caps, macOS's sans-semibold. At-a-glance recognition.
+@MainActor
+struct DistroChip: View {
+    let brand: OSBrand
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: brand.glyph)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(brand.textOnAccent)
+            Text(brand.displayName)
+                .font(OSBranding.nameFont(for: brand))
+                .foregroundStyle(brand.textOnAccent)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(
+            Capsule().fill(brand.accent)
+        )
     }
 }
 
@@ -1021,24 +1066,35 @@ public struct VMRow: View {
     }
 
     public var body: some View {
+        let brand = OSBranding.brand(for: bundle.manifest.osVariant,
+                                     family: bundle.manifest.osFamily)
         HStack(spacing: 0) {
-            OSStripe(family: bundle.manifest.osFamily, height: 44)
+            Rectangle()
+                .fill(brand.accent)
+                .frame(width: 3)
+                .frame(maxHeight: 44)
             HStack(spacing: 12) {
-                // NAME + live heartbeat when running
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        if session.status == .running {
-                            Heartbeat(color: LuminaTheme.ok)
+                // NAME + live heartbeat when running + distro glyph
+                HStack(spacing: 10) {
+                    Image(systemName: brand.glyph)
+                        .font(.system(size: 14))
+                        .foregroundStyle(brand.accent)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            if session.status == .running {
+                                Heartbeat(color: LuminaTheme.ok)
+                            }
+                            Text(bundle.manifest.name)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(LuminaTheme.ink)
+                                .lineLimit(1)
                         }
-                        Text(bundle.manifest.name)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(LuminaTheme.ink)
+                        Text(bundle.manifest.osVariant)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(LuminaTheme.inkMute)
                             .lineLimit(1)
                     }
-                    Text(bundle.manifest.osVariant)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(LuminaTheme.inkMute)
-                        .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -1055,14 +1111,14 @@ public struct VMRow: View {
                     .foregroundStyle(LuminaTheme.inkDim)
                     .frame(width: 100, alignment: .leading)
 
-                // DISK — text + live sparkline
+                // DISK — text + live sparkline (per-OS brand accent)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("\(bundle.diskUsedFormatted) / \(bundle.diskCapFormatted)")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(LuminaTheme.inkDim)
                         .monospacedDigit()
                     DiskSparkline(stats: stats,
-                                  tint: LuminaTheme.accent,
+                                  tint: brand.accent,
                                   running: session.status == .running)
                         .frame(height: 12)
                 }
