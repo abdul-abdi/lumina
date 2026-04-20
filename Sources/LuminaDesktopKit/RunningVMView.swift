@@ -11,7 +11,6 @@ import LuminaBootable
 @MainActor
 public struct RunningVMView: View {
     @Bindable var session: LuminaDesktopSession
-    @State private var vzMachine: VZVirtualMachine?
     @State private var showReleaseToast = false
     @State private var bootingDots = 0
     @State private var isFullscreen = false
@@ -79,26 +78,16 @@ public struct RunningVMView: View {
         }
         .navigationTitle(session.bundle.manifest.name)
         .task {
-            if session.status == .stopped {
-                await session.boot()
-            }
-            vzMachine = await session.virtualMachine()
+            // Briefly flash the "press ⌘⌥ to release pointer" reminder
+            // on the first frame. Boot is NOT triggered from here —
+            // the caller that opened this window (▶ BOOT button, ⌘K
+            // launcher, menu item) owns the boot. Triggering boot here
+            // too would race with the caller's boot and produce
+            // double-boot symptoms (the original root cause of the
+            // "first boot is unreliable" bug).
             withAnimation(.easeIn(duration: 0.2)) { showReleaseToast = true }
             try? await Task.sleep(for: .seconds(3))
             withAnimation(.easeOut(duration: 0.3)) { showReleaseToast = false }
-        }
-        .onChange(of: session.status) { _, newStatus in
-            // Clear the stale VZVirtualMachine reference when the VM is no
-            // longer running — prevents the framebuffer branch from
-            // rendering a dead connection on state transitions.
-            Task {
-                switch newStatus {
-                case .stopped, .crashed, .shuttingDown:
-                    vzMachine = nil
-                default:
-                    vzMachine = await session.virtualMachine()
-                }
-            }
         }
     }
 
@@ -127,7 +116,7 @@ public struct RunningVMView: View {
         case .booting:
             bootingScreen
         case .running, .paused:
-            if let vm = vzMachine {
+            if let vm = session.vzMachine {
                 LuminaVirtualMachineView(virtualMachine: vm, capturesSystemKeys: true)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black)

@@ -59,6 +59,14 @@ public final class LuminaDesktopSession: Identifiable {
     public var bootDuration: Duration?
     public var serialDigest: String = ""
 
+    /// VZ machine handle, observable so `RunningVMView` renders the
+    /// framebuffer the moment it's available. Owned by the session,
+    /// not by the view — this keeps plumbing out of SwiftUI's
+    /// `@State` + `.onChange` + `Task` lifecycle, which is fragile
+    /// because SwiftUI can cancel the observer's Task before it
+    /// completes its actor hop.
+    public var vzMachine: VZVirtualMachine?
+
     /// The underlying VM actor. Held nonisolated; access from main actor
     /// goes through the helper methods below which await it.
     private nonisolated(unsafe) var vm: VM?
@@ -74,6 +82,22 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     public func boot() async {
+        // Re-entry guard. `boot()` is triggered from several UI paths
+        // (card ▶ BOOT, ⌘K launcher, VM window `.task`, menu bar item).
+        // Two of them firing for a single user click would each build a
+        // `VZVirtualMachine` pointing at the same `disk.img`; VZ rejects
+        // the second attachment lock with `VZErrorDomain Code 2` and the
+        // user sees "first boot failed, Try Again works." The race is
+        // the root cause — retry logic only papers over it. Returning
+        // early when already booting / running / stopping makes `boot()`
+        // idempotent from every caller and eliminates the race.
+        switch status {
+        case .booting, .running, .paused, .shuttingDown:
+            return
+        case .stopped, .crashed:
+            break
+        }
+
         status = .booting
         lastError = nil
         let start = ContinuousClock.now
@@ -100,40 +124,47 @@ public final class LuminaDesktopSession: Identifiable {
         // eliminates the dominant cause of VZ Code 2 for them too.
         ensureSpotlightDisabled()
 
-        // Retry transient VZ Code 2 (invalid storage device attachment).
-        // With the Spotlight opt-out in place the only remaining causes
-        // are the kernel taking a beat to reclaim a prior process's fd
-        // (after an app restart) and APFS cloneFile() settle. Both
-        // clear in <500ms, so one retry at 500ms is sufficient — no
-        // need for a progressive-backoff ladder. Fast path: single
-        // attempt, ~500ms total. Slow path: one retry, ~1s total —
-        // roughly the same as manual "Try Again" reaction time.
+        // Minimal retry safety net. With the re-entry guard above
+        // eliminating the concurrent-boot race (the real Code 2 cause)
+        // and the Spotlight opt-out removing the indexer-lock race, one
+        // retry at 200ms covers the residual case of a process fd not
+        // yet reclaimed after a pkill cycle. Not a progressive ladder —
+        // if a single 200ms wait doesn't clear the condition, something
+        // more fundamental is wrong and masking it further hurts more
+        // than it helps.
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             let newVM = VM(options: opts)
             self.vm = newVM
             do {
                 try await newVM.boot()
+                // Grab the VZ handle and publish it BEFORE flipping
+                // status to `.running`. Observing views read `status`
+                // AND `vzMachine` in the same body — if we flip status
+                // first, the view can render the `.running` branch
+                // with a nil handle and fall back to the "connecting
+                // to display…" placeholder. Writing vzMachine first
+                // means both mutations land in the same observation
+                // tick and the view body sees a consistent state.
+                let handle = await newVM.vzMachine()
+                self.vzMachine = handle.machine
                 self.status = .running
                 self.bootDuration = ContinuousClock.now - start
                 // Persist lastBootedAt. On the very first successful boot we
                 // also detach the installer ISO sidecar — the install has
                 // completed and EFI now prefers the HDD, so keeping the CD-ROM
                 // mounted just clutters every card with "installer attached"
-                // forever. Both writes are non-fatal: the FS watcher on
-                // ~/.lumina/desktop-vms will pick the new manifest up; if the
-                // write fails, last-used sort is just slightly stale.
+                // forever. Both writes are non-fatal.
                 persistBootRecord()
                 // Attach stop observer so guest-initiated `poweroff`, external
                 // crashes, and any other VZ-side termination flip status back
-                // to .stopped / .crashed. Without this the menu bar (and the
-                // rest of the UI) keeps a dead VM in the RUNNING list.
+                // to .stopped / .crashed.
                 await attachStopObserver(to: newVM)
                 return
             } catch {
                 if Self.isTransientVZStorageError(error), attempt < maxAttempts {
                     self.vm = nil
-                    try? await Task.sleep(for: .milliseconds(500))
+                    try? await Task.sleep(for: .milliseconds(200))
                     continue
                 }
                 self.status = .crashed(reason: "\(error)")
@@ -201,6 +232,7 @@ public final class LuminaDesktopSession: Identifiable {
         if case .stopped = status { return }
 
         vmDelegate = nil
+        vzMachine = nil
         vm = nil
         if let reason {
             status = .crashed(reason: reason)
@@ -212,6 +244,10 @@ public final class LuminaDesktopSession: Identifiable {
 
     public func shutdown() async {
         status = .shuttingDown
+        // Clear the handle immediately so the view stops rendering
+        // into a VZ machine that's about to tear down. The framebuffer
+        // branch falls back to the stopped screen in the same tick.
+        vzMachine = nil
         vmDelegate = nil
         if let vm = self.vm {
             await vm.setDelegate(nil)
