@@ -1,0 +1,87 @@
+# Apps/LuminaDesktop/project.yml
+#
+# xcodegen project specification. Run `xcodegen generate` from this
+# directory to materialize Apps/LuminaDesktop.xcodeproj. The .xcodeproj
+# is gitignored — `project.yml` is the source of truth.
+#
+# Build:
+#   brew install xcodegen
+#   cd Apps/LuminaDesktop
+#   xcodegen generate
+#   xcodebuild -scheme LuminaDesktop -configuration Release archive
+#
+# Distribution: ad-hoc signed (no Apple Developer account required for
+# v0.7.0; see ROADMAP §17). The release script signs with `codesign -s -`
+# and ships the .app bundle in a DMG; users right-click → Open on first run.
+
+name: LuminaDesktop
+options:
+  bundleIdPrefix: app.lumina
+  deploymentTarget:
+    macOS: "14.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    MACOSX_DEPLOYMENT_TARGET: 14.0
+    PRODUCT_NAME: Lumina
+    MARKETING_VERSION: 0.7.0
+    CURRENT_PROJECT_VERSION: 1
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+packages:
+  Lumina:
+    path: ../..
+
+targets:
+  LuminaDesktop:
+    type: application
+    platform: macOS
+    sources:
+      - path: LuminaDesktop
+    info:
+      path: LuminaDesktop/Info.plist
+      properties:
+        CFBundleName: Lumina
+        CFBundleDisplayName: Lumina
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticGraphicsSwitching: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Lumina VM Bundle
+            CFBundleTypeRole: Editor
+            LSItemContentTypes:
+              - app.lumina.luminavm
+            LSHandlerRank: Owner
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: app.lumina.luminavm
+            UTTypeDescription: Lumina VM Bundle
+            UTTypeConformsTo:
+              - com.apple.package
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - luminaVM
+    entitlements:
+      path: LuminaDesktop/LuminaDesktop.entitlements
+      properties:
+        com.apple.security.virtualization: true
+        com.apple.security.hypervisor: true
+        com.apple.security.network.client: true
+    dependencies:
+      - package: Lumina
+        product: Lumina
+      - package: Lumina
+        product: LuminaGraphics
+      - package: Lumina
+        product: LuminaBootable
+      - package: Lumina
+        product: LuminaDesktopKit

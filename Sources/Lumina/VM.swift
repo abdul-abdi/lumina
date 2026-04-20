@@ -1090,6 +1090,22 @@ public actor VM {
         serialConsole.output
     }
 
+    /// Sendable handle wrapping the underlying VZVirtualMachine for the
+    /// SwiftUI display layer. VZ's class is not Sendable; this opt-in
+    /// `@unchecked Sendable` wrapper lets us cross the actor boundary
+    /// while preserving the "VZ calls happen on the main thread" contract
+    /// (`LuminaVirtualMachineView` lives on `@MainActor`).
+    public struct VZMachineHandle: @unchecked Sendable {
+        public let machine: VZVirtualMachine?
+    }
+
+    /// Direct accessor for the underlying VZVirtualMachine, used by the
+    /// SwiftUI display layer (`LuminaVirtualMachineView` in
+    /// LuminaDesktopKit).
+    public func vzMachine() -> VZMachineHandle {
+        VZMachineHandle(machine: virtualMachine)
+    }
+
     // MARK: - Private
 
     private func shutdownVM() async {

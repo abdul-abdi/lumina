@@ -110,6 +110,7 @@ let package = Package(
             name: "LuminaDesktopKitTests",
             dependencies: [
                 "LuminaDesktopKit",
+                "LuminaBootable",  // M6 tests use VMBundle directly
                 .product(name: "Testing", package: "swift-testing"),
             ]
         ),
