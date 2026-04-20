@@ -97,6 +97,20 @@ public struct VMBundle: Sendable, Equatable {
             at: rootURL.appendingPathComponent("snapshots"),
             withIntermediateDirectories: true
         )
+        // Opt the bundle out of Spotlight. A multi-GB `disk.img` that's
+        // being actively written by a running guest triggers constant
+        // re-indexing on every flush — the indexer briefly holds a
+        // read lock on the file, which races with VZ's attempt to take
+        // an exclusive lock on boot and produces
+        // `VZErrorDomain Code 2 — invalid storage device attachment`.
+        // `.metadata_never_index` at the directory root is Apple's
+        // documented opt-out; it applies to every file in the directory.
+        // Creating it is idempotent — if the flag already exists or the
+        // creation fails for any reason, we continue. Non-fatal.
+        try? Data().write(
+            to: rootURL.appendingPathComponent(".metadata_never_index"),
+            options: .atomic
+        )
         let manifest = VMBundleManifest(
             id: id,
             name: name,

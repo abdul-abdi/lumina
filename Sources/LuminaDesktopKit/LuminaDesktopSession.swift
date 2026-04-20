@@ -94,14 +94,21 @@ public final class LuminaDesktopSession: Identifiable {
         )
         opts.sound = SoundConfig(enabled: true)
 
+        // Migrate existing bundles to the Spotlight opt-out applied at
+        // VMBundle.create() time. Old bundles pre-dating that change
+        // don't have the flag; touching it here is idempotent and
+        // eliminates the dominant cause of VZ Code 2 for them too.
+        ensureSpotlightDisabled()
+
         // Retry transient VZ Code 2 (invalid storage device attachment).
-        // VZ fails validate()/start() with this error when macOS hasn't
-        // released a previous process's fd to the same disk.img, while
-        // Spotlight is indexing, or immediately after an APFS clone
-        // settles. All three clear within a few hundred milliseconds —
-        // users hit this as "first Boot fails, Try Again works." We
-        // automate the Try Again so it never surfaces as a crash.
-        let maxAttempts = 3
+        // With the Spotlight opt-out in place the only remaining causes
+        // are the kernel taking a beat to reclaim a prior process's fd
+        // (after an app restart) and APFS cloneFile() settle. Both
+        // clear in <500ms, so one retry at 500ms is sufficient — no
+        // need for a progressive-backoff ladder. Fast path: single
+        // attempt, ~500ms total. Slow path: one retry, ~1s total —
+        // roughly the same as manual "Try Again" reaction time.
+        let maxAttempts = 2
         for attempt in 1...maxAttempts {
             let newVM = VM(options: opts)
             self.vm = newVM
@@ -126,16 +133,20 @@ public final class LuminaDesktopSession: Identifiable {
             } catch {
                 if Self.isTransientVZStorageError(error), attempt < maxAttempts {
                     self.vm = nil
-                    // 150ms → 400ms backoff. Empirically enough for
-                    // Spotlight / fd-reclaim / clone-settle to clear.
-                    let delayMs = attempt == 1 ? 150 : 400
-                    try? await Task.sleep(for: .milliseconds(delayMs))
+                    try? await Task.sleep(for: .milliseconds(500))
                     continue
                 }
                 self.status = .crashed(reason: "\(error)")
                 self.lastError = "\(error)"
                 return
             }
+        }
+    }
+
+    private func ensureSpotlightDisabled() {
+        let flag = bundle.rootURL.appendingPathComponent(".metadata_never_index")
+        if !FileManager.default.fileExists(atPath: flag.path) {
+            try? Data().write(to: flag, options: .atomic)
         }
     }
 
