@@ -87,6 +87,7 @@ let package = Package(
             name: "LuminaTests",
             dependencies: [
                 "Lumina",
+                "LuminaBootable",  // M3+: shared helpers (DiskImageAllocator) in cross-target tests
                 .product(name: "Testing", package: "swift-testing"),
             ]
         ),
