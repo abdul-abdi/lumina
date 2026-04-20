@@ -170,6 +170,21 @@ public struct GraphicsConfig: Sendable {
     }
 }
 
+// MARK: - v0.7.0 M3: Bootable profiles
+
+/// Identifier for a headless agent image in `~/.lumina/images/<name>/`.
+///
+/// Thin wrapper so callers can round-trip the name through `BootableProfile`
+/// without plucking it out of `VMOptions.image` (which survives for backwards
+/// compatibility but is derived from this value going forward).
+public struct AgentImageRef: Sendable, Equatable {
+    public let image: String
+
+    public init(image: String) {
+        self.image = image
+    }
+}
+
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {

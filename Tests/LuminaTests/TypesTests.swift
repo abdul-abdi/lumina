@@ -95,6 +95,23 @@ import Testing
 }
 
 
+// MARK: - v0.7.0 M3 — BootableProfile types
+
+@Test func agentImageRef_initWithImageName_storesName() {
+    let ref = AgentImageRef(image: "default")
+    #expect(ref.image == "default")
+}
+
+@Test func agentImageRef_initWithCustomName_storesName() {
+    let ref = AgentImageRef(image: "my-image")
+    #expect(ref.image == "my-image")
+}
+
+@Test func agentImageRef_isSendable() {
+    func takeSendable<T: Sendable>(_: T) {}
+    takeSendable(AgentImageRef(image: "x"))
+}
+
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
     // Create a temp image with rosetta metadata
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-types-\(UUID().uuidString)")
