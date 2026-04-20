@@ -119,11 +119,21 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     /// Read the current pending-iso sidecar (set by `lumina desktop create
-    /// --iso`). Cleared after first boot.
+    /// --iso`). Stale sidecars pointing at deleted/moved/temp files are
+    /// silently cleared — VZ would fail with POSIX 45 (Operation not
+    /// supported) on a missing volume, and forcing the user to diagnose
+    /// that is hostile when the fix is "just boot without the CD-ROM."
     private func pendingCDROM() -> URL? {
         let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
         guard let data = try? Data(contentsOf: sidecar),
               let path = String(data: data, encoding: .utf8) else { return nil }
-        return URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = URL(fileURLWithPath: trimmed)
+        if FileManager.default.fileExists(atPath: url.path) {
+            return url
+        }
+        // Stale sidecar — remove it so subsequent boots don't hit this path.
+        try? FileManager.default.removeItem(at: sidecar)
+        return nil
     }
 }

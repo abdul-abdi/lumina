@@ -56,6 +56,7 @@ public struct LibraryView: View {
     @Bindable public var model: AppModel
     @State private var section: SidebarSection = .all
     @State private var showingWizard = false
+    @State private var wizardInitialTile: String? = nil
     @State private var hoveringID: UUID?
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
     @AppStorage("lumina.layout") private var layoutRaw: String = LibraryLayout.list.rawValue
@@ -108,8 +109,15 @@ public struct LibraryView: View {
         }
         .tint(LuminaTheme.accent)
         .sheet(isPresented: $showingWizard) {
-            NewVMWizard(model: model, isPresented: $showingWizard)
+            NewVMWizard(model: model, isPresented: $showingWizard,
+                        initialTileID: wizardInitialTile)
+                .onDisappear { wizardInitialTile = nil }
         }
+    }
+
+    fileprivate func showWizard(preselect tileID: String? = nil) {
+        wizardInitialTile = tileID
+        showingWizard = true
     }
 
     // ── SIDEBAR ──────────────────────────────────────────────────
@@ -168,7 +176,7 @@ public struct LibraryView: View {
         ZStack {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
             if filteredForSection.isEmpty && model.bundles.isEmpty {
-                EmptyStateView(showingWizard: $showingWizard)
+                EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {
                 EmptyFilterView(section: section)
             } else {
@@ -300,7 +308,7 @@ public struct LuminaSearchField: View {
 // ── EMPTY STATES ──────────────────────────────────────────────────
 @MainActor
 public struct EmptyStateView: View {
-    @Binding var showingWizard: Bool
+    let onChoose: (String?) -> Void   // nil = open blank wizard, else pre-pick tile id
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -309,12 +317,10 @@ public struct EmptyStateView: View {
                 BrandMarkLarge()
                     .frame(width: 80, height: 80)
                 VStack(spacing: 8) {
-                    HStack(spacing: 0) {
-                        Text("subprocess.run()")
-                            .foregroundStyle(LuminaTheme.accent)
-                    }
-                    .font(.system(size: 36, weight: .medium, design: .monospaced))
-                    .tracking(-0.5)
+                    Text("subprocess.run()")
+                        .foregroundStyle(LuminaTheme.accent)
+                        .font(.system(size: 36, weight: .medium, design: .monospaced))
+                        .tracking(-0.5)
 
                     HStack(spacing: 10) {
                         Text("for")
@@ -334,16 +340,16 @@ public struct EmptyStateView: View {
 
                 HStack(spacing: 10) {
                     PrimaryAction(label: "Try Ubuntu", systemImage: "circle.hexagongrid.fill", isPrimary: true) {
-                        showingWizard = true
+                        onChoose("ubuntu-24.04")
                     }
                     PrimaryAction(label: "Install Windows 11", systemImage: "macwindow") {
-                        showingWizard = true
+                        onChoose("windows-11-arm")
                     }
                     PrimaryAction(label: "Install macOS", systemImage: "apple.logo") {
-                        showingWizard = true
+                        onChoose("macos-latest")
                     }
                     PrimaryAction(label: "Use my own…", systemImage: "doc.badge.plus") {
-                        showingWizard = true
+                        onChoose("byo-file")
                     }
                 }
                 .padding(.top, 8)

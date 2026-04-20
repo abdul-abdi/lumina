@@ -66,8 +66,18 @@ public struct RunningVMView: View {
             try? await Task.sleep(for: .seconds(3))
             withAnimation(.easeOut(duration: 0.3)) { showReleaseToast = false }
         }
-        .onChange(of: session.status) { _, _ in
-            Task { vzMachine = await session.virtualMachine() }
+        .onChange(of: session.status) { _, newStatus in
+            // Clear the stale VZVirtualMachine reference when the VM is no
+            // longer running — prevents the framebuffer branch from
+            // rendering a dead connection on state transitions.
+            Task {
+                switch newStatus {
+                case .stopped, .crashed, .shuttingDown:
+                    vzMachine = nil
+                default:
+                    vzMachine = await session.virtualMachine()
+                }
+            }
         }
     }
 
@@ -131,13 +141,22 @@ public struct RunningVMView: View {
     }
 
     private var connectingScreen: some View {
-        VStack {
+        VStack(spacing: 14) {
+            Image(systemName: "tv.circle")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(LuminaTheme.accent.opacity(0.6))
             Text("CONNECTING TO DISPLAY…")
                 .font(LuminaTheme.label)
-                .tracking(2)
-                .foregroundStyle(LuminaTheme.inkMute)
+                .tracking(2.5)
+                .foregroundStyle(LuminaTheme.ink)
+            Text("VZ handshake in progress. If this persists, the guest may have failed to render its framebuffer.")
+                .font(.system(size: 11))
+                .foregroundStyle(LuminaTheme.inkDim)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 440)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(LuminaTheme.bgInset)
     }
 
     private func crashedScreen(reason: String) -> some View {

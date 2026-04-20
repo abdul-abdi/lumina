@@ -9,6 +9,7 @@ import LuminaBootable
 public struct NewVMWizard: View {
     @Bindable var model: AppModel
     @Binding var isPresented: Bool
+    let initialTileID: String?
 
     @State private var step: Step = .chooseOS
     @State private var selectedTile: OSWizardTile?
@@ -18,9 +19,10 @@ public struct NewVMWizard: View {
     @State private var cpus: Int = 2
     @State private var diskGB: Double = 32
 
-    public init(model: AppModel, isPresented: Binding<Bool>) {
+    public init(model: AppModel, isPresented: Binding<Bool>, initialTileID: String? = nil) {
         self.model = model
         self._isPresented = isPresented
+        self.initialTileID = initialTileID
     }
 
     enum Step: Int, CaseIterable { case chooseOS = 0, variant, resources, review }
@@ -47,6 +49,13 @@ public struct NewVMWizard: View {
         .background(LuminaTheme.bg)
         // Inherit from parent — respects AppearancePreference toggle.
         .animation(.easeInOut(duration: 0.18), value: step)
+        .onAppear {
+            if let id = initialTileID, let tile = OSCatalog.tile(id: id) {
+                selectedTile = tile
+                step = .variant  // skip step 1 since tile is pre-picked
+                applyOSDefaults()
+            }
+        }
     }
 
     private var header: some View {
@@ -161,19 +170,34 @@ public struct NewVMWizard: View {
 
                 switch tile.acquisition {
                 case .catalogISO(let entry):
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Installer ISO")
-                                .font(.headline)
-                            Text(entry.isoURL.absoluteString)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                            Text("Approx. \(formatGB(entry.isoSizeBytes)) — downloaded on first create.")
-                                .font(.caption)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("INSTALLER ISO")
+                            .font(LuminaTheme.label).tracking(1.5)
+                            .foregroundStyle(LuminaTheme.inkMute)
+                        Text(entry.isoURL.absoluteString)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(LuminaTheme.inkDim)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                        HStack(spacing: 8) {
+                            Button("Open in Browser") {
+                                NSWorkspace.shared.open(entry.isoURL)
+                            }
+                            Button("Copy URL") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(entry.isoURL.absoluteString, forType: .string)
+                            }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
+                        Text("≈ \(formatGB(entry.isoSizeBytes)) download. Once you have the ISO on disk, attach it below.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(LuminaTheme.inkMute)
+                            .padding(.top, 4)
+                        isoPicker
                     }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(LuminaTheme.bg1)
+                    .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
                 case .microsoftAccountDownload:
                     GroupBox {
                         VStack(alignment: .leading, spacing: 8) {
@@ -286,45 +310,74 @@ public struct NewVMWizard: View {
     private var isoPicker: some View {
         HStack {
             if let f = byoFile {
-                Text(f.lastPathComponent).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.fill")
+                        .foregroundStyle(LuminaTheme.accent)
+                    Text(f.lastPathComponent).foregroundStyle(LuminaTheme.ink)
+                }
             } else {
-                Text("No file selected").foregroundStyle(.tertiary)
+                Text("No file selected").foregroundStyle(LuminaTheme.inkMute)
             }
             Spacer()
-            Button("Choose…") {
+            Button("Choose File…") {
                 let panel = NSOpenPanel()
                 panel.allowsMultipleSelection = false
                 panel.canChooseDirectories = false
-                panel.allowedContentTypes = []
-                panel.title = "Pick an ISO file"
+                panel.canChooseFiles = true
+                // Empty allowedContentTypes would block all files. Nil = allow any.
+                // We accept anything since users may have .iso, .img, .dmg,
+                // or a renamed distribution ISO.
+                panel.title = "Pick an ISO or IPSW file"
+                panel.message = "Select a .iso, .img, or .ipsw file"
                 if panel.runModal() == .OK { byoFile = panel.url }
             }
+            .buttonStyle(.borderedProminent)
+            .tint(LuminaTheme.accent)
         }
     }
 
     private var ipswPicker: some View {
         HStack {
             if let f = byoFile {
-                Text(f.lastPathComponent).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.fill")
+                        .foregroundStyle(LuminaTheme.accent)
+                    Text(f.lastPathComponent).foregroundStyle(LuminaTheme.ink)
+                }
             } else {
-                Text("No file selected").foregroundStyle(.tertiary)
+                Text("No file selected").foregroundStyle(LuminaTheme.inkMute)
             }
             Spacer()
             Button("Choose IPSW…") {
                 let panel = NSOpenPanel()
                 panel.allowsMultipleSelection = false
                 panel.canChooseDirectories = false
+                panel.canChooseFiles = true
                 panel.title = "Pick an IPSW file"
+                panel.message = "Apple macOS restore image (.ipsw)"
                 if panel.runModal() == .OK { byoFile = panel.url }
             }
+            .buttonStyle(.borderedProminent)
+            .tint(LuminaTheme.accent)
         }
     }
 
     private var canAdvance: Bool {
         switch step {
-        case .chooseOS: selectedTile != nil
-        case .variant: true   // catalog tiles auto-advance; BYO must have file but we let it pass for v0.7
-        case .resources, .review: true
+        case .chooseOS: return selectedTile != nil
+        case .variant:
+            guard let tile = selectedTile else { return false }
+            switch tile.acquisition {
+            case .userProvided, .microsoftAccountDownload, .catalogISO:
+                // User must attach the ISO before we can proceed — we don't
+                // run a background downloader in v0.7.0.
+                return byoFile != nil
+            case .appleIPSW:
+                // macOS IPSW can go without a pre-picked file; the restore
+                // runs through `lumina desktop install-macos` with the URL.
+                return true
+            }
+        case .resources, .review: return true
         }
     }
 
