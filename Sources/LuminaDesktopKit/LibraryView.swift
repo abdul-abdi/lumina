@@ -139,17 +139,30 @@ public struct LibraryView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) async {
+        // NSItemProvider.loadItem returns an NSSecureCoding, which is not
+        // Sendable. We extract the file path via the Data-representation
+        // callback API (Sendable-safe) and reconstruct URL on the main
+        // actor.
         for provider in providers {
-            if let url = try? await provider.loadItem(forTypeIdentifier: "public.file-url") as? URL {
-                let ext = url.pathExtension.lowercased()
-                guard ["iso", "img", "ipsw"].contains(ext) else { continue }
-                // Stage the file as a BYO-flavored wizard launch.
-                wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
-                showingWizard = true
-                // Persist the chosen file path for the wizard to pick up.
-                UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
-                break
+            let path: String? = await withCheckedContinuation { cont in
+                provider.loadDataRepresentation(forTypeIdentifier: "public.file-url") { data, _ in
+                    guard let data = data,
+                          let str = String(data: data, encoding: .utf8),
+                          let url = URL(string: str) else {
+                        cont.resume(returning: nil)
+                        return
+                    }
+                    cont.resume(returning: url.path)
+                }
             }
+            guard let p = path else { continue }
+            let url = URL(fileURLWithPath: p)
+            let ext = url.pathExtension.lowercased()
+            guard ["iso", "img", "ipsw"].contains(ext) else { continue }
+            wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
+            showingWizard = true
+            UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
+            break
         }
     }
 
@@ -180,13 +193,7 @@ public struct LibraryView: View {
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 300)
         .scrollContentBackground(.hidden)
-        .background {
-            if #available(macOS 26.0, *) {
-                Rectangle().fill(.regularMaterial).glassEffect(.regular, in: Rectangle())
-            } else {
-                MaterialBackground(material: .sidebar)
-            }
-        }
+        .background(MaterialBackground(material: .sidebar))
         .environment(\.defaultMinListRowHeight, 30)
         // Force the selection tint to our brand amber. .tint() at the
         // NavigationSplitView level doesn't always cascade into List row

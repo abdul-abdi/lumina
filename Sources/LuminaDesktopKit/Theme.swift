@@ -129,27 +129,22 @@ private func dynamic(dark: String, light: String) -> Color {
     }))
 }
 
-// ── Liquid Glass helpers (macOS 26+) ───────────────────────────────
-
-/// Apply Apple's Liquid Glass material if available; fallback to a
-/// proportional translucent material on older systems.
+// ── Translucent material helpers ───────────────────────────────────
+// Earlier drafts referenced macOS 26 Liquid Glass APIs (`Glass`,
+// `.glassEffect`). Dropped because `#available` is a runtime check;
+// the compiler still needs the symbols in the SDK. CI runs on
+// macos-15 (SDK 15.x) which doesn't have those types, so the build
+// failed. System materials render indistinguishably for our use.
 public extension View {
     @ViewBuilder
-    func luminaGlass(intensity: GlassIntensity = .regular, in shape: some Shape = Rectangle()) -> some View {
-        if #available(macOS 26.0, *) {
-            self.glassEffect(intensity.glass, in: shape)
-        } else {
-            self.background(intensity.fallback, in: shape)
-        }
+    func luminaGlass(intensity: GlassIntensity = .regular,
+                     in shape: some Shape = Rectangle()) -> some View {
+        self.background(intensity.fallback, in: shape)
     }
 
     @ViewBuilder
     func luminaGlassRow() -> some View {
-        if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8))
-        } else {
-            self.background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        }
+        self.background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -226,15 +221,6 @@ public extension LuminaTheme {
 
 public enum GlassIntensity: Sendable {
     case thin, regular, thick
-
-    @available(macOS 26.0, *)
-    var glass: Glass {
-        switch self {
-        case .thin: .clear
-        case .regular: .regular
-        case .thick: .regular.tint(LuminaTheme.bg2)
-        }
-    }
 
     var fallback: Material {
         switch self {
