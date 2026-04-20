@@ -323,6 +323,9 @@ public actor VM {
         if let graphics = options.graphics {
             attachGraphicsDevices(to: config, graphics: graphics)
         }
+        if let sound = options.sound, sound.enabled {
+            attachSoundDevice(to: config, sound: sound)
+        }
 
         do {
             try config.validate()
@@ -450,6 +453,9 @@ public actor VM {
         // preserved for EFI runs that happen to be headless).
         if let graphics = options.graphics {
             attachGraphicsDevices(to: config, graphics: graphics)
+        }
+        if let sound = options.sound, sound.enabled {
+            attachSoundDevice(to: config, sound: sound)
         }
 
         // Validate + start.
@@ -1139,6 +1145,28 @@ enum VMError: Error, Sendable {
     case invalidState(String)
     case noSocketDevice
     case pipeFailed
+}
+
+// MARK: - Sound (v0.7.0 M4, agent-path-neutral)
+
+/// Attach a `VZVirtioSoundDeviceConfiguration` with `sound.streamCount`
+/// output streams. Free function so it doesn't pull anything into the
+/// agent path until `options.sound` is non-nil.
+private func attachSoundDevice(
+    to config: VZVirtualMachineConfiguration,
+    sound: SoundConfig
+) {
+    let device = VZVirtioSoundDeviceConfiguration()
+    var streams: [VZVirtioSoundDeviceStreamConfiguration] = []
+    for _ in 0..<max(1, sound.streamCount) {
+        let output = VZVirtioSoundDeviceOutputStreamConfiguration()
+        output.sink = VZHostAudioOutputStreamSink()
+        streams.append(output)
+    }
+    device.streams = streams
+    var existing = config.audioDevices
+    existing.append(device)
+    config.audioDevices = existing
 }
 
 // MARK: - Graphics (v0.7.0, agent-path-neutral)

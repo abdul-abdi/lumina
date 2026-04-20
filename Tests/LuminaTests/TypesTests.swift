@@ -194,6 +194,35 @@ import Testing
     }
 }
 
+// MARK: - v0.7.0 M4 — SoundConfig
+
+@Test func soundConfig_defaultStreamCount() {
+    let s = SoundConfig(enabled: true)
+    #expect(s.enabled)
+    #expect(s.streamCount == 1)
+}
+
+@Test func soundConfig_disabledIsValid() {
+    let s = SoundConfig(enabled: false)
+    #expect(!s.enabled)
+}
+
+@Test func soundConfig_explicitStreamCount() {
+    let s = SoundConfig(enabled: true, streamCount: 2)
+    #expect(s.streamCount == 2)
+}
+
+@Test func vmOptions_defaultSoundIsNil() {
+    let o = VMOptions.default
+    #expect(o.sound == nil)
+}
+
+@Test func vmOptions_canSetSound() {
+    var o = VMOptions.default
+    o.sound = SoundConfig(enabled: true)
+    #expect(o.sound?.enabled == true)
+}
+
 @Test func vmOptions_effectiveBootable_preservesExplicitEFI() {
     let tmp = FileManager.default.temporaryDirectory
     var opts = VMOptions.default

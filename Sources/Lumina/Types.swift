@@ -252,6 +252,22 @@ public enum BootableProfile: Sendable, Equatable {
     case macOS(MacOSBootConfig)
 }
 
+// MARK: - v0.7.0 M4: Audio
+
+/// Optional virtio sound device for desktop guests. nil = no sound device.
+///
+/// Linux desktop and Windows 11 ARM guests both benefit; agent path leaves
+/// this nil and incurs zero cost.
+public struct SoundConfig: Sendable, Equatable {
+    public var enabled: Bool
+    public var streamCount: Int
+
+    public init(enabled: Bool, streamCount: Int = 1) {
+        self.enabled = enabled
+        self.streamCount = streamCount
+    }
+}
+
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {
@@ -269,6 +285,10 @@ public struct VMOptions: Sendable {
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
     public var graphics: GraphicsConfig?
+    /// v0.7.0 M4: optional virtio sound device for desktop guests.
+    /// nil = no sound device (agent-path-safe).
+    public var sound: SoundConfig?
+
     /// v0.7.0 M3: optional override for how this VM boots. `nil` means "use
     /// the headless agent path with `image`." Non-nil wins over `image`.
     ///
@@ -302,7 +322,8 @@ public struct VMOptions: Sendable {
         rosetta: Bool = false,
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
-        bootable: BootableProfile? = nil
+        bootable: BootableProfile? = nil,
+        sound: SoundConfig? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -316,6 +337,7 @@ public struct VMOptions: Sendable {
         self.diskSize = diskSize
         self.graphics = graphics
         self.bootable = bootable
+        self.sound = sound
     }
 
     public init(from runOptions: RunOptions) {
@@ -335,6 +357,8 @@ public struct VMOptions: Sendable {
         // Disposable `run` always takes the agent path — the CLI has no way
         // to build a .luminaVM bundle in one shot today.
         self.bootable = nil
+        // Disposable `run` is headless; no audio.
+        self.sound = nil
     }
 }
 
