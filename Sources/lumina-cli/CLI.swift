@@ -202,11 +202,127 @@ struct Run: AsyncParsableCommand {
 
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()
+        let legacyNDJSON = useLegacyExecOutput()
 
-        if shouldUseStreaming(format: format, streaming: shouldStream) {
-            try await runStreaming(options: options, format: format)
-        } else {
-            try await runBuffered(options: options, format: format)
+        switch (format, legacyNDJSON) {
+        case (.json, false):
+            try await runUnifiedJSON(options: options)
+        case (.json, true):
+            try await runStreaming(options: options, format: .json)
+        case (.text, _):
+            if shouldStream {
+                try await runStreaming(options: options, format: .text)
+            } else {
+                try await runBuffered(options: options, format: .text)
+            }
+        }
+    }
+
+    // MARK: - Unified JSON Envelope (v0.6.0)
+
+    /// Stream internally, accumulate stdout/stderr, emit a single ResultJSON.
+    /// On error: emit envelope with `error` = one of {timeout, vm_crashed, connection_failed}
+    /// and `partial_stdout` / `partial_stderr` when the command actually ran.
+    private func runUnifiedJSON(options: RunOptions) async throws {
+        let start = ContinuousClock.now
+        var stdoutBuf = ""
+        var stderrBuf = ""
+        var stdoutBytes: [UInt8] = []
+        var stderrBytes: [UInt8] = []
+        var sawBinaryStdout = false
+        var sawBinaryStderr = false
+        var exitCode: Int32? = nil
+
+        do {
+            let chunks = Lumina.stream(command, options: options)
+            for try await chunk in chunks {
+                switch chunk {
+                case .stdout(let s):
+                    stdoutBuf += s
+                case .stderr(let s):
+                    stderrBuf += s
+                case .stdoutBytes(let bytes):
+                    sawBinaryStdout = true
+                    stdoutBytes.append(contentsOf: bytes)
+                    stdoutBuf += String(decoding: bytes, as: UTF8.self)
+                case .stderrBytes(let bytes):
+                    sawBinaryStderr = true
+                    stderrBytes.append(contentsOf: bytes)
+                    stderrBuf += String(decoding: bytes, as: UTF8.self)
+                case .exit(let code):
+                    exitCode = code
+                }
+            }
+        } catch {
+            // If the command already completed (we captured an exit chunk) and the
+            // error is a post-exit download/transfer failure, surface the successful
+            // exit but log the transfer error to stderr.
+            if let code = exitCode {
+                FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
+                let ms = millisSince(start)
+                var r = ResultJSON(
+                    stdout: stdoutBuf,
+                    stderr: stderrBuf,
+                    exit_code: Int(code),
+                    duration_ms: ms
+                )
+                if sawBinaryStdout { r.stdout_bytes = Data(stdoutBytes).base64EncodedString() }
+                if sawBinaryStderr { r.stderr_bytes = Data(stderrBytes).base64EncodedString() }
+                encodeAndPrint(r)
+                if code != 0 { throw ExitCode(code) }
+                throw ExitCode.failure
+            }
+
+            let ms = millisSince(start)
+            let (state, commandRan) = errorStateForRun(error)
+            var r = ResultJSON(error: state, duration_ms: ms)
+            if commandRan {
+                if !stdoutBuf.isEmpty { r.partial_stdout = stdoutBuf }
+                if !stderrBuf.isEmpty { r.partial_stderr = stderrBuf }
+            }
+            encodeAndPrint(r)
+            throw ExitCode.failure
+        }
+
+        let ms = millisSince(start)
+        var r = ResultJSON(
+            stdout: stdoutBuf,
+            stderr: stderrBuf,
+            exit_code: Int(exitCode ?? 0),
+            duration_ms: ms
+        )
+        if sawBinaryStdout {
+            r.stdout_bytes = Data(stdoutBytes).base64EncodedString()
+        }
+        if sawBinaryStderr {
+            r.stderr_bytes = Data(stderrBytes).base64EncodedString()
+        }
+        encodeAndPrint(r)
+        if let code = exitCode, code != 0 {
+            throw ExitCode(code)
+        }
+    }
+
+    /// Classify a `Lumina.stream` error into a v0.6.0 error state for `run`.
+    /// Returns (errorState, commandRan). `commandRan=false` → no partials emitted
+    /// (the command never started executing in the guest).
+    private func errorStateForRun(_ error: any Error) -> (String, Bool) {
+        guard let le = error as? LuminaError else {
+            return ("connection_failed", false)
+        }
+        switch le {
+        case .timeout:
+            return ("timeout", true)
+        case .guestCrashed:
+            return ("vm_crashed", true)
+        case .bootFailed, .connectionFailed, .imageNotFound, .cloneFailed, .uploadFailed:
+            return ("connection_failed", false)
+        case .protocolError:
+            return ("connection_failed", true)
+        case .downloadFailed:
+            return ("connection_failed", true)
+        case .sessionNotFound, .sessionDead, .sessionFailed:
+            return ("connection_failed", false)
         }
     }
 
@@ -354,6 +470,22 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
         duration_ms: durationMs
     )
     encodeAndPrint(r)
+}
+
+/// Map a session server's `.error(message:)` payload to a v0.6.0 error state.
+/// The message is produced by `String(describing: error)` on the server side,
+/// so we match the canonical LuminaError case descriptions.
+func errorStateForExecMessage(_ message: String) -> String {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if trimmed == "timeout" || trimmed.hasPrefix("timeout:") {
+        return "timeout"
+    }
+    if trimmed.hasPrefix("guest crashed") || trimmed.hasPrefix("guestcrashed") {
+        return "vm_crashed"
+    }
+    // Anything else from the session server means the session is still alive
+    // but the exec could not complete cleanly. Treat as session_disconnected.
+    return "session_disconnected"
 }
 
 private func printErrorJSON(
@@ -1109,10 +1241,12 @@ struct Exec: AsyncParsableCommand {
                 case .error(let message):
                     stdinTask?.cancel()
                     let ms = millisSince(start)
+                    let state = errorStateForExecMessage(message)
                     printErrorJSON(
                         LuminaError.sessionFailed(message),
                         durationMs: ms,
                         friendly: true,
+                        errorState: state,
                         partialStdout: stdoutBuf,
                         partialStderr: stderrBuf
                     )
