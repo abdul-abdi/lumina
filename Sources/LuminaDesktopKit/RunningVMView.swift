@@ -291,19 +291,25 @@ struct FullscreenObserver: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
+        // Bridge NSWindow fullscreen notifications → Binding<Bool> via
+        // Task { @MainActor }, so Swift 6 strict concurrency doesn't
+        // complain about main-actor-mutation from a Sendable closure.
+        // isFullscreen is a Binding; updating it must be on the main
+        // actor — Task { @MainActor ... } gives us that hop.
         DispatchQueue.main.async {
             guard let window = v.window else { return }
+            let binding = self.$isFullscreen
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didEnterFullScreenNotification,
                 object: window, queue: .main
             ) { _ in
-                self.isFullscreen = true
+                Task { @MainActor in binding.wrappedValue = true }
             }
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didExitFullScreenNotification,
                 object: window, queue: .main
             ) { _ in
-                self.isFullscreen = false
+                Task { @MainActor in binding.wrappedValue = false }
             }
         }
         return v
