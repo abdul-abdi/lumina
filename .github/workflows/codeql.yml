@@ -1,14 +1,20 @@
 name: CodeQL
 
-# Static security analysis for the two languages we actually ship:
-#   - Swift (host + library + CLI + SwiftUI app)
-#   - Go    (guest agent)
+# Static security analysis for the guest agent (Go).
+#
+# Swift was previously in the matrix but consistently failed under
+# the CodeQL tracer — Apple framework symbols (VZMac*,
+# VZLinuxRosettaDirectoryShare) don't resolve inside the wrapped
+# build, and both autobuild and explicit `swift build` hit the same
+# issue. Swift CodeQL coverage is also thin for systems code
+# touching Virtualization.framework. The guest agent, which handles
+# network + syscall logic, is where the real attack surface lives
+# and where CodeQL's Go rules actually bite.
 #
 # Runs on PR, main, and a weekly schedule so drift in upstream
-# databases surfaces even during quiet weeks. Failures don't block
-# merges by default; CodeQL findings are visible in the Security tab
-# and should be triaged, not auto-gated, because false positives in
-# systems code are common.
+# databases surfaces even during quiet weeks. Findings are visible
+# in the Security tab and should be triaged, not auto-gated —
+# false positives in systems code are common.
 
 on:
   push:
@@ -37,8 +43,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: swift
-            os: macos-15
           - language: go
             os: ubuntu-latest
             build-path: Guest/lumina-agent
@@ -53,16 +57,6 @@ jobs:
           # issues beyond the default set. Worth the extra runtime for
           # a systems codebase touching virtualization APIs.
           queries: security-extended
-
-      # Swift: explicit `swift build` under the CodeQL tracer. The
-      # autobuild action fails on this package — it can't resolve
-      # `VZMac*` types in `Sources/Lumina/MacOSSupport.swift` under
-      # its wrapper (likely SDK header lookup disruption). `swift
-      # build` works directly, and the tracer set up by the `init`
-      # step captures the compilation regardless.
-      - name: Build (Swift)
-        if: matrix.language == 'swift'
-        run: swift build
 
       - name: Build guest agent (Go)
         if: matrix.language == 'go'
