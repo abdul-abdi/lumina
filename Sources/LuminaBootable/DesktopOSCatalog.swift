@@ -11,6 +11,11 @@
 //   release. `DesktopOSCatalogTests.allEntriesHaveRealChecksums` rejects
 //   any build that still carries the `placeholderSHA256` sentinel.
 //
+//   The wizard (NewVMWizard.createAndDismiss) runs SHA-256 over the
+//   user-picked ISO and refuses to create the VM on mismatch. Drift
+//   between catalog hashes and the vendor's current ISO surfaces at VM
+//   creation, not at boot.
+//
 // On ARM64 ISO shape per distro:
 //   - Ubuntu: 24.04.x LTS publishes a Server ARM64 ISO; their installer
 //     (subiquity) on arm64 is CLI-based. For desktop-class UX the user runs
@@ -68,9 +73,9 @@ public enum DesktopOSCatalog {
         // URLs + SHA-256 digests verified against each vendor's signed
         // SHA256SUMS / CHECKSUM file on 2026-04-20 (Ubuntu 24.04.3, Kali
         // 2026.1, Fedora 42, Debian 12.12.0). The digests are load-bearing
-        // — the wizard's file-pick step verifies an ISO against them
-        // before staging, rejecting tampered or partially-downloaded
-        // files.
+        // — NewVMWizard.createAndDismiss hashes any user-picked file and
+        // refuses to create the VM unless the digest matches an entry
+        // below, rejecting tampered or partially-downloaded files.
         DesktopOSEntry(
             id: "ubuntu-24.04",
             displayName: "Ubuntu 24.04 LTS (Server, ARM64)",

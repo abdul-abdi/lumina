@@ -106,17 +106,24 @@ public actor VM {
         _state = .booting
 
         // v0.7.0 M3: route non-agent profiles off the hot agent path.
-        // The agent case falls through to the existing code below, byte-
-        // identical to the v0.6.0 behaviour (regression-gate invariant).
+        // The .agent case is a single-cmp-and-branch before falling through
+        // to the v0.6.0 code below — the CI agent-boot P50 gate is the
+        // source of truth on timing.
         switch options.effectiveBootable {
         case .agent:
-            break  // fall through
+            break  // fall through to the v0.6.0 agent boot path
         case .efi(let cfg):
             try await bootEFIPath(cfg: cfg)
             return
         case .macOS:
+            // Library callers with `VMOptions.bootable = .macOS(...)` must
+            // go through `MacOSVM` directly; `VM` drives VZVirtualMachine
+            // and cannot configure a VZMacOSVirtualMachine. The CLI wires
+            // this correctly at DesktopCommand.bootMacOS().
             _state = .idle
-            throw .bootFailed(underlying: VMError.invalidState("macOS guests land in v0.7.0 M5"))
+            throw .bootFailed(underlying: VMError.invalidState(
+                "VM.boot() does not support macOS guests — use MacOSVM directly"
+            ))
         }
 
         // Clean orphans from previous crashes
@@ -317,9 +324,10 @@ public actor VM {
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         // v0.7.0: Optional display + input devices for the desktop use case.
-        // The agent path leaves `options.graphics` nil and this block is a
-        // single-branch no-op — zero cost to cold boot. Enforced by the
-        // agent-boot regression gate in .github/workflows/ci.yml.
+        // The agent path leaves `options.graphics` nil and both `if let`s
+        // compile to a single nil-check + branch-not-taken — measurably
+        // within the CI agent-boot P50 budget
+        // (.github/workflows/ci.yml enforces this).
         if let graphics = options.graphics {
             attachGraphicsDevices(to: config, graphics: graphics)
         }

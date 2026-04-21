@@ -374,6 +374,7 @@ public struct VMCard: View {
         .animation(.easeOut(duration: 0.14), value: isHovering)
         .onHover { isHovering = $0 }
         .onTapGesture { openWindow() }
+        .onDisappear { stats.stop() }
         .contextMenu {
             Button("Open") { openWindow() }
             Button("Reveal in Finder") {

@@ -134,7 +134,13 @@ public actor MacOSVM {
         }
         let installer = installerBox.value
 
-        // Observe progress.
+        // Observe progress. This is the one exception to the
+        // VZ-calls-on-executor rule in this file: `NSProgress` KVO is
+        // documented thread-safe by Apple, and `VZMacOSInstaller.progress`
+        // is a plain `NSProgress` property (not a VZ-isolated call), so
+        // the observation itself doesn't need to be queued. The
+        // `install(completionHandler:)` call below IS a VZ call and runs
+        // on `queue` via withCheckedThrowingContinuation.
         let progressToken: NSKeyValueObservation? = installer.progress.observe(\.fractionCompleted) { progress, _ in
             progressHandler?(progress.fractionCompleted)
         }

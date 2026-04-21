@@ -18,6 +18,7 @@ public struct NewVMWizard: View {
     @State private var memoryGB: Double = 4
     @State private var cpus: Int = 2
     @State private var diskGB: Double = 32
+    @State private var isVerifying: Bool = false
 
     public init(model: AppModel, isPresented: Binding<Bool>, initialTileID: String? = nil) {
         self.model = model
@@ -285,6 +286,15 @@ public struct NewVMWizard: View {
             row("Memory", "\(Int(memoryGB)) GB")
             row("CPUs", "\(cpus)")
             row("Disk", "\(Int(diskGB)) GB")
+            if isVerifying {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Verifying ISO against published SHA-256…")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(LuminaTheme.inkMute)
+                }
+                .padding(.top, 4)
+            }
             Spacer()
         }
         .padding(20)
@@ -421,7 +431,8 @@ public struct NewVMWizard: View {
                 // runs through `lumina desktop install-macos` with the URL.
                 return true
             }
-        case .resources, .review: return true
+        case .resources: return true
+        case .review: return !isVerifying
         }
     }
 
@@ -456,6 +467,41 @@ public struct NewVMWizard: View {
 
     private func createAndDismiss() {
         guard let tile = selectedTile else { return }
+
+        // Fail-closed SHA-256 check on catalog ISOs. The vendor publishes a
+        // signed digest; we bake it into DesktopOSCatalog; here we prove the
+        // picked file matches before we stage it. Guards against corrupted
+        // downloads, wrong-mirror fetches, and captive-portal interception.
+        // Microsoft/Apple/user-provided acquisitions have no canonical hash
+        // to check against, so they flow straight through.
+        if case .catalogISO(let entry) = tile.acquisition, let picked = byoFile {
+            isVerifying = true
+            Task {
+                let verdict = await ISOVerifier.verify(at: picked, expectedSHA256: entry.sha256)
+                await MainActor.run {
+                    isVerifying = false
+                    switch verdict {
+                    case .match:
+                        performCreate(tile: tile)
+                    case .mismatch(let actual):
+                        model.pendingError = """
+                        ISO hash mismatch for \(tile.displayName).
+                        Expected SHA-256: \(entry.sha256)
+                        Got:              \(actual)
+                        The file is corrupted, partial, or not the build we expected. Re-download from the vendor's canonical URL and try again.
+                        """
+                    case .ioError(let message):
+                        model.pendingError = "Couldn't verify ISO: \(message)"
+                    }
+                }
+            }
+            return
+        }
+
+        performCreate(tile: tile)
+    }
+
+    private func performCreate(tile: OSWizardTile) {
         let osFamily = tile.family
         let osVariant = tile.id
         let memBytes = UInt64(memoryGB) * 1024 * 1024 * 1024
@@ -488,6 +534,7 @@ public struct NewVMWizard: View {
         model.refresh()
         isPresented = false
     }
+
 
     private func formatGB(_ bytes: UInt64) -> String {
         String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))

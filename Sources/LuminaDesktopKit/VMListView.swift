@@ -169,6 +169,7 @@ public struct VMRow: View {
         )
         .animation(.easeOut(duration: 0.08), value: isHovering)
         .onHover { isHovering = $0 }
+        .onDisappear { stats.stop() }
         .contextMenu {
             Button("Open") {
                 openWindow(id: "vm-window", value: bundle.manifest.id)

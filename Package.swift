@@ -33,10 +33,15 @@ import PackageDescription
 //                       can't emit a signed .app with entitlements.
 //
 // Agent protection invariant: the agent path through `VM.boot()` (the
-// `.agent` case of `BootableProfile`) is byte-identical to v0.6.0, and
-// nothing in LuminaGraphics / LuminaBootable / LuminaDesktopKit is
-// reachable from `lumina run` or `lumina session start` unless the
-// caller opts in via `VMOptions.graphics` or `VMOptions.bootable`.
+// `.agent` case of `BootableProfile`) is functionally equivalent to
+// v0.6.0 within the CI agent-boot P50 budget — the new v0.7.0 additions
+// (`effectiveBootable` switch, optional `graphics`/`sound` attachments)
+// are guarded single-branch no-ops when `VMOptions.bootable`,
+// `VMOptions.graphics`, and `VMOptions.sound` are nil. Nothing in
+// LuminaGraphics / LuminaBootable / LuminaDesktopKit is reachable from
+// `lumina run` or `lumina session start` unless the caller opts in.
+// The agent-boot P50 gate in .github/workflows/ci.yml enforces the
+// timing contract.
 
 let package = Package(
     name: "Lumina",
