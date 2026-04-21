@@ -155,6 +155,11 @@ public actor MacOSVM {
                 }
             }
         } catch {
+            // Installer failed mid-flight: a VZ machine is already running
+            // on the executor queue from the VZVirtualMachine(configuration:)
+            // call above. Tear it down before resetting state so a retry
+            // doesn't orphan the old VZ instance inside this actor.
+            await stopVZMachineIfRunning()
             _state = .idle
             throw Error.installFailed("\(error)")
         }
@@ -211,6 +216,7 @@ public actor MacOSVM {
                 }
             }
         } catch {
+            await stopVZMachineIfRunning()
             _state = .idle
             throw Error.bootFailed("\(error)")
         }
@@ -221,6 +227,15 @@ public actor MacOSVM {
     public func shutdown() async {
         guard _state != .shutdown else { return }
         _state = .shutdown
+        await stopVZMachineIfRunning()
+    }
+
+    /// Stop and release any live `VZVirtualMachine` this actor holds. Safe
+    /// to call when none is set. VZ's `stop()` is called on the executor
+    /// queue per the thread-affinity rule; the completion result is ignored
+    /// because failure to stop gracefully is not actionable here — the
+    /// next `start` will create a fresh VZ machine.
+    private func stopVZMachineIfRunning() async {
         guard let vm = virtualMachine else { return }
         let queue = executor.queue
         let vmBox = UncheckedSendable(vm)

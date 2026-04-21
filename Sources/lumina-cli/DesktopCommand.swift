@@ -305,14 +305,40 @@ struct DesktopBoot: AsyncParsableCommand {
 
         print("Booted \(bundle.manifest.name). Press Ctrl-C to stop.")
 
-        // Run until timeout or signal.
-        if timeoutSec > 0 {
-            try? await Task.sleep(for: .seconds(timeoutSec))
-        } else {
-            // Block forever (until Ctrl-C). The CLI process will be
-            // terminated by the user; the VM actor cleans up via shutdown
-            // when the process exits.
-            try? await Task.sleep(for: .seconds(3600 * 24 * 365))
+        // SIGINT/SIGTERM via DispatchSource, NOT the default POSIX handler —
+        // the default disposition terminates the process without giving
+        // vm.shutdown() a chance to run, which aborts any in-flight disk.img
+        // writes. We bridge the dispatch source into the async context via
+        // AsyncStream and await the first event (or the timeout).
+        let signalQueue = DispatchQueue(label: "com.lumina.desktop-boot.signals")
+        let (signalStream, signalContinuation) = AsyncStream<Int32>.makeStream()
+        let signalSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+            Foundation.signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
+            src.setEventHandler { signalContinuation.yield(sig) }
+            src.resume()
+            return src
+        }
+        defer {
+            signalSources.forEach { $0.cancel() }
+            signalContinuation.finish()
+        }
+
+        let timeoutSeconds = timeoutSec
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for await _ in signalStream {
+                    FileHandle.standardError.write(Data("\nShutting down...\n".utf8))
+                    return
+                }
+            }
+            if timeoutSeconds > 0 {
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                }
+            }
+            await group.next()
+            group.cancelAll()
         }
 
         await vm.shutdown()
@@ -346,8 +372,11 @@ struct DesktopList: ParsableCommand {
 
         var manifests: [VMBundleManifest] = []
         for dir in entries {
-            guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
-            guard let bundle = try? VMBundle.load(from: dir) else { continue }
+            // Resolve symlinks so `.isDirectoryKey` sees the target type,
+            // not the symlink itself (FileManager doesn't auto-resolve).
+            let resolved = dir.resolvingSymlinksInPath()
+            guard (try? resolved.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            guard let bundle = try? VMBundle.load(from: resolved) else { continue }
             manifests.append(bundle.manifest)
         }
 

@@ -30,9 +30,14 @@ public struct VMStore: Sendable {
 
         var bundles: [VMBundle] = []
         for url in entries {
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            // `.isDirectoryKey` returns false on symlinks pointing at real
+            // bundle dirs (FileManager doesn't follow symlinks here). Resolve
+            // first so a symlinked bundle under ~/.lumina/desktop-vms/ is
+            // enumerated normally.
+            let resolved = url.resolvingSymlinksInPath()
+            let isDir = (try? resolved.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
-            guard let bundle = try? VMBundle.load(from: url) else { continue }
+            guard let bundle = try? VMBundle.load(from: resolved) else { continue }
             bundles.append(bundle)
         }
         return bundles.sorted { $0.manifest.createdAt < $1.manifest.createdAt }
