@@ -181,7 +181,7 @@ public struct CommandLauncher: View {
             case .vm(let b, _): "\(b.manifest.osVariant) · \(b.lastBootedRelative)"
             case .newVM: "launch the New VM wizard"
             case .reveal: "open the bundle in Finder"
-            case .delete: "soft-delete (you can restore)"
+            case .delete: "move to Trash (recover in Finder)"
             }
         }
     }

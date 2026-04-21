@@ -163,7 +163,14 @@ public actor MacOSVM {
             _state = .idle
             throw Error.installFailed("\(error)")
         }
-        _state = .ready
+        // Installer finished. VZMacOSInstaller leaves the VZ machine stopped
+        // on success, but `self.virtualMachine` still points at the
+        // installer-configured instance. Tear it down and return to .idle so
+        // boot() can construct a fresh configuration — subsequent boots do
+        // not share installer-path state (CD-ROM attachment, installer
+        // NSProgress observers, etc.).
+        await stopVZMachineIfRunning()
+        _state = .idle
     }
 
     /// Boot a macOS guest that's already installed.

@@ -94,7 +94,7 @@ struct VMStatePreview: View {
         switch status {
         case .running:
             return [
-                "› up     just now",
+                "› up     \(Self.formatUptime(since: bootedAt))",
                 "› disk   \(bundle.diskUsedFormatted) / \(bundle.diskCapFormatted)",
                 "› snaps  \(bundle.snapshotCount)",
             ]
@@ -117,6 +117,23 @@ struct VMStatePreview: View {
                 "› snaps  \(bundle.snapshotCount)",
             ]
         }
+    }
+
+    /// Uptime since `bootedAt`. Used only for the `.running` case; re-evaluated
+    /// whenever the view body runs (status flip, bundle reload via FSEvents).
+    /// Coarse bucketing matches `VMBundle.lastBootedRelative` so cards stay
+    /// visually consistent across running/stopped states.
+    static func formatUptime(since bootedAt: Date?) -> String {
+        guard let bootedAt else { return "(unknown)" }
+        let secs = Int(Date().timeIntervalSince(bootedAt))
+        if secs < 60 { return "just now" }
+        if secs < 3600 { return "\(secs / 60)m" }
+        if secs < 86400 {
+            let h = secs / 3600
+            let m = (secs % 3600) / 60
+            return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+        }
+        return "\(secs / 86400)d"
     }
 }
 

@@ -19,6 +19,10 @@ public struct NewVMWizard: View {
     @State private var cpus: Int = 2
     @State private var diskGB: Double = 32
     @State private var isVerifying: Bool = false
+    /// Tracks the last ISO URL we successfully SHA-256 verified. Prevents
+    /// re-hashing when the user goes back to .variant and forward again
+    /// without swapping files. Resets when `byoFile` changes.
+    @State private var verifiedISO: URL? = nil
 
     public init(model: AppModel, isPresented: Binding<Bool>, initialTileID: String? = nil) {
         self.model = model
@@ -57,6 +61,9 @@ public struct NewVMWizard: View {
                 applyOSDefaults()
             }
         }
+        // Swapping the attached ISO invalidates any prior SHA-256 verdict;
+        // the next Next-click has to re-verify.
+        .onChange(of: byoFile) { _, _ in verifiedISO = nil }
     }
 
     private var header: some View {
@@ -421,6 +428,7 @@ public struct NewVMWizard: View {
         case .chooseOS: return selectedTile != nil
         case .variant:
             guard let tile = selectedTile else { return false }
+            if isVerifying { return false }
             switch tile.acquisition {
             case .userProvided, .microsoftAccountDownload, .catalogISO:
                 // User must attach the ISO before we can proceed — we don't
@@ -439,7 +447,40 @@ public struct NewVMWizard: View {
     private func next() {
         switch step {
         case .chooseOS: step = .variant
-        case .variant: step = .resources
+        case .variant:
+            // Fail-closed SHA-256 on catalog ISOs before advancing. Verifying
+            // here (not at Create) saves the user two wasted steps on a
+            // corrupted download: they find out the file is bad while still
+            // attached to the variant picker, where they can re-attach a
+            // fresh download without losing configuration.
+            if let tile = selectedTile,
+               case .catalogISO(let entry) = tile.acquisition,
+               let picked = byoFile,
+               picked != verifiedISO {
+                isVerifying = true
+                Task {
+                    let verdict = await ISOVerifier.verify(at: picked, expectedSHA256: entry.sha256)
+                    await MainActor.run {
+                        isVerifying = false
+                        switch verdict {
+                        case .match:
+                            verifiedISO = picked
+                            step = .resources
+                        case .mismatch(let actual):
+                            model.pendingError = """
+                            ISO hash mismatch for \(tile.displayName).
+                            Expected SHA-256: \(entry.sha256)
+                            Got:              \(actual)
+                            The file is corrupted, partial, or not the build we expected. Re-download from the vendor's canonical URL and try again.
+                            """
+                        case .ioError(let message):
+                            model.pendingError = "Couldn't verify ISO: \(message)"
+                        }
+                    }
+                }
+                return
+            }
+            step = .resources
         case .resources: step = .review
         case .review: createAndDismiss()
         }
@@ -467,37 +508,9 @@ public struct NewVMWizard: View {
 
     private func createAndDismiss() {
         guard let tile = selectedTile else { return }
-
-        // Fail-closed SHA-256 check on catalog ISOs. The vendor publishes a
-        // signed digest; we bake it into DesktopOSCatalog; here we prove the
-        // picked file matches before we stage it. Guards against corrupted
-        // downloads, wrong-mirror fetches, and captive-portal interception.
-        // Microsoft/Apple/user-provided acquisitions have no canonical hash
-        // to check against, so they flow straight through.
-        if case .catalogISO(let entry) = tile.acquisition, let picked = byoFile {
-            isVerifying = true
-            Task {
-                let verdict = await ISOVerifier.verify(at: picked, expectedSHA256: entry.sha256)
-                await MainActor.run {
-                    isVerifying = false
-                    switch verdict {
-                    case .match:
-                        performCreate(tile: tile)
-                    case .mismatch(let actual):
-                        model.pendingError = """
-                        ISO hash mismatch for \(tile.displayName).
-                        Expected SHA-256: \(entry.sha256)
-                        Got:              \(actual)
-                        The file is corrupted, partial, or not the build we expected. Re-download from the vendor's canonical URL and try again.
-                        """
-                    case .ioError(let message):
-                        model.pendingError = "Couldn't verify ISO: \(message)"
-                    }
-                }
-            }
-            return
-        }
-
+        // Catalog ISOs are SHA-256 verified when advancing from .variant;
+        // no path reaches here with an unverified file. Microsoft/Apple/
+        // user-provided acquisitions have no canonical hash to check.
         performCreate(tile: tile)
     }
 

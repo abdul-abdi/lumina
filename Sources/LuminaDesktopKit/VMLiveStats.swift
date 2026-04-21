@@ -45,6 +45,15 @@ public final class VMLiveStats {
         timer = nil
     }
 
+    /// Belt-and-suspenders: if a caller forgets `.onDisappear { stop() }`,
+    /// the Timer stays on the runloop firing no-op `[weak self]` closures
+    /// until process exit. `isolated deinit` (SE-0371, Swift 6.1) runs on
+    /// MainActor so we can invalidate the Timer directly; the @MainActor
+    /// class contract already constrains every call site to main anyway.
+    isolated deinit {
+        timer?.invalidate()
+    }
+
     private func pushSample() {
         let now = Date()
         let bytes = bundle.actualDiskBytes
