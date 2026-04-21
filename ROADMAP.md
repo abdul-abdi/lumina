@@ -4,7 +4,7 @@ Forward-looking plan. Shipped milestones move to [the release history](https://g
 
 ## Shipped
 
-- **v0.7.0** (2026-04-20) — Lumina Desktop: full-OS guests (Linux ISO, Windows 11 ARM, macOS IPSW) + SwiftUI app + clipboard scaffolding + ARM64 ISO pre-flight + virtio sound + Rosetta-at-runtime for desktop guests. Ad-hoc signed; notarization deferred to v0.7.1.
+- **v0.7.0** (2026-04-20) — Lumina Desktop: full-OS guests (Linux ISO, Windows 11 ARM, macOS IPSW) + SwiftUI app + clipboard scaffolding + ARM64 ISO pre-flight + virtio sound + Rosetta-at-runtime for desktop guests + **fail-closed SHA-256 verification** of catalog ISOs in the wizard (real per-vendor digests baked into `DesktopOSCatalog`) + concurrent-boot re-entry guard for first-boot reliability. Ad-hoc signed; notarization deferred to v0.7.1.
 - **v0.6.0** (2026-04-20) — Interactive agent sessions: PTY, port forwarding, unified JSON envelope, `lumina ps`, typed exec errors.
 - v0.5.0 — Agent-grade VM execution: concurrent exec, stdin piping, pre-warmed pools, unified NDJSON (pre-unified-envelope).
 - v0.4.x and earlier — initial runtime, sessions, images, volumes.
@@ -13,7 +13,8 @@ Forward-looking plan. Shipped milestones move to [the release history](https://g
 
 - **Notarization** — once Apple Developer Program account is set up, swap ad-hoc signing for Developer ID + notarytool.
 - **Lumina Guest Additions repo** — publish .deb/.rpm packages at https://guest.lumina.app/ so the cloud-init seed actually finishes the clipboard install. M7 ships the host-side scaffolding; this completes the loop.
-- **Real ISO checksum verification** — replace placeholder SHA-256s in `DesktopOSCatalog` with values from each distro's signed SHA256SUMS file.
+- **Automated catalog re-scrape** — weekly cron (`drift.yml`) already HEADs each `DesktopOSCatalog` URL; promote to auto-PR when a vendor filename drifts so the baked SHA-256 never goes stale for long.
+- **CLI-side ISO SHA-256 verification** — `lumina desktop create --iso` currently does arch pre-flight but not digest verification; the app wizard does. Mirror the verification into the CLI.
 - **Windows scancode remap at runtime** — apply `WindowsInputQuirks` table inside the running-VM input layer for Windows guests.
 - **Multi-display per VM** — `VZGraphicsDeviceConfiguration.displays` accepts arrays.
 

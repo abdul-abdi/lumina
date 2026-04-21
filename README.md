@@ -33,9 +33,10 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 - 🪟 **Windows 11 on ARM** — retail ISO install flow
 - 🍎 **macOS guests** — IPSW-restored `VZMacOSVirtualMachine` (needs Apple Silicon host)
 - 🖥 **Lumina Desktop.app** — a SwiftUI library + wizard + per-VM windows, with ⌘K fuzzy launcher, live per-card disk sparklines, drag-drop ISOs, native fullscreen, and a brand-aware look per guest OS (Ubuntu orange, Kali cyber blue, Windows MS blue, macOS silver, …)
+- 🔒 **Catalog ISO integrity** — the wizard streams user-picked catalog ISOs through SHA-256 before creating the VM and refuses partial or tampered downloads
 - 🎨 **Ad-hoc signed build** — no Apple Developer Program account required; notarization is a v0.7.1 upgrade
 
-The agent path is untouched. The CI regression gate holds `lumina run "true"` P50 ≤ 550ms (measured: 524–558ms).
+The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
 ## Install
 
@@ -297,12 +298,12 @@ Deeper patterns — `MacOSVM` actor, `IPSWCatalog`, snapshots, `withNetwork`, cu
 
 ```bash
 make build                        # debug + codesign
-make test                         # 282 unit + 36 integration tests
+make test                         # 289 unit + 36 integration tests
 make release                      # optimized + codesign
 make install                      # -> ~/.local/bin/lumina
 make test-desktop                 # Alpine ARM64 EFI smoke test
 bash scripts/build-app.sh --install   # build + install + launch Lumina.app
-bash scripts/generate-icon.swift  # regenerate AppIcon.icns
+swift scripts/generate-icon.swift  # regenerate AppIcon.icns
 ```
 
 Guest agent + custom kernel + baked image + xcodegen app project instructions on the [Building from Source wiki page](https://github.com/abdul-abdi/lumina/wiki/Building-from-Source).

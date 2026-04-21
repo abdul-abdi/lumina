@@ -6,7 +6,7 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.6.0.
+here reflects what ships in v0.7.0.
 
 ## What Lumina Is
 
@@ -15,7 +15,8 @@ boots a Linux VM, executes a command inside it, and returns output as structured
 JSON. There are two shapes you will use:
 
 - **One-shot:** `lumina run "<cmd>"` — boots a disposable VM, runs the command,
-  tears the VM down. ~400ms cold start.
+  tears the VM down. ~540ms cold start P50 on M3 Pro (release build). The CI
+  regression gate holds median ≤ 2000ms so this number won't silently drift.
 - **Session:** `lumina session start` gives you a persistent VM id (SID). You
   then `lumina exec <sid> "<cmd>"` as many times as you want at ~30ms per
   exec. Sessions support interactive PTYs, port forwarding, and file transfer.
@@ -106,7 +107,7 @@ Unreachable sessions (stale socket, crashed process) appear as
 
 Clean teardown. Idempotent — stopping an already-stopped SID is not an error.
 
-### `lumina desktop` (v0.7.0+, experimental)
+### `lumina desktop` (v0.7.0)
 
 Desktop VMs are a different primitive from agent sessions: they boot a
 full installer ISO (Ubuntu, Kali, Fedora, Debian, Windows 11 ARM, macOS)
@@ -158,6 +159,18 @@ architecture pre-flight on the supplied `--iso` and rejects x86_64 / RISC-V
 ISOs with a clear error. Pass `--force` to skip the check (intended for
 ISOs whose EFI bootloader filename is non-standard; you'll find out very
 quickly if it doesn't actually boot).
+
+#### ISO integrity
+
+`DesktopOSCatalog` carries hardcoded SHA-256 digests for Ubuntu 24.04, Kali
+2026.1, Fedora 42, Debian 12.12 (URLs + digests verified against each
+vendor's signed SHA256SUMS). The Lumina Desktop **app wizard** streams any
+user-picked catalog ISO through SHA-256 before creating the VM and refuses
+mismatches. `lumina desktop create --iso` (CLI path) does not yet verify —
+if you're scripting and integrity matters, `shasum -a 256` the file
+yourself before passing it to `--iso`, or drive creation through the app.
+BYO / Windows-MSA / Apple-IPSW paths have no catalog digest to check
+against — Apple IPSWs are signed and verified by `VZMacOSRestoreImage`.
 
 #### Windows 11 ARM caveats
 
@@ -236,9 +249,10 @@ of a command that returned non-zero. `make: *** [build] Error 1` is a
 
 ## What NOT to Do
 
-- **Do not assume boot time.** Cold start is targeting ~400ms in v0.6.0, but
-  image variant, host load, and first-run image fetch change this. If you need
-  fast iteration, start a session once and `exec` many times.
+- **Do not assume boot time.** v0.7.0 cold start measures ~540ms P50 on M3 Pro
+  release builds; the CI gate caps median at 2000ms. Image variant, host load,
+  and first-run image fetch move the number. If you need fast iteration, start
+  a session once and `exec` many times.
 - **Do not rely on ordering between concurrent `exec`s.** Multiple execs on one
   session run in parallel. If one exec writes a file another exec reads, chain
   them with `&&` inside one `exec` invocation or sequence them serially from the
