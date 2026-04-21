@@ -44,15 +44,12 @@ public final class VMLiveStats {
         timer?.invalidate()
         timer = nil
     }
-
-    /// Belt-and-suspenders: if a caller forgets `.onDisappear { stop() }`,
-    /// the Timer stays on the runloop firing no-op `[weak self]` closures
-    /// until process exit. `isolated deinit` (SE-0371, Swift 6.1) runs on
-    /// MainActor so we can invalidate the Timer directly; the @MainActor
-    /// class contract already constrains every call site to main anyway.
-    isolated deinit {
-        timer?.invalidate()
-    }
+    // `deinit { timer?.invalidate() }` would be belt-and-suspenders, but
+    // reading main-actor-isolated `timer` from a nonisolated deinit needs
+    // Swift 6.1's `isolated deinit` (SE-0371) which is still experimental on
+    // GitHub macos-15 runners. Every call site already uses
+    // `.onDisappear { stop() }`; the structural fix (move ownership to
+    // AppModel, keyed by bundle.id, so timers never leak) is tracked by #11.
 
     private func pushSample() {
         let now = Date()
