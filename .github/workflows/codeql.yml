@@ -54,12 +54,15 @@ jobs:
           # a systems codebase touching virtualization APIs.
           queries: security-extended
 
-      # Swift: CodeQL autobuild invokes `swift build`. For the Go
-      # agent we explicitly build so CodeQL can trace the full module
-      # (its autobuild picks the wrong module on multi-module repos).
-      - name: Autobuild (Swift)
+      # Swift: explicit `swift build` under the CodeQL tracer. The
+      # autobuild action fails on this package — it can't resolve
+      # `VZMac*` types in `Sources/Lumina/MacOSSupport.swift` under
+      # its wrapper (likely SDK header lookup disruption). `swift
+      # build` works directly, and the tracer set up by the `init`
+      # step captures the compilation regardless.
+      - name: Build (Swift)
         if: matrix.language == 'swift'
-        uses: github/codeql-action/autobuild@v3
+        run: swift build
 
       - name: Build guest agent (Go)
         if: matrix.language == 'go'

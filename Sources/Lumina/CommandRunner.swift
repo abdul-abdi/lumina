@@ -85,19 +85,20 @@ final class CommandRunner: @unchecked Sendable {
 
         for _ in 0..<maxRetries {
             do {
-                let conn: VZVirtioSocketConnection = try await withCheckedThrowingContinuation { cont in
-                    queue.async { [socketDevice] in
-                        socketDevice.connect(toPort: Self.vsockPort) { result in
+                let socketBox = UncheckedSendable(socketDevice)
+                let connBox: UncheckedSendable<VZVirtioSocketConnection> = try await withCheckedThrowingContinuation { cont in
+                    queue.async {
+                        socketBox.value.connect(toPort: Self.vsockPort) { result in
                             switch result {
                             case .success(let connection):
-                                cont.resume(returning: connection)
+                                cont.resume(returning: UncheckedSendable(connection))
                             case .failure(let error):
                                 cont.resume(throwing: error)
                             }
                         }
                     }
                 }
-                setConnection(conn)
+                setConnection(connBox.value)
                 break
             } catch {
                 try? await Task.sleep(nanoseconds: Self.retryInterval)

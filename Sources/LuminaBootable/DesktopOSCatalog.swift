@@ -4,19 +4,18 @@
 // (M6). Entries point at vendor-canonical ARM64 ISO URLs with published
 // SHA-256 checksums.
 //
-// PRE-SHIP VERIFICATION (release-blocking for v0.7.0):
-//   The URL + checksum values below are the best-known templates as of
-//   2026-04-20. Before v0.7.0 tags, each entry MUST be re-verified against
-//   the vendor's current download page and signed SHA256SUMS file. The
-//   checksums marked `"00..00"` are placeholders — CI rejects a build that
-//   still contains them (see DesktopOSCatalogTests.allEntriesHaveSensibleDefaults
-//   plus a ship-gate lint once we add one).
+// PRE-SHIP VERIFICATION:
+//   URL + checksum values were last verified against each vendor's signed
+//   SHA256SUMS / CHECKSUM file on 2026-04-20. ARM64 release paths and
+//   filenames move with point releases, so re-verify before any tagged
+//   release. `DesktopOSCatalogTests.allEntriesHaveRealChecksums` rejects
+//   any build that still carries the `placeholderSHA256` sentinel.
 //
 // On ARM64 ISO shape per distro:
-//   - Ubuntu: 24.04.1 LTS publishes a Server ARM64 ISO; their installer
+//   - Ubuntu: 24.04.x LTS publishes a Server ARM64 ISO; their installer
 //     (subiquity) on arm64 is CLI-based. For desktop-class UX the user runs
-//     `sudo apt install ubuntu-desktop` post-install. The M6 wizard documents
-//     this. We track the 24.04.1 Server ARM64 ISO here.
+//     `sudo apt install ubuntu-desktop` post-install. The M6 wizard
+//     documents this. We track the current 24.04.x Server ARM64 ISO here.
 //   - Kali: `kali-linux-<year>.<release>-installer-arm64.iso` (Debian-based
 //     graphical installer).
 //   - Fedora: Workstation Live `aarch64`. Filename uses `aarch64` (not
@@ -66,15 +65,12 @@ public enum DesktopOSCatalog {
     public static let placeholderSHA256 = String(repeating: "0", count: 64)
 
     public static let all: [DesktopOSEntry] = [
-        // URLs verified via web search on 2026-04-20 against the vendor
-        // sites. ARM64 release paths and filenames change per-point-release
-        // (Ubuntu `24.04.3`, Kali `2026.1`, Fedora `42`, Debian `12.12.0`).
-        // The sha256 field remains a placeholder — v0.7.1 adds runtime
-        // fetch from SHA256SUMS at the wizard's file-pick step.
-        // Real SHA-256 checksums fetched from each distro's signed
-        // SHA256SUMS / CHECKSUM file on 2026-04-20. These are load-bearing
-        // — the wizard's file-pick step can now verify an ISO before
-        // staging it, rejecting tampered or partially-downloaded files.
+        // URLs + SHA-256 digests verified against each vendor's signed
+        // SHA256SUMS / CHECKSUM file on 2026-04-20 (Ubuntu 24.04.3, Kali
+        // 2026.1, Fedora 42, Debian 12.12.0). The digests are load-bearing
+        // — the wizard's file-pick step verifies an ISO against them
+        // before staging, rejecting tampered or partially-downloaded
+        // files.
         DesktopOSEntry(
             id: "ubuntu-24.04",
             displayName: "Ubuntu 24.04 LTS (Server, ARM64)",

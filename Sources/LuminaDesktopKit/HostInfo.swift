@@ -55,7 +55,12 @@ public struct HostInfo: Sendable {
         guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: size)
         guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
-        return String(cString: buffer)
+        // Decode the null-terminated sysctl result without the deprecated
+        // `String(cString: [CChar])` initializer.
+        return buffer.withUnsafeBufferPointer { buf -> String? in
+            guard let base = buf.baseAddress else { return nil }
+            return String(cString: base)
+        }
     }
 }
 

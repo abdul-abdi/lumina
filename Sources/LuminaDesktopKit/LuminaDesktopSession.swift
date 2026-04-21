@@ -67,9 +67,10 @@ public final class LuminaDesktopSession: Identifiable {
     /// completes its actor hop.
     public var vzMachine: VZVirtualMachine?
 
-    /// The underlying VM actor. Held nonisolated; access from main actor
-    /// goes through the helper methods below which await it.
-    private nonisolated(unsafe) var vm: VM?
+    /// The underlying VM actor. MainActor-isolated (inherits from the
+    /// enclosing `@MainActor` class). `VM` is an actor, so `VM?` is
+    /// `Sendable` and can be awaited from any isolation without friction.
+    private var vm: VM?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
     /// VZ holds the delegate weakly, so we retain it here until the
@@ -121,56 +122,45 @@ public final class LuminaDesktopSession: Identifiable {
         // Migrate existing bundles to the Spotlight opt-out applied at
         // VMBundle.create() time. Old bundles pre-dating that change
         // don't have the flag; touching it here is idempotent and
-        // eliminates the dominant cause of VZ Code 2 for them too.
+        // removes the indexer-lock race as a Code 2 source.
         ensureSpotlightDisabled()
 
-        // Minimal retry safety net. With the re-entry guard above
-        // eliminating the concurrent-boot race (the real Code 2 cause)
-        // and the Spotlight opt-out removing the indexer-lock race, one
-        // retry at 200ms covers the residual case of a process fd not
-        // yet reclaimed after a pkill cycle. Not a progressive ladder —
-        // if a single 200ms wait doesn't clear the condition, something
-        // more fundamental is wrong and masking it further hurts more
-        // than it helps.
-        let maxAttempts = 2
-        for attempt in 1...maxAttempts {
-            let newVM = VM(options: opts)
-            self.vm = newVM
-            do {
-                try await newVM.boot()
-                // Grab the VZ handle and publish it BEFORE flipping
-                // status to `.running`. Observing views read `status`
-                // AND `vzMachine` in the same body — if we flip status
-                // first, the view can render the `.running` branch
-                // with a nil handle and fall back to the "connecting
-                // to display…" placeholder. Writing vzMachine first
-                // means both mutations land in the same observation
-                // tick and the view body sees a consistent state.
-                let handle = await newVM.vzMachine()
-                self.vzMachine = handle.machine
-                self.status = .running
-                self.bootDuration = ContinuousClock.now - start
-                // Persist lastBootedAt. On the very first successful boot we
-                // also detach the installer ISO sidecar — the install has
-                // completed and EFI now prefers the HDD, so keeping the CD-ROM
-                // mounted just clutters every card with "installer attached"
-                // forever. Both writes are non-fatal.
-                persistBootRecord()
-                // Attach stop observer so guest-initiated `poweroff`, external
-                // crashes, and any other VZ-side termination flip status back
-                // to .stopped / .crashed.
-                await attachStopObserver(to: newVM)
-                return
-            } catch {
-                if Self.isTransientVZStorageError(error), attempt < maxAttempts {
-                    self.vm = nil
-                    try? await Task.sleep(for: .milliseconds(200))
-                    continue
-                }
-                self.status = .crashed(reason: "\(error)")
-                self.lastError = "\(error)"
-                return
-            }
+        // Single-shot boot. The historical concurrent-boot race that
+        // produced `VZErrorDomain Code 2` on first click is now fixed
+        // structurally by the re-entry guard at the top of this method
+        // (see commit a8e211d). With that race gone and the Spotlight
+        // opt-out applied above, we have no reproducer for Code 2
+        // requiring a retry. If it reappears, surface it — retries here
+        // only hid the previous bug for months.
+        let newVM = VM(options: opts)
+        self.vm = newVM
+        do {
+            try await newVM.boot()
+            // Grab the VZ handle and publish it BEFORE flipping status
+            // to `.running`. Observing views read `status` AND
+            // `vzMachine` in the same body — if we flipped status
+            // first, the view could render the `.running` branch with a
+            // nil handle and fall back to the "connecting to display…"
+            // placeholder. Writing vzMachine first means both mutations
+            // land in the same observation tick.
+            let handle = await newVM.vzMachine()
+            self.vzMachine = handle.machine
+            self.status = .running
+            self.bootDuration = ContinuousClock.now - start
+            // Persist lastBootedAt. On the very first successful boot we
+            // also detach the installer ISO sidecar — the install has
+            // completed and EFI now prefers the HDD, so keeping the CD-ROM
+            // mounted just clutters every card with "installer attached"
+            // forever. Both writes are non-fatal.
+            persistBootRecord()
+            // Attach stop observer so guest-initiated `poweroff`, external
+            // crashes, and any other VZ-side termination flip status back
+            // to .stopped / .crashed.
+            await attachStopObserver(to: newVM)
+        } catch {
+            self.vm = nil
+            self.status = .crashed(reason: "\(error)")
+            self.lastError = "\(error)"
         }
     }
 
@@ -179,26 +169,6 @@ public final class LuminaDesktopSession: Identifiable {
         if !FileManager.default.fileExists(atPath: flag.path) {
             try? Data().write(to: flag, options: .atomic)
         }
-    }
-
-    /// Identify VZ's "invalid storage device attachment" error
-    /// (`VZErrorDomain` code 2). This specific code is transient when it
-    /// appears on first boot — the attachment construction already
-    /// succeeded, so the file exists and is accessible, and VZ's own
-    /// later validation pass happens to fail on a state that resolves
-    /// itself. We retry only on this exact signature to avoid masking
-    /// real configuration bugs (wrong disk format, missing file, etc.)
-    /// which produce different codes.
-    private static func isTransientVZStorageError(_ error: any Error) -> Bool {
-        // Unwrap LuminaError.bootFailed(underlying:) once — VM.swift
-        // wraps every boot-time failure in this envelope.
-        if let lumina = error as? LuminaError,
-           case .bootFailed(let underlying) = lumina {
-            let ns = underlying as NSError
-            return ns.domain == "VZErrorDomain" && ns.code == 2
-        }
-        let ns = error as NSError
-        return ns.domain == "VZErrorDomain" && ns.code == 2
     }
 
     private func persistBootRecord() {

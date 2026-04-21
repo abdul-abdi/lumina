@@ -341,9 +341,10 @@ public actor VM {
         self.virtualMachine = vm
 
         do {
+            let vmBox = UncheckedSendable(vm)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
                 queue.async {
-                    vm.start { result in
+                    vmBox.value.start { result in
                         cont.resume(with: result)
                     }
                 }
@@ -357,15 +358,17 @@ public actor VM {
         // Connect CommandRunner via vsock
         let socketDevice: VZVirtioSocketDevice
         do {
-            socketDevice = try await withCheckedThrowingContinuation { cont in
+            let vmBox = UncheckedSendable(vm)
+            let boxed: UncheckedSendable<VZVirtioSocketDevice> = try await withCheckedThrowingContinuation { cont in
                 queue.async {
-                    if let device = vm.socketDevices.first as? VZVirtioSocketDevice {
-                        cont.resume(returning: device)
+                    if let device = vmBox.value.socketDevices.first as? VZVirtioSocketDevice {
+                        cont.resume(returning: UncheckedSendable(device))
                     } else {
                         cont.resume(throwing: VMError.noSocketDevice)
                     }
                 }
             }
+            socketDevice = boxed.value
         } catch {
             await shutdownVM()
             throw .bootFailed(underlying: error)
@@ -486,9 +489,10 @@ public actor VM {
         self.virtualMachine = vm
 
         do {
+            let vmBox = UncheckedSendable(vm)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
                 queue.async {
-                    vm.start { result in
+                    vmBox.value.start { result in
                         cont.resume(with: result)
                     }
                 }
@@ -911,9 +915,10 @@ public actor VM {
         // underlying fd is closed on dealloc; the dup'd fd remains valid.
         let fd: Int32
         do {
+            let socketBox = UncheckedSendable(socketDevice)
             fd = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, any Error>) in
                 queue.async {
-                    socketDevice.connect(toPort: port) { result in
+                    socketBox.value.connect(toPort: port) { result in
                         switch result {
                         case .success(let c):
                             let d = dup(c.fileDescriptor)
@@ -1036,7 +1041,12 @@ public actor VM {
                                  nil, 0, NI_NUMERICHOST)
             guard rc == 0 else { continue }
 
-            let ip = String(cString: host)
+            // Decode the null-terminated C string into Swift without the
+            // deprecated `String(cString: [CChar])` initializer.
+            let ip = host.withUnsafeBufferPointer { buf -> String in
+                guard let base = buf.baseAddress else { return "" }
+                return String(cString: base)
+            }
             let parts = ip.split(separator: ".")
             guard parts.count == 4 else { continue }
 
@@ -1133,9 +1143,10 @@ public actor VM {
     private func shutdownVM() async {
         if let vm = virtualMachine {
             let queue = executor.queue
+            let vmBox = UncheckedSendable(vm)
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 queue.async {
-                    vm.stop(completionHandler: { _ in
+                    vmBox.value.stop(completionHandler: { _ in
                         cont.resume()
                     })
                 }
@@ -1183,6 +1194,21 @@ enum VMError: Error, Sendable {
     case invalidState(String)
     case noSocketDevice
     case pipeFailed
+}
+
+// MARK: - Sendable crossing shim
+
+/// `@unchecked Sendable` box for the single-closure crossings this target
+/// makes into `DispatchQueue.async` and friends with non-`Sendable`
+/// references — principally VZ API objects. The caller's contract: the
+/// wrapped value is used on the correct isolation domain inside the
+/// closure (e.g. `VZVirtualMachine` on its creation queue). Without this
+/// box, Swift 6's `SendableClosureCaptures` diagnostic fires on every
+/// `queue.async { vm.something(...) }` call site; wrapping makes the
+/// intent explicit rather than silencing it with `@preconcurrency`.
+struct UncheckedSendable<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
 }
 
 // MARK: - Sound (v0.7.0 M4, agent-path-neutral)

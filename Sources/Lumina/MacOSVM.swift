@@ -121,12 +121,18 @@ public actor MacOSVM {
         self.virtualMachine = vm
         _state = .installing(progress: 0.0)
 
-        let installer = await withCheckedContinuation { (cont: CheckedContinuation<VZMacOSInstaller, Never>) in
+        let vmBox = UncheckedSendable(vm)
+        let preparedBox = UncheckedSendable(prepared)
+        let installerBox: UncheckedSendable<VZMacOSInstaller> = await withCheckedContinuation { (cont: CheckedContinuation<UncheckedSendable<VZMacOSInstaller>, Never>) in
             queue.async {
-                let inst = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: prepared.restoreImage.url)
-                cont.resume(returning: inst)
+                let inst = VZMacOSInstaller(
+                    virtualMachine: vmBox.value,
+                    restoringFromImageAt: preparedBox.value.restoreImage.url
+                )
+                cont.resume(returning: UncheckedSendable(inst))
             }
         }
+        let installer = installerBox.value
 
         // Observe progress.
         let progressToken: NSKeyValueObservation? = installer.progress.observe(\.fractionCompleted) { progress, _ in
@@ -137,7 +143,7 @@ public actor MacOSVM {
         do {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
                 queue.async {
-                    installer.install { result in
+                    installerBox.value.install { result in
                         cont.resume(with: result)
                     }
                 }
@@ -190,9 +196,10 @@ public actor MacOSVM {
         self.virtualMachine = vm
 
         do {
+            let vmBox = UncheckedSendable(vm)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
                 queue.async {
-                    vm.start { result in
+                    vmBox.value.start { result in
                         cont.resume(with: result)
                     }
                 }
@@ -210,9 +217,10 @@ public actor MacOSVM {
         _state = .shutdown
         guard let vm = virtualMachine else { return }
         let queue = executor.queue
+        let vmBox = UncheckedSendable(vm)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async {
-                vm.stop(completionHandler: { _ in
+                vmBox.value.stop(completionHandler: { _ in
                     cont.resume()
                 })
             }

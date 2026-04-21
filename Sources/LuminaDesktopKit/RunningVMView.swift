@@ -1,8 +1,14 @@
 // Sources/LuminaDesktopKit/RunningVMView.swift
 //
-// v0.7.0 M6 — per-VM running window. Embeds LuminaVirtualMachineView,
-// adds toolbar (pause/restart/snapshot/shutdown/fullscreen), and the
-// pointer-release toast. Aligned to lumina.run phosphor-amber theme.
+// v0.7.0 M6 — per-VM running window. Embeds LuminaVirtualMachineView
+// edge-to-edge with a centered VM name and right-aligned toolbar
+// buttons (STOP / RESTART / SNAPSHOT). Fullscreen is handled by
+// macOS — toggled via ⌘⌃F or the VM menu's `Enter / Exit Full
+// Screen` item. In fullscreen the entire toolbar auto-hides and
+// reveals on hover-to-top: on macOS 15+ via the Scene-level
+// `.windowToolbarFullScreenVisibility(.onHover)` modifier; on macOS
+// 14 via `LegacyFullscreenConfigurator` below, which flips
+// `NSApp.presentationOptions` on the enter/exit notifications.
 
 import SwiftUI
 @preconcurrency import Virtualization
@@ -11,10 +17,6 @@ import LuminaBootable
 @MainActor
 public struct RunningVMView: View {
     @Bindable var session: LuminaDesktopSession
-    @State private var showReleaseToast = false
-    @State private var bootingDots = 0
-    @State private var isFullscreen = false
-    @State private var showFullscreenChrome = true
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
 
     private var appearance: AppearancePreference {
@@ -26,30 +28,22 @@ public struct RunningVMView: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .top) {
-            LuminaTheme.bgInset.ignoresSafeArea()
+        ZStack {
+            LuminaTheme.bgInset
             framebuffer
-                .ignoresSafeArea(.all, edges: isFullscreen ? .all : [])
-            if showReleaseToast {
-                releaseToast
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                    .padding(.top, 16)
-            }
-            if isFullscreen {
-                FullscreenChrome(
-                    visible: $showFullscreenChrome,
-                    sessionName: session.bundle.manifest.name,
-                    onExit: { toggleFullscreen() },
-                    onShutdown: { Task { await session.shutdown() } }
-                )
-            }
         }
         .preferredColorScheme(appearance.colorScheme)
-        .background(
-            FullscreenObserver(isFullscreen: $isFullscreen)
-        )
-        .toolbar(isFullscreen ? .hidden : .automatic, for: .windowToolbar)
         .toolbar {
+            // Centered VM name. `.principal` puts the item in the title
+            // bar's center slot — the macOS standard location for window
+            // titles (Finder, Preview, many Apple apps). With a proper
+            // title bar (not `.hiddenTitleBar`), this renders as plain
+            // centered text without the capsule artifact we had before.
+            ToolbarItem(placement: .principal) {
+                Text(session.bundle.manifest.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(LuminaTheme.ink)
+            }
             ToolbarItemGroup(placement: .primaryAction) {
                 toolbarButton("⏻ STOP", color: LuminaTheme.err) {
                     Task { await session.shutdown() }
@@ -68,32 +62,33 @@ public struct RunningVMView: View {
                 }
                 .keyboardShortcut("t", modifiers: .command)
                 .disabled(!session.status.isLive)
-
-                toolbarButton("⛶ FULLSCREEN") {
-                    toggleFullscreen()
-                }
-                .keyboardShortcut("f", modifiers: [.command, .control])
-                .help("Enter full screen (⌘⌃F). The VM takes over your display.")
             }
         }
+        // Window title for accessibility + Expose / Dock / Window menu.
+        // The on-screen toolbar shows the name via the `.principal`
+        // ToolbarItem above; this call is for system services, not
+        // visible chrome. With `.windowToolbarStyle(.unified(showsTitle:
+        // false))` set on the scene, the toolbar no longer renders its
+        // own title and the left-aligned NSWindow title is also
+        // suppressed — the `.principal` text above is the sole visible
+        // label.
         .navigationTitle(session.bundle.manifest.name)
-        .task {
-            // Briefly flash the "press ⌘⌥ to release pointer" reminder
-            // on the first frame. Boot is NOT triggered from here —
-            // the caller that opened this window (▶ BOOT button, ⌘K
-            // launcher, menu item) owns the boot. Triggering boot here
-            // too would race with the caller's boot and produce
-            // double-boot symptoms (the original root cause of the
-            // "first boot is unreliable" bug).
-            withAnimation(.easeIn(duration: 0.2)) { showReleaseToast = true }
-            try? await Task.sleep(for: .seconds(3))
-            withAnimation(.easeOut(duration: 0.3)) { showReleaseToast = false }
-        }
+        // Fullscreen auto-hide: on macOS 15+ we use the
+        // SwiftUI-native `.windowToolbarFullScreenVisibility(.onHover)`
+        // modifier — toolbar hides in fullscreen and reveals when
+        // the cursor crosses the menu-bar reveal threshold at the
+        // top edge (same gesture that unfurls the menu bar). On
+        // macOS 14 we fall back to `LegacyFullscreenConfigurator`
+        // below, which flips `NSApp.presentationOptions` on the
+        // window's `didEnter/ExitFullScreen` notifications.
+        .modifier(FullscreenToolbarAutoHide())
+        .background(legacyFullscreenBackground)
     }
 
-    private func toggleFullscreen() {
-        if let window = NSApp.keyWindow {
-            window.toggleFullScreen(nil)
+    @ViewBuilder
+    private var legacyFullscreenBackground: some View {
+        if #unavailable(macOS 15.0) {
+            LegacyFullscreenConfigurator()
         }
     }
 
@@ -249,177 +244,86 @@ public struct RunningVMView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var releaseToast: some View {
-        HStack(spacing: 8) {
-            Text("⌘⌥")
-                .font(LuminaTheme.label)
-                .tracking(2)
-                .foregroundStyle(LuminaTheme.accent)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .overlay(Rectangle().stroke(LuminaTheme.accent, lineWidth: 1))
-            Text("RELEASE POINTER")
-                .font(LuminaTheme.label)
-                .tracking(2)
-                .foregroundStyle(LuminaTheme.ink)
+}
+
+// ── FULLSCREEN TOOLBAR AUTO-HIDE ─────────────────────────────────
+/// Applies `.windowToolbarFullScreenVisibility(.onHover)` on macOS
+/// 15+, a no-op on earlier versions. The modifier tells the SwiftUI
+/// runtime to treat the window's toolbar the same way as the system
+/// menu bar in fullscreen: hide it while the guest has focus, and
+/// reveal it briefly when the cursor crosses the top-edge reveal
+/// threshold.
+struct FullscreenToolbarAutoHide: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.windowToolbarFullScreenVisibility(.onHover)
+        } else {
+            content
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(LuminaTheme.bg2.opacity(0.95))
-        .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
     }
 }
 
-// ── FULLSCREEN — immersive, auto-hiding chrome ────────────────────
-
-/// Observes NSWindow fullscreen transitions and mirrors them into a
-/// SwiftUI @State. Required because SwiftUI doesn't expose fullscreen
-/// state directly — we need the AppKit notification.
+// ── LEGACY FULLSCREEN CONFIG (macOS 14 fallback) ─────────────────
+/// macOS 14 fallback for toolbar auto-hide in fullscreen. On macOS
+/// 15+ the SwiftUI-native `.windowToolbarFullScreenVisibility(.onHover)`
+/// Scene modifier handles this declaratively — this type is only
+/// attached to the view on 14.x. It reaches into the underlying
+/// `NSWindow` via an NSViewRepresentable and:
+///
+///   1. Sets `collectionBehavior` to `.fullScreenPrimary` so
+///      `toggleFullScreen(nil)` enters true immersive mode.
+///   2. On `didEnterFullScreen`, sets `NSApp.presentationOptions` to
+///      the full immersion set (`autoHideMenuBar | autoHideDock |
+///      autoHideToolbar` alongside `.fullScreen`). macOS then
+///      honors mouse-to-top reveal natively for both menu bar and
+///      toolbar.
+///   3. On `didExitFullScreen`, clears the options.
 @MainActor
-struct FullscreenObserver: NSViewRepresentable {
-    @Binding var isFullscreen: Bool
-
+struct LegacyFullscreenConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
-        // Bridge NSWindow fullscreen notifications → Binding<Bool> via
-        // Task { @MainActor }, so Swift 6 strict concurrency doesn't
-        // complain about main-actor-mutation from a Sendable closure.
-        // isFullscreen is a Binding; updating it must be on the main
-        // actor — Task { @MainActor ... } gives us that hop.
         DispatchQueue.main.async {
             guard let window = v.window else { return }
-            let binding = self.$isFullscreen
+
+            // (1) Allow true fullscreen primary mode.
+            window.collectionBehavior.insert(.fullScreenPrimary)
+            window.collectionBehavior.remove(.fullScreenNone)
+
+            // (2) Hide NSWindow's own title rendering in the title bar.
+            // `.navigationTitle(...)` sets the window title for system
+            // services (Window menu, Dock, Expose, accessibility) — we
+            // want those to work, but NOT see a duplicate left-aligned
+            // title when the principal toolbar item already renders the
+            // VM name centered.
+            window.titleVisibility = .hidden
+
+            // (3) Enter-fullscreen: apply immersive presentation options.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didEnterFullScreenNotification,
                 object: window, queue: .main
             ) { _ in
-                Task { @MainActor in binding.wrappedValue = true }
+                Task { @MainActor in
+                    NSApp.presentationOptions = [
+                        .fullScreen,
+                        .autoHideMenuBar,
+                        .autoHideDock,
+                        .autoHideToolbar,
+                    ]
+                }
             }
+
+            // (4) Exit-fullscreen: restore default.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didExitFullScreenNotification,
                 object: window, queue: .main
             ) { _ in
-                Task { @MainActor in binding.wrappedValue = false }
+                Task { @MainActor in
+                    NSApp.presentationOptions = []
+                }
             }
         }
         return v
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
-}
-
-/// Fullscreen chrome — auto-hiding overlay with VM name + exit button.
-/// First-time users see the chrome for 4 seconds with a 'press ESC to
-/// exit' hint so the fullscreen doesn't feel like a trap. After that
-/// it auto-hides 2.5s after mouse inactivity and re-appears when the
-/// cursor approaches the top 60pt of the view.
-@MainActor
-struct FullscreenChrome: View {
-    @Binding var visible: Bool
-    let sessionName: String
-    let onExit: () -> Void
-    let onShutdown: () -> Void
-    @State private var hideTimer: Task<Void, Never>?
-
-    var body: some View {
-        VStack(spacing: 10) {
-            if visible {
-                chrome
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-            Spacer()
-        }
-        .onAppear { scheduleHide() }
-        .background(
-            MouseHoverDetector { point in
-                if point.y < 60 { showChrome() }
-            }
-        )
-        .animation(.easeInOut(duration: 0.25), value: visible)
-    }
-
-    private var chrome: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Circle().fill(LuminaTheme.ok).frame(width: 6, height: 6)
-                Text(sessionName)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(LuminaTheme.ink)
-            }
-            Spacer()
-            Button {
-                onShutdown()
-            } label: {
-                Label("STOP", systemImage: "power")
-                    .font(LuminaTheme.label).tracking(1.5)
-                    .foregroundStyle(LuminaTheme.err)
-            }
-            .buttonStyle(.plain)
-            Button {
-                onExit()
-            } label: {
-                Label("EXIT FULL SCREEN", systemImage: "arrow.down.right.and.arrow.up.left")
-                    .font(LuminaTheme.label).tracking(1.5)
-                    .foregroundStyle(LuminaTheme.ink)
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut(.escape, modifiers: [])
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .background(
-            Capsule().fill(LuminaTheme.bg2.opacity(0.92))
-        )
-        .overlay(
-            Capsule().stroke(LuminaTheme.rule2, lineWidth: 0.5)
-        )
-        .padding(.horizontal, 24)
-        .padding(.top, 16)
-        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
-    }
-
-    private func showChrome() {
-        withAnimation(.easeInOut(duration: 0.2)) { visible = true }
-        scheduleHide()
-    }
-
-    private func scheduleHide() {
-        hideTimer?.cancel()
-        hideTimer = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(2.5))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeInOut(duration: 0.3)) { visible = false }
-        }
-    }
-}
-
-/// Track mouse position (global coords relative to this view) and fire
-/// a callback. Used by FullscreenChrome to reveal when cursor nears top.
-@MainActor
-struct MouseHoverDetector: NSViewRepresentable {
-    let onMove: (CGPoint) -> Void
-
-    func makeNSView(context: Context) -> NSView {
-        let v = HoverNSView()
-        v.onMove = onMove
-        return v
-    }
-    func updateNSView(_ nsView: NSView, context: Context) {}
-
-    private class HoverNSView: NSView {
-        var onMove: ((CGPoint) -> Void)?
-        override func updateTrackingAreas() {
-            trackingAreas.forEach { removeTrackingArea($0) }
-            let area = NSTrackingArea(
-                rect: bounds,
-                options: [.mouseMoved, .activeAlways, .inVisibleRect],
-                owner: self, userInfo: nil
-            )
-            addTrackingArea(area)
-        }
-        override func mouseMoved(with event: NSEvent) {
-            let p = convert(event.locationInWindow, from: nil)
-            onMove?(CGPoint(x: p.x, y: bounds.height - p.y))  // flip Y
-        }
-    }
 }

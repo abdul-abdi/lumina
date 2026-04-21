@@ -41,6 +41,19 @@ import Testing
         }
     }
 
+    /// Ship-gate: refuse any build that still carries the placeholder
+    /// SHA-256. The catalog header promises this check; without it, a
+    /// placeholder could ship and the wizard's ISO verification would
+    /// silently accept any file.
+    @Test func allEntriesHaveRealChecksums() {
+        for e in DesktopOSCatalog.all {
+            #expect(
+                e.sha256 != DesktopOSCatalog.placeholderSHA256,
+                "\(e.id): sha256 is still the placeholder sentinel"
+            )
+        }
+    }
+
     @Test func catalogContainsCoreFourDistros() {
         let ids = Set(DesktopOSCatalog.all.map { $0.id })
         #expect(ids.contains("ubuntu-24.04"))

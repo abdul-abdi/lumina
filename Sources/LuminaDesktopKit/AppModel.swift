@@ -26,11 +26,13 @@ public final class AppModel {
     // FS watcher for ~/.lumina/desktop-vms/ — VMs created via CLI or other
     // processes show up in the library within ~100ms of landing on disk.
     // No poll, no "refresh" button. The file system IS the model.
-    // nonisolated(unsafe): the AppModel lives for the app's lifetime, so
-    // deinit cleanup isn't practically reachable. The watcher resources
-    // are released when the process exits.
-    private nonisolated(unsafe) var fsWatcher: DispatchSourceFileSystemObject?
-    private nonisolated(unsafe) var fsWatcherFd: Int32 = -1
+    //
+    // Both properties are MainActor-isolated (the enclosing class is
+    // `@MainActor`). The watcher's event handler fires on `.main`, and
+    // the cancel handler captures the raw fd by value so it doesn't need
+    // to touch `self`.
+    private var fsWatcher: DispatchSourceFileSystemObject?
+    private var fsWatcherFd: Int32 = -1
 
     public init(store: VMStore = VMStore()) {
         self.store = store
@@ -58,11 +60,12 @@ public final class AppModel {
             guard let self else { return }
             self.scheduleCoalescedRefresh()
         }
-        src.setCancelHandler { [weak self] in
-            if let fd = self?.fsWatcherFd, fd >= 0 {
-                Darwin.close(fd)
-                self?.fsWatcherFd = -1
-            }
+        // Capture the fd by value so the handler doesn't need `self`.
+        // After cancel there's nothing left to mutate on the model — the
+        // source itself is torn down by Dispatch and the fd is closed here.
+        let capturedFd = fd
+        src.setCancelHandler {
+            if capturedFd >= 0 { Darwin.close(capturedFd) }
         }
         src.resume()
         fsWatcher = src

@@ -76,13 +76,17 @@ jobs:
     permissions:
       contents: read
     env:
-      # Current baseline on macos-15 + Swift 6 toolchain. Dominant
-      # sources: `nonisolated(unsafe)` no-op warnings on non-Sendable
-      # properties held on @MainActor classes (LuminaDesktopSession,
-      # AppModel), and `init(cString:)` deprecations in HostInfo +
-      # VM.swift. All three categories are mechanical to fix; this
-      # budget should drop as they do.
-      MAX_WARNINGS: "70"
+      # Zero-warning baseline on macos-15 + Swift 6 toolchain. The
+      # previous budget (70) covered: VZ non-Sendable captures in
+      # `@Sendable` closures (CommandRunner, VM, MacOSVM), `sending`
+      # data-race warnings on VZ return values, `init(cString:)`
+      # deprecations, and `nonisolated(unsafe)` no-ops. All four
+      # categories were fixed in the v0.7.0 cleanup pass — the VZ
+      # captures now go through an explicit `UncheckedSendable<T>`
+      # box, `nonisolated(unsafe)` is gone, and the array-form of
+      # `String(cString:)` was replaced with the pointer form.
+      # Ratchet stays at zero: any new warning fails the check.
+      MAX_WARNINGS: "0"
     steps:
       - uses: actions/checkout@v4
 

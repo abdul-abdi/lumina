@@ -5,13 +5,71 @@
 // Tokens resolve dynamically to the active color scheme.
 
 import SwiftUI
+import AppKit
+
+/// Observable mirror of macOS's global appearance preference
+/// (`AppleInterfaceStyle`). Views that want to react to system
+/// dark↔light toggles while `AppearancePreference.system` is selected
+/// should read `SystemAppearance.shared.isDark` so their body
+/// re-evaluates on change.
+///
+/// Without this, eagerly resolving `.system` to a concrete scheme (in
+/// `AppearancePreference.colorScheme`) would break auto-follow: users
+/// flipping macOS dark/light via Control Center would see Lumina stay
+/// on the last-resolved scheme until another re-render.
+@MainActor
+@Observable
+public final class SystemAppearance {
+    public static let shared = SystemAppearance()
+
+    public private(set) var isDark: Bool
+
+    private init() {
+        self.isDark = Self.readSystemIsDark()
+        // `AppleInterfaceThemeChangedNotification` is a distributed
+        // notification macOS posts to every running app when the user
+        // toggles system appearance (System Settings, Control Center,
+        // Shortcuts, etc.). No KVO on NSApp.effectiveAppearance — that
+        // one triggers on OUR window overrides too, which would cause
+        // a re-render loop.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.isDark = Self.readSystemIsDark()
+            }
+        }
+    }
+
+    private static func readSystemIsDark() -> Bool {
+        if let style = UserDefaults.standard.string(forKey: "AppleInterfaceStyle"),
+           style.lowercased().contains("dark") {
+            return true
+        }
+        return false
+    }
+}
 
 public enum AppearancePreference: String, CaseIterable, Sendable {
     case system, light, dark
 
+    /// Resolved color scheme for `.preferredColorScheme`.
+    ///
+    /// `.system` returns a concrete `.dark` or `.light` rather than `nil`.
+    /// Passing `nil` to `.preferredColorScheme` triggers a two-hop
+    /// transition (remove override → query system → apply) which macOS
+    /// visibly crossfades — that's the Light→System lag. Returning a
+    /// concrete scheme collapses it to one hop.
+    ///
+    /// Callers that want `.system` selections to auto-follow macOS
+    /// Dark↔Light toggles should read `SystemAppearance.shared.isDark`
+    /// in the view body — observing it causes re-evaluation when the
+    /// user flips the system appearance externally.
+    @MainActor
     public var colorScheme: ColorScheme? {
         switch self {
-        case .system: nil
+        case .system: SystemAppearance.shared.isDark ? .dark : .light
         case .light: .light
         case .dark: .dark
         }

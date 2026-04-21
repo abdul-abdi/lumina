@@ -11,6 +11,7 @@ import LuminaBootable
 @main
 struct LuminaDesktopApp: App {
     @State private var model = AppModel()
+    @State private var uiState = AppUIState.shared
 
     var body: some Scene {
         WindowGroup("Lumina", id: "library") {
@@ -20,7 +21,7 @@ struct LuminaDesktopApp: App {
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1200, height: 720)
         .commands {
-            LuminaCommands(model: model)
+            LuminaCommands(model: model, uiState: uiState)
         }
 
         WindowGroup(id: "vm-window", for: UUID.self) { $vmID in
@@ -31,8 +32,17 @@ struct LuminaDesktopApp: App {
                 Text("VM not found").padding()
             }
         }
-        .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified(showsTitle: true))
+        // `unified(showsTitle: false)` strips the toolbar's own
+        // title rendering (the left-aligned label AND the center
+        // "pill" — both are drawn by the unified title bar when
+        // `showsTitle` is true). The only VM name that remains
+        // visible is the plain centered label drawn via the
+        // `.principal` ToolbarItem in `RunningVMView`. The
+        // companion `.windowToolbarFullScreenVisibility(.onHover)`
+        // call (macOS 15+) that drives fullscreen auto-hide lives
+        // on the view body in `RunningVMView` — it's declared on
+        // `extension View` in SwiftUI, not on Scene.
+        .windowToolbarStyle(.unified(showsTitle: false))
 
         Settings {
             PreferencesView(model: model)
@@ -157,9 +167,44 @@ struct MenuBarContent: View {
 /// users get a menu at the top of the screen via the OS's automatic
 /// menu-reveal-on-hover. First-time discovery happens here, not in a
 /// floating toast.
+// ── APP-LEVEL UI STATE ────────────────────────────────────────────
+/// Tracks cross-window UI state the menu bar needs to observe:
+/// whether any Lumina window is currently in fullscreen. The VM menu
+/// uses this to switch the label between "Enter Full Screen" and
+/// "Exit Full Screen" without flashing a floating overlay on content.
+@MainActor
+@Observable
+final class AppUIState {
+    static let shared = AppUIState()
+
+    var hasFullscreenWindow: Bool = false
+
+    private init() {
+        let center = NotificationCenter.default
+        center.addObserver(
+            forName: NSWindow.didEnterFullScreenNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.hasFullscreenWindow = true }
+        }
+        center.addObserver(
+            forName: NSWindow.didExitFullScreenNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // Any *other* window might still be fullscreen — re-check
+            // instead of blindly clearing.
+            Task { @MainActor in
+                self?.hasFullscreenWindow = NSApplication.shared.windows
+                    .contains { $0.styleMask.contains(.fullScreen) }
+            }
+        }
+    }
+}
+
 @MainActor
 struct LuminaCommands: Commands {
     @Bindable var model: AppModel
+    @Bindable var uiState: AppUIState
 
     var body: some Commands {
         // ── Lumina menu (app menu) ──
@@ -240,8 +285,14 @@ struct LuminaCommands: Commands {
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(model.selection == nil)
             Divider()
-            Button("Enter Full Screen") { enterFullscreen() }
-                .keyboardShortcut("f", modifiers: [.command, .control])
+            // Standard macOS pattern: label flips based on whether any
+            // window is already fullscreen. No floating chrome — the
+            // menu bar itself is the escape route (OS reveals it on
+            // mouse-to-top in immersive fullscreen).
+            Button(uiState.hasFullscreenWindow ? "Exit Full Screen" : "Enter Full Screen") {
+                enterFullscreen()
+            }
+            .keyboardShortcut("f", modifiers: [.command, .control])
         }
 
         // ── View menu ──

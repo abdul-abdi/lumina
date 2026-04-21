@@ -3,17 +3,28 @@ import PackageDescription
 
 // Lumina is a multi-product package.
 //
-//   Lumina            — headless agent runtime. Zero external deps beyond
-//                       Virtualization.framework. Agent path boot time is
-//                       sacred; every other target must stay out of this
-//                       critical section.
+//   Lumina            — core runtime. Zero external deps beyond
+//                       Virtualization.framework. Hosts both the headless
+//                       agent path (`VM` actor, `CommandRunner`) and the
+//                       full-OS bootable code (`EFIBootable`, `MacOSVM`,
+//                       `MacOSSupport`, `ClipboardProtocol`) because
+//                       `VM.boot()` dispatches across all three profiles;
+//                       placing the bootable code in `LuminaBootable`
+//                       would cycle. Dead-code elimination keeps it out
+//                       of the agent path's runtime footprint, and the
+//                       `effectiveBootable` switch at the top of
+//                       `VM.boot()` routes `.efi` / `.macOS` away from
+//                       the agent hot path byte-for-byte.
 //
 //   LuminaGraphics    — optional display + input device helpers for the
 //                       desktop use case. Layered on top of Lumina; never
 //                       imported by the headless path.
 //
-//   LuminaBootable    — ISO / IPSW / EFI boot pipelines for full-OS
-//                       guests (Linux desktop, Windows 11 ARM, macOS).
+//   LuminaBootable    — higher-level ISO / IPSW boot surfaces that don't
+//                       need to live next to `VM`: `VMBundle`,
+//                       `DesktopOSCatalog`, `IPSWCatalog`,
+//                       `DiskImageAllocator`, `ISOInspector`,
+//                       `CloudInitSeed`, `WindowsSupport`.
 //
 //   LuminaDesktopKit  — SwiftUI primitives (VZVirtualMachineView wrapper,
 //                       image-library views). Depends on LuminaGraphics +
@@ -21,9 +32,11 @@ import PackageDescription
 //                       Apps/LuminaDesktop/ as an Xcode project — SPM
 //                       can't emit a signed .app with entitlements.
 //
-// Agent protection invariant: nothing in LuminaGraphics / LuminaBootable /
-// LuminaDesktopKit is reachable from `lumina run` or `lumina session start`
-// unless `VMOptions.graphics` is explicitly non-nil.
+// Agent protection invariant: the agent path through `VM.boot()` (the
+// `.agent` case of `BootableProfile`) is byte-identical to v0.6.0, and
+// nothing in LuminaGraphics / LuminaBootable / LuminaDesktopKit is
+// reachable from `lumina run` or `lumina session start` unless the
+// caller opts in via `VMOptions.graphics` or `VMOptions.bootable`.
 
 let package = Package(
     name: "Lumina",
