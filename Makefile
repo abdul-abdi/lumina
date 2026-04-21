@@ -1,4 +1,4 @@
-.PHONY: build release sign test test-integration clean run
+.PHONY: build release sign test test-integration test-desktop clean run
 
 BINARY_DEBUG = $(shell swift build --show-bin-path)/lumina
 BINARY_RELEASE = $(shell swift build -c release --show-bin-path)/lumina
@@ -27,6 +27,11 @@ test:
 # Run comprehensive e2e test suite via the actual CLI (requires VM image + jq)
 test-integration: build
 	@bash tests/e2e.sh $(BINARY_DEBUG)
+
+# v0.7.0 M3 — desktop (EFI) boot smoke test against a small Alpine ARM64 ISO.
+# Requires network on first run to fetch the ISO; caches under ~/.lumina/cache/.
+test-desktop: build
+	@bash tests/desktop.sh
 
 # Run quick smoke tests only (subset of e2e, faster)
 test-smoke: build

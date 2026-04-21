@@ -1,0 +1,1688 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lumina — subprocess.run() for virtual machines</title>
+<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~30ms, cold starts in ~400ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
+<meta property="og:title" content="lumina — subprocess.run() for virtual machines" />
+<meta property="og:description" content="A native sandbox primitive for AI agents on Apple Silicon. Now with Lumina Desktop." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0a;
+  --bg-1: #0f0f0f;
+  --bg-2: #141414;
+  --ink: #e8e4d8;
+  --ink-dim: #9a9384;
+  --ink-mute: #6b6558;
+  --rule: #1f1d18;
+  --rule-2: #2a2620;
+  --accent: #ffb347;          /* phosphor amber */
+  --accent-2: #ff7a3d;
+  --ok: #8fc97a;
+  --err: #e87272;
+  --warn: #e5c96a;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-serif: "Fraunces", ui-serif, Georgia, serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); }
+body {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.55;
+  font-feature-settings: "ss01","ss02","zero","cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Film grain over everything */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.9   0 0 0 0 0.88   0 0 0 0 0.82   0 0 0 0.08 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  opacity: .5;
+  mix-blend-mode: overlay;
+}
+
+/* Cursor reactive halo */
+.halo {
+  position: fixed;
+  pointer-events: none;
+  width: 520px; height: 520px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,179,71,.08), rgba(255,179,71,0) 60%);
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  transition: opacity .4s ease;
+  mix-blend-mode: screen;
+}
+
+a { color: inherit; }
+::selection { background: var(--accent); color: #111; }
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 32px;
+  position: relative;
+  z-index: 2;
+}
+
+/* ───── NAV ───── */
+nav.top {
+  border-bottom: 1px solid var(--rule);
+  position: sticky; top: 0;
+  background: rgba(10,10,10,.86);
+  backdrop-filter: blur(8px);
+  z-index: 50;
+}
+nav.top .row {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 48px;
+}
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 600; letter-spacing: -.01em;
+}
+.brand-mark {
+  width: 18px; height: 18px; position: relative;
+  display: inline-block;
+}
+.brand-mark::before,
+.brand-mark::after {
+  content: "";
+  position: absolute; inset: 0;
+  border: 1px solid var(--accent);
+}
+.brand-mark::after {
+  transform: translate(4px, 4px);
+  border-color: var(--ink);
+  opacity: .5;
+}
+.brand .tld { color: var(--ink-mute); font-weight: 400; }
+nav.top ul {
+  display: flex; gap: 26px; list-style: none; margin: 0; padding: 0;
+  color: var(--ink-dim);
+}
+nav.top ul a { text-decoration: none; }
+nav.top ul a:hover { color: var(--ink); }
+.nav-status {
+  display: flex; align-items: center; gap: 8px; font-size: 12px;
+  color: var(--ink-dim);
+}
+.dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(143,201,122,.7);
+  animation: pulse 2.2s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(143,201,122,.55); }
+  70% { box-shadow: 0 0 0 10px rgba(143,201,122,0); }
+  100% { box-shadow: 0 0 0 0 rgba(143,201,122,0); }
+}
+
+/* ───── Bookends ───── */
+.meta-strip {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto auto;
+  align-items: center;
+  gap: 24px;
+  font-size: 11px;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  border-bottom: 1px dashed var(--rule-2);
+  padding: 10px 0;
+}
+.meta-strip span b { color: var(--ink-dim); font-weight: 500; }
+
+/* ───── HERO ───── */
+.hero {
+  padding: 80px 0 60px;
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+}
+.hero .kicker {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--accent);
+  padding: 6px 10px;
+  border: 1px solid var(--accent);
+  background: rgba(255,179,71,.06);
+}
+.hero h1 {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: clamp(44px, 7vw, 96px);
+  line-height: .98;
+  letter-spacing: -.035em;
+  margin: 28px 0 20px;
+  color: var(--ink);
+}
+.hero h1 .sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 400;
+  color: var(--ink-dim);
+  letter-spacing: -.01em;
+}
+.hero h1 .op {
+  color: var(--accent);
+}
+.hero .lede {
+  max-width: 640px;
+  color: var(--ink-dim);
+  font-size: 16px;
+  line-height: 1.6;
+}
+.hero .lede b { color: var(--ink); font-weight: 500; }
+
+.cta-row {
+  display: flex; flex-wrap: wrap; gap: 12px;
+  margin-top: 34px; align-items: center;
+}
+.btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  border: 1px solid var(--rule-2);
+  background: var(--bg-1);
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn.primary {
+  background: var(--accent); color: #111; border-color: var(--accent);
+  font-weight: 600;
+}
+.btn.primary:hover {
+  background: var(--ink); color: #111; border-color: var(--ink);
+}
+.btn .k { opacity: .6; font-size: 11px; }
+.btn .arr { transition: transform .2s; }
+.btn:hover .arr { transform: translateX(3px); }
+
+.install-line {
+  display: inline-flex; align-items: center; gap: 14px;
+  font-size: 13px; color: var(--ink-dim);
+  padding: 12px 16px;
+  border: 1px dashed var(--rule-2);
+  background: var(--bg-1);
+}
+.install-line .prompt { color: var(--accent); }
+.install-line code { color: var(--ink); }
+.install-line button {
+  background: none; border: 0; color: var(--ink-mute);
+  cursor: pointer; font-family: var(--font-mono); font-size: 12px;
+}
+.install-line button:hover { color: var(--accent); }
+
+.platform-note {
+  margin-top: 16px;
+  font-size: 11px; color: var(--ink-mute); letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.platform-note .chip {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--rule-2);
+  margin-right: 8px;
+  color: var(--ink-dim);
+}
+
+/* ───── Hero split grid ───── */
+.hero-grid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  gap: 56px;
+  align-items: end;
+}
+@media (max-width: 920px) {
+  .hero-grid { grid-template-columns: 1fr; }
+}
+
+/* ───── LIVE PS PANEL ───── */
+.ps-panel {
+  border: 1px solid var(--rule);
+  background:
+    radial-gradient(ellipse at 100% 0%, rgba(255,179,71,.05), transparent 55%),
+    var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  line-height: 1.5;
+  min-height: 440px;
+  position: relative;
+  overflow: hidden;
+}
+.ps-panel::after {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(255,255,255,.012) 2px 3px);
+}
+.ps-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 11px; color: var(--ink-mute);
+  letter-spacing: .1em; text-transform: uppercase;
+  background: var(--bg-2);
+}
+.ps-title { color: var(--accent); font-weight: 500; }
+.ps-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-dim); }
+.ps-colhead, .ps-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 80px 66px 50px 54px;
+  gap: 10px;
+  padding: 6px 14px;
+  align-items: center;
+}
+.ps-colhead {
+  font-size: 9.5px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--ink-mute);
+  border-bottom: 1px dashed var(--rule-2);
+}
+.ps-rows { flex: 1; overflow: hidden; position: relative; }
+.ps-row {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px dashed var(--rule-2);
+  opacity: 0;
+  transform: translateY(-4px);
+  animation: ps-in .35s ease-out forwards;
+}
+.ps-row.leave {
+  animation: ps-out .3s ease-in forwards;
+}
+@keyframes ps-in { to { opacity: 1; transform: none; } }
+@keyframes ps-out { to { opacity: 0; transform: translateY(4px); } }
+.ps-row .st {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
+}
+.ps-row .st i {
+  width: 6px; height: 6px; display: inline-block;
+}
+.ps-row.exec .st { color: var(--accent); }
+.ps-row.exec .st i { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+.ps-row.idle .st { color: var(--ok); }
+.ps-row.idle .st i { background: var(--ok); }
+.ps-row.boot .st { color: var(--ink-dim); }
+.ps-row.boot .st i { background: var(--ink-dim); animation: blink 1.1s infinite; }
+.ps-row .sid { color: var(--ink); letter-spacing: 0; }
+.ps-row .img { color: var(--ink-dim); }
+.ps-row .up, .ps-row .execs, .ps-row .lat { color: var(--ink-dim); }
+.ps-row.exec .lat { color: var(--accent); }
+.ps-foot {
+  display: flex; justify-content: space-between;
+  padding: 10px 14px;
+  border-top: 1px solid var(--rule);
+  font-size: 10.5px; color: var(--ink-mute);
+  letter-spacing: .06em;
+  background: var(--bg-2);
+}
+.ps-foot code { color: var(--accent); padding: 1px 4px; border: 1px solid var(--rule-2); }
+
+/* counters */
+.counters {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+  margin-top: 40px;
+}
+.counters > div {
+  padding: 18px 20px;
+  border-right: 1px solid var(--rule);
+  position: relative;
+  overflow: hidden;
+}
+.counters > div:last-child { border-right: 0; }
+.counters .label {
+  font-size: 10px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-mute);
+}
+.counters .val {
+  font-size: 28px; font-weight: 500;
+  margin-top: 6px; letter-spacing: -.02em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.counters .val .u { font-size: 13px; color: var(--ink-mute); margin-left: 2px; }
+.counters .tick {
+  position: absolute; right: 14px; top: 18px;
+  width: 6px; height: 6px; background: var(--ok);
+  animation: blink 1.4s infinite;
+}
+@keyframes blink { 50% { opacity: .2; } }
+
+/* ───── SECTION CHROME ───── */
+section.block {
+  padding: 80px 0;
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+}
+.section-head {
+  display: grid;
+  grid-template-columns: 140px 1fr auto;
+  gap: 28px;
+  align-items: baseline;
+  margin-bottom: 36px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed var(--rule-2);
+}
+.section-head .no {
+  font-size: 11px; letter-spacing: .18em;
+  color: var(--accent); text-transform: uppercase;
+}
+.section-head h2 {
+  margin: 0;
+  font-size: 28px; font-weight: 500;
+  letter-spacing: -.02em;
+  color: var(--ink);
+}
+.section-head h2 .it {
+  font-family: var(--font-serif); font-style: italic;
+  color: var(--ink-dim); font-weight: 400;
+}
+.section-head .eyebrow {
+  font-size: 11px; letter-spacing: .14em;
+  color: var(--ink-mute); text-transform: uppercase;
+}
+
+/* ───── TERMINAL DEMO ───── */
+.term {
+  border: 1px solid var(--rule);
+  background: #000;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow: hidden;
+  position: relative;
+}
+.term-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--rule);
+  font-size: 11px; color: var(--ink-mute);
+  letter-spacing: .1em; text-transform: uppercase;
+}
+.term-head .lights { display: flex; gap: 6px; }
+.term-head .lights i {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--rule-2); display: inline-block;
+}
+.term-head .lights i:nth-child(1) { background: #3a2a22; }
+.term-head .lights i:nth-child(2) { background: #3a3422; }
+.term-head .lights i:nth-child(3) { background: #243a22; }
+.term-head .title { flex: 1; text-align: center; }
+.term-head .session {
+  color: var(--ink-dim);
+  font-feature-settings: "tnum";
+}
+.term-body {
+  padding: 18px 20px 26px;
+  min-height: 420px;
+  background:
+    radial-gradient(ellipse at top, rgba(255,179,71,.04), transparent 60%),
+    #050505;
+  color: var(--ink);
+  position: relative;
+}
+.term-body::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0 2px,
+    rgba(255,255,255,.015) 2px 3px);
+  pointer-events: none;
+}
+.ln { display: flex; gap: 10px; white-space: pre-wrap; word-break: break-word; }
+.ln .prmpt { color: var(--accent); user-select: none; flex-shrink: 0; }
+.ln .cmd { color: var(--ink); }
+.ln.out { color: var(--ink-dim); padding-left: 22px; }
+.ln.out.json { color: var(--ink); }
+.tok-k { color: var(--accent); }
+.tok-s { color: var(--ok); }
+.tok-n { color: #e5c96a; }
+.tok-c { color: var(--ink-mute); font-style: italic; }
+.cursor {
+  display: inline-block;
+  width: 8px; height: 1.05em;
+  background: var(--accent);
+  vertical-align: -2px;
+  animation: caret 1s steps(1) infinite;
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* ───── TWO COL CODE ───── */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+@media (max-width: 820px) { .two-col { grid-template-columns: 1fr; } }
+
+.code {
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow: hidden;
+}
+.code header {
+  display: flex; justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-2);
+  font-size: 11px; color: var(--ink-mute);
+  letter-spacing: .12em; text-transform: uppercase;
+}
+.code header .right { color: var(--ink-dim); }
+.code pre {
+  margin: 0; padding: 18px 20px;
+  white-space: pre;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  color: var(--ink);
+}
+.code .co { color: var(--ink-mute); font-style: italic; }
+.code .kw { color: var(--accent); }
+.code .st { color: var(--ok); }
+.code .nm { color: #e5c96a; }
+.code .fn { color: #f0a968; }
+
+/* ───── PRIMITIVES GRID ───── */
+.prims {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 1px solid var(--rule);
+}
+@media (max-width: 820px) { .prims { grid-template-columns: repeat(2, 1fr); } }
+.prim {
+  padding: 22px;
+  border-right: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+  transition: background .15s;
+}
+.prim:hover { background: var(--bg-1); }
+.prims .prim:nth-child(4n) { border-right: 0; }
+.prims .prim:nth-last-child(-n+4) { border-bottom: 0; }
+@media (max-width: 820px) {
+  .prims .prim { border-right: 1px solid var(--rule) !important; }
+  .prims .prim:nth-child(2n) { border-right: 0 !important; }
+}
+.prim .sig {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 12px;
+}
+.prim .sig code {
+  color: var(--accent); font-weight: 600; font-size: 13px;
+}
+.prim .sig small {
+  color: var(--ink-mute); font-size: 10px;
+  letter-spacing: .14em; text-transform: uppercase;
+}
+.prim p {
+  margin: 0 0 14px; color: var(--ink-dim); font-size: 12.5px;
+  line-height: 1.55;
+}
+.prim ul {
+  list-style: none; padding: 0; margin: 0;
+  font-size: 12px; color: var(--ink-mute);
+}
+.prim ul li { padding: 3px 0; border-top: 1px dashed var(--rule-2); }
+.prim ul li::before { content: "› "; color: var(--accent); }
+
+/* ───── ENVELOPE SPEC ───── */
+.envelope {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+}
+@media (max-width: 820px) { .envelope { grid-template-columns: 1fr; } }
+.env-col { padding: 22px 24px; }
+.env-col.ok { border-right: 1px solid var(--rule); }
+.env-col h4 {
+  margin: 0 0 14px;
+  font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-mute);
+  display: flex; justify-content: space-between;
+}
+.env-col.ok h4 span:last-child { color: var(--ok); }
+.env-col.err h4 span:last-child { color: var(--err); }
+.env-col pre {
+  margin: 0; padding: 0;
+  font-size: 12.5px; line-height: 1.7;
+  white-space: pre;
+}
+.env-col .k { color: var(--accent); }
+.env-col .s { color: var(--ok); }
+.env-col .n { color: #e5c96a; }
+.env-col .err { color: var(--err); }
+
+/* ───── ERROR TABLE ───── */
+.errtab {
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+  font-size: 13px;
+}
+.errtab .row {
+  display: grid;
+  grid-template-columns: 220px 1fr 1fr 200px;
+  border-bottom: 1px solid var(--rule);
+}
+.errtab .row:last-child { border-bottom: 0; }
+.errtab .row > div {
+  padding: 16px 20px;
+  border-right: 1px dashed var(--rule-2);
+}
+.errtab .row > div:last-child { border-right: 0; }
+.errtab .row.head > div {
+  font-size: 10px; letter-spacing: .18em;
+  text-transform: uppercase; color: var(--ink-mute);
+  padding: 10px 20px;
+  background: var(--bg-2);
+}
+.errtab code {
+  color: var(--err); font-size: 12px;
+}
+.errtab code.ok { color: var(--ok); }
+.errtab .retry {
+  font-size: 11px; letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.errtab .desc { color: var(--ink-dim); }
+@media (max-width: 820px) {
+  .errtab .row { grid-template-columns: 1fr; }
+  .errtab .row > div { border-right: 0; border-bottom: 1px dashed var(--rule-2); }
+}
+
+/* ───── BENCHMARKS ───── */
+.bench {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0;
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+}
+@media (max-width: 820px) { .bench { grid-template-columns: 1fr; } }
+.bench > div {
+  padding: 28px 26px;
+  border-right: 1px solid var(--rule);
+  position: relative;
+}
+.bench > div:last-child { border-right: 0; }
+.bench h5 {
+  margin: 0;
+  font-size: 11px; letter-spacing: .16em;
+  text-transform: uppercase; color: var(--ink-mute);
+}
+.bench .big {
+  font-size: 44px; font-weight: 500; letter-spacing: -.03em;
+  margin: 14px 0 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.bench .big .u { color: var(--accent); font-size: 22px; margin-left: 4px; }
+.bench .sub { color: var(--ink-dim); font-size: 12.5px; }
+.bench .bars {
+  margin-top: 20px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.bench .bar {
+  display: grid; grid-template-columns: 100px 1fr 60px;
+  align-items: center; gap: 10px;
+  font-size: 11.5px; color: var(--ink-dim);
+}
+.bench .bar .t { height: 4px; background: var(--rule-2); position: relative; }
+.bench .bar .t > i {
+  position: absolute; top: 0; left: 0; bottom: 0;
+  background: var(--accent);
+  display: block;
+}
+.bench .bar .v { text-align: right; color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+
+/* ───── DESKTOP — v0.7.0 ───── */
+.desktop-grid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  gap: 32px;
+  align-items: stretch;
+}
+@media (max-width: 920px) { .desktop-grid { grid-template-columns: 1fr; } }
+.desktop-card {
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+  padding: 28px 30px;
+  position: relative;
+}
+.desktop-card .label {
+  position: absolute; top: -9px; left: 18px;
+  background: var(--bg); padding: 0 10px;
+  font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent);
+}
+.desktop-card h3 {
+  margin: 0 0 8px;
+  font-size: 22px; font-weight: 500; letter-spacing: -.02em;
+}
+.desktop-card h3 .it { font-family: var(--font-serif); font-style: italic; color: var(--ink-dim); font-weight: 400; }
+.desktop-card p { color: var(--ink-dim); font-size: 13.5px; margin: 0 0 16px; line-height: 1.6; }
+.desktop-card ul { list-style: none; padding: 0; margin: 0; font-size: 12.5px; color: var(--ink-mute); }
+.desktop-card ul li { padding: 5px 0; border-top: 1px dashed var(--rule-2); }
+.desktop-card ul li::before { content: "› "; color: var(--accent); }
+.os-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0;
+  border: 1px solid var(--rule);
+  background: var(--bg-1);
+}
+.os-tile {
+  padding: 16px 14px;
+  border-right: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.os-tiles .os-tile:nth-child(3n) { border-right: 0; }
+.os-tiles .os-tile:nth-last-child(-n+3) { border-bottom: 0; }
+.os-tile .name { font-size: 12px; color: var(--ink); margin-bottom: 4px; font-weight: 500; }
+.os-tile .meta { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-mute); }
+
+/* ───── USE CASES ───── */
+.uses {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0;
+  border: 1px solid var(--rule);
+}
+@media (max-width: 820px) { .uses { grid-template-columns: 1fr; } }
+.use {
+  padding: 28px 26px;
+  border-right: 1px solid var(--rule);
+  position: relative;
+}
+.use:last-child { border-right: 0; }
+.use .ico {
+  width: 72px; height: 72px;
+  border: 1px solid var(--rule-2);
+  margin-bottom: 20px;
+  padding: 10px;
+  font-size: 10px;
+  color: var(--accent);
+  white-space: pre;
+  line-height: 1.1;
+  font-family: var(--font-mono);
+}
+.use h4 {
+  margin: 0 0 8px;
+  font-size: 18px; font-weight: 500;
+  letter-spacing: -.01em;
+}
+.use h4 .it {
+  font-family: var(--font-serif); font-style: italic;
+  color: var(--ink-dim); font-weight: 400;
+}
+.use p { margin: 0; color: var(--ink-dim); font-size: 13px; line-height: 1.6; }
+.use .tag {
+  position: absolute; top: 20px; right: 20px;
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--ink-mute);
+}
+
+/* ───── INSTALL ───── */
+.install-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0;
+  border: 1px solid var(--rule);
+}
+@media (max-width: 820px) { .install-grid { grid-template-columns: 1fr; } }
+.install-grid > div {
+  padding: 22px 24px;
+  border-right: 1px solid var(--rule);
+}
+.install-grid > div:last-child { border-right: 0; }
+.install-grid h5 {
+  margin: 0 0 14px;
+  font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--ink-mute);
+}
+.install-grid h5 .step { color: var(--accent); margin-right: 6px; }
+.install-grid pre {
+  margin: 0; padding: 12px 14px;
+  background: #000; border: 1px solid var(--rule);
+  font-size: 12.5px; color: var(--ink);
+  overflow-x: auto;
+  white-space: pre;
+}
+.install-grid .prm { color: var(--accent); }
+.install-grid p { color: var(--ink-dim); font-size: 12.5px; margin: 10px 0 0; }
+
+/* ───── FOOTER ───── */
+footer {
+  padding: 60px 0 40px;
+  color: var(--ink-mute);
+  font-size: 12px;
+}
+footer .grid {
+  display: grid;
+  grid-template-columns: 1.5fr repeat(4, 1fr);
+  gap: 40px;
+  padding-bottom: 40px;
+  border-bottom: 1px dashed var(--rule-2);
+}
+@media (max-width: 820px) { footer .grid { grid-template-columns: 1fr 1fr; } }
+footer h6 {
+  margin: 0 0 14px;
+  font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--ink-dim);
+}
+footer ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+footer ul a { text-decoration: none; color: var(--ink-dim); }
+footer ul a:hover { color: var(--accent); }
+footer .legal {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-top: 24px;
+}
+footer .legal .sig {
+  font-family: var(--font-serif); font-style: italic;
+  color: var(--ink-dim);
+}
+
+/* ───── reveal ───── */
+.reveal {
+  opacity: 0; transform: translateY(12px);
+  transition: opacity .7s ease, transform .7s ease;
+}
+.reveal.in { opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal, .reveal.in { opacity: 1; transform: none; transition: none; }
+  .halo { display: none; }
+  body::before { display: none; }
+  .term-body::after, .ps-panel::after { display: none; }
+  .dot { animation: none; }
+  .ps-row, .ps-row.leave { animation: none; opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+
+<div class="halo" id="halo"></div>
+
+<!-- NAV -->
+<nav class="top">
+  <div class="wrap">
+    <div class="row">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span>lumina<span class="tld">.run</span></span>
+      </div>
+      <ul>
+        <li><a href="#desktop">desktop</a></li>
+        <li><a href="#primitives">primitives</a></li>
+        <li><a href="#envelope">envelope</a></li>
+        <li><a href="#benchmarks">benchmarks</a></li>
+        <li><a href="#install">install</a></li>
+        <li><a href="https://github.com/abdul-abdi/lumina">github</a></li>
+      </ul>
+      <div class="nav-status">
+        <span class="dot"></span>
+        <span>v0.7.0 · stable</span>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<div class="wrap">
+  <div class="meta-strip">
+    <span>LUMINA / <b>A SANDBOX PRIMITIVE FOR AGENTS</b></span>
+    <span>BUILD <b>0.7.0</b></span>
+    <span>PLATFORM <b>DARWIN-ARM64</b></span>
+    <span>LAT <b id="meta-lat">31MS</b></span>
+    <span id="meta-clock">—</span>
+  </div>
+</div>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <span class="kicker"><span class="dot" style="background:var(--accent); animation: none"></span>§ 01 — OVERVIEW</span>
+        <h1>
+          <span class="op">subprocess.run()</span><br/>
+          for <span class="sub">virtual machines.</span>
+        </h1>
+        <p class="lede">
+          Boot a Linux VM, run a command, collect <b>structured JSON</b>.
+          Sessions exec in <b>~30ms</b>, cold starts in <b>~400ms</b>,
+          and the sandbox is sealed — no host fs, no SSH, no escape hatch.
+          Built for the agent loop. <b>v0.7.0 adds Lumina Desktop</b> — full-OS
+          guests with a SwiftUI face.
+        </p>
+        <div class="cta-row">
+          <a href="#install" class="btn primary">
+            <span>get lumina</span>
+            <span class="arr">→</span>
+          </a>
+          <a href="#desktop" class="btn">
+            <span>see desktop</span>
+            <span class="k">↗</span>
+          </a>
+        </div>
+        <div class="install-line" style="margin-top: 22px;">
+          <span class="prompt">$</span>
+          <code>brew install lumina-run/tap/lumina</code>
+          <button onclick="copyInstall(this)">[ copy ]</button>
+        </div>
+        <p class="platform-note">
+          <span class="chip">macOS 14+</span>
+          <span class="chip">Apple Silicon</span>
+          Built on the native Virtualization framework. Linux host support on the roadmap.
+        </p>
+      </div>
+
+      <div class="ps-panel">
+        <div class="ps-head">
+          <span class="ps-title">$ lumina ps --watch</span>
+          <span class="ps-meta"><span class="dot" style="background:var(--ok); animation:none"></span><span id="ps-count">—</span> live · streaming</span>
+        </div>
+        <div class="ps-colhead">
+          <span>STATE</span><span>SID</span><span>IMAGE</span><span>UPTIME</span><span>EXECS</span><span>LAT</span>
+        </div>
+        <div class="ps-rows" id="ps-rows"></div>
+        <div class="ps-foot">
+          <span>│ press <code>q</code> to exit · <code>?</code> for keys</span>
+          <span id="ps-clock">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="counters">
+      <div>
+        <div class="label">Cold start</div>
+        <div class="val" id="c-boot">402<span class="u">ms</span></div>
+        <span class="tick"></span>
+      </div>
+      <div>
+        <div class="label">Exec latency</div>
+        <div class="val" id="c-exec">31<span class="u">ms</span></div>
+        <span class="tick"></span>
+      </div>
+      <div>
+        <div class="label">Live sessions</div>
+        <div class="val" id="c-sess">1,284</div>
+        <span class="tick"></span>
+      </div>
+      <div>
+        <div class="label">Execs / hr</div>
+        <div class="val" id="c-execs">847,312</div>
+        <span class="tick"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- TERMINAL DEMO -->
+<section class="block" id="demo">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 02</div>
+      <h2>Watch it work<span class="it"> — a session, start to stop.</span></h2>
+      <div class="eyebrow">LIVE / LOOPING</div>
+    </div>
+    <div class="term reveal">
+      <div class="term-head">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <div class="title">~/lumina demo</div>
+        <div class="session">sid · <span id="sid-display">b3a1-e4f7…</span></div>
+      </div>
+      <div class="term-body" id="term-body"></div>
+    </div>
+  </div>
+</section>
+
+<!-- TWO CODE EXAMPLES -->
+<section class="block">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 03</div>
+      <h2>Two shapes<span class="it"> — one-shot or session.</span></h2>
+      <div class="eyebrow">CORE API</div>
+    </div>
+    <div class="two-col">
+      <div class="code reveal">
+        <header>
+          <span>one-shot · disposable VM</span>
+          <span class="right">~400ms</span>
+        </header>
+<pre><span class="co"># boot, run, tear down. zero state.</span>
+<span class="kw">$</span> lumina run <span class="st">"uname -a"</span>
+
+<span class="co">{</span>
+  <span class="kw">"stdout"</span>: <span class="st">"Linux lumina 6.6.22 …\n"</span>,
+  <span class="kw">"stderr"</span>: <span class="st">""</span>,
+  <span class="kw">"exit_code"</span>: <span class="nm">0</span>,
+  <span class="kw">"duration_ms"</span>: <span class="nm">438</span>
+<span class="co">}</span></pre>
+      </div>
+      <div class="code reveal">
+        <header>
+          <span>session · persistent VM</span>
+          <span class="right">~30ms / exec</span>
+        </header>
+<pre><span class="kw">$</span> SID=$(lumina session start --memory 4GB \
+       --forward 3000:3000 | jq -r <span class="st">'.sid'</span>)
+
+<span class="kw">$</span> lumina cp ./project/ <span class="st">"$SID:/work/"</span>
+<span class="kw">$</span> lumina exec <span class="st">"$SID"</span> --workdir /work <span class="st">"npm ci"</span>
+<span class="kw">$</span> lumina exec --pty <span class="st">"$SID"</span> <span class="st">"claude"</span>
+
+<span class="co"># many execs in parallel, ~30ms each.
+# terminal restores on SIGINT — handled for you.</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- DESKTOP — v0.7.0 -->
+<section class="block" id="desktop">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 04</div>
+      <h2>Lumina Desktop<span class="it"> — full-OS guests, with a face.</span></h2>
+      <div class="eyebrow">NEW IN v0.7.0</div>
+    </div>
+    <div class="desktop-grid reveal">
+      <div class="desktop-card">
+        <span class="label">// app</span>
+        <h3>A virtual Mac<span class="it"> — for every OS you might want to try.</span></h3>
+        <p>
+          Two clicks from cold-launch to a booting Ubuntu installer. Sealed
+          guest disk under <code style="color:var(--accent)">~/.lumina/desktop-vms/</code>,
+          shared with the CLI. Spin up, use, dispose — same primitive, with
+          a screen.
+        </p>
+        <ul>
+          <li>Library · grid · grouped · pinned</li>
+          <li>4-step wizard · OS tiles · BYO ISO/IPSW</li>
+          <li>per-VM window · pointer release ⌘⌥</li>
+          <li>snapshots · disk-guard · branchable tree</li>
+          <li>signed `.app` · ad-hoc · notarized in v0.7.1</li>
+        </ul>
+      </div>
+      <div>
+        <div class="os-tiles">
+          <div class="os-tile">
+            <div class="name">Ubuntu 24.04 LTS</div>
+            <div class="meta">ARM64 · ~2.7 GB ISO</div>
+          </div>
+          <div class="os-tile">
+            <div class="name">Kali (rolling)</div>
+            <div class="meta">ARM64 · installer</div>
+          </div>
+          <div class="os-tile">
+            <div class="name">Fedora 41</div>
+            <div class="meta">aarch64 · workstation</div>
+          </div>
+          <div class="os-tile">
+            <div class="name">Debian 12</div>
+            <div class="meta">arm64 · netinst</div>
+          </div>
+          <div class="os-tile">
+            <div class="name">Windows 11</div>
+            <div class="meta">ARM64 · BYO ISO</div>
+          </div>
+          <div class="os-tile">
+            <div class="name">macOS 14+</div>
+            <div class="meta">IPSW · Apple Silicon</div>
+          </div>
+        </div>
+        <div class="install-line" style="margin-top: 18px; width: 100%;">
+          <span class="prompt">$</span>
+          <code>lumina desktop create --os-variant ubuntu-24.04 --iso ./*.iso</code>
+        </div>
+        <p style="font-size: 11px; color: var(--ink-mute); letter-spacing: .08em; text-transform: uppercase; margin-top: 14px;">
+          <span style="color: var(--accent)">▷</span>  CLI ↔ App share state · open the .app or stay in the terminal
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PRIMITIVES -->
+<section class="block" id="primitives">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 05</div>
+      <h2>Stable primitives<span class="it"> — what you can rely on.</span></h2>
+      <div class="eyebrow">CONTRACT / v0.7.0</div>
+    </div>
+    <div class="prims reveal">
+      <div class="prim">
+        <div class="sig"><code>lumina run</code><small>one-shot</small></div>
+        <p>Disposable VM. Boots, runs, tears down. For isolated commands that share no state.</p>
+        <ul>
+          <li>--memory · --cpus</li>
+          <li>--image · --volume</li>
+          <li>--timeout · --forward</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>session start</code><small>persistent</small></div>
+        <p>Spawns a long-lived VM. Returns a UUID-form SID. Provisioning belongs here, not on exec.</p>
+        <ul>
+          <li>--memory · --cpus · --disk</li>
+          <li>--image (claude-box · default)</li>
+          <li>--forward host:guest</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>exec &lt;sid&gt;</code><small>~30ms</small></div>
+        <p>Fresh shell per invocation. Multiple execs run in parallel on one session. No state persists.</p>
+        <ul>
+          <li>--workdir · --env / -e</li>
+          <li>--timeout</li>
+          <li>--pty (REPLs, curses)</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>cp</code><small>transfer</small></div>
+        <p>Explicit direction. Whichever side starts with <code style="color:var(--accent)">&lt;sid&gt;:</code> is the VM. Use this over virtio-fs for writes.</p>
+        <ul>
+          <li>host ↔ guest</li>
+          <li>files &amp; directories</li>
+          <li>auto-detected kind</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>ps</code><small>listing</small></div>
+        <p>Live sessions. Piped output is JSON. Stale sockets surface as <code style="color:var(--err)">unreachable</code>.</p>
+        <ul>
+          <li>sid · image · uptime</li>
+          <li>active_execs</li>
+          <li>parse JSON, never TTY</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>desktop create</code><small>v0.7.0</small></div>
+        <p>Make a <code style="color:var(--accent)">.luminaVM</code> bundle for a full-OS guest. Stages an installer ISO; ARM64 pre-flight rejects x86.</p>
+        <ul>
+          <li>--os-variant · --iso</li>
+          <li>--memory · --cpus · --disk-size</li>
+          <li>--force (skip arch check)</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>desktop boot</code><small>v0.7.0</small></div>
+        <p>Boot a <code style="color:var(--accent)">.luminaVM</code> bundle through EFI. Headless or windowed. Optional Rosetta runtime.</p>
+        <ul>
+          <li>--headless · --serial</li>
+          <li>--timeout · --rosetta</li>
+          <li>resumable install</li>
+        </ul>
+      </div>
+      <div class="prim">
+        <div class="sig"><code>exec --pty</code><small>raw bytes</small></div>
+        <p>Interactive TTY. Separate protocol from exec — raw byte stream, not envelope. For <code style="color:var(--accent)">isatty()</code> apps.</p>
+        <ul>
+          <li>claude · vim · python3</li>
+          <li>one pty per session</li>
+          <li>raw mode · auto restore</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ENVELOPE -->
+<section class="block" id="envelope">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 06</div>
+      <h2>Output envelope<span class="it"> — one shape, always.</span></h2>
+      <div class="eyebrow">CONTRACT</div>
+    </div>
+    <p style="max-width: 780px; color: var(--ink-dim); margin: 0 0 22px;">
+      When stdout is a pipe, every <code style="color:var(--accent)">run</code> and <code style="color:var(--accent)">exec</code> emits a single JSON object.
+      Success and error are disjoint — dispatch on the presence of the <code style="color:var(--accent)">error</code> field first.
+      A non-zero <code style="color:var(--accent)">exit_code</code> is a successful exec, not an error.
+    </p>
+    <div class="envelope reveal">
+      <div class="env-col ok">
+        <h4><span>// success</span><span>● exit_code present</span></h4>
+<pre>{
+  <span class="k">"stdout"</span>: <span class="s">"hello\n"</span>,
+  <span class="k">"stderr"</span>: <span class="s">""</span>,
+  <span class="k">"exit_code"</span>: <span class="n">0</span>,
+  <span class="k">"duration_ms"</span>: <span class="n">31</span>
+}</pre>
+      </div>
+      <div class="env-col err">
+        <h4><span>// error</span><span>● error present</span></h4>
+<pre>{
+  <span class="k">"error"</span>: <span class="err">"timeout"</span>,
+  <span class="k">"duration_ms"</span>: <span class="n">30012</span>,
+  <span class="k">"partial_stdout"</span>: <span class="s">"starting…\n"</span>,
+  <span class="k">"partial_stderr"</span>: <span class="s">""</span>
+}</pre>
+      </div>
+    </div>
+
+    <div style="height:32px"></div>
+
+    <div class="errtab reveal">
+      <div class="row head">
+        <div>State</div>
+        <div>What happened</div>
+        <div>Recovery</div>
+        <div>Retry?</div>
+      </div>
+      <div class="row">
+        <div><code>timeout</code></div>
+        <div class="desc">Command exceeded <code style="color:var(--accent)">--timeout</code>. <code class="ok" style="color:var(--ok)">partial_*</code> present.</div>
+        <div class="desc">Longer timeout, or chunk the work.</div>
+        <div class="retry">Retryable</div>
+      </div>
+      <div class="row">
+        <div><code>vm_crashed</code></div>
+        <div class="desc">Guest died mid-exec — OOM, kernel panic. <code class="ok" style="color:var(--ok)">partial_*</code> present.</div>
+        <div class="desc">Session: <code style="color:var(--accent)">session stop</code> &amp; restart.</div>
+        <div class="retry">Restart</div>
+      </div>
+      <div class="row">
+        <div><code>connection_failed</code></div>
+        <div class="desc">vsock never came up. Command never ran; no <code style="color:var(--accent)">partial_*</code>.</div>
+        <div class="desc">Session is dead — restart.</div>
+        <div class="retry">Dead</div>
+      </div>
+      <div class="row">
+        <div><code>session_disconnected</code></div>
+        <div class="desc">Control socket broke mid-exec. Only on <code style="color:var(--accent)">exec</code>, never <code style="color:var(--accent)">run</code>.</div>
+        <div class="desc">Reconnect or restart the session.</div>
+        <div class="retry">Reconnect</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- BENCHMARKS -->
+<section class="block" id="benchmarks">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 07</div>
+      <h2>Built for tight loops<span class="it"> — the latency budget.</span></h2>
+      <div class="eyebrow">MEASURED / M3 PRO</div>
+    </div>
+    <div class="bench reveal">
+      <div>
+        <h5>Cold start</h5>
+        <div class="big">402<span class="u">ms</span></div>
+        <div class="sub">Boot → VM ready → first exec.</div>
+        <div class="bars">
+          <div class="bar"><span>lumina</span><span class="t"><i style="width:14%"></i></span><span class="v">402ms</span></div>
+          <div class="bar"><span>firecracker</span><span class="t"><i style="width:18%"></i></span><span class="v">~550ms</span></div>
+          <div class="bar"><span>docker run</span><span class="t"><i style="width:48%"></i></span><span class="v">~1.4s</span></div>
+          <div class="bar"><span>ec2</span><span class="t"><i style="width:92%"></i></span><span class="v">~28s</span></div>
+        </div>
+      </div>
+      <div>
+        <h5>Exec latency</h5>
+        <div class="big">31<span class="u">ms</span></div>
+        <div class="sub">Warm session, trivial command.</div>
+        <div class="bars">
+          <div class="bar"><span>p50</span><span class="t"><i style="width:10%"></i></span><span class="v">31ms</span></div>
+          <div class="bar"><span>p95</span><span class="t"><i style="width:22%"></i></span><span class="v">68ms</span></div>
+          <div class="bar"><span>p99</span><span class="t"><i style="width:38%"></i></span><span class="v">118ms</span></div>
+          <div class="bar"><span>p999</span><span class="t"><i style="width:66%"></i></span><span class="v">204ms</span></div>
+        </div>
+      </div>
+      <div>
+        <h5>Concurrency</h5>
+        <div class="big">128<span class="u">×</span></div>
+        <div class="sub">Parallel execs / session. No ordering guarantee.</div>
+        <div class="bars">
+          <div class="bar"><span>memory floor</span><span class="t"><i style="width:28%"></i></span><span class="v">512 MB</span></div>
+          <div class="bar"><span>default disk</span><span class="t"><i style="width:40%"></i></span><span class="v">8 GB</span></div>
+          <div class="bar"><span>vsock mtu</span><span class="t"><i style="width:62%"></i></span><span class="v">64 KB</span></div>
+          <div class="bar"><span>kernel</span><span class="t"><i style="width:100%"></i></span><span class="v">6.6.22</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- USE CASES -->
+<section class="block">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 08</div>
+      <h2>Why agents need this<span class="it"> — three shapes.</span></h2>
+      <div class="eyebrow">PATTERNS</div>
+    </div>
+    <div class="uses reveal">
+      <div class="use">
+        <span class="tag">— 01</span>
+        <div class="ico">┌────────┐
+│ AGENT  │
+└───┬────┘
+    │ exec
+    ▼
+ [ sandbox ]</div>
+        <h4>Agents<span class="it"> / the inner loop.</span></h4>
+        <p>Claude Code, Cursor, OpenDevin — any agent running untrusted shell commands. One session, thousands of execs, full teardown when done. The session is the tab.</p>
+      </div>
+      <div class="use">
+        <span class="tag">— 02</span>
+        <div class="ico">  ┌───┐
+  │CI │──┬──▶ run tests
+  └───┘  ├──▶ build artifact
+         └──▶ ship
+  disposable × N</div>
+        <h4>CI &amp; Eval<span class="it"> / reproducible runs.</span></h4>
+        <p>Per-job VM, no cross-contamination between builds, exact resource ceiling. Fast enough to replace <code style="color:var(--accent)">docker run</code> in the hot path.</p>
+      </div>
+      <div class="use">
+        <span class="tag">— 03</span>
+        <div class="ico">user ▸ lumina ▸ VM
+          ┌─────┐
+          │ ??? │
+          └─────┘
+  sealed · audited · ephemeral</div>
+        <h4>Untrusted code<span class="it"> / user uploads.</span></h4>
+        <p>Run code from users, plugins, or model output. Sealed guest — no host filesystem. <code style="color:var(--accent)">--forward</code> only binds <code style="color:var(--accent)">127.0.0.1</code>. Audit via <code style="color:var(--accent)">lumina ps</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section class="block" id="install">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="no">§ 09</div>
+      <h2>Get it running<span class="it"> — three commands.</span></h2>
+      <div class="eyebrow">QUICKSTART</div>
+    </div>
+    <div class="install-grid reveal">
+      <div>
+        <h5><span class="step">01</span>INSTALL</h5>
+<pre><span class="prm">$</span> brew install \
+    lumina-run/tap/lumina</pre>
+        <p>Homebrew, macOS 14+, Apple Silicon. Linux host on the roadmap.</p>
+      </div>
+      <div>
+        <h5><span class="step">02</span>FIRST RUN</h5>
+<pre><span class="prm">$</span> lumina run \
+    <span style="color:var(--ok)">"echo hello from a VM"</span></pre>
+        <p>Pulls the default image (~180MB) the first time. After that, boots from a snapshot.</p>
+      </div>
+      <div>
+        <h5><span class="step">03</span>SESSION</h5>
+<pre><span class="prm">$</span> lumina session start \
+    --memory 4GB</pre>
+        <p>Captures the SID. Pipe to <code style="color:var(--accent)">jq -r '.sid'</code> and drive it from your agent.</p>
+      </div>
+    </div>
+    <p style="text-align:center; margin-top: 28px; color: var(--ink-mute); font-size: 12px; letter-spacing: .1em;">
+      —  <code style="color: var(--accent)">LUMINA_OUTPUT=ndjson</code> opt-in remains for legacy consumers until v0.8.0  —
+    </p>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="wrap">
+    <div class="grid">
+      <div>
+        <div class="brand" style="margin-bottom: 16px;">
+          <span class="brand-mark"></span>
+          <span>lumina<span class="tld">.run</span></span>
+        </div>
+        <p style="color: var(--ink-dim); margin: 0 0 14px; max-width: 320px;">
+          A sandbox primitive for AI agents.<br/>
+          <span style="font-family: var(--font-serif); font-style: italic;">
+            Boot a VM. Run a command. Parse the JSON.
+          </span>
+        </p>
+        <div style="display: flex; gap: 10px; font-size: 11px; color: var(--ink-mute); letter-spacing: .1em; text-transform: uppercase;">
+          <span>v0.7.0</span> ·
+          <span>MIT</span> ·
+          <span id="foot-clock">—</span>
+        </div>
+      </div>
+      <div>
+        <h6>CLI</h6>
+        <ul>
+          <li><a href="#primitives">lumina run</a></li>
+          <li><a href="#primitives">session start</a></li>
+          <li><a href="#primitives">exec &amp; --pty</a></li>
+          <li><a href="#desktop">desktop create / boot</a></li>
+        </ul>
+      </div>
+      <div>
+        <h6>Spec</h6>
+        <ul>
+          <li><a href="#envelope">Output envelope</a></li>
+          <li><a href="#envelope">Error states</a></li>
+          <li><a href="#benchmarks">Benchmarks</a></li>
+          <li><a href="#desktop">Lumina Desktop</a></li>
+        </ul>
+      </div>
+      <div>
+        <h6>Community</h6>
+        <ul>
+          <li><a href="https://github.com/abdul-abdi/lumina">GitHub</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/releases">Changelog</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/wiki">Wiki</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/issues">Issues</a></li>
+        </ul>
+      </div>
+      <div>
+        <h6>Project</h6>
+        <ul>
+          <li><a href="https://github.com/abdul-abdi/lumina/blob/main/ROADMAP.md">Roadmap</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/blob/main/AGENTS.md">Agent guide</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/blob/main/CLAUDE.md">Architecture</a></li>
+          <li><a href="https://github.com/abdul-abdi/lumina/blob/main/LICENSE">License</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="legal">
+      <div>© 2026 lumina — all rights reserved.</div>
+      <div class="sig">crafted for the agent loop ✦</div>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* ───── copy install ───── */
+function copyInstall(btn) {
+  navigator.clipboard?.writeText('brew install lumina-run/tap/lumina');
+  const orig = btn.textContent;
+  btn.textContent = '[ copied ]';
+  setTimeout(() => btn.textContent = orig, 1400);
+}
+
+/* ───── live counters (jitter + drift) ───── */
+const counters = {
+  boot: { el: document.getElementById('c-boot'), base: 402, jit: 6 },
+  exec: { el: document.getElementById('c-exec'), base: 31, jit: 3 },
+  sess: { el: document.getElementById('c-sess'), base: 1284 },
+  execs: { el: document.getElementById('c-execs'), base: 847312 },
+};
+let execsCount = counters.execs.base;
+setInterval(() => {
+  const b = counters.boot.base + Math.floor(Math.random()*counters.boot.jit*2 - counters.boot.jit);
+  const e = counters.exec.base + Math.floor(Math.random()*counters.exec.jit*2 - counters.exec.jit);
+  const s = counters.sess.base + Math.floor(Math.random()*4 - 2);
+  execsCount += Math.floor(Math.random()*60 + 10);
+  counters.boot.el.innerHTML = b + '<span class="u">ms</span>';
+  counters.exec.el.innerHTML = e + '<span class="u">ms</span>';
+  counters.sess.el.textContent = s.toLocaleString();
+  counters.execs.el.textContent = execsCount.toLocaleString();
+  document.getElementById('meta-lat').textContent = e + 'MS';
+}, 900);
+
+/* clock */
+function tick() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const t = `UTC ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  document.getElementById('meta-clock').textContent = t;
+  const f = document.getElementById('foot-clock'); if (f) f.textContent = t;
+  const pc = document.getElementById('ps-clock'); if (pc) pc.textContent = t;
+}
+tick(); setInterval(tick, 1000);
+
+/* sid drift (visual only) */
+(function() {
+  const el = document.getElementById('sid-display');
+  const hex = '0123456789abcdef';
+  setInterval(() => {
+    const a = Array.from({length:4}, () => hex[Math.floor(Math.random()*16)]).join('');
+    const b = Array.from({length:4}, () => hex[Math.floor(Math.random()*16)]).join('');
+    el.textContent = `${a}-${b}…`;
+  }, 4200);
+})();
+
+/* ───── live ps panel ───── */
+(function() {
+  const rowsEl = document.getElementById('ps-rows');
+  const countEl = document.getElementById('ps-count');
+  if (!rowsEl) return;
+  const MAX_ROWS = 9;
+  const images = ['default', 'claude-box', 'godev', 'pydev', 'ubuntu-24.04', 'kali-rolling'];
+  const states = ['exec', 'idle', 'boot'];
+
+  function randSid() {
+    const hex = '0123456789abcdef';
+    return Array.from({length:8}, () => hex[Math.floor(Math.random()*16)]).join('').slice(0,4)
+      + '-' + Array.from({length:4}, () => hex[Math.floor(Math.random()*16)]).join('');
+  }
+  function fmtUptime(ms) {
+    const s = Math.floor(ms/1000);
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+    return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  }
+  function makeRow() {
+    const state = states[Math.floor(Math.random() * states.length)];
+    const sid = randSid();
+    const image = images[Math.floor(Math.random() * images.length)];
+    const uptime = Math.floor(Math.random() * 600000) + 1000;
+    const execs = Math.floor(Math.random() * 200);
+    const lat = state === 'exec' ? (20 + Math.floor(Math.random() * 80)) :
+                state === 'boot' ? '—' : (Math.floor(Math.random() * 40));
+    const div = document.createElement('div');
+    div.className = 'ps-row ' + state;
+    div.innerHTML = `
+      <span class="st"><i></i>${state.toUpperCase()}</span>
+      <span class="sid">${sid}</span>
+      <span class="img">${image}</span>
+      <span class="up">${fmtUptime(uptime)}</span>
+      <span class="execs">${execs}</span>
+      <span class="lat">${lat === '—' ? '—' : lat + 'ms'}</span>
+    `;
+    return div;
+  }
+  function seed() {
+    for (let i = 0; i < MAX_ROWS - 2; i++) {
+      const r = makeRow();
+      r.style.animation = 'none';
+      r.style.opacity = '1';
+      r.style.transform = 'none';
+      rowsEl.appendChild(r);
+    }
+    update();
+  }
+  function update() {
+    const live = rowsEl.querySelectorAll('.ps-row:not(.leave)').length;
+    countEl.textContent = live;
+  }
+  seed();
+  setInterval(() => {
+    if (rowsEl.children.length >= MAX_ROWS) {
+      const oldest = rowsEl.firstElementChild;
+      if (oldest) {
+        oldest.classList.add('leave');
+        setTimeout(() => oldest.remove(), 320);
+      }
+    }
+    rowsEl.appendChild(makeRow());
+    update();
+  }, 2200);
+})();
+
+/* halo */
+const halo = document.getElementById('halo');
+let hx = window.innerWidth/2, hy = window.innerHeight/2;
+let tx = hx, ty = hy;
+window.addEventListener('mousemove', e => { tx = e.clientX; ty = e.clientY; });
+function haloLoop() {
+  hx += (tx - hx) * 0.08;
+  hy += (ty - hy) * 0.08;
+  halo.style.left = hx + 'px';
+  halo.style.top = hy + 'px';
+  requestAnimationFrame(haloLoop);
+}
+haloLoop();
+
+/* ───── reveal on scroll ───── */
+const io = new IntersectionObserver(entries => {
+  entries.forEach(en => {
+    if (en.isIntersecting) en.target.classList.add('in');
+  });
+}, { threshold: 0.12 });
+document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+/* ───── TERMINAL DEMO (auto-typing loop) ───── */
+const script = [
+  { type: 'cmd', text: 'lumina session start --memory 4GB --forward 3000:3000' },
+  { type: 'out', text: '{"sid":"b3a1e4f7-2c90-4e32-91d1-0f6aa3c2ea88"}', json: true, delay: 380 },
+  { type: 'cmd', text: 'SID=b3a1e4f7-2c90-4e32-91d1-0f6aa3c2ea88', echo: true },
+  { type: 'cmd', text: 'lumina cp ./agent/ "$SID:/work/agent/"', delay: 80 },
+  { type: 'out', text: '→ 148 files · 12.4 MB · 214ms', delay: 220 },
+  { type: 'cmd', text: 'lumina exec "$SID" --workdir /work/agent "npm ci && npm run build"', delay: 80 },
+  { type: 'out', text: 'added 312 packages in 4.2s', delay: 260 },
+  { type: 'out', text: '✓ build complete · /work/agent/dist · 1.1s', ok: true, delay: 120 },
+  { type: 'cmd', text: 'lumina exec "$SID" --timeout 60s "pytest -xvs"', delay: 80 },
+  { type: 'out', text: '{"stdout":"... 47 passed in 2.1s\\n","stderr":"","exit_code":0,"duration_ms":2143}', json: true, delay: 340 },
+  { type: 'cmd', text: 'lumina exec --pty "$SID" "claude"', delay: 80 },
+  { type: 'out', text: '╭─ claude-sonnet-4.6 ─ /work/agent ─╮', delay: 140 },
+  { type: 'out', text: '│  ▷ ready — 23ms exec latency      │' },
+  { type: 'out', text: '╰────────────────────────────────────╯', delay: 60 },
+  { type: 'cmd', text: 'lumina session stop "$SID"', delay: 300 },
+  { type: 'out', text: '→ stopped · uptime 3m 14s · 428 execs', ok: true, delay: 180 },
+];
+
+const body = document.getElementById('term-body');
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function colorCmd(s) {
+  const patterns = [
+    { cls: 'tok-s', re: /"[^"]*"/y },
+    { cls: 'tok-k', re: /\blumina\b/y },
+    { cls: 'tok-k', re: /--[a-z][a-z-]*/y },
+    { cls: 'tok-n', re: /\$SID|SID=/y },
+  ];
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    let matched = false;
+    for (const p of patterns) {
+      p.re.lastIndex = i;
+      const m = p.re.exec(s);
+      if (m && m.index === i) {
+        out += '<span class="' + p.cls + '">' + esc(m[0]) + '</span>';
+        i += m[0].length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      out += esc(s[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+function colorJson(s) {
+  const patterns = [
+    { cls: 'tok-k', re: /"[^"]+"(?=\s*:)/y },
+    { cls: 'tok-s', re: /"[^"]*"/y },
+    { cls: 'tok-n', re: /-?\d+(?:\.\d+)?/y },
+  ];
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    let matched = false;
+    for (const p of patterns) {
+      p.re.lastIndex = i;
+      const m = p.re.exec(s);
+      if (m && m.index === i) {
+        out += '<span class="' + p.cls + '">' + esc(m[0]) + '</span>';
+        i += m[0].length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      out += esc(s[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+let running = false;
+async function runScript() {
+  if (running) return;
+  running = true;
+  body.innerHTML = '';
+  for (const step of script) {
+    if (step.type === 'cmd') {
+      const line = document.createElement('div');
+      line.className = 'ln';
+      const prmpt = document.createElement('span');
+      prmpt.className = 'prmpt';
+      prmpt.textContent = '❯';
+      const cmdSpan = document.createElement('span');
+      cmdSpan.className = 'cmd';
+      line.appendChild(prmpt);
+      line.appendChild(cmdSpan);
+      body.appendChild(line);
+      for (let i = 0; i < step.text.length; i++) {
+        cmdSpan.innerHTML = colorCmd(step.text.slice(0, i+1)) + '<span class="cursor"></span>';
+        await sleep(step.echo ? 6 : 14 + Math.random()*22);
+      }
+      cmdSpan.innerHTML = colorCmd(step.text);
+      await sleep(step.delay || 120);
+    } else {
+      const line = document.createElement('div');
+      line.className = 'ln out' + (step.json ? ' json' : '');
+      if (step.ok) line.style.color = 'var(--ok)';
+      line.innerHTML = step.json ? colorJson(step.text) : esc(step.text);
+      body.appendChild(line);
+      body.scrollTop = body.scrollHeight;
+      await sleep(step.delay || 80);
+    }
+  }
+  await sleep(1600);
+  running = false;
+  runScript();
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+const termIo = new IntersectionObserver((ents) => {
+  ents.forEach(e => { if (e.isIntersecting) runScript(); });
+}, { threshold: 0.3 });
+termIo.observe(body);
+
+</script>
+</body>
+</html>

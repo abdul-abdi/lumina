@@ -105,6 +105,27 @@ public actor VM {
         }
         _state = .booting
 
+        // v0.7.0 M3: route non-agent profiles off the hot agent path.
+        // The .agent case is a single-cmp-and-branch before falling through
+        // to the v0.6.0 code below — the CI agent-boot P50 gate is the
+        // source of truth on timing.
+        switch options.effectiveBootable {
+        case .agent:
+            break  // fall through to the v0.6.0 agent boot path
+        case .efi(let cfg):
+            try await bootEFIPath(cfg: cfg)
+            return
+        case .macOS:
+            // Library callers with `VMOptions.bootable = .macOS(...)` must
+            // go through `MacOSVM` directly; `VM` drives VZVirtualMachine
+            // and cannot configure a VZMacOSVirtualMachine. The CLI wires
+            // this correctly at DesktopCommand.bootMacOS().
+            _state = .idle
+            throw .bootFailed(underlying: VMError.invalidState(
+                "VM.boot() does not support macOS guests — use MacOSVM directly"
+            ))
+        }
+
         // Clean orphans from previous crashes
         DiskClone.cleanOrphans()
 
@@ -302,6 +323,18 @@ public actor VM {
         // Entropy
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
+        // v0.7.0: Optional display + input devices for the desktop use case.
+        // The agent path leaves `options.graphics` nil and both `if let`s
+        // compile to a single nil-check + branch-not-taken — measurably
+        // within the CI agent-boot P50 budget
+        // (.github/workflows/ci.yml enforces this).
+        if let graphics = options.graphics {
+            attachGraphicsDevices(to: config, graphics: graphics)
+        }
+        if let sound = options.sound, sound.enabled {
+            attachSoundDevice(to: config, sound: sound)
+        }
+
         do {
             try config.validate()
         } catch {
@@ -316,9 +349,10 @@ public actor VM {
         self.virtualMachine = vm
 
         do {
+            let vmBox = UncheckedSendable(vm)
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
                 queue.async {
-                    vm.start { result in
+                    vmBox.value.start { result in
                         cont.resume(with: result)
                     }
                 }
@@ -332,15 +366,17 @@ public actor VM {
         // Connect CommandRunner via vsock
         let socketDevice: VZVirtioSocketDevice
         do {
-            socketDevice = try await withCheckedThrowingContinuation { cont in
+            let vmBox = UncheckedSendable(vm)
+            let boxed: UncheckedSendable<VZVirtioSocketDevice> = try await withCheckedThrowingContinuation { cont in
                 queue.async {
-                    if let device = vm.socketDevices.first as? VZVirtioSocketDevice {
-                        cont.resume(returning: device)
+                    if let device = vmBox.value.socketDevices.first as? VZVirtioSocketDevice {
+                        cont.resume(returning: UncheckedSendable(device))
                     } else {
                         cont.resume(throwing: VMError.noSocketDevice)
                     }
                 }
             }
+            socketDevice = boxed.value
         } catch {
             await shutdownVM()
             throw .bootFailed(underlying: error)
@@ -358,6 +394,124 @@ public actor VM {
             throw error
         }
         self.commandRunner = runner
+        _state = .ready
+    }
+
+    // MARK: - EFI Boot Path (v0.7.0 M3)
+
+    /// Boot a VM from the EFI pipeline (Linux desktop ISOs, Windows 11 ARM).
+    ///
+    /// EFI guests have NO `lumina-agent` inside — the vsock CommandRunner is
+    /// not set up. `exec()` / `stream()` will throw `invalidState` because
+    /// `commandRunner` stays nil. Callers that want to run commands in a
+    /// desktop guest must use session-level agent guests (agent-path VMs),
+    /// not this boot pipeline.
+    ///
+    /// The state machine: `.idle` → `.booting` → `.ready` (VM started, no
+    /// command connection). Shutdown works through the shared `shutdownVM`
+    /// helper because `clone` stays nil and `pipeHandles` is populated with
+    /// just the serial capture pair.
+    private func bootEFIPath(cfg: EFIBootConfig) async throws(LuminaError) {
+        let config = VZVirtualMachineConfiguration()
+        config.cpuCount = options.cpuCount
+        config.memorySize = options.memory
+
+        // Boot loader + storage: delegated to EFIBootable.
+        do {
+            try EFIBootable(config: cfg).apply(to: config)
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        // Serial console — capture guest output for diagnostics.
+        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+        let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
+        let (guestToHostRead, guestToHostWrite) = try createPipePair()
+        serialPort.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: hostToGuestRead,
+            fileHandleForWriting: guestToHostWrite
+        )
+        config.serialPorts = [serialPort]
+        pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
+
+        let console = self.serialConsole
+        Task.detached {
+            let handle = guestToHostRead
+            while true {
+                let data = handle.availableData
+                if data.isEmpty { break }
+                console.append(data)
+            }
+        }
+
+        // Network — same pluggable provider as the agent path.
+        let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        do {
+            networkDevice.attachment = try options.networkProvider.createAttachment()
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+        self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
+        config.networkDevices = [networkDevice]
+
+        // Entropy — same as agent path.
+        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+        // Graphics + input — same opt-in wiring as agent path. When
+        // `options.graphics == nil` this is a no-op (agent-path guarantee
+        // preserved for EFI runs that happen to be headless).
+        if let graphics = options.graphics {
+            attachGraphicsDevices(to: config, graphics: graphics)
+        }
+        if let sound = options.sound, sound.enabled {
+            attachSoundDevice(to: config, sound: sound)
+        }
+
+        // v0.7.0 M8: optional Rosetta directory share — Linux guests can
+        // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
+        // as the agent path; gated behind options.rosetta.
+        if options.rosetta {
+            if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
+                if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
+                    let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                    device.share = rosettaShare
+                    var sharing = config.directorySharingDevices
+                    sharing.append(device)
+                    config.directorySharingDevices = sharing
+                }
+            }
+        }
+
+        // Validate + start.
+        do {
+            try config.validate()
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        let queue = executor.queue
+        let vm = VZVirtualMachine(configuration: config, queue: queue)
+        self.virtualMachine = vm
+
+        do {
+            let vmBox = UncheckedSendable(vm)
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                queue.async {
+                    vmBox.value.start { result in
+                        cont.resume(with: result)
+                    }
+                }
+            }
+        } catch {
+            _state = .idle
+            throw .bootFailed(underlying: error)
+        }
+
+        // No CommandRunner for EFI guests. State is .ready meaning "VM is
+        // running." Exec operations will throw invalidState.
         _state = .ready
     }
 
@@ -769,9 +923,10 @@ public actor VM {
         // underlying fd is closed on dealloc; the dup'd fd remains valid.
         let fd: Int32
         do {
+            let socketBox = UncheckedSendable(socketDevice)
             fd = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, any Error>) in
                 queue.async {
-                    socketDevice.connect(toPort: port) { result in
+                    socketBox.value.connect(toPort: port) { result in
                         switch result {
                         case .success(let c):
                             let d = dup(c.fileDescriptor)
@@ -894,7 +1049,12 @@ public actor VM {
                                  nil, 0, NI_NUMERICHOST)
             guard rc == 0 else { continue }
 
-            let ip = String(cString: host)
+            // Decode the null-terminated C string into Swift without the
+            // deprecated `String(cString: [CChar])` initializer.
+            let ip = host.withUnsafeBufferPointer { buf -> String in
+                guard let base = buf.baseAddress else { return "" }
+                return String(cString: base)
+            }
             let parts = ip.split(separator: ".")
             guard parts.count == 4 else { continue }
 
@@ -963,14 +1123,38 @@ public actor VM {
         serialConsole.output
     }
 
+    /// Sendable handle wrapping the underlying VZVirtualMachine for the
+    /// SwiftUI display layer. VZ's class is not Sendable; this opt-in
+    /// `@unchecked Sendable` wrapper lets us cross the actor boundary
+    /// while preserving the "VZ calls happen on the main thread" contract
+    /// (`LuminaVirtualMachineView` lives on `@MainActor`).
+    public struct VZMachineHandle: @unchecked Sendable {
+        public let machine: VZVirtualMachine?
+    }
+
+    /// Direct accessor for the underlying VZVirtualMachine, used by the
+    /// SwiftUI display layer (`LuminaVirtualMachineView` in
+    /// LuminaDesktopKit).
+    public func vzMachine() -> VZMachineHandle {
+        VZMachineHandle(machine: virtualMachine)
+    }
+
+    /// Install a `VZVirtualMachineDelegate` on the underlying VM so
+    /// callers can be notified of guest-initiated stops and errors.
+    /// The delegate is weakly held by VZ; the caller owns retention.
+    public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
+        virtualMachine?.delegate = delegate
+    }
+
     // MARK: - Private
 
     private func shutdownVM() async {
         if let vm = virtualMachine {
             let queue = executor.queue
+            let vmBox = UncheckedSendable(vm)
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 queue.async {
-                    vm.stop(completionHandler: { _ in
+                    vmBox.value.stop(completionHandler: { _ in
                         cont.resume()
                     })
                 }
@@ -1018,4 +1202,102 @@ enum VMError: Error, Sendable {
     case invalidState(String)
     case noSocketDevice
     case pipeFailed
+}
+
+// MARK: - Sendable crossing shim
+
+/// `@unchecked Sendable` box for the single-closure crossings this target
+/// makes into `DispatchQueue.async` and friends with non-`Sendable`
+/// references — principally VZ API objects. The caller's contract: the
+/// wrapped value is used on the correct isolation domain inside the
+/// closure (e.g. `VZVirtualMachine` on its creation queue). Without this
+/// box, Swift 6's `SendableClosureCaptures` diagnostic fires on every
+/// `queue.async { vm.something(...) }` call site; wrapping makes the
+/// intent explicit rather than silencing it with `@preconcurrency`.
+struct UncheckedSendable<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+// MARK: - Sound (v0.7.0 M4, agent-path-neutral)
+
+/// Attach a `VZVirtioSoundDeviceConfiguration` with `sound.streamCount`
+/// output streams. Free function so it doesn't pull anything into the
+/// agent path until `options.sound` is non-nil. `internal` so MacOSVM
+/// (same target) can reuse it.
+internal func attachSoundDevice(
+    to config: VZVirtualMachineConfiguration,
+    sound: SoundConfig
+) {
+    let device = VZVirtioSoundDeviceConfiguration()
+    var streams: [VZVirtioSoundDeviceStreamConfiguration] = []
+    for _ in 0..<max(1, sound.streamCount) {
+        let output = VZVirtioSoundDeviceOutputStreamConfiguration()
+        output.sink = VZHostAudioOutputStreamSink()
+        streams.append(output)
+    }
+    device.streams = streams
+    var existing = config.audioDevices
+    existing.append(device)
+    config.audioDevices = existing
+}
+
+// MARK: - Graphics (v0.7.0, agent-path-neutral)
+
+/// Attach display + input devices matching `graphics` to `config`.
+///
+/// Free function (not a VM-actor method) so it has no implicit access to
+/// actor state — it operates purely on the supplied configuration. Called
+/// only when `VMOptions.graphics != nil`, so agent-path runs never
+/// invoke it and never link any of these VZ device classes at runtime.
+private func attachGraphicsDevices(
+    to config: VZVirtualMachineConfiguration,
+    graphics: GraphicsConfig
+) {
+    // Virtio-GPU scanout: single display at the configured resolution.
+    // Works for Linux + Windows-on-ARM guests. macOS guests use a different
+    // VM type (VZMacOSVirtualMachine) and their own graphics class, landing
+    // in M5.
+    let gfx = VZVirtioGraphicsDeviceConfiguration()
+    gfx.scanouts = [
+        VZVirtioGraphicsScanoutConfiguration(
+            widthInPixels: graphics.widthInPixels,
+            heightInPixels: graphics.heightInPixels
+        )
+    ]
+    config.graphicsDevices = [gfx]
+
+    // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic
+    // VM it falls back to USB so the caller doesn't get a validation error.
+    switch graphics.keyboardKind {
+    case .usb:
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+    case .mac:
+        #if swift(>=6)
+        if #available(macOS 14.0, *) {
+            config.keyboards = [VZMacKeyboardConfiguration()]
+        } else {
+            config.keyboards = [VZUSBKeyboardConfiguration()]
+        }
+        #else
+        config.keyboards = [VZUSBKeyboardConfiguration()]
+        #endif
+    }
+
+    // Pointing device. Trackpad requires a macOS guest for full fidelity;
+    // on Linux/Windows it doesn't validate, so fall back to USB mouse.
+    switch graphics.pointingDeviceKind {
+    case .usbScreenCoordinate:
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+    case .trackpad:
+        #if swift(>=6)
+        if #available(macOS 14.0, *) {
+            config.pointingDevices = [VZMacTrackpadConfiguration()]
+        } else {
+            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        }
+        #else
+        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        #endif
+    }
 }

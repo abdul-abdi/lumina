@@ -38,3 +38,7 @@ demo.tape
 
 # Git worktrees for parallel feature development
 .worktrees/
+
+# v0.7.0 M6: xcodegen-generated Xcode project (project.yml is the source of truth)
+Apps/LuminaDesktop/LuminaDesktop.xcodeproj/
+Apps/LuminaDesktop/LuminaDesktop.xcworkspace/

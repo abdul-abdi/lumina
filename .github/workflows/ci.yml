@@ -1,10 +1,26 @@
 name: CI
 
+# Fast, PR-blocking gate. Everything here must finish in under ~5 minutes
+# so the feedback loop stays tight. Heavier checks (VM integration, CodeQL,
+# drift detection) live in their own workflows.
+#
+# Scope:
+#   - Swift build (+ codesign smoke)
+#   - Unit tests in parallel
+#   - Guest agent cross-compile + `go vet`
+#   - Agent-boot perf gate (two-probe capability-check; skips on
+#     incapable runners with an honest diagnostic)
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Cancel superseded runs so rapid-fire pushes don't spin up N runners.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -12,8 +28,29 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: read
+    env:
+      # Pinned v0.6.0 baseline image for the agent-boot perf gate.
+      # Bump cadence: on any v0.N.0 tag that changes the agent-path
+      # serialization or the boot envelope. Document the bump in
+      # ROADMAP.md so the baseline's provenance is traceable.
+      LUMINA_BASELINE_IMAGE_URL: "https://github.com/abdul-abdi/lumina/releases/download/lumina-v0.6.0/lumina-image-default.tar.gz"
+      AGENT_BOOT_P50_MAX_MS: "2000"
     steps:
       - uses: actions/checkout@v4
+
+      # SPM + Xcode DerivedData caching. Key includes Package.resolved
+      # so any dep bump invalidates; restore-keys give a close-enough
+      # fallback when the exact key misses.
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+            .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
 
       - name: Swift version
         run: swift --version
@@ -25,16 +62,108 @@ jobs:
           codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
           "$BIN_PATH" --help
 
-      - name: Run unit tests
-        run: swift test
+      - name: Run unit tests (parallel)
+        run: swift test --parallel
 
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
           cache-dependency-path: Guest/lumina-agent/go.sum
 
-      - name: Verify guest agent compiles
+      - name: Vet & compile guest agent
+        # The guest agent is linux/arm64-only. `go vet` defaults to the
+        # host platform — on macOS that's darwin/arm64, where
+        # Linux-specific constants like `unix.TIOCSPTLCK` don't exist.
+        # Pin vet to the actual target so it checks the code we ship.
         run: |
           cd Guest/lumina-agent
+          GOOS=linux GOARCH=arm64 go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
-          echo "Guest agent: OK"
+          echo "Guest agent: vet OK, build OK"
+
+      # Agent-boot regression gate — v0.7.0 discipline.
+      #
+      # Desktop-stack changes (graphics, input devices, new boot loaders)
+      # must NOT regress the agent path. This step boots a real VM via
+      # the pinned baseline image and asserts median cold-boot duration
+      # stays under the threshold. Change the threshold only after a
+      # deliberate decision, recorded in ROADMAP.md.
+      #
+      # Baseline (M3 Pro local, release build): ~390ms P50, ~470ms P95.
+      # CI runners are ~2–3× slower; threshold set conservatively.
+      #
+      # Runner caveat: standard GitHub-hosted macOS runners are themselves
+      # VMs and can't always nest Virtualization.framework. The two-probe
+      # capability check below detects incapable runners and skips with
+      # a meaningful notice — the gate remains authoritative on
+      # self-hosted, larger-runner, and local dev. Nothing we ship
+      # depends on the gate running in default CI; this is performance
+      # regression hygiene, not correctness.
+      - name: Agent-boot regression gate
+        run: |
+          set -euo pipefail
+          echo "Downloading baseline image..."
+          curl -fsSL -o /tmp/lumina-image.tar.gz "$LUMINA_BASELINE_IMAGE_URL"
+          mkdir -p "$HOME/.lumina/images/default"
+          tar xzf /tmp/lumina-image.tar.gz -C "$HOME/.lumina/images/default"
+
+          BIN="$(swift build --show-bin-path)/lumina"
+
+          run_once() { "$BIN" run "true" 2>&1; }
+
+          # Lumina's unified output envelope always includes `duration_ms`,
+          # even for error responses. The authoritative success signal is
+          # `error == null && exit_code == 0`. A naive `.duration_ms`
+          # check accepts errored runs and reports nonsense sub-10ms
+          # measurements.
+          extract_success_ms() {
+            printf '%s' "$1" | jq -r '
+              select((.error // null) == null and (.exit_code // -1) == 0)
+              | .duration_ms // empty
+            ' 2>/dev/null || true
+          }
+
+          echo "Probe 1/2: verify runner can boot a VM successfully..."
+          PROBE1_OUT="$(run_once || true)"
+          PROBE1_MS="$(extract_success_ms "$PROBE1_OUT")"
+          if [ -z "$PROBE1_MS" ]; then
+            echo "::notice::Agent-boot gate skipped: Virtualization unavailable on this runner."
+            printf '%s\n' "$PROBE1_OUT" | head -20
+            exit 0
+          fi
+          echo "  probe 1: ${PROBE1_MS}ms — VZ available."
+
+          echo "Probe 2/2: verify runner can sustain consecutive boots..."
+          PROBE2_OUT="$(run_once || true)"
+          PROBE2_MS="$(extract_success_ms "$PROBE2_OUT")"
+          if [ -z "$PROBE2_MS" ]; then
+            echo "::notice::Agent-boot gate skipped: runner failed the second boot (clone cleanup or VZ resource limit)."
+            printf '%s\n' "$PROBE2_OUT" | head -20
+            exit 0
+          fi
+          echo "  probe 2: ${PROBE2_MS}ms — runner can sustain consecutive boots."
+
+          echo "Measuring cold-boot duration over 5 iterations..."
+          MEASUREMENTS=()
+          for i in 1 2 3 4 5; do
+            OUT="$(run_once || true)"
+            MS="$(extract_success_ms "$OUT")"
+            if [ -z "$MS" ]; then
+              echo "::error::Iteration $i failed to produce a successful boot envelope."
+              printf '%s\n' "$OUT" | head -20
+              exit 1
+            fi
+            echo "  iter $i: ${MS}ms"
+            MEASUREMENTS+=("$MS")
+          done
+
+          MEDIAN=$(printf '%s\n' "${MEASUREMENTS[@]}" | sort -n | sed -n '3p')
+          echo ""
+          echo "Agent boot P50: ${MEDIAN}ms (max allowed: ${AGENT_BOOT_P50_MAX_MS}ms)"
+
+          if [ "$MEDIAN" -gt "$AGENT_BOOT_P50_MAX_MS" ]; then
+            echo "::error::Agent-boot regression: median ${MEDIAN}ms exceeds ${AGENT_BOOT_P50_MAX_MS}ms threshold."
+            echo "::error::If intentional, bump AGENT_BOOT_P50_MAX_MS in .github/workflows/ci.yml and document in ROADMAP.md."
+            exit 1
+          fi
+          echo "::notice::Agent-boot gate passed (${MEDIAN}ms / ${AGENT_BOOT_P50_MAX_MS}ms budget)."

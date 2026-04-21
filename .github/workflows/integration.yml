@@ -1,0 +1,108 @@
+name: Integration Tests
+
+# Heavy VM-backed tests. Runs `tests/e2e.sh`, `tests/desktop.sh`, and
+# optionally `tests/stress.sh` against a real lumina build on a runner
+# that can actually nest Virtualization.framework.
+#
+# Standard GitHub-hosted `macos-15` runners are VMs themselves and
+# typically can't sustain consecutive VZ boots — we detect that with
+# the same two-probe pattern as the agent-boot perf gate in ci.yml and
+# skip cleanly (exit 0 with a diagnostic notice). On a self-hosted
+# runner, larger runner, or local dev these tests enforce fully.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: e2e + desktop + stress
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      LUMINA_BASELINE_IMAGE_URL: "https://github.com/abdul-abdi/lumina/releases/download/lumina-v0.6.0/lumina-image-default.tar.gz"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Build & codesign
+        run: |
+          swift build
+          BIN_PATH=$(swift build --show-bin-path)/lumina
+          codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
+          echo "BIN=$BIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Fetch baseline image
+        run: |
+          curl -fsSL -o /tmp/lumina-image.tar.gz "$LUMINA_BASELINE_IMAGE_URL"
+          mkdir -p "$HOME/.lumina/images/default"
+          tar xzf /tmp/lumina-image.tar.gz -C "$HOME/.lumina/images/default"
+
+      # Two-probe VZ capability gate. Identical semantics to ci.yml's
+      # agent-boot gate probe: require a success envelope (no error,
+      # exit_code == 0) on two consecutive runs before we trust the
+      # runner with the full integration suite.
+      - name: VZ capability probe
+        id: vz
+        run: |
+          set -euo pipefail
+          run_once() { "$BIN" run "true" 2>&1; }
+          extract_success_ms() {
+            printf '%s' "$1" | jq -r '
+              select((.error // null) == null and (.exit_code // -1) == 0)
+              | .duration_ms // empty
+            ' 2>/dev/null || true
+          }
+
+          PROBE1="$(run_once || true)"
+          MS1="$(extract_success_ms "$PROBE1")"
+          if [ -z "$MS1" ]; then
+            echo "capable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Integration tests skipped: runner can't boot a VM."
+            printf '%s\n' "$PROBE1" | head -20
+            exit 0
+          fi
+
+          PROBE2="$(run_once || true)"
+          MS2="$(extract_success_ms "$PROBE2")"
+          if [ -z "$MS2" ]; then
+            echo "capable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Integration tests skipped: runner can't sustain consecutive boots."
+            printf '%s\n' "$PROBE2" | head -20
+            exit 0
+          fi
+
+          echo "capable=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Runner is VZ-capable (${MS1}ms / ${MS2}ms). Running full integration suite."
+
+      - name: Run e2e suite (tests/e2e.sh)
+        if: steps.vz.outputs.capable == 'true'
+        run: bash tests/e2e.sh "$BIN"
+
+      - name: Run desktop EFI smoke (tests/desktop.sh)
+        if: steps.vz.outputs.capable == 'true'
+        run: bash tests/desktop.sh
+
+      # Stress tests are best-effort on CI — they spawn many VMs and can
+      # surface runner-specific resource exhaustion that isn't a true
+      # regression. Advisory but visible.
+      - name: Run stress suite (tests/stress.sh)
+        if: steps.vz.outputs.capable == 'true'
+        continue-on-error: true
+        run: bash tests/stress.sh "$BIN"
