@@ -184,65 +184,73 @@ public actor MacOSVM {
     }
 
     /// Boot a macOS guest that's already installed.
+    ///
+    /// A mid-boot Task cancel (user clicks Stop in the desktop app before
+    /// the guest reaches userspace) triggers `onCancel` on the start
+    /// continuation, which invokes `vm.stop(…)` on the executor queue.
+    /// That resumes `start`'s completion with an error; the `catch` funnels
+    /// through `stopVZMachineIfRunning` to release `flock()` on the
+    /// primary disk, so a subsequent `boot()` succeeds cold.
     public func boot() async throws {
         guard _state == .idle else {
             throw Error.invalidState("boot requires .idle state, was \(_state)")
         }
         _state = .booting
 
-        let vzConfig = VZVirtualMachineConfiguration()
-        vzConfig.cpuCount = cpuCount
-        vzConfig.memorySize = memoryBytes
-
         do {
+            let vzConfig = VZVirtualMachineConfiguration()
+            vzConfig.cpuCount = cpuCount
+            vzConfig.memorySize = memoryBytes
+
             try MacOSBootable(config: _bootConfig).apply(to: vzConfig)
-        } catch {
-            _state = .idle
-            throw Error.bootFailed("MacOSBootable.apply: \(error)")
-        }
 
-        let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = VZNATNetworkDeviceAttachment()
-        if let macString = macAddressString,
-           let mac = VZMACAddress(string: macString) {
-            network.macAddress = mac
-        }
-        vzConfig.networkDevices = [network]
-        vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-        if let graphics {
-            attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
-        }
-        if let sound, sound.enabled {
-            attachSoundDevice(to: vzConfig, sound: sound)
-        }
+            let network = VZVirtioNetworkDeviceConfiguration()
+            network.attachment = VZNATNetworkDeviceAttachment()
+            if let macString = macAddressString,
+               let mac = VZMACAddress(string: macString) {
+                network.macAddress = mac
+            }
+            vzConfig.networkDevices = [network]
+            vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+            if let graphics {
+                attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
+            }
+            if let sound, sound.enabled {
+                attachSoundDevice(to: vzConfig, sound: sound)
+            }
 
-        do {
             try vzConfig.validate()
-        } catch {
-            _state = .idle
-            throw Error.bootFailed("config validation: \(error)")
-        }
+            try Task.checkCancellation()
 
-        let queue = executor.queue
-        let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
-        self.virtualMachine = vm
+            let queue = executor.queue
+            let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
+            self.virtualMachine = vm
 
-        do {
             let vmBox = UncheckedSendable(vm)
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
-                queue.async {
-                    vmBox.value.start { result in
-                        cont.resume(with: result)
+            let startQueue = queue
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+                        startQueue.async {
+                            vmBox.value.start { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
                     }
                 }
-            }
+            )
+
+            _state = .ready
         } catch {
             await stopVZMachineIfRunning()
             _state = .idle
             throw Error.bootFailed("\(error)")
         }
-
-        _state = .ready
     }
 
     public func shutdown() async {

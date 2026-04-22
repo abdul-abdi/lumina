@@ -124,7 +124,7 @@ public final class LuminaDesktopSession: Identifiable {
         opts.graphics = GraphicsConfig(
             widthInPixels: 1920,
             heightInPixels: 1080,
-            keyboardKind: bundle.manifest.osFamily == .windows ? .usb : .usb,
+            keyboardKind: .usb,
             pointingDeviceKind: .usbScreenCoordinate
         )
         opts.sound = SoundConfig(enabled: true)
@@ -135,15 +135,28 @@ public final class LuminaDesktopSession: Identifiable {
         // removes the indexer-lock race as a Code 2 source.
         ensureSpotlightDisabled()
 
-        // Single-shot boot. The historical concurrent-boot race that
-        // produced `VZErrorDomain Code 2` on first click is now fixed
-        // structurally by the re-entry guard at the top of this method
-        // (see commit a8e211d). With that race gone and the Spotlight
-        // opt-out applied above, we have no reproducer for Code 2
-        // requiring a retry. If it reappears, surface it — retries here
-        // only hid the previous bug for months.
+        // Build and install the stop/crash observer BEFORE boot. See
+        // `VM.setDelegate(_:)` for the full rationale: any guest crash
+        // during the 300–500 ms kernel-boot window (panic, dracut
+        // timeout, missing hardware model, Windows TPM refusal) fires
+        // `didStopWithError` into whatever delegate the VZ machine has
+        // at that instant. Pre-boot install guarantees the delegate is
+        // live; post-boot install (prior design) leaves a gap where a
+        // kernel-boot-window crash silently lands on a nil delegate and
+        // the UI sits at `.running` with a dead VM.
+        let forwarder = VMStopForwarder(
+            onGuestStop: { [weak self] in
+                Task { @MainActor in self?.handleExternalStop(reason: nil) }
+            },
+            onError: { [weak self] err in
+                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
+            }
+        )
+        self.vmDelegate = forwarder
+
         let newVM = VM(options: opts)
         self.vm = newVM
+        await newVM.setDelegate(forwarder)
         do {
             try await newVM.boot()
             // Grab the VZ handle and publish it BEFORE flipping status
@@ -163,12 +176,19 @@ public final class LuminaDesktopSession: Identifiable {
             // mounted just clutters every card with "installer attached"
             // forever. Both writes are non-fatal.
             persistBootRecord()
-            // Attach stop observer so guest-initiated `poweroff`, external
-            // crashes, and any other VZ-side termination flip status back
-            // to .stopped / .crashed.
-            await attachStopObserver(to: newVM)
+        } catch let err as LuminaError where err.isCancellation {
+            // User clicked Stop mid-boot. The VM actor's cancellation
+            // path has already torn down the VZ machine, released the
+            // disk `flock()`, and closed serial pipes. Treat this as a
+            // clean stop so the re-entry guard allows a retry.
+            self.vm = nil
+            self.vmDelegate = nil
+            self.vzMachine = nil
+            self.status = .stopped
         } catch {
             self.vm = nil
+            self.vmDelegate = nil
+            self.vzMachine = nil
             self.status = .crashed(reason: "\(error)")
             self.lastError = "\(error)"
         }
@@ -190,19 +210,6 @@ public final class LuminaDesktopSession: Identifiable {
         var updated = bundle
         updated.manifest.lastBootedAt = Date()
         try? updated.save()
-    }
-
-    private func attachStopObserver(to vm: VM) async {
-        let forwarder = VMStopForwarder(
-            onGuestStop: { [weak self] in
-                Task { @MainActor in self?.handleExternalStop(reason: nil) }
-            },
-            onError: { [weak self] err in
-                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
-            }
-        )
-        self.vmDelegate = forwarder
-        await vm.setDelegate(forwarder)
     }
 
     private func handleExternalStop(reason: String?) {

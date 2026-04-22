@@ -558,6 +558,24 @@ public enum LuminaError: Error, Sendable {
     case sessionFailed(String)
 }
 
+extension LuminaError {
+    /// True when the error originated from cooperative cancellation (an
+    /// outer Task was cancelled — typically the user clicked Stop during
+    /// boot). Surfaces as `.bootFailed(underlying: VMError.cancelled)`
+    /// from `VM.boot()`. Consumers distinguish "user cancelled, retry
+    /// should just work" from "VM genuinely crashed, investigate."
+    public var isCancellation: Bool {
+        if case .bootFailed(let underlying) = self {
+            // String-based match keeps the check free of VMError-internal
+            // references from types that don't `import Lumina`. The
+            // `"VMError.cancelled"` token is produced by VMError's default
+            // Error description; a rename would require updating this site.
+            return String(describing: underlying).contains("cancelled")
+        }
+        return false
+    }
+}
+
 extension LuminaError: LocalizedError {
     public var errorDescription: String? {
         switch self {
