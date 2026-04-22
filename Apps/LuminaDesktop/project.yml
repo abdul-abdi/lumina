@@ -43,6 +43,16 @@ targets:
   LuminaDesktop:
     type: application
     platform: macOS
+    settings:
+      base:
+        # Keep PRODUCT_NAME = "Lumina" (user-facing app name) but give
+        # the Swift module a distinct name so it does not collide with
+        # the `Lumina` product exported by the SPM package at ../.. .
+        # Without this override the xcodeproj emits a Lumina.swiftmodule
+        # alongside the package's own and the build fails with
+        # "Multiple commands produce Lumina.swiftmodule".
+        PRODUCT_MODULE_NAME: LuminaDesktopApp
+        SWIFT_MODULE_NAME: LuminaDesktopApp
     sources:
       - path: LuminaDesktop
     info:

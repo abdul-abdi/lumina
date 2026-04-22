@@ -181,21 +181,20 @@ public final class LuminaDesktopSession: Identifiable {
             // mounted just clutters every card with "installer attached"
             // forever. Both writes are non-fatal.
             persistBootRecord()
-        } catch let err as LuminaError where err.isCancellation {
-            // User clicked Stop mid-boot. The VM actor's cancellation
-            // path has already torn down the VZ machine, released the
-            // disk `flock()`, and closed serial pipes. Treat this as a
-            // clean stop so the re-entry guard allows a retry.
-            self.vm = nil
-            self.vmDelegate = nil
-            self.vzMachine = nil
-            self.status = .stopped
         } catch {
             self.vm = nil
             self.vmDelegate = nil
             self.vzMachine = nil
-            self.status = .crashed(reason: "\(error)")
-            self.lastError = "\(error)"
+            if let le = error as? LuminaError, le.isCancellation {
+                // User clicked Stop mid-boot. The VM actor's cancellation
+                // path has already torn down the VZ machine, released the
+                // disk `flock()`, and closed serial pipes. Treat this as a
+                // clean stop so the re-entry guard allows a retry.
+                self.status = .stopped
+            } else {
+                self.status = .crashed(reason: "\(error)")
+                self.lastError = "\(error)"
+            }
         }
     }
 
