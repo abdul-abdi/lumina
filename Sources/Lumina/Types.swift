@@ -309,6 +309,15 @@ public struct VMOptions: Sendable {
     /// leave it nil (one-shot boots don't benefit from stability). A
     /// malformed string falls back to VZ's default silently.
     public var macAddress: String?
+    /// Optional on-disk destination for the guest's serial console output.
+    /// When set, `VM.boot()` spawns a sibling drain task that appends raw
+    /// bytes from the guest's serial port to this path so failures are
+    /// post-mortem diagnosable without replaying the boot. Parent
+    /// directory must already exist. Nil disables persistence (serial
+    /// output still lives in the in-memory `SerialConsole`, so crash-time
+    /// `guestCrashed(serialOutput:)` still fires — this just adds a
+    /// durable log on top).
+    public var serialLogURL: URL?
     /// v0.7.0: optional display + input for the desktop use case.
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
@@ -352,7 +361,8 @@ public struct VMOptions: Sendable {
         graphics: GraphicsConfig? = nil,
         bootable: BootableProfile? = nil,
         sound: SoundConfig? = nil,
-        macAddress: String? = nil
+        macAddress: String? = nil,
+        serialLogURL: URL? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -368,6 +378,7 @@ public struct VMOptions: Sendable {
         self.bootable = bootable
         self.sound = sound
         self.macAddress = macAddress
+        self.serialLogURL = serialLogURL
     }
 
     public init(from runOptions: RunOptions) {
@@ -391,6 +402,9 @@ public struct VMOptions: Sendable {
         self.sound = nil
         // Disposable `run` is one-shot; no benefit from a stable MAC.
         self.macAddress = nil
+        // Disposable `run` has no bundle; caller can set a specific log
+        // path via the library API if they want the serial dump.
+        self.serialLogURL = nil
     }
 }
 

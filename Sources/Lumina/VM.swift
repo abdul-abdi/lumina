@@ -504,12 +504,42 @@ public actor VM {
             pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
             let console = self.serialConsole
+            // Optional on-disk serial log. Opened in append mode so
+            // re-boots of the same bundle accumulate history (useful for
+            // diagnosing "install went further this time" regressions).
+            // Create the parent directory if the bundle shipped without
+            // one — non-fatal if either step fails; the in-memory
+            // SerialConsole is unaffected.
+            let persistHandle: FileHandle? = {
+                guard let url = options.serialLogURL else { return nil }
+                let dir = url.deletingLastPathComponent()
+                try? FileManager.default.createDirectory(
+                    at: dir, withIntermediateDirectories: true
+                )
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                let h = try? FileHandle(forWritingTo: url)
+                try? h?.seekToEnd()
+                return h
+            }()
+            if let h = persistHandle {
+                // Record a boot-delimiter marker so humans reading the
+                // file can tell where one boot ends and the next begins.
+                let marker = "\n--- lumina boot \(ISO8601DateFormatter().string(from: Date())) ---\n"
+                do { try h.write(contentsOf: Data(marker.utf8)) } catch { /* non-fatal */ }
+                pipeHandles.append(h)
+            }
+
             serialReadTasks.append(Task.detached {
                 let handle = guestToHostRead
                 while !Task.isCancelled {
                     let data = handle.availableData
                     if data.isEmpty { break }
                     console.append(data)
+                    if let h = persistHandle {
+                        _ = try? h.write(contentsOf: data)
+                    }
                 }
             })
 

@@ -95,6 +95,14 @@ struct DesktopCreate: AsyncParsableCommand {
     @Flag(name: .customLong("force"), help: "Skip ARM64 architecture pre-flight check on the ISO.")
     var force = false
 
+    @Option(name: .customLong("network"),
+            help: "Network attachment mode: 'nat' (default, vmnet NAT) or 'bridged' (join host LAN, guest DHCPs against your router — bypasses vmnet and fixes the Debian/Kali netcfg DHCP-race).")
+    var networkMode: String = "nat"
+
+    @Option(name: .customLong("bridge-interface"),
+            help: "Host interface to bridge against when --network=bridged (e.g. 'en0'). Defaults to the first bridgeable interface.")
+    var bridgeInterface: String?
+
     mutating func run() async throws {
         let memBytes = DesktopHelpers.parseMemoryOrExit(memory)
         let diskBytes = DesktopHelpers.parseDiskOrExit(diskSize)
@@ -159,7 +167,23 @@ struct DesktopCreate: AsyncParsableCommand {
             rootURL = base.appendingPathComponent(id.uuidString)
         }
 
-        let bundle: VMBundle
+        // Parse --network. Unknown values are a hard error rather than
+        // silent fallback to nat — the user explicitly chose bridged and
+        // should know when a typo prevents that.
+        let parsedNetworkMode: NetworkMode
+        switch networkMode.lowercased() {
+        case "nat":
+            parsedNetworkMode = .nat
+        case "bridged":
+            parsedNetworkMode = .bridged(interface: bridgeInterface)
+        default:
+            FileHandle.standardError.write(Data(
+                "error: --network must be 'nat' or 'bridged' (got '\(networkMode)')\n".utf8
+            ))
+            throw ExitCode(2)
+        }
+
+        var bundle: VMBundle
         do {
             bundle = try VMBundle.create(
                 at: rootURL,
@@ -177,6 +201,18 @@ struct DesktopCreate: AsyncParsableCommand {
         } catch {
             FileHandle.standardError.write(Data("error: failed to create bundle: \(error)\n".utf8))
             throw ExitCode(1)
+        }
+
+        // Persist the chosen network mode. Default (`.nat`) is left as
+        // nil so the manifest stays minimal for the common case; explicit
+        // `.bridged` is written so the boot layer picks it up on every
+        // subsequent invocation.
+        switch parsedNetworkMode {
+        case .nat:
+            break
+        case .bridged:
+            bundle.manifest.networkMode = parsedNetworkMode
+            try? bundle.save()
         }
 
         // Allocate the primary disk.
@@ -261,6 +297,19 @@ struct DesktopBoot: AsyncParsableCommand {
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
         opts.macAddress = stableMAC
+        // Respect the manifest's network mode — .bridged here flows to
+        // VZBridgedNetworkDeviceAttachment which delegates DHCP to the
+        // user's LAN router instead of vmnet's bootpd.
+        switch bundle.manifest.networkMode ?? .nat {
+        case .nat:
+            opts.networkProvider = NATNetworkProvider()
+        case .bridged(let iface):
+            opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
+        }
+        // Serial log to bundle/logs/serial.log so failures are
+        // post-mortem diagnosable without retrying the boot.
+        opts.serialLogURL = bundle.logsDirectory
+            .appendingPathComponent("serial.log")
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,

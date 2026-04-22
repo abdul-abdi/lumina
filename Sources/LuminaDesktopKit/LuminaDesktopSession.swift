@@ -103,25 +103,56 @@ public final class LuminaDesktopSession: Identifiable {
         lastError = nil
         let start = ContinuousClock.now
 
+        // Reload the bundle from disk so we see any manifest mutations
+        // persisted by prior boots: MAC backfill, lastBootedAt update,
+        // rename via `jq`, etc. Without this reload the session's
+        // in-memory `bundle` is frozen at session-creation time and
+        // subsequent boots re-generate the MAC over top of a stale
+        // `macAddress == nil` — defeating MAC persistence.
+        //
+        // If the bundle has been deleted or its manifest is corrupt,
+        // fall through to the in-memory copy; `ensureMACAddress()`
+        // handles the nil-manifest case and the subsequent boot call
+        // will surface a real error.
+        var mutableBundle = (try? VMBundle.load(from: bundle.rootURL)) ?? bundle
+
         // Populate the bundle's stable MAC on first boot of a pre-v0.7.1
         // bundle. Idempotent: returns the existing MAC when the manifest
         // already has one. Propagated into VMOptions below so every boot
         // of this bundle presents the same L2 identity to vmnet — this is
-        // what fixes the "DHCP autoconfig failed" class of installer bugs
-        // caused by vmnet issuing a fresh lease each boot.
-        var mutableBundle = bundle
+        // what fixes the across-reboot "DHCP autoconfig failed" class of
+        // installer bugs caused by vmnet issuing a fresh lease each boot.
+        // (The *first-boot* Debian-installer DHCP race is a netcfg
+        // single-probe-timeout issue unfixable on the host side — the
+        // workaround is "Retry network autoconfiguration" in the
+        // installer's failure screen.)
         let stableMAC = mutableBundle.ensureMACAddress()
 
-        let isWindows = bundle.manifest.osFamily == .windows
-        let isInstallPhase = bundle.manifest.lastBootedAt == nil
+        let isWindows = mutableBundle.manifest.osFamily == .windows
+        let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
 
         var opts = VMOptions.default
-        opts.memory = bundle.manifest.memoryBytes
-        opts.cpuCount = bundle.manifest.cpuCount
+        opts.memory = mutableBundle.manifest.memoryBytes
+        opts.cpuCount = mutableBundle.manifest.cpuCount
         opts.macAddress = stableMAC
+        // Resolve the network provider from the manifest. Nil / .nat keep
+        // the historical VZNAT path; .bridged swaps in a bridge to the
+        // host LAN so the guest's DHCP goes to the user's real router
+        // instead of vmnet's embedded bootpd — the only reliable fix
+        // for vmnet degradation and the Debian-netcfg first-probe race
+        // (user edits `manifest.json` `networkMode.mode = "bridged"` or
+        // passes `--network=bridged` on `lumina desktop create`).
+        opts.networkProvider = Self.networkProvider(for: mutableBundle.manifest.networkMode)
+        // Persist serial output to bundle/logs/serial.log for post-mortem
+        // diagnosis. When a Debian/Kali installer reaches "Network
+        // autoconfiguration failed" or Windows setup prints a cryptic
+        // error, this file is the ground truth for what the guest
+        // actually saw. Appended on every boot with a dated delimiter.
+        opts.serialLogURL = mutableBundle.logsDirectory
+            .appendingPathComponent("serial.log")
         opts.bootable = .efi(EFIBootConfig(
-            variableStoreURL: bundle.efiVarsURL,
-            primaryDisk: bundle.primaryDiskURL,
+            variableStoreURL: mutableBundle.efiVarsURL,
+            primaryDisk: mutableBundle.primaryDiskURL,
             cdromISO: pendingCDROM(),
             preferUSBCDROM: isWindows,
             installPhase: isInstallPhase
@@ -214,6 +245,31 @@ public final class LuminaDesktopSession: Identifiable {
         var updated = bundle
         updated.manifest.lastBootedAt = Date()
         try? updated.save()
+    }
+
+    /// Map a persisted `NetworkMode` to the corresponding `NetworkProvider`.
+    ///
+    /// Nil → `.nat` for backward compatibility with pre-v0.7.1 bundles
+    /// and for every ad-hoc-signed install: the default distribution
+    /// does not carry the `com.apple.vm.networking` entitlement because
+    /// macOS 14+ refuses to launch ad-hoc binaries that declare it.
+    ///
+    /// `.bridged` uses `VZBridgedNetworkDeviceAttachment`. Requires a
+    /// signed build with the `com.apple.vm.networking` entitlement —
+    /// add an Apple ID in Xcode > Settings > Accounts, open the
+    /// xcodeproj, flip the target to Automatic signing with your
+    /// Personal Team, add `com.apple.vm.networking` under Signing &
+    /// Capabilities, Run. If the binary is missing the entitlement, VZ
+    /// rejects the config at `validate()` and `VM.boot()` surfaces a
+    /// `LuminaError.bootFailed` — no silent downgrade; the user flips
+    /// `manifest.json.networkMode` back to `nat` or rebuilds signed.
+    private static func networkProvider(for mode: NetworkMode?) -> any NetworkProvider {
+        switch mode ?? .nat {
+        case .nat:
+            return NATNetworkProvider()
+        case .bridged(let iface):
+            return BridgedNetworkProvider(interfaceIdentifier: iface)
+        }
     }
 
     private func handleExternalStop(reason: String?) {
