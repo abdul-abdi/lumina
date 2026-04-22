@@ -112,6 +112,7 @@ Benchmarked on M3 Pro, macOS 26.4, release build.
 | 4 concurrent cold boots | **753ms** aggregate wall-clock | — | Apple Silicon + VZ scales cleanly |
 | Daemon idle memory | **0 MB** | — | no daemon — sessions are spawned processes |
 | Sustained session exec rate | **100/s** | — | 3-minute soak test |
+| Concurrent CLI clients / session | **1000+ / 200-in-2s** | — | async reader lifted pool-starvation ceiling |
 
 ### Desktop path (v0.7.0 new)
 
@@ -125,7 +126,7 @@ Benchmarked on M3 Pro, macOS 26.4, release build.
 | FSEvents pickup (new VM appears) | **80ms** | coalesced from directory write events |
 | Binary size (`Lumina.app`) | **4.6 MB** | no Sparkle, no bundled frameworks |
 
-Validated under stress: 10 concurrent 512MB VMs booted on 18GB M3 Pro, 100K-line stdout round-trip in ~1s, 3-minute sustained session with 171 periodic execs.  [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
+Validated under stress: 20 concurrent 512MB VMs (100% success), 1000 parallel CLI `exec` clients against one session (100% success, 1.99s wall), 100K-line stdout round-trip in ~1s, 100MB stdout byte-exact in 532ms, 3-minute sustained session with 171 periodic execs.  [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
 
 ---
 
@@ -146,12 +147,17 @@ lumina run --volume mydata:/data "cat /data/file.txt"
 ```bash
 SID=$(lumina session start)                      # ~540ms
 SID=$(lumina session start --memory 4GB --cpus 4 --forward 3000:3000)
+SID=$(lumina session start --ttl 30m)            # auto-stop after 30m idle
 lumina exec $SID "uname -a"                      # ~31ms
 echo '{"k":1}' | lumina exec $SID "jq ."         # stdin piping
 lumina cp ./script.py $SID:/tmp/script.py        # file transfer
 lumina exec --pty $SID "claude"                  # interactive TTY
 lumina session list && lumina session stop $SID
 ```
+
+`--ttl <duration>` arms an idle watchdog that auto-stops the session once
+there has been no client activity **and** no active execs for the interval.
+Default is `0` (never auto-stop). Live execs and PTYs prevent shutdown.
 
 ### Desktop VMs — install Ubuntu, Kali, Windows 11 ARM, macOS
 
