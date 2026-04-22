@@ -157,18 +157,38 @@ public actor MacOSVM {
         defer { progressToken?.invalidate() }
 
         do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
-                queue.async {
-                    installerBox.value.install { result in
-                        cont.resume(with: result)
+            // Cooperative cancellation during a 30+ minute IPSW restore.
+            // If the user cancels mid-restore (closes the install window,
+            // hits Stop), `onCancel` calls `vm.stop(…)` on the executor
+            // queue which unwinds the installer's completion with an
+            // error. The outer `catch` then releases the `flock()` on
+            // `disk.img` / `aux.img` via `stopVZMachineIfRunning`, so a
+            // subsequent `install()` or `boot()` succeeds cold. Without
+            // this, cancelled installs orphaned the VZ machine and the
+            // next attempt failed with `VZErrorDomain Code 2`.
+            let startQueue = queue
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+                        startQueue.async {
+                            installerBox.value.install { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
                     }
                 }
-            }
+            )
         } catch {
-            // Installer failed mid-flight: a VZ machine is already running
-            // on the executor queue from the VZVirtualMachine(configuration:)
-            // call above. Tear it down before resetting state so a retry
-            // doesn't orphan the old VZ instance inside this actor.
+            // Installer failed mid-flight (or was cancelled): a VZ machine
+            // is already running on the executor queue from the
+            // VZVirtualMachine(configuration:) call above. Tear it down
+            // before resetting state so a retry doesn't orphan the old VZ
+            // instance inside this actor.
             await stopVZMachineIfRunning()
             _state = .idle
             throw Error.installFailed("\(error)")
