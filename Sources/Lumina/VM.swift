@@ -246,6 +246,15 @@ public actor VM {
             _state = .idle
             throw .bootFailed(underlying: error)
         }
+        // Pin the MAC if the caller provided one. Desktop bundles persist a
+        // stable MAC in their manifest so every boot uses the same L2 id —
+        // vmnet's DHCP lease stays hot and the guest's IP is reproducible.
+        // A malformed string silently falls through to VZ's default (random
+        // locally-administered on every boot).
+        if let macString = options.macAddress,
+           let mac = VZMACAddress(string: macString) {
+            networkDevice.macAddress = mac
+        }
         self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
         var networkDevices: [VZVirtioNetworkDeviceConfiguration] = [networkDevice]
 
@@ -453,13 +462,23 @@ public actor VM {
             }
         })
 
-        // Network — same pluggable provider as the agent path.
+        // Network — same pluggable provider as the agent path, plus the
+        // same MAC-pinning behavior so desktop .luminaVM bundles present a
+        // stable L2 identity to vmnet on every boot. Without this, VZ picks
+        // a fresh random MAC each boot; vmnet then issues a new DHCP lease,
+        // which in turn produces the "Network autoconfiguration failed"
+        // race observed in the Kali installer when netcfg probes before
+        // the fresh lease is recorded host-side.
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
         do {
             networkDevice.attachment = try options.networkProvider.createAttachment()
         } catch {
             _state = .idle
             throw .bootFailed(underlying: error)
+        }
+        if let macString = options.macAddress,
+           let mac = VZMACAddress(string: macString) {
+            networkDevice.macAddress = mac
         }
         self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
         config.networkDevices = [networkDevice]

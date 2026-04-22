@@ -103,9 +103,19 @@ public final class LuminaDesktopSession: Identifiable {
         lastError = nil
         let start = ContinuousClock.now
 
+        // Populate the bundle's stable MAC on first boot of a pre-v0.7.1
+        // bundle. Idempotent: returns the existing MAC when the manifest
+        // already has one. Propagated into VMOptions below so every boot
+        // of this bundle presents the same L2 identity to vmnet — this is
+        // what fixes the "DHCP autoconfig failed" class of installer bugs
+        // caused by vmnet issuing a fresh lease each boot.
+        var mutableBundle = bundle
+        let stableMAC = mutableBundle.ensureMACAddress()
+
         var opts = VMOptions.default
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
+        opts.macAddress = stableMAC
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,

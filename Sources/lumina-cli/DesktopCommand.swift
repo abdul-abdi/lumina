@@ -250,9 +250,14 @@ struct DesktopBoot: AsyncParsableCommand {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
+        // Ensure + persist a stable MAC on first boot. See
+        // `LuminaDesktopSession.boot()` for the full rationale.
+        let stableMAC = bundle.ensureMACAddress()
+
         var opts = VMOptions.default
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
+        opts.macAddress = stableMAC
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
@@ -432,13 +437,17 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
     var cpus: Int = 4
 
     mutating func run() async throws {
-        let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
+        var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
         let ipswURL = URL(fileURLWithPath: (ipswPath as NSString).expandingTildeInPath)
 
         guard FileManager.default.fileExists(atPath: ipswURL.path) else {
             FileHandle.standardError.write(Data("error: IPSW not found: \(ipswPath)\n".utf8))
             throw ExitCode(2)
         }
+
+        // Ensure the bundle has a persisted MAC before install so regular
+        // boots after install match what VZ saw during the install run.
+        let stableMAC = bundle.ensureMACAddress()
 
         let cfg = MacOSBootConfig(
             ipsw: ipswURL,
@@ -448,7 +457,8 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
         let vm = MacOSVM(
             bootConfig: cfg,
             memoryBytes: DesktopHelpers.parseMemoryOrExit(memory),
-            cpuCount: cpus
+            cpuCount: cpus,
+            macAddress: stableMAC
         )
 
         print("Restoring macOS from \(ipswPath) into \(bundle.rootURL.path)")

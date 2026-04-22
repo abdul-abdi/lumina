@@ -281,6 +281,14 @@ public struct VMOptions: Sendable {
     public var networkIP: String?
     public var rosetta: Bool
     public var diskSize: UInt64?
+    /// Stable L2 identity in `xx:xx:xx:xx:xx:xx` hex form. When set, the VM
+    /// boots with this exact MAC instead of VZ's default random-per-boot
+    /// value. Desktop bundles always set this from `VMBundleManifest` so
+    /// re-boots of the same bundle present the same MAC to vmnet — required
+    /// for a stable DHCP lease and reproducible routing. Disposable CLI VMs
+    /// leave it nil (one-shot boots don't benefit from stability). A
+    /// malformed string falls back to VZ's default silently.
+    public var macAddress: String?
     /// v0.7.0: optional display + input for the desktop use case.
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
@@ -323,7 +331,8 @@ public struct VMOptions: Sendable {
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
         bootable: BootableProfile? = nil,
-        sound: SoundConfig? = nil
+        sound: SoundConfig? = nil,
+        macAddress: String? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -338,6 +347,7 @@ public struct VMOptions: Sendable {
         self.graphics = graphics
         self.bootable = bootable
         self.sound = sound
+        self.macAddress = macAddress
     }
 
     public init(from runOptions: RunOptions) {
@@ -359,6 +369,8 @@ public struct VMOptions: Sendable {
         self.bootable = nil
         // Disposable `run` is headless; no audio.
         self.sound = nil
+        // Disposable `run` is one-shot; no benefit from a stable MAC.
+        self.macAddress = nil
     }
 }
 

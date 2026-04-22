@@ -32,6 +32,13 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
     public var diskBytes: UInt64
     public var createdAt: Date
     public var lastBootedAt: Date?
+    /// Stable MAC address in `xx:xx:xx:xx:xx:xx` hex form. Persisted so
+    /// every boot of the same bundle presents the same L2 identity to
+    /// vmnet's DHCP server, eliminating lease-table churn and making the
+    /// guest's IP stable across boots. Optional for backward compatibility
+    /// with pre-v0.7.1 bundles; a nil value is lazily filled on first boot
+    /// via `ensureMACAddress()`.
+    public var macAddress: String?
 
     public init(
         schemaVersion: Int = 1,
@@ -43,7 +50,8 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
         cpuCount: Int,
         diskBytes: UInt64,
         createdAt: Date,
-        lastBootedAt: Date?
+        lastBootedAt: Date?,
+        macAddress: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -55,6 +63,18 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
         self.diskBytes = diskBytes
         self.createdAt = createdAt
         self.lastBootedAt = lastBootedAt
+        self.macAddress = macAddress
+    }
+
+    /// Generate a MAC address in the locally-administered unicast range —
+    /// byte 0 bit 1 set (locally administered), bit 0 cleared (unicast).
+    /// No dependency on `Virtualization.framework`; the returned string is
+    /// directly parseable by `VZMACAddress(string:)`.
+    public static func generateLocallyAdministeredMAC() -> String {
+        var bytes = [UInt8](repeating: 0, count: 6)
+        for i in 0..<6 { bytes[i] = UInt8.random(in: 0...255) }
+        bytes[0] = (bytes[0] & 0xFE) | 0x02
+        return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
     }
 }
 
@@ -120,10 +140,28 @@ public struct VMBundle: Sendable, Equatable {
             cpuCount: cpuCount,
             diskBytes: diskBytes,
             createdAt: now,
-            lastBootedAt: nil
+            lastBootedAt: nil,
+            macAddress: VMBundleManifest.generateLocallyAdministeredMAC()
         )
         try writeManifest(manifest, into: rootURL)
         return VMBundle(rootURL: rootURL, manifest: manifest)
+    }
+
+    /// Populate `manifest.macAddress` if missing (pre-v0.7.1 bundle),
+    /// persist the change, and return the effective MAC. Safe to call on
+    /// every boot — idempotent when the manifest already has a MAC. Write
+    /// failure is swallowed because boot should proceed even if we can't
+    /// update the on-disk manifest; the caller still gets a usable MAC for
+    /// this boot.
+    @discardableResult
+    public mutating func ensureMACAddress() -> String {
+        if let existing = manifest.macAddress, !existing.isEmpty {
+            return existing
+        }
+        let generated = VMBundleManifest.generateLocallyAdministeredMAC()
+        manifest.macAddress = generated
+        try? save()
+        return generated
     }
 
     public static func load(from rootURL: URL) throws -> VMBundle {

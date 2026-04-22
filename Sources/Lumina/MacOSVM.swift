@@ -38,6 +38,7 @@ public actor MacOSVM {
     private let cpuCount: Int
     private let graphics: GraphicsConfig?
     private let sound: SoundConfig?
+    private let macAddressString: String?
 
     public var state: State { _state }
     public var bootConfig: MacOSBootConfig { _bootConfig }
@@ -52,13 +53,15 @@ public actor MacOSVM {
             keyboardKind: .mac,
             pointingDeviceKind: .trackpad
         ),
-        sound: SoundConfig? = SoundConfig(enabled: true)
+        sound: SoundConfig? = SoundConfig(enabled: true),
+        macAddress: String? = nil
     ) {
         self._bootConfig = bootConfig
         self.memoryBytes = memoryBytes
         self.cpuCount = cpuCount
         self.graphics = graphics
         self.sound = sound
+        self.macAddressString = macAddress
         self.executor = VMExecutor(
             queue: DispatchQueue(label: "com.lumina.macosvm", qos: .userInitiated)
         )
@@ -98,9 +101,16 @@ public actor MacOSVM {
             throw Error.installFailed("MacOSBootable.apply: \(error)")
         }
 
-        // Network for install (downloads inside recovery).
+        // Network for install (downloads inside recovery). Pinning the
+        // MAC when the bundle has one keeps vmnet's DHCP lease stable
+        // between the install run and subsequent regular boots, so the
+        // guest sees the same IP across reboots.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
+        if let macString = macAddressString,
+           let mac = VZMACAddress(string: macString) {
+            network.macAddress = mac
+        }
         vzConfig.networkDevices = [network]
         vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         if let graphics {
@@ -193,6 +203,10 @@ public actor MacOSVM {
 
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
+        if let macString = macAddressString,
+           let mac = VZMACAddress(string: macString) {
+            network.macAddress = mac
+        }
         vzConfig.networkDevices = [network]
         vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         if let graphics {
