@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>lumina — subprocess.run() for virtual machines</title>
-<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~30ms, cold starts in ~400ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
+<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~31ms, cold starts in ~524ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
 <meta property="og:title" content="lumina — subprocess.run() for virtual machines" />
 <meta property="og:description" content="A native sandbox primitive for AI agents on Apple Silicon. Now with Lumina Desktop." />
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -859,7 +859,7 @@ footer .legal .sig {
     <span>LUMINA / <b>A SANDBOX PRIMITIVE FOR AGENTS</b></span>
     <span>BUILD <b>0.7.0</b></span>
     <span>PLATFORM <b>DARWIN-ARM64</b></span>
-    <span>LAT <b id="meta-lat">31MS</b></span>
+    <span>EXEC <b id="meta-lat">31MS</b></span>
     <span id="meta-clock">—</span>
   </div>
 </div>
@@ -876,10 +876,10 @@ footer .legal .sig {
         </h1>
         <p class="lede">
           Boot a Linux VM, run a command, collect <b>structured JSON</b>.
-          Sessions exec in <b>~30ms</b>, cold starts in <b>~400ms</b>,
-          and the sandbox is sealed — no host fs, no SSH, no escape hatch.
-          Built for the agent loop. <b>v0.7.0 adds Lumina Desktop</b> — full-OS
-          guests with a SwiftUI face.
+          Sessions exec in <b>~31ms</b>, cold boots land in <b>~524ms P50</b>
+          on an M3 Pro, and the sandbox is sealed by default — no host fs,
+          no SSH, no escape hatch. Built for the agent loop.
+          <b>v0.7.0 adds Lumina Desktop</b> — full-OS guests with a SwiftUI face.
         </p>
         <div class="cta-row">
           <a href="#install" class="btn primary">
@@ -893,7 +893,7 @@ footer .legal .sig {
         </div>
         <div class="install-line" style="margin-top: 22px;">
           <span class="prompt">$</span>
-          <code>brew install lumina-run/tap/lumina</code>
+          <code>curl -fsSL abdul-abdi.github.io/lumina/install.sh | sh</code>
           <button onclick="copyInstall(this)">[ copy ]</button>
         </div>
         <p class="platform-note">
@@ -921,8 +921,8 @@ footer .legal .sig {
 
     <div class="counters">
       <div>
-        <div class="label">Cold start</div>
-        <div class="val" id="c-boot">402<span class="u">ms</span></div>
+        <div class="label">Cold start (P50)</div>
+        <div class="val" id="c-boot">524<span class="u">ms</span></div>
         <span class="tick"></span>
       </div>
       <div>
@@ -975,16 +975,16 @@ footer .legal .sig {
       <div class="code reveal">
         <header>
           <span>one-shot · disposable VM</span>
-          <span class="right">~400ms</span>
+          <span class="right">~540ms</span>
         </header>
 <pre><span class="co"># boot, run, tear down. zero state.</span>
 <span class="kw">$</span> lumina run <span class="st">"uname -a"</span>
 
 <span class="co">{</span>
-  <span class="kw">"stdout"</span>: <span class="st">"Linux lumina 6.6.22 …\n"</span>,
+  <span class="kw">"stdout"</span>: <span class="st">"Linux lumina 6.12-virt …\n"</span>,
   <span class="kw">"stderr"</span>: <span class="st">""</span>,
   <span class="kw">"exit_code"</span>: <span class="nm">0</span>,
-  <span class="kw">"duration_ms"</span>: <span class="nm">438</span>
+  <span class="kw">"duration_ms"</span>: <span class="nm">542</span>
 <span class="co">}</span></pre>
       </div>
       <div class="code reveal">
@@ -1025,11 +1025,11 @@ footer .legal .sig {
           a screen.
         </p>
         <ul>
-          <li>Library · grid · grouped · pinned</li>
-          <li>4-step wizard · OS tiles · BYO ISO/IPSW</li>
-          <li>per-VM window · pointer release ⌘⌥</li>
-          <li>snapshots · disk-guard · branchable tree</li>
-          <li>signed `.app` · ad-hoc · notarized in v0.7.1</li>
+          <li>Library · grid · sparklines · host ribbon</li>
+          <li>Wizard · OS tiles · BYO ISO/IPSW · drag-drop</li>
+          <li>⌘K fuzzy launcher · menu bar states</li>
+          <li>Fail-closed ISO integrity (SHA-256)</li>
+          <li>Native fullscreen · per-VM window</li>
         </ul>
       </div>
       <div>
@@ -1082,20 +1082,20 @@ footer .legal .sig {
     <div class="prims reveal">
       <div class="prim">
         <div class="sig"><code>lumina run</code><small>one-shot</small></div>
-        <p>Disposable VM. Boots, runs, tears down. For isolated commands that share no state.</p>
+        <p>Disposable VM. Boots, runs, tears down. Per-invocation flags only — provisioning goes on <code style="color:var(--accent)">session start</code>.</p>
         <ul>
-          <li>--memory · --cpus</li>
-          <li>--image · --volume</li>
-          <li>--timeout · --forward</li>
+          <li>--image · --volume · --workdir</li>
+          <li>--timeout · --env / -e</li>
+          <li>--copy · --download</li>
         </ul>
       </div>
       <div class="prim">
         <div class="sig"><code>session start</code><small>persistent</small></div>
         <p>Spawns a long-lived VM. Returns a UUID-form SID. Provisioning belongs here, not on exec.</p>
         <ul>
-          <li>--memory · --cpus · --disk</li>
-          <li>--image (claude-box · default)</li>
-          <li>--forward host:guest</li>
+          <li>--memory · --cpus · --disk-size</li>
+          <li>--image (default · custom)</li>
+          <li>--forward host:guest · --volume</li>
         </ul>
       </div>
       <div class="prim">
@@ -1136,11 +1136,11 @@ footer .legal .sig {
       </div>
       <div class="prim">
         <div class="sig"><code>desktop boot</code><small>v0.7.0</small></div>
-        <p>Boot a <code style="color:var(--accent)">.luminaVM</code> bundle through EFI. Headless or windowed. Optional Rosetta runtime.</p>
+        <p>Boot a <code style="color:var(--accent)">.luminaVM</code> bundle through EFI. Headless or windowed. macOS guests via <code style="color:var(--accent)">desktop install-macos</code> + IPSW.</p>
         <ul>
           <li>--headless · --serial</li>
-          <li>--timeout · --rosetta</li>
-          <li>resumable install</li>
+          <li>--timeout · resumable install</li>
+          <li>Linux · Windows 11 ARM · macOS</li>
         </ul>
       </div>
       <div class="prim">
@@ -1237,36 +1237,36 @@ footer .legal .sig {
     </div>
     <div class="bench reveal">
       <div>
-        <h5>Cold start</h5>
-        <div class="big">402<span class="u">ms</span></div>
-        <div class="sub">Boot → VM ready → first exec.</div>
+        <h5>Cold boot <code style="font-size:11px; color:var(--ink-mute)">true</code></h5>
+        <div class="big">524<span class="u">ms</span></div>
+        <div class="sub">P50 — fresh VM to vsock-ready. P95: 558ms.</div>
         <div class="bars">
-          <div class="bar"><span>lumina</span><span class="t"><i style="width:14%"></i></span><span class="v">402ms</span></div>
-          <div class="bar"><span>firecracker</span><span class="t"><i style="width:18%"></i></span><span class="v">~550ms</span></div>
-          <div class="bar"><span>docker run</span><span class="t"><i style="width:48%"></i></span><span class="v">~1.4s</span></div>
-          <div class="bar"><span>ec2</span><span class="t"><i style="width:92%"></i></span><span class="v">~28s</span></div>
+          <div class="bar"><span>P50</span><span class="t"><i style="width:28%"></i></span><span class="v">524ms</span></div>
+          <div class="bar"><span>P95</span><span class="t"><i style="width:30%"></i></span><span class="v">558ms</span></div>
+          <div class="bar"><span>4× concurrent</span><span class="t"><i style="width:40%"></i></span><span class="v">753ms agg</span></div>
+          <div class="bar"><span>cold + first exec</span><span class="t"><i style="width:29%"></i></span><span class="v">542ms</span></div>
         </div>
       </div>
       <div>
-        <h5>Exec latency</h5>
+        <h5>Warm exec</h5>
         <div class="big">31<span class="u">ms</span></div>
-        <div class="sub">Warm session, trivial command.</div>
+        <div class="sub">Warm session, <code style="font-size:11px; color:var(--ink-mute)">true</code> round-trip. 1ms stdev.</div>
         <div class="bars">
-          <div class="bar"><span>p50</span><span class="t"><i style="width:10%"></i></span><span class="v">31ms</span></div>
-          <div class="bar"><span>p95</span><span class="t"><i style="width:22%"></i></span><span class="v">68ms</span></div>
-          <div class="bar"><span>p99</span><span class="t"><i style="width:38%"></i></span><span class="v">118ms</span></div>
-          <div class="bar"><span>p999</span><span class="t"><i style="width:66%"></i></span><span class="v">204ms</span></div>
+          <div class="bar"><span>P50</span><span class="t"><i style="width:10%"></i></span><span class="v">31ms</span></div>
+          <div class="bar"><span>P95</span><span class="t"><i style="width:11%"></i></span><span class="v">33ms</span></div>
+          <div class="bar"><span>sustained</span><span class="t"><i style="width:50%"></i></span><span class="v">100 exec/s</span></div>
+          <div class="bar"><span>daemon RSS</span><span class="t"><i style="width:0%"></i></span><span class="v">0 MB</span></div>
         </div>
       </div>
       <div>
-        <h5>Concurrency</h5>
-        <div class="big">128<span class="u">×</span></div>
-        <div class="sub">Parallel execs / session. No ordering guarantee.</div>
+        <h5>Capacity</h5>
+        <div class="big">10<span class="u">×</span></div>
+        <div class="sub">Concurrent 512MB VMs on 18GB M3 Pro. Memory-bound, not framework-bound.</div>
         <div class="bars">
           <div class="bar"><span>memory floor</span><span class="t"><i style="width:28%"></i></span><span class="v">512 MB</span></div>
           <div class="bar"><span>default disk</span><span class="t"><i style="width:40%"></i></span><span class="v">8 GB</span></div>
-          <div class="bar"><span>vsock mtu</span><span class="t"><i style="width:62%"></i></span><span class="v">64 KB</span></div>
-          <div class="bar"><span>kernel</span><span class="t"><i style="width:100%"></i></span><span class="v">6.6.22</span></div>
+          <div class="bar"><span>vsock frame</span><span class="t"><i style="width:70%"></i></span><span class="v">128 KB</span></div>
+          <div class="bar"><span>kernel</span><span class="t"><i style="width:100%"></i></span><span class="v">linux-virt</span></div>
         </div>
       </div>
     </div>
@@ -1328,15 +1328,15 @@ footer .legal .sig {
     <div class="install-grid reveal">
       <div>
         <h5><span class="step">01</span>INSTALL</h5>
-<pre><span class="prm">$</span> brew install \
-    lumina-run/tap/lumina</pre>
-        <p>Homebrew, macOS 14+, Apple Silicon. Linux host on the roadmap.</p>
+<pre><span class="prm">$</span> curl -fsSL \
+    <span style="color:var(--ok)">abdul-abdi.github.io/lumina/install.sh</span> | sh</pre>
+        <p>One-liner installer fetches the signed CLI binary from the latest GitHub release and drops it in <code style="color:var(--accent)">~/.local/bin</code>. macOS 14+ on Apple Silicon.</p>
       </div>
       <div>
         <h5><span class="step">02</span>FIRST RUN</h5>
 <pre><span class="prm">$</span> lumina run \
     <span style="color:var(--ok)">"echo hello from a VM"</span></pre>
-        <p>Pulls the default image (~180MB) the first time. After that, boots from a snapshot.</p>
+        <p>Auto-pulls the default image (~30 MB) from GitHub Releases the first time. After that, every run gets a fresh APFS COW clone — no state crosses.</p>
       </div>
       <div>
         <h5><span class="step">03</span>SESSION</h5>
@@ -1419,7 +1419,7 @@ footer .legal .sig {
 <script>
 /* ───── copy install ───── */
 function copyInstall(btn) {
-  navigator.clipboard?.writeText('brew install lumina-run/tap/lumina');
+  navigator.clipboard?.writeText('curl -fsSL abdul-abdi.github.io/lumina/install.sh | sh');
   const orig = btn.textContent;
   btn.textContent = '[ copied ]';
   setTimeout(() => btn.textContent = orig, 1400);
@@ -1427,7 +1427,7 @@ function copyInstall(btn) {
 
 /* ───── live counters (jitter + drift) ───── */
 const counters = {
-  boot: { el: document.getElementById('c-boot'), base: 402, jit: 6 },
+  boot: { el: document.getElementById('c-boot'), base: 524, jit: 14 },
   exec: { el: document.getElementById('c-exec'), base: 31, jit: 3 },
   sess: { el: document.getElementById('c-sess'), base: 1284 },
   execs: { el: document.getElementById('c-execs'), base: 847312 },
@@ -1473,7 +1473,7 @@ tick(); setInterval(tick, 1000);
   const countEl = document.getElementById('ps-count');
   if (!rowsEl) return;
   const MAX_ROWS = 9;
-  const images = ['default', 'claude-box', 'godev', 'pydev', 'ubuntu-24.04', 'kali-rolling'];
+  const images = ['default', 'godev', 'pydev', 'rustdev', 'ubuntu-24.04', 'kali-rolling'];
   const states = ['exec', 'idle', 'boot'];
 
   function randSid() {
