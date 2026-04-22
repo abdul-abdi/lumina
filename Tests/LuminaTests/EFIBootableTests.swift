@@ -99,6 +99,71 @@ import Virtualization
         #expect(cdromDevice != nil)
     }
 
+    @Test func configure_usesVirtioBlockCDROMByDefault() throws {
+        let vars = tmp.appendingPathComponent("efi.vars")
+        let disk = tmp.appendingPathComponent("disk.img")
+        let iso = tmp.appendingPathComponent("linux.iso")
+        try DiskImageAllocator.allocate(at: disk, logicalSize: 64 * 1024 * 1024)
+        FileManager.default.createFile(atPath: iso.path, contents: Data(count: 64 * 1024))
+
+        // preferUSBCDROM defaults to false — virtio block for Linux.
+        let cfg = EFIBootConfig(variableStoreURL: vars, primaryDisk: disk, cdromISO: iso)
+        let vzConfig = baseConfig()
+        try EFIBootable(config: cfg).apply(to: vzConfig)
+
+        let cdrom = vzConfig.storageDevices[1]
+        #expect(cdrom is VZVirtioBlockDeviceConfiguration)
+    }
+
+    @Test func configure_usesUSBMassStorageCDROMWhenPreferred() throws {
+        // macOS 13+ only — older hosts always get virtio block and this
+        // test degrades gracefully to pass-through.
+        guard #available(macOS 13.0, *) else { return }
+
+        let vars = tmp.appendingPathComponent("efi.vars")
+        let disk = tmp.appendingPathComponent("disk.img")
+        let iso = tmp.appendingPathComponent("windows.iso")
+        try DiskImageAllocator.allocate(at: disk, logicalSize: 64 * 1024 * 1024)
+        FileManager.default.createFile(atPath: iso.path, contents: Data(count: 64 * 1024))
+
+        let cfg = EFIBootConfig(
+            variableStoreURL: vars,
+            primaryDisk: disk,
+            cdromISO: iso,
+            preferUSBCDROM: true
+        )
+        let vzConfig = baseConfig()
+        try EFIBootable(config: cfg).apply(to: vzConfig)
+
+        let cdrom = vzConfig.storageDevices[1]
+        #expect(cdrom is VZUSBMassStorageDeviceConfiguration,
+                "Windows-family bundles should get USB mass-storage for the installer ISO")
+    }
+
+    @Test func configure_installPhaseFlagPropagates() throws {
+        // Smoke-test that installPhase flag roundtrips through apply()
+        // without crashing. The actual `VZDiskImageSynchronizationMode`
+        // selection is internal — we trust the unit-test surface for the
+        // flag and exercise end-to-end in an install benchmark.
+        let vars = tmp.appendingPathComponent("efi.vars")
+        let disk = tmp.appendingPathComponent("disk.img")
+        try DiskImageAllocator.allocate(at: disk, logicalSize: 64 * 1024 * 1024)
+
+        let installCfg = EFIBootConfig(
+            variableStoreURL: vars,
+            primaryDisk: disk,
+            installPhase: true
+        )
+        try EFIBootable(config: installCfg).apply(to: baseConfig())
+
+        let normalCfg = EFIBootConfig(
+            variableStoreURL: vars,
+            primaryDisk: disk,
+            installPhase: false
+        )
+        try EFIBootable(config: normalCfg).apply(to: baseConfig())
+    }
+
     @Test func configure_attachesExtraDisks() throws {
         let vars = tmp.appendingPathComponent("efi.vars")
         let disk = tmp.appendingPathComponent("disk.img")

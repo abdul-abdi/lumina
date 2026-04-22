@@ -112,6 +112,9 @@ public final class LuminaDesktopSession: Identifiable {
         var mutableBundle = bundle
         let stableMAC = mutableBundle.ensureMACAddress()
 
+        let isWindows = bundle.manifest.osFamily == .windows
+        let isInstallPhase = bundle.manifest.lastBootedAt == nil
+
         var opts = VMOptions.default
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
@@ -119,7 +122,9 @@ public final class LuminaDesktopSession: Identifiable {
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
-            cdromISO: pendingCDROM()
+            cdromISO: pendingCDROM(),
+            preferUSBCDROM: isWindows,
+            installPhase: isInstallPhase
         ))
         opts.graphics = GraphicsConfig(
             widthInPixels: 1920,

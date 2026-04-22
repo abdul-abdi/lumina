@@ -254,6 +254,9 @@ struct DesktopBoot: AsyncParsableCommand {
         // `LuminaDesktopSession.boot()` for the full rationale.
         let stableMAC = bundle.ensureMACAddress()
 
+        let isWindows = bundle.manifest.osFamily == .windows
+        let isInstallPhase = bundle.manifest.lastBootedAt == nil
+
         var opts = VMOptions.default
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
@@ -261,7 +264,9 @@ struct DesktopBoot: AsyncParsableCommand {
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
-            cdromISO: cdromURL
+            cdromISO: cdromURL,
+            preferUSBCDROM: isWindows,
+            installPhase: isInstallPhase
         ))
         if !headless {
             opts.graphics = GraphicsConfig(

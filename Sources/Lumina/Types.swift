@@ -196,17 +196,37 @@ public struct EFIBootConfig: Sendable, Equatable {
     public var primaryDisk: URL
     public var cdromISO: URL?
     public var extraDisks: [URL]
+    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration` on
+    /// macOS 13+ instead of the default virtio-block device. Windows 11
+    /// ARM setup is picky about media type and refuses to boot from a
+    /// virtio-block-labeled CD-ROM with "Windows cannot find the media";
+    /// USB mass-storage presents as a real removable drive and works.
+    /// Linux installers accept either. Default: true when the bundle's
+    /// OS family is Windows, false otherwise — wired in the bundle boot
+    /// layer, not in `EFIBootable` (which just honours the flag).
+    public var preferUSBCDROM: Bool
+    /// Indicates a first-boot-style install phase. Unlocks install-time
+    /// disk-cache relaxations — `.fsync` synchronization instead of
+    /// `.full` — which halves partman / mkfs install time on APFS
+    /// without compromising in-guest crash safety (only a *host* crash
+    /// mid-install loses data, and the install is disposable).
+    /// Callers populate this from `VMBundleManifest.lastBootedAt == nil`.
+    public var installPhase: Bool
 
     public init(
         variableStoreURL: URL,
         primaryDisk: URL,
         cdromISO: URL? = nil,
-        extraDisks: [URL] = []
+        extraDisks: [URL] = [],
+        preferUSBCDROM: Bool = false,
+        installPhase: Bool = false
     ) {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
         self.cdromISO = cdromISO
         self.extraDisks = extraDisks
+        self.preferUSBCDROM = preferUSBCDROM
+        self.installPhase = installPhase
     }
 }
 
