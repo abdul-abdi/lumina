@@ -105,7 +105,12 @@ public final class SessionServer: @unchecked Sendable {
             throw LuminaError.sessionFailed("Failed to bind socket: \(errno)")
         }
 
-        guard listen(serverFd, 5) == 0 else {
+        // Use SOMAXCONN (128 on macOS). A larger backlog has no cost on a
+        // Unix domain socket and prevents parallel CLI clients from hanging
+        // when their connect() is deferred past the accept queue. The
+        // previous value of 5 was observed to hang at ~8 concurrent
+        // `lumina exec` invocations against a single session.
+        guard listen(serverFd, Int32(SOMAXCONN)) == 0 else {
             Darwin.close(serverFd)
             serverFd = -1
             throw LuminaError.sessionFailed("Failed to listen on socket: \(errno)")
