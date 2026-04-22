@@ -86,12 +86,17 @@ targets:
         com.apple.security.virtualization: true
         com.apple.security.hypervisor: true
         com.apple.security.network.client: true
-        # com.apple.vm.networking (for VZBridgedNetworkDeviceAttachment /
-        # NetworkMode.bridged) is intentionally NOT declared here. macOS
-        # 14+ refuses to launch ad-hoc-signed binaries carrying it
-        # ("Launchd job spawn failed" / POSIX 163). Developers with an
-        # Apple ID added in Xcode > Settings > Accounts can add it in
-        # Signing & Capabilities for local bridged-networking testing.
+        # Required for VZBridgedNetworkDeviceAttachment (NetworkMode.bridged),
+        # which bypasses vmnet NAT entirely and delegates DHCP to the
+        # user's real router — the only reliable fix for Debian-netcfg
+        # first-probe DHCP failure and vmnet degradation after N VM
+        # lifecycles. Works when the target is signed with a Personal
+        # Team (Xcode > Settings > Accounts, add Apple ID) or Developer ID.
+        # macOS 14+ refuses to LAUNCH ad-hoc-signed binaries that declare
+        # this entitlement — `scripts/build-app.sh` uses the adhoc
+        # entitlements file (no networking key) for /Applications
+        # installs to keep that path runnable.
+        com.apple.vm.networking: true
     dependencies:
       - package: Lumina
         product: Lumina

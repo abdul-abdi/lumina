@@ -16,7 +16,18 @@ cd "$REPO_ROOT"
 CONFIG="${LUMINA_BUILD_CONFIG:-release}"
 SIGN_IDENTITY="${LUMINA_SIGN_IDENTITY:--}"
 APP_DIR=".build/Lumina.app"
-ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop.entitlements"
+# Entitlements file selection:
+#   Ad-hoc sign (`-`) → -adhoc.entitlements   (no com.apple.vm.networking;
+#                                              macOS 14+ refuses to launch
+#                                              ad-hoc binaries declaring it).
+#   Signed build      → .entitlements         (full set including the
+#                                              networking entitlement so
+#                                              NetworkMode.bridged works).
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop-adhoc.entitlements"
+else
+    ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop.entitlements"
+fi
 VERSION="0.7.0"
 BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
