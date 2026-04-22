@@ -1057,7 +1057,11 @@ final class CommandRunner: @unchecked Sendable {
     }
 
     /// Buffered line reader. The buffer is owned by the caller (the dispatcher task)
-    /// to avoid shared mutable state.
+    /// to avoid shared mutable state. Stays synchronous: the dispatcher is a
+    /// single long-lived `Task.detached` per VM, so blocking on its own thread
+    /// does not starve the cooperative pool the way per-connection handlers
+    /// would. (Per-connection callers in SessionServer use an async read for
+    /// exactly that reason; see SessionServer.readMessage.)
     private func readLine(from handle: FileHandle, buffer: inout Data) throws(LuminaError) -> Data {
         if let line = extractLine(from: &buffer) {
             return line
