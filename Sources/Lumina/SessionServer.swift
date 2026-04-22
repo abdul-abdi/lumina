@@ -133,7 +133,16 @@ public final class SessionServer: @unchecked Sendable {
     /// Read one NDJSON line from a file handle.
     /// Uses the caller-provided buffer to retain leftover bytes when multiple
     /// frames arrive in a single read (coalesced NDJSON).
-    public func readMessage(from handle: FileHandle, buffer: inout Data) throws -> Data {
+    ///
+    /// The blocking `read(2)` runs on a dedicated GCD queue via a checked
+    /// continuation so it does **not** hold a Swift cooperative-pool thread
+    /// while waiting. Previously this used `FileHandle.availableData`, which
+    /// is synchronous: with one connection per cooperative thread blocked in
+    /// `read`, the pool was exhausted around CPU-count connections and the
+    /// accept loop starved, hanging ~8+ parallel CLI clients. Moving the
+    /// read to a GCD queue and suspending the Task at the await boundary
+    /// frees cooperative threads for dispatch.
+    public func readMessage(from handle: FileHandle, buffer: inout Data) async throws -> Data {
         while true {
             // Check if buffer already has a complete line
             if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
@@ -143,7 +152,7 @@ public final class SessionServer: @unchecked Sendable {
                 return line
             }
 
-            let chunk = handle.availableData
+            let chunk = await Self.asyncReadChunk(fd: handle.fileDescriptor)
             if chunk.isEmpty {
                 if buffer.isEmpty { throw LuminaError.connectionFailed }
                 let remaining = buffer
@@ -154,6 +163,38 @@ public final class SessionServer: @unchecked Sendable {
             if buffer.count > SessionProtocol.maxMessageSize {
                 buffer = Data()
                 throw LuminaError.protocolError("Session message exceeds 64KB")
+            }
+        }
+    }
+
+    /// Concurrent GCD queue for blocking socket reads. Deliberately **not**
+    /// the Swift cooperative pool — we want these reads off the pool so
+    /// many parked connections cannot starve scheduler threads. Concurrent
+    /// attribute lets GCD scale threads as connections pile up.
+    private static let readQueue = DispatchQueue(
+        label: "com.lumina.session.read",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// Issue one `read(2)` and return the bytes as `Data`. Returns empty
+    /// `Data` on EOF or error; callers distinguish via buffer state.
+    /// EINTR is retried transparently. 8 KiB read chunk — anything larger
+    /// than that gets rebuffered by the NDJSON framer.
+    private static func asyncReadChunk(fd: Int32) async -> Data {
+        await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
+            readQueue.async {
+                var buf = [UInt8](repeating: 0, count: 8192)
+                let n: ssize_t = buf.withUnsafeMutableBufferPointer { ptr in
+                    var r: ssize_t
+                    repeat { r = Darwin.read(fd, ptr.baseAddress, ptr.count) } while r < 0 && errno == EINTR
+                    return r
+                }
+                if n <= 0 {
+                    cont.resume(returning: Data())
+                } else {
+                    cont.resume(returning: Data(buf[0..<Int(n)]))
+                }
             }
         }
     }
@@ -241,7 +282,7 @@ public final class SessionServer: @unchecked Sendable {
         while true {
             let msgData: Data
             do {
-                msgData = try readMessage(from: handles.read, buffer: &readBuf)
+                msgData = try await readMessage(from: handles.read, buffer: &readBuf)
             } catch {
                 break // client disconnected
             }
@@ -396,7 +437,7 @@ public final class SessionServer: @unchecked Sendable {
                 while !Task.isCancelled {
                     let msgData: Data
                     do {
-                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
                     } catch {
                         break // socket closed or shut down
                     }
@@ -496,7 +537,7 @@ public final class SessionServer: @unchecked Sendable {
                 while !Task.isCancelled {
                     let msgData: Data
                     do {
-                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
                     } catch {
                         break // socket closed or shut down
                     }

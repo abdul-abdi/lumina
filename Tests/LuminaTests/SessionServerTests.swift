@@ -56,7 +56,7 @@ import Testing
 
 /// Verify that readMessage correctly handles coalesced NDJSON frames
 /// by splitting on newlines and retaining leftover bytes in the buffer.
-@Test func serverReadMessageHandlesCoalescedFrames() throws {
+@Test func serverReadMessageHandlesCoalescedFrames() async throws {
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -87,12 +87,12 @@ import Testing
     var buffer = Data()
 
     // First read should return the exec request
-    let msg1Data = try server.readMessage(from: reader, buffer: &buffer)
+    let msg1Data = try await server.readMessage(from: reader, buffer: &buffer)
     let decoded1 = try SessionProtocol.decodeRequest(msg1Data)
     #expect(decoded1 == .exec(cmd: "echo hello", timeout: 30, env: [:]))
 
     // Second read should return the shutdown request (from leftover buffer)
-    let msg2Data = try server.readMessage(from: reader, buffer: &buffer)
+    let msg2Data = try await server.readMessage(from: reader, buffer: &buffer)
     let decoded2 = try SessionProtocol.decodeRequest(msg2Data)
     #expect(decoded2 == .shutdown)
 
