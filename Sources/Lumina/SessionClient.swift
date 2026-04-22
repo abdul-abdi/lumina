@@ -107,6 +107,16 @@ public final class SessionClient: @unchecked Sendable {
     /// Uses a persistent buffer to handle coalesced NDJSON frames — if a
     /// single read returns multiple newline-delimited messages, the leftover
     /// bytes are retained for the next call.
+    ///
+    /// `availableData` is intentionally synchronous here. SessionClient runs
+    /// inside the `lumina` CLI process — one process per invocation, its
+    /// own cooperative pool, one connection open at a time. Unlike
+    /// `SessionServer.readMessage` (where N parked per-connection tasks
+    /// starved the server's shared pool), a single blocked read here cannot
+    /// starve anything the same process also needs — the CLI has nothing
+    /// else to do. Making this async would add await/resume overhead with
+    /// zero concurrency gain. See `CommandRunner.readLine` for the same
+    /// reasoning on the dispatcher singleton.
     public func receive() throws -> SessionResponse {
         guard let handle = readHandle else {
             throw LuminaError.connectionFailed

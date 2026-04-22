@@ -99,6 +99,76 @@ import Testing
     _ = server // keep server alive
 }
 
+/// Regression test for the cooperative-pool starvation bug fixed in
+/// commit edd1410 ("async readMessage to stop starving the cooperative
+/// pool"). Before that fix, `readMessage` used `FileHandle.availableData`
+/// — a synchronous blocking `read(2)`. Running inside an async Task on
+/// Swift's cooperative thread pool, each parked connection held one pool
+/// thread in `read(2)` indefinitely. Around CPU-count connections (~8-11
+/// on an M-series) the pool saturated and the session wedged: accept
+/// loop, dispatch, and response writes all stalled.
+///
+/// The fix moves the blocking read to a dedicated GCD concurrent queue
+/// via `withCheckedContinuation`, freeing cooperative threads for
+/// dispatch work while the kernel read blocks.
+///
+/// This test locks in the invariant: 64 concurrent `readMessage` calls
+/// (≈8× typical CPU-count) must all complete, not hang. A regression
+/// to the synchronous path would park every reader on the pool and the
+/// final `group.waitForAll()` would never return, blowing the wall-clock
+/// budget below.
+@Test func readMessageDoesNotStarveCooperativePool() async throws {
+    let pairCount = 64
+
+    var allFds: [Int32] = []
+    var readers: [FileHandle] = []
+    var writers: [FileHandle] = []
+    for _ in 0..<pairCount {
+        var fds: [Int32] = [0, 0]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            throw LuminaError.sessionFailed("socketpair failed: errno=\(errno)")
+        }
+        allFds.append(fds[0])
+        allFds.append(fds[1])
+        readers.append(FileHandle(fileDescriptor: fds[0], closeOnDealloc: false))
+        writers.append(FileHandle(fileDescriptor: fds[1], closeOnDealloc: false))
+    }
+    defer { allFds.forEach { close($0) } }
+
+    let frame = try SessionProtocol.encode(
+        SessionRequest.exec(cmd: "echo probe", timeout: 10, env: [:])
+    )
+
+    // `readMessage` does not touch `self.serverFd`, so an un-bound server
+    // instance is fine. We only need the method.
+    let tmpSocket = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString + ".sock")
+    let server = SessionServer(socketPath: tmpSocket)
+
+    let start = ContinuousClock.now
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for reader in readers {
+            group.addTask {
+                var buffer = Data()
+                _ = try await server.readMessage(from: reader, buffer: &buffer)
+            }
+        }
+        // Give readers a moment to suspend in the await boundary.
+        try await Task.sleep(for: .milliseconds(100))
+        for writer in writers {
+            writer.write(frame)
+        }
+        try await group.waitForAll()
+    }
+    let elapsed = ContinuousClock.now - start
+
+    // Empirical: ~300-500ms for 64 readers on an M3 Pro. 10s is a
+    // generous ceiling chosen to catch a regression, not fine-grained
+    // performance. A blocking-read regression hangs well past this.
+    #expect(elapsed < .seconds(10),
+        "64 concurrent readMessage calls took \(elapsed) — possible cooperative-pool regression (see commit edd1410)")
+}
+
 @Test func bindRejectsPathExceeding103Bytes() throws {
     // sockaddr_un.sun_path is 104 bytes on macOS (including null terminator).
     // Paths > 103 bytes must be rejected before silent truncation occurs.
