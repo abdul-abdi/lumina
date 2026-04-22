@@ -38,6 +38,15 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
+### v0.7.1 — desktop boot reliability (in progress on `refactor/idiomatic-pass`)
+
+Four hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real. Each is unit-tested; end-to-end installer validation is the current open item.
+
+- **Stable MAC per `.luminaVM` bundle.** Every bundle persists a locally-administered MAC in `manifest.json` via `VMBundleManifest.macAddress` and `VMBundle.ensureMACAddress()`. Legacy (pre-v0.7.1) manifests are lazily backfilled on first boot. Pre-fix every VZ machine got a random MAC on each boot, so vmnet's bootpd churned DHCP leases and the Kali/Debian installers' short-timeout `netcfg` DISCOVER raced the new lease. Post-fix the guest sees the same MAC/IP across reboots and vmnet keeps the lease hot.
+- **Cancel-during-boot → clean retry.** `VM.boot()` now wraps `vm.start` in `withTaskCancellationHandler`; an outer Task cancel (user clicks Stop, window closes, session shutdown) calls `vm.stop(…)` on the executor queue which resumes the start continuation with an error, funnels through a single `catch` that calls `shutdownVM()` to release the `flock()` on `disk.img` + `efi.vars`, and throws `LuminaError.bootFailed(underlying: VMError.cancelled)`. The next `boot()` starts cold. Prior design leaked state and produced `VZErrorDomain Code 2` on retry.
+- **Pre-start delegate install.** `VMStopForwarder` is now attached *before* `vm.start(…)` via `VM.setDelegate(_:)`. Guest crashes in the 300–500 ms kernel → init window (kernel panic, dracut timeout, missing hardware model, Windows TPM refusal) fire `didStopWithError` into a live observer and the desktop session transitions to `.crashed(reason:)`. Prior design attached the delegate after boot returned and lost the callback for early crashes — the UI sat at `.running` over a dead VM.
+- **Windows 11 ARM installer reliability + install-phase speed.** `EFIBootConfig.preferUSBCDROM` (default `true` for `osFamily == .windows`) attaches the installer ISO via `VZUSBMassStorageDeviceConfiguration` (macOS 13+) instead of virtio-block — Windows setup refuses "unknown media" from virtio and installs cleanly from USB mass-storage. `EFIBootConfig.installPhase` (`true` while `manifest.lastBootedAt == nil`) flips the primary disk from `.full` to `.fsync` synchronization on macOS 13+; partman / mkfs install time roughly halves on APFS. Post-install returns to `.full` for real crash safety.
+
 ## Install
 
 > **Requires:** macOS 14+ (Sonoma) · Apple Silicon (M1/M2/M3/M4)
