@@ -52,10 +52,59 @@ public final class SessionServer: @unchecked Sendable {
         ptyLock.withLock { activePtyId }
     }
 
+    /// Wall-clock instant of the most recent client activity. Used by the
+    /// idle-TTL watchdog. Guarded by `lock`. Seeded to `bootTime` so the
+    /// TTL is measured from the server coming up, not from a distant past.
+    private var lastActivity: Date
+
+    private func touchActivity() {
+        lock.withLock { lastActivity = Date() }
+    }
+
     public init(socketPath: URL, imageName: String = "unknown", bootTime: Date = Date()) {
         self.socketPath = socketPath
         self.imageName = imageName
         self.bootTime = bootTime
+        self.lastActivity = bootTime
+    }
+
+    /// Poll every `ttl/4` seconds. If the server has been idle (no recent
+    /// accept AND no active execs on the VM) for at least `ttl`, close the
+    /// listening fd so the serve() accept loop exits. This is best-effort —
+    /// a client that's mid-read will still get torn down when handleConnection
+    /// sees its socket close.
+    private func runIdleWatchdog(ttl: TimeInterval, vm: VM) async {
+        // Poll at ttl/4, clamped to [5s, 5min]. Short TTLs (testing) get
+        // prompt teardown; long TTLs (30m production) avoid wasteful churn.
+        let pollInterval = min(max(ttl / 4, 5.0), 300.0)
+        while !Task.isCancelled {
+            let pollNanos = UInt64(pollInterval * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: pollNanos)
+            if Task.isCancelled { return }
+
+            let (lastSeen, fdOpen): (Date, Bool) = lock.withLock {
+                (self.lastActivity, self.serverFd >= 0)
+            }
+            guard fdOpen else { return }
+
+            // Only shut down when truly idle: no active execs on the VM.
+            // active-execs includes PTYs; a live interactive session is
+            // never auto-terminated.
+            let activeExecs = await vm.activeExecCount
+            if activeExecs > 0 { continue }
+
+            if Date().timeIntervalSince(lastSeen) >= ttl {
+                NSLog("[Lumina.Session] Idle TTL reached (%.0fs), auto-shutting down", ttl)
+                // Close the listening fd so accept() returns and serve() exits.
+                lock.withLock {
+                    if serverFd >= 0 {
+                        Darwin.close(serverFd)
+                        serverFd = -1
+                    }
+                }
+                return
+            }
+        }
     }
 
     /// Bind and listen on the Unix domain socket.
@@ -242,7 +291,28 @@ public final class SessionServer: @unchecked Sendable {
     /// The enclosing TaskGroup awaits all in-flight connection tasks on scope
     /// exit, so a shutdown on one client still lets other clients finish
     /// their pending response before the serve call returns.
-    public func serve(vm: VM, onShutdown: (@Sendable () async -> Void)? = nil) async {
+    ///
+    /// `idleTTL`: if non-nil and > 0, the server auto-shuts down when it
+    /// has been idle (zero accepted-then-closed connections AND zero active
+    /// execs on the VM) for at least the TTL. Set to nil or 0 to disable.
+    public func serve(
+        vm: VM,
+        idleTTL: TimeInterval? = nil,
+        onShutdown: (@Sendable () async -> Void)? = nil
+    ) async {
+        // Spawn the idle watchdog before the accept loop so it can close the
+        // serverFd from underneath us — which makes accept() return and the
+        // loop exits through the serverFd < 0 branch.
+        let watchdog: Task<Void, Never>?
+        if let ttl = idleTTL, ttl > 0 {
+            watchdog = Task.detached { [weak self] in
+                await self?.runIdleWatchdog(ttl: ttl, vm: vm)
+            }
+        } else {
+            watchdog = nil
+        }
+        defer { watchdog?.cancel() }
+
         await withTaskGroup(of: Void.self) { group in
             while serverFd >= 0 {
                 let handles: (read: FileHandle, write: FileHandle)
@@ -252,6 +322,7 @@ public final class SessionServer: @unchecked Sendable {
                     if serverFd < 0 { break } // server was closed
                     continue
                 }
+                touchActivity()
 
                 group.addTask { [weak self] in
                     await self?.handleConnection(handles: handles, vm: vm, onShutdown: onShutdown)

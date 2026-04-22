@@ -34,6 +34,9 @@ struct SessionServe: AsyncParsableCommand {
     @Option(help: "Forward port (host:guest, repeatable)")
     var forward: [String] = []
 
+    @Option(help: "Idle TTL (e.g. 30m, 1h, 0 to disable). Session auto-stops after this long with no client activity and no active execs.")
+    var ttl: String = "0"
+
     func run() async throws {
         // Ignore SIGPIPE — when a client disconnects mid-exec, writing to
         // the broken socket must not kill the server process.
@@ -157,7 +160,17 @@ struct SessionServe: AsyncParsableCommand {
 
         // Serve until shutdown. Forwards are torn down BEFORE vm.shutdown
         // so the stop message can still reach the guest over vsock.
-        await server.serve(vm: vm) { @Sendable in
+        // parseDuration returns a Duration; convert to TimeInterval (Double
+        // seconds) for the SessionServer API. `ttl == "0"` → Duration.zero →
+        // seconds == 0 → TTL disabled inside SessionServer.
+        let idleTTLSeconds: TimeInterval?
+        if let d = parseDuration(ttl) {
+            let secs = TimeInterval(d.components.seconds)
+            idleTTLSeconds = secs > 0 ? secs : nil
+        } else {
+            idleTTLSeconds = nil
+        }
+        await server.serve(vm: vm, idleTTL: idleTTLSeconds) { @Sendable in
             await forwarder.teardownAll()
         }
 
