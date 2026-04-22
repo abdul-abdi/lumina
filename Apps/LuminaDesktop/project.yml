@@ -86,17 +86,17 @@ targets:
         com.apple.security.virtualization: true
         com.apple.security.hypervisor: true
         com.apple.security.network.client: true
-        # Required for VZBridgedNetworkDeviceAttachment (NetworkMode.bridged),
-        # which bypasses vmnet NAT entirely and delegates DHCP to the
-        # user's real router — the only reliable fix for Debian-netcfg
-        # first-probe DHCP failure and vmnet degradation after N VM
-        # lifecycles. Works when the target is signed with a Personal
-        # Team (Xcode > Settings > Accounts, add Apple ID) or Developer ID.
-        # macOS 14+ refuses to LAUNCH ad-hoc-signed binaries that declare
-        # this entitlement — `scripts/build-app.sh` uses the adhoc
-        # entitlements file (no networking key) for /Applications
-        # installs to keep that path runnable.
-        com.apple.vm.networking: true
+        # com.apple.vm.networking (for VZBridgedNetworkDeviceAttachment /
+        # NetworkMode.bridged) is NOT declared by default: Apple's free
+        # Personal Team cannot provision it and Xcode signing fails
+        # with "Entitlement com.apple.vm.networking not found and could
+        # not be included in profile." To unlock bridged networking,
+        # enroll in the paid Apple Developer Program ($99/yr), select
+        # your team here, and add `com.apple.vm.networking: true` back
+        # to this file. ad-hoc /Applications installs additionally
+        # require omitting this key (macOS 14+ refuses to launch
+        # ad-hoc binaries that declare it). Both paths handled by
+        # scripts/build-app.sh via LuminaDesktop-adhoc.entitlements.
     dependencies:
       - package: Lumina
         product: Lumina

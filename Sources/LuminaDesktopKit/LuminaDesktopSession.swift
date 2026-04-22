@@ -216,7 +216,10 @@ public final class LuminaDesktopSession: Identifiable {
             self.vm = nil
             self.vmDelegate = nil
             self.vzMachine = nil
-            if let le = error as? LuminaError, le.isCancellation {
+            // `error` is already `LuminaError` — `VM.boot()` is typed
+            // `throws(LuminaError)`, so Swift knows the concrete type in
+            // this catch. `isCancellation` is a LuminaError extension.
+            if error.isCancellation {
                 // User clicked Stop mid-boot. The VM actor's cancellation
                 // path has already torn down the VZ machine, released the
                 // disk `flock()`, and closed serial pipes. Treat this as a
