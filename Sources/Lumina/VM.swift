@@ -75,6 +75,11 @@ public actor VM {
     private var clone: DiskClone?
     private var _state: VMState = .idle
     private var pipeHandles: [FileHandle] = []
+
+    /// Background tasks reading serial console output. Retained so
+    /// `shutdownVM()` can cancel them explicitly rather than relying
+    /// on EOF-from-pipe-close as the termination signal.
+    private var serialReadTasks: [Task<Void, Never>] = []
     private var macLastByte: UInt8?  // Last byte of MAC for IP derivation
 
     /// The actor executor, backed by a serial DispatchQueue.
@@ -218,16 +223,19 @@ public actor VM {
         config.serialPorts = [serialPort]
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
-        // Start reading serial output in background
+        // Drain serial output in the background. Retained so teardown can
+        // cancel explicitly; the blocking `availableData` read still
+        // unblocks via pipe-close EOF, but cooperative cancellation is
+        // now expressed in the loop condition rather than implicit.
         let console = self.serialConsole
-        Task.detached {
+        serialReadTasks.append(Task.detached {
             let handle = guestToHostRead
-            while true {
+            while !Task.isCancelled {
                 let data = handle.availableData
                 if data.isEmpty { break }
                 console.append(data)
             }
-        }
+        })
 
         // Network (pluggable via NetworkProvider protocol)
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
@@ -436,14 +444,14 @@ public actor VM {
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
         let console = self.serialConsole
-        Task.detached {
+        serialReadTasks.append(Task.detached {
             let handle = guestToHostRead
-            while true {
+            while !Task.isCancelled {
                 let data = handle.availableData
                 if data.isEmpty { break }
                 console.append(data)
             }
-        }
+        })
 
         // Network — same pluggable provider as the agent path.
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
@@ -1162,6 +1170,11 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
+        // Cancel serial drain tasks before closing handles so the cooperative
+        // cancellation signal arrives first; the handle close then delivers
+        // the EOF that unblocks any in-flight `availableData` read.
+        for task in serialReadTasks { task.cancel() }
+        serialReadTasks = []
         for handle in pipeHandles {
             try? handle.close()
         }

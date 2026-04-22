@@ -12,16 +12,17 @@ import LuminaBootable
 struct LuminaDesktopApp: App {
     @State private var model = AppModel()
     @State private var uiState = AppUIState.shared
+    @State private var coordinator = LauncherCoordinator()
 
     var body: some Scene {
         WindowGroup("Lumina", id: "library") {
-            LibraryView(model: model)
+            LibraryView(model: model, coordinator: coordinator)
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1200, height: 720)
         .commands {
-            LuminaCommands(model: model, uiState: uiState)
+            LuminaCommands(model: model, uiState: uiState, coordinator: coordinator)
         }
 
         WindowGroup(id: "vm-window", for: UUID.self) { $vmID in
@@ -54,7 +55,7 @@ struct LuminaDesktopApp: App {
         // a dropdown with quick actions. Works even when the main
         // window is hidden or the app is in fullscreen.
         MenuBarExtra {
-            MenuBarContent(model: model)
+            MenuBarContent(model: model, coordinator: coordinator)
         } label: {
             MenuBarLabel(model: model)
         }
@@ -94,6 +95,7 @@ struct MenuBarLabel: View {
 @MainActor
 struct MenuBarContent: View {
     @Bindable var model: AppModel
+    @Bindable var coordinator: LauncherCoordinator
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -143,14 +145,14 @@ struct MenuBarContent: View {
         Button("New VM…") {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "library")
-            NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+            coordinator.openWizard(preselecting: "ubuntu-24.04")
         }
         .keyboardShortcut("n", modifiers: .command)
 
         Button("Command Launcher (⌘K)") {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "library")
-            NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+            coordinator.showLauncher()
         }
 
         Divider()
@@ -205,6 +207,7 @@ final class AppUIState {
 struct LuminaCommands: Commands {
     @Bindable var model: AppModel
     @Bindable var uiState: AppUIState
+    @Bindable var coordinator: LauncherCoordinator
 
     var body: some Commands {
         // ── Lumina menu (app menu) ──
@@ -224,7 +227,7 @@ struct LuminaCommands: Commands {
         // ── File menu ──
         CommandGroup(replacing: .newItem) {
             Button("New VM…") {
-                NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+                coordinator.openWizard(preselecting: "ubuntu-24.04")
             }
             .keyboardShortcut("n", modifiers: .command)
 
@@ -298,7 +301,7 @@ struct LuminaCommands: Commands {
         // ── View menu ──
         CommandGroup(after: .toolbar) {
             Button("Open Command Launcher") {
-                NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+                coordinator.showLauncher()
             }
             .keyboardShortcut("k", modifiers: .command)
             Divider()
@@ -324,7 +327,7 @@ struct LuminaCommands: Commands {
                 NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki")!)
             }
             Button("Keyboard Shortcuts") {
-                NotificationCenter.default.post(name: .luminaShowShortcuts, object: nil)
+                NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki/Keyboard-Shortcuts")!)
             }
             .keyboardShortcut("/", modifiers: .command)
             Divider()
@@ -371,7 +374,7 @@ struct LuminaCommands: Commands {
     }
 
     private func openWizard(tile: String) {
-        NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: tile)
+        coordinator.openWizard(preselecting: tile)
     }
 
     private func setAppearance(_ raw: String) {
@@ -383,11 +386,6 @@ struct LuminaCommands: Commands {
             w.toggleFullScreen(nil)
         }
     }
-}
-
-public extension Notification.Name {
-    static let luminaShowLauncher = Notification.Name("LuminaShowLauncher")
-    static let luminaShowShortcuts = Notification.Name("LuminaShowShortcuts")
 }
 
 @MainActor

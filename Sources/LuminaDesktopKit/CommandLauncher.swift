@@ -12,14 +12,16 @@ import LuminaBootable
 @MainActor
 public struct CommandLauncher: View {
     @Bindable var model: AppModel
+    @Bindable var coordinator: LauncherCoordinator
     @Binding var isPresented: Bool
     @Environment(\.openWindow) private var openWindow
     @State private var query: String = ""
     @State private var selectedIndex: Int = 0
     @FocusState private var searchFocused: Bool
 
-    public init(model: AppModel, isPresented: Binding<Bool>) {
+    public init(model: AppModel, coordinator: LauncherCoordinator, isPresented: Binding<Bool>) {
         self.model = model
+        self.coordinator = coordinator
         self._isPresented = isPresented
     }
 
@@ -250,11 +252,8 @@ public struct CommandLauncher: View {
         case .vm(let bundle, .open):
             openWindow(id: "vm-window", value: bundle.manifest.id)
         case .newVM(let tileID, _):
-            // Signal to LibraryView to open wizard with this tile preselected.
-            NotificationCenter.default.post(
-                name: .luminaLauncherOpenWizard,
-                object: tileID
-            )
+            // Signal to LibraryView to open the wizard with this tile preselected.
+            coordinator.openWizard(preselecting: tileID)
         case .reveal(let bundle):
             NSWorkspace.shared.activateFileViewerSelecting([bundle.rootURL])
         case .delete(let bundle):
@@ -299,6 +298,3 @@ struct CommandRow: View {
     }
 }
 
-public extension Notification.Name {
-    static let luminaLauncherOpenWizard = Notification.Name("LuminaLauncherOpenWizard")
-}

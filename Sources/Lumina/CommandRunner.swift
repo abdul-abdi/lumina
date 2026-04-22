@@ -44,7 +44,7 @@ final class CommandRunner: @unchecked Sendable {
     private var transferContinuation: AsyncStream<GuestMessage>.Continuation?
 
     // ── Network readiness: one-shot continuation for configure_network flow ──
-    private var networkContinuation: CheckedContinuation<GuestMessage, Never>?
+    private var networkContinuation: CheckedContinuation<GuestMessage, Error>?
 
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
@@ -191,29 +191,25 @@ final class CommandRunner: @unchecked Sendable {
                 switch s {
                 case .stdout:
                     stdout += data
-                    if stdoutBytes != nil {
-                        stdoutBytes!.append(Data(data.utf8))
-                    }
+                    stdoutBytes?.append(Data(data.utf8))
                 case .stderr:
                     stderr += data
-                    if stderrBytes != nil {
-                        stderrBytes!.append(Data(data.utf8))
-                    }
+                    stderrBytes?.append(Data(data.utf8))
                 }
             case .outputBinary(_, let s, let bytes):
-                // First binary chunk: seed bytes accumulator with whatever
+                // First binary chunk: seed the bytes accumulator with whatever
                 // UTF-8 text has been collected so far, so downstream consumers
                 // reading stdoutBytes get a byte-exact view of the full stream.
                 switch s {
                 case .stdout:
                     if stdoutBytes == nil { stdoutBytes = Data(stdout.utf8) }
-                    stdoutBytes!.append(bytes)
+                    stdoutBytes?.append(bytes)
                     // Also append a best-effort UTF-8 view to `stdout` so text-only
                     // consumers see approximate output; may contain replacement chars.
                     stdout += String(decoding: bytes, as: UTF8.self)
                 case .stderr:
                     if stderrBytes == nil { stderrBytes = Data(stderr.utf8) }
-                    stderrBytes!.append(bytes)
+                    stderrBytes?.append(bytes)
                     stderr += String(decoding: bytes, as: UTF8.self)
                 }
             case .exit(_, let code):
@@ -496,8 +492,9 @@ final class CommandRunner: @unchecked Sendable {
         for (_, handler) in execHandlersCopy { handler.finish() }
         for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
-        // Resume any pending configureNetwork() caller so it doesn't hang forever.
-        networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending configureNetwork() caller with a real error —
+        // the connection died before the guest replied with network_ready.
+        networkCont?.resume(throwing: LuminaError.connectionFailed)
         // Resume any pending requestPortForward() callers with connectionFailed.
         for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
 
@@ -551,22 +548,30 @@ final class CommandRunner: @unchecked Sendable {
         }
 
         // Register continuation BEFORE sending the message to avoid a race
-        // where the guest replies before we're ready to receive.
-        // We don't need the returned GuestMessage — just the synchronization.
-        _ = await withCheckedContinuation { (cont: CheckedContinuation<GuestMessage, Never>) in
-            lock.lock()
-            networkContinuation = cont
-            lock.unlock()
-            // Now safe to send — reply routes to cont via the dispatcher.
-            do {
-                try writeToOutput(msgData)
-            } catch {
-                // writeToOutput failed — unregister and resume so the caller doesn't hang.
+        // where the guest replies before we're ready to receive. We don't
+        // use the returned GuestMessage — just the synchronization — but
+        // the throwing continuation lets teardown surface as a real error
+        // instead of a synthetic `.networkReady(ip:"")` success.
+        do {
+            _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
                 lock.lock()
-                networkContinuation = nil
+                networkContinuation = cont
                 lock.unlock()
-                cont.resume(returning: .networkReady(ip: ""))
+                // Now safe to send — reply routes to cont via the dispatcher.
+                do {
+                    try writeToOutput(msgData)
+                } catch {
+                    // writeToOutput failed — unregister and resume so the caller doesn't hang.
+                    lock.lock()
+                    networkContinuation = nil
+                    lock.unlock()
+                    cont.resume(throwing: error)
+                }
             }
+        } catch let err as LuminaError {
+            throw err
+        } catch {
+            throw .connectionFailed
         }
         // network_ready received; DNS, route, and IP are now live on the guest.
     }
@@ -877,8 +882,9 @@ final class CommandRunner: @unchecked Sendable {
         for (_, handler) in execHandlersCopy { handler.finish() }
         for (_, handler) in ptyHandlersCopy { handler.finish() }
         transferCont?.finish()
-        // Resume any pending configureNetwork() caller so it doesn't hang forever.
-        networkCont?.resume(returning: .networkReady(ip: ""))
+        // Resume any pending configureNetwork() caller with a real error —
+        // the connection died before the guest replied with network_ready.
+        networkCont?.resume(throwing: LuminaError.connectionFailed)
         // Resume any pending requestPortForward() callers with connectionFailed.
         for (_, cont) in pfConts { cont.resume(throwing: LuminaError.connectionFailed) }
     }

@@ -84,9 +84,12 @@ public final class SessionServer: @unchecked Sendable {
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
                 pathBytes.withUnsafeBufferPointer { src in
-                    // Guard above ensures src.count <= 104; min is a safety backstop.
+                    // src.baseAddress is nil only for an empty buffer; the guard
+                    // above requires a non-empty path (count <= 103) so this is
+                    // defensive, not expected.
+                    guard let base = src.baseAddress else { return }
                     let count = min(src.count, 104)
-                    dest.update(from: src.baseAddress!, count: count)
+                    dest.update(from: base, count: count)
                 }
             }
         }
