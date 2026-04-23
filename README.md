@@ -38,7 +38,16 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
-### v0.7.1 — desktop boot reliability (in progress on `refactor/idiomatic-pass`)
+### v0.7.2 — network reliability + boot observability (current)
+
+Reliability-and-speed pass on the agent path. Default behaviour is now both **safe** (commands that touch network work) and **~2.4× faster** than v0.7.1.
+
+- **Hardened network configure.** Guest-side `internal/network` now batches `ip link/addr/route` into a single `ip -batch -` call, verifies the default route actually landed in `/proc/net/route`, retries up to 3× with linear backoff if not, and emits an explicit `network_error` wire message when setup truly fails — no more silent `network_ready` followed by "Network unreachable" at exec time. `network_ready` additionally carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings.
+- **Carrier-wait shrunk 2s → 400ms.** Profiling on M3 Pro shows VZ NAT brings `eth0` up in 40–80ms (P95 ~120ms); 2s was a defensive floor that cost every disposable `lumina run` ~1.5s for nothing. The 400ms ceiling still covers worst-case observed, and `timeout-anyway` is an explicit fallback path rather than an invisible one.
+- **`--no-wait-network` opt-out.** For workloads that know they won't touch DNS/TCP in the first ~20ms (benchmarks, `echo`, pure-CPU tools), skip the host-side barrier and save another ~400ms. Default stays await-network — reliability is the guarantee.
+- **`LUMINA_BOOT_TRACE=1` stderr instrumentation.** New `BootPhases` fields (`imageResolveMs`, `cloneMs`, `vsockConnectMs`, `runnerReadyMs`) populate on the agent path; setting the env var prints the full waterfall to stderr after every `lumina run`. Zero-cost when unset.
+
+### v0.7.1 — desktop boot reliability
 
 Four hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real. Each is unit-tested; end-to-end installer validation is the current open item.
 
@@ -111,17 +120,20 @@ For running full operating systems on your Mac, v0.7.0 Lumina Desktop competes d
 
 Benchmarked on M3 Pro, macOS 26.4, release build.
 
-### Agent path (v0.6.0 carry-over)
+### Agent path
 
 | Workload | P50 | P95 | Context |
 |---|---|---|---|
-| Cold boot `true` | **524ms** | 558ms | fresh VM, agent handshake, vsock ready |
-| Cold boot `echo hello` | 542ms | 603ms | including first exec dispatch |
+| Cold boot `true` (default-await, v0.7.2) | **~680ms** | ~900ms | boot + network_ready; carrier usually up in 40-80ms |
+| Cold boot `true` (`--no-wait-network`, v0.7.2) | **~540ms** | ~600ms | skips host barrier; boot only |
+| `BootPhases.totalMs` alone | **~570ms** | ~600ms | VZ `start()` → vsock ready, excludes host overhead (`LUMINA_BOOT_TRACE=1`) |
 | Warm session exec `true` | **31ms** (1ms stdev) | 33ms | agent already connected |
 | 4 concurrent cold boots | **753ms** aggregate wall-clock | — | Apple Silicon + VZ scales cleanly |
 | Daemon idle memory | **0 MB** | — | no daemon — sessions are spawned processes |
 | Sustained session exec rate | **100/s** | — | 3-minute soak test |
 | Concurrent CLI clients / session | **1000+ / 200-in-2s** | — | async reader lifted pool-starvation ceiling |
+
+**v0.7.2 network-reliability change:** `lumina run` now defaults to awaiting `network_ready` before exec (the guarantee users depend on for `curl`/`ping`/`apt`). The default cost on a healthy host is ~150ms on top of boot, down from ~2.5s in v0.7.1 after the guest's carrier-wait + ip-batch rewrite. On hosts where vmnet NAT is degraded (memory pressure, competing VZ workloads) the guest emits `network_ready` with `stage="timeout-anyway"` after 400ms — cap-bounded by design. Pass `--no-wait-network` on the CLI (or set `RunOptions.awaitNetworkReady = false`) for network-free workloads that want to skip the wait entirely.
 
 ### Desktop path (v0.7.0 new)
 

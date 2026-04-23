@@ -6,9 +6,17 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.7.1.
+here reflects what ships in v0.7.2.
 
-## v0.7.1 deltas (read these if you're on a pre-v0.7.1 mental model)
+## v0.7.2 deltas (current — read these first)
+
+- **Hardened network configure, default-await stays safe and is now fast.** Guest `internal/network/network.go` now batches `ip link/addr/route` into one `ip -batch -` call, reads `/proc/net/route` to verify the default route actually landed, retries up to 3× on failure, and emits `network_error` with reason when setup truly breaks. `network_ready` carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings. Carrier wait ceiling shrunk 2s → 400ms. Net result: `lumina run "echo hello"` went from ~3050ms to ~680ms (P50, default-await, healthy host).
+- **`--no-wait-network` CLI flag / `RunOptions.awaitNetworkReady = false`.** Opt-out for workloads that know they don't touch DNS/TCP in the first ~20ms. Default stays `true` (reliable). Saves ~150ms on top of the already-fast default.
+- **`LUMINA_BOOT_TRACE=1` stderr trace.** Agent-path boot now reports phase breakdown: `image resolve / disk clone / config build / vz start / vsock connect / guest agent ready / total`. Use this when diagnosing slow boots — the hotspot is rarely where you'd guess.
+- **`BootPhases.isValid`** accessor distinguishes populated vs. agent-path-attached (zero-valued) BootPhases for UI gating.
+- **Session socket hardening.** `~/.lumina/sessions/<sid>/control.sock` is now mode `0600` and the session directory is `0700` — other users on the host can no longer connect to your session.
+
+## v0.7.1 deltas
 
 - **Stable MAC per `.luminaVM` bundle.** Desktop bundles persist a locally-administered MAC in `manifest.json`. Legacy manifests get lazily backfilled on first boot via `VMBundle.ensureMACAddress()`. Fixes the vmnet DHCP-churn class of "Network autoconfiguration failed" errors.
 - **Cancel-during-boot is safe.** `VM.boot()` and `MacOSVM.install()` wrap `vm.start`/installer calls in `withTaskCancellationHandler`; a mid-boot cancel releases `flock()` on the disk and the next boot starts cold. Prior design produced `VZErrorDomain Code 2` on retry.
@@ -29,8 +37,9 @@ boots a Linux VM, executes a command inside it, and returns output as structured
 JSON. There are two shapes you will use:
 
 - **One-shot:** `lumina run "<cmd>"` — boots a disposable VM, runs the command,
-  tears the VM down. ~540ms cold start P50 on M3 Pro (release build). The CI
-  regression gate holds median ≤ 2000ms so this number won't silently drift.
+  tears the VM down. ~680ms cold start P50 on M3 Pro (v0.7.2+, default-await;
+  ~540ms with `--no-wait-network` for no-network workloads). The CI regression
+  gate holds median ≤ 2000ms so this number won't silently drift.
 - **Session:** `lumina session start` gives you a persistent VM id (SID). You
   then `lumina exec <sid> "<cmd>"` as many times as you want at ~30ms per
   exec. Sessions support interactive PTYs, port forwarding, and file transfer.
@@ -312,9 +321,11 @@ of a command that returned non-zero. `make: *** [build] Error 1` is a
 
 ## What NOT to Do
 
-- **Do not assume boot time.** v0.7.1 cold start measures ~390ms P50 on M3 Pro
-  release builds (baked image; legacy Alpine runs ~570ms); the CI gate caps
-  median at 2000ms. Image variant, host load, and first-run image fetch move
+- **Do not assume boot time.** v0.7.2 `lumina run "true"` measures ~680ms P50
+  default-await (reliability guarantee preserved) / ~540ms with
+  `--no-wait-network`, on M3 Pro release builds. `BootPhases.totalMs` alone is
+  ~570ms legacy / ~390ms baked. The CI gate caps median at 2000ms. Image
+  variant, host load, and first-run image fetch move
   the number. If you need fast iteration, start a session once and `exec`
   many times. Warm exec is ~31ms P50 with 1ms stdev.
 - **Do not rely on ordering between concurrent `exec`s.** Multiple execs on one
