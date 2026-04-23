@@ -46,6 +46,22 @@ import Testing
         #expect(model.filteredBundles[0].manifest.name == "Kali Box")
     }
 
+    @Test func runningCountIsZeroWithNoSessions() throws {
+        let bundle = try VMBundle.create(
+            at: tmp.appendingPathComponent(UUID().uuidString),
+            name: "Empty",
+            osFamily: .linux,
+            osVariant: "ubuntu-24.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        let model = AppModel(store: VMStore(rootURL: tmp))
+        // Session exists but status is .stopped (default).
+        _ = model.session(for: bundle)
+        #expect(model.runningCount == 0)
+    }
+
     @Test func sessionIsCreatedOnceAndCached() throws {
         let bundle = try VMBundle.create(
             at: tmp.appendingPathComponent(UUID().uuidString),

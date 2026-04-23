@@ -134,6 +134,17 @@ public final class AppModel {
         return s
     }
 
+    /// Number of sessions currently in a live status. Reading any child
+    /// session's `status` inside this computed property means `@Observable`
+    /// tracks the transitive reads, so the value re-evaluates whenever any
+    /// individual session flips — not just when `sessions` mutates. Views
+    /// bind to this instead of re-implementing the reduce-in-body pattern.
+    public var runningCount: Int {
+        sessions.values.reduce(into: 0) { count, session in
+            if session.status.isLive { count += 1 }
+        }
+    }
+
     public func deleteBundle(_ bundle: VMBundle) {
         // Stop any running session first.
         if let session = sessions[bundle.manifest.id], session.status.isLive {

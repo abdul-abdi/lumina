@@ -21,6 +21,7 @@ public enum SidebarSection: String, Hashable, CaseIterable {
     case linux = "Linux"
     case windows = "Windows"
     case macOS = "macOS"
+    case agentImages = "Agent Images"
     case downloads = "Downloads"
     case snapshots = "Snapshots"
 
@@ -31,6 +32,7 @@ public enum SidebarSection: String, Hashable, CaseIterable {
         case .linux: "circle.hexagongrid.fill"
         case .windows: "macwindow"
         case .macOS: "apple.logo"
+        case .agentImages: "shippingbox"
         case .downloads: "arrow.down.circle"
         case .snapshots: "clock.arrow.circlepath"
         }
@@ -204,6 +206,9 @@ public struct LibraryView: View {
             sidebarRow(.windows, count: byFamily[.windows]?.count ?? 0)
             sidebarRow(.macOS, count: byFamily[.macOS]?.count ?? 0)
 
+            sectionHeader("AGENT")
+            sidebarRow(.agentImages, count: 0)
+
             sectionHeader("ACTIVITY")
             sidebarRow(.downloads, count: 0)
             sidebarRow(.snapshots, count: 0)
@@ -267,7 +272,9 @@ public struct LibraryView: View {
     private var detail: some View {
         ZStack {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
-            if filteredForSection.isEmpty && model.bundles.isEmpty {
+            if section == .agentImages {
+                CustomImagesView()
+            } else if filteredForSection.isEmpty && model.bundles.isEmpty {
                 EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {
                 EmptyFilterView(section: section)
@@ -299,7 +306,7 @@ public struct LibraryView: View {
             base = model.filteredBundles.filter { $0.manifest.osFamily == .windows }
         case .macOS:
             base = model.filteredBundles.filter { $0.manifest.osFamily == .macOS }
-        case .downloads, .snapshots:
+        case .downloads, .snapshots, .agentImages:
             base = []
         }
         return base
