@@ -1415,12 +1415,28 @@ enum VMError: Error, Sendable {
 /// Consumed by the cold-boot regression bench (see `Tests/LuminaTests/
 /// BootPhaseTests.swift`) and by the `LUMINA_BOOT_TRACE=1` CLI hook
 /// which prints the struct to stderr after `boot()` returns.
+///
+/// **Agent-path semantics:** On `lumina run`/`exec` callers, this struct
+/// is zero-valued because the agent path attaches to an existing VM
+/// rather than invoking `VM.boot()` directly — no phase is observed so
+/// none is written. Use `BootPhases.isValid` to distinguish a populated
+/// struct from an unobserved one before rendering timings in UI.
+/// Desktop callers (and any code that owns the `VM.boot()` call) see
+/// fully populated values.
 public struct BootPhases: Sendable, Equatable {
     public var configMs: Double = 0
     public var vzStartMs: Double = 0
     public var totalMs: Double = 0
 
     public init() {}
+
+    /// True when any phase was observed (i.e. `VM.boot()` ran to the
+    /// point of writing at least one field). False on the agent path
+    /// where the VM was attached, not booted here. Callers rendering
+    /// boot timings in UI should gate on this to avoid "0 ms" rows.
+    public var isValid: Bool {
+        totalMs > 0
+    }
 }
 
 // MARK: - Sendable crossing shim

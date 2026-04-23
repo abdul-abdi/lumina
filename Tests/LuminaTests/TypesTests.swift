@@ -298,3 +298,19 @@ import Testing
     b.vzStartMs = 42
     #expect(a == b)
 }
+
+@Test func bootPhases_isValid_reflectsTotalMs() {
+    // Agent-path / unobserved: zero-valued, isValid false.
+    var p = BootPhases()
+    #expect(!p.isValid)
+
+    // Writing a per-phase field without totalMs (partial observation,
+    // e.g. cancelled mid-boot) keeps isValid false — totalMs is the
+    // authoritative "boot ran to completion" signal.
+    p.configMs = 5
+    #expect(!p.isValid)
+
+    // Populated (VM.boot ran to `.ready`): isValid true.
+    p.totalMs = 390
+    #expect(p.isValid)
+}
