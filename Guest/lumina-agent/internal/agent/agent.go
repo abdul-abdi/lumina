@@ -270,6 +270,7 @@ func (a *Agent) heartbeat(ctx context.Context) {
 		case <-ticker.C:
 			if err := a.w.Send(protocol.NewHeartbeat()); err != nil {
 				a.exec.KillAll()
+				a.pty.KillAll()
 				return
 			}
 		}

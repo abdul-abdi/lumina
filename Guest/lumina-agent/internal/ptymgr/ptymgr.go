@@ -66,6 +66,24 @@ func (m *Manager) HasActive(id string) bool {
 	return ok
 }
 
+// KillAll SIGKILLs every running PTY process group. Paired with
+// execmgr.KillAll on heartbeat failure — without this, a disconnected
+// host leaves shell processes running until the next accept cycle.
+// The Execute goroutine's cmd.Wait unblocks, its defer deletes the map
+// entry, and the next connection starts with a clean slate.
+func (m *Manager) KillAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.running {
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		}
+		if p.cancel != nil {
+			p.cancel()
+		}
+	}
+}
+
 // Input forwards raw bytes to the master fd. Silently drops if the
 // PTY has exited.
 func (m *Manager) Input(msg protocol.PtyInputMsg) {

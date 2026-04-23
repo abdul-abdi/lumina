@@ -205,9 +205,10 @@ public struct VMBundle: Sendable, Equatable {
     /// Populate `manifest.macAddress` if missing (pre-v0.7.1 bundle),
     /// persist the change, and return the effective MAC. Safe to call on
     /// every boot — idempotent when the manifest already has a MAC. Write
-    /// failure is swallowed because boot should proceed even if we can't
-    /// update the on-disk manifest; the caller still gets a usable MAC for
-    /// this boot.
+    /// failure doesn't fail the boot (caller still gets a usable MAC this
+    /// run) but is surfaced on stderr so the user can see that the next
+    /// cold boot will regenerate — the exact failure mode this method
+    /// exists to prevent.
     @discardableResult
     public mutating func ensureMACAddress() -> String {
         if let existing = manifest.macAddress, !existing.isEmpty {
@@ -215,7 +216,13 @@ public struct VMBundle: Sendable, Equatable {
         }
         let generated = VMBundleManifest.generateLocallyAdministeredMAC()
         manifest.macAddress = generated
-        try? save()
+        do {
+            try save()
+        } catch {
+            let msg = "lumina: warning: failed to persist MAC for \(rootURL.lastPathComponent): \(error). "
+                + "This boot uses \(generated); the next cold boot will regenerate.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
         return generated
     }
 
