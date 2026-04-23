@@ -87,6 +87,36 @@ public final class LuminaDesktopSession: Identifiable {
     public var bootDuration: Duration?
     public var serialDigest: String = ""
 
+    /// Atomic read of every observable session field as a single
+    /// `Sendable`, `Equatable` value. v0.7.1 #21: callers that want a
+    /// consistent view of session state (tests, debug dumps, future
+    /// `lumina ps --verbose`) read this instead of stitching together
+    /// four individual properties at different observation ticks.
+    public var snapshot: SessionSnapshot {
+        SessionSnapshot(
+            status: status,
+            lastError: lastError,
+            bootDuration: bootDuration,
+            serialDigest: serialDigest
+        )
+    }
+
+    /// Atomically apply a snapshot — writes every observable field in
+    /// a single synchronous block so SwiftUI observers see one tick
+    /// containing the full transition, not four separate ticks where
+    /// status briefly desyncs from duration/error.
+    ///
+    /// Each field is only written when it actually differs from the
+    /// current value, so idempotent applies (applyAtomic of the
+    /// current snapshot) don't fire spurious observation ticks.
+    /// v0.7.1 #21.
+    public func applyAtomic(_ next: SessionSnapshot) {
+        if status != next.status { status = next.status }
+        if lastError != next.lastError { lastError = next.lastError }
+        if bootDuration != next.bootDuration { bootDuration = next.bootDuration }
+        if serialDigest != next.serialDigest { serialDigest = next.serialDigest }
+    }
+
     /// VZ machine handle, observable so `RunningVMView` renders the
     /// framebuffer the moment it's available. Owned by the session,
     /// not by the view — this keeps plumbing out of SwiftUI's
@@ -120,8 +150,16 @@ public final class LuminaDesktopSession: Identifiable {
         // Re-entry guard — see `Status.canBoot` for the full rationale.
         guard status.canBoot else { return }
 
-        status = .booting
-        lastError = nil
+        // Enter .booting with a clean error slate in a single tick.
+        // Two separate assignments previously meant observers could
+        // see `.booting` paired with a stale `lastError` from a prior
+        // crashed boot — tiny window but a real impossible-state.
+        applyAtomic(SessionSnapshot(
+            status: .booting,
+            lastError: nil,
+            bootDuration: bootDuration,
+            serialDigest: serialDigest
+        ))
         let start = ContinuousClock.now
 
         // Reload the bundle from disk so we see any manifest mutations
@@ -226,8 +264,15 @@ public final class LuminaDesktopSession: Identifiable {
             // land in the same observation tick.
             let handle = await newVM.vzMachine()
             self.vzMachine = handle.machine
-            self.status = .running
-            self.bootDuration = ContinuousClock.now - start
+            // Land status + bootDuration in a single observation tick
+            // so the UI never renders `.running` with a nil duration
+            // (or the previous run's duration).
+            applyAtomic(SessionSnapshot(
+                status: .running,
+                lastError: nil,
+                bootDuration: ContinuousClock.now - start,
+                serialDigest: serialDigest
+            ))
             // Persist lastBootedAt. On the very first successful boot we
             // also detach the installer ISO sidecar — the install has
             // completed and EFI now prefers the HDD, so keeping the CD-ROM
@@ -246,10 +291,19 @@ public final class LuminaDesktopSession: Identifiable {
                 // path has already torn down the VZ machine, released the
                 // disk `flock()`, and closed serial pipes. Treat this as a
                 // clean stop so the re-entry guard allows a retry.
-                self.status = .stopped
+                applyAtomic(SessionSnapshot(
+                    status: .stopped,
+                    lastError: nil,
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest
+                ))
             } else {
-                self.status = .crashed(reason: "\(error)")
-                self.lastError = "\(error)"
+                applyAtomic(SessionSnapshot(
+                    status: .crashed(reason: "\(error)"),
+                    lastError: "\(error)",
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest
+                ))
             }
         }
     }
@@ -322,11 +376,23 @@ public final class LuminaDesktopSession: Identifiable {
         vmDelegate = nil
         vzMachine = nil
         vm = nil
+        // Atomic transition — crashed(reason) must not be observed
+        // without lastError populated, and stopped must not carry a
+        // stale lastError from a prior crash. Single observation tick.
         if let reason {
-            status = .crashed(reason: reason)
-            lastError = reason
+            applyAtomic(SessionSnapshot(
+                status: .crashed(reason: reason),
+                lastError: reason,
+                bootDuration: bootDuration,
+                serialDigest: serialDigest
+            ))
         } else {
-            status = .stopped
+            applyAtomic(SessionSnapshot(
+                status: .stopped,
+                lastError: nil,
+                bootDuration: bootDuration,
+                serialDigest: serialDigest
+            ))
         }
     }
 
