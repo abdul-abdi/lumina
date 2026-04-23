@@ -13,27 +13,32 @@
 
 import SwiftUI
 import Lumina
+import LuminaBootable
 
 @MainActor
 public struct CustomImagesView: View {
     @State private var images: [CustomImageEntry] = []
     @State private var error: String?
     @State private var launchNotice: LaunchNotice?
+    @State private var catalogPullingID: String?
 
     public init() {}
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            if let error {
-                Text(error)
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.err)
-                    .padding(16)
-            } else if images.isEmpty {
-                emptyState
-            } else {
-                list
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                if let error {
+                    Text(error)
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.err)
+                        .padding(16)
+                } else if images.isEmpty && uninstalledCatalog.isEmpty {
+                    emptyState
+                } else {
+                    if !images.isEmpty { installedList }
+                    if !uninstalledCatalog.isEmpty { catalogSection }
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -50,6 +55,14 @@ public struct CustomImagesView: View {
         } message: {
             Text(launchNotice?.message ?? "")
         }
+    }
+
+    /// Catalog entries whose id isn't already installed locally.
+    /// Installed entries would just duplicate rows from the main list,
+    /// so we hide them.
+    private var uninstalledCatalog: [AgentImageEntry] {
+        let installed = Set(images.map { $0.name })
+        return AgentImageCatalog.all.filter { !installed.contains($0.id) }
     }
 
     /// Alert payload surfaced after a launch attempt. `.info` is a
@@ -99,21 +112,97 @@ public struct CustomImagesView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var list: some View {
-        ScrollView {
+    private var installedList: some View {
+        LazyVStack(spacing: 8) {
+            ForEach(images, id: \.name) { img in
+                ImageRow(
+                    entry: img,
+                    onRemove: { remove(img.name) },
+                    onLaunchOutcome: { outcome in
+                        launchNotice = noticeFor(outcome: outcome)
+                    }
+                )
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 10)
+    }
+
+    private var catalogSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("CATALOG")
+                        .font(LuminaTheme.label)
+                        .tracking(2.5)
+                        .foregroundStyle(LuminaTheme.accent)
+                    Spacer()
+                }
+                Text("Curated images from github.com/abdul-abdi/lumina/releases. Pull verifies SHA-256 before extraction.")
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 10)
+
             LazyVStack(spacing: 8) {
-                ForEach(images, id: \.name) { img in
-                    ImageRow(
-                        entry: img,
-                        onRemove: { remove(img.name) },
-                        onLaunchOutcome: { outcome in
-                            launchNotice = noticeFor(outcome: outcome)
-                        }
+                ForEach(uninstalledCatalog, id: \.id) { entry in
+                    CatalogRow(
+                        entry: entry,
+                        isPulling: catalogPullingID == entry.id,
+                        disabled: catalogPullingID != nil && catalogPullingID != entry.id,
+                        onPull: { pull(entry) }
                     )
                 }
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
+        }
+    }
+
+    private func pull(_ entry: AgentImageEntry) {
+        // Refuse placeholder sha256 — mirrors the CLI behaviour.
+        let placeholder = String(repeating: "0", count: 64)
+        if entry.sha256.lowercased() == placeholder {
+            launchNotice = LaunchNotice(
+                title: "Not yet published",
+                message: "\(entry.displayName) hasn't been released yet. The build-baked-image.yml workflow will publish the tarball to GitHub Releases on the next tag. Try again after v0.7.1 ships.",
+                isError: false
+            )
+            return
+        }
+        catalogPullingID = entry.id
+        Task {
+            do {
+                let puller = ImagePuller(
+                    repo: "abdul-abdi/lumina",
+                    tag: "catalog-\(entry.id)",
+                    assetName: entry.url.lastPathComponent,
+                    directURL: entry.url,
+                    expectedSHA256: entry.sha256,
+                    imageName: entry.id
+                )
+                try await puller.pull { _ in }
+                await MainActor.run {
+                    catalogPullingID = nil
+                    refresh()
+                    launchNotice = LaunchNotice(
+                        title: "Pulled \(entry.displayName)",
+                        message: "Installed at ~/.lumina/images/\(entry.id)/. Try: `lumina run --image \(entry.id) 'uname -a'`",
+                        isError: false
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    catalogPullingID = nil
+                    launchNotice = LaunchNotice(
+                        title: "Pull failed",
+                        message: "\(entry.displayName): \(error)",
+                        isError: true
+                    )
+                }
+            }
         }
     }
 
@@ -305,6 +394,117 @@ private struct ImageRow: View {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
+    }
+}
+
+// MARK: - Catalog row (uninstalled entries from AgentImageCatalog)
+
+@MainActor
+private struct CatalogRow: View {
+    let entry: AgentImageEntry
+    let isPulling: Bool
+    let disabled: Bool
+    let onPull: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            glyph
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(entry.id)
+                        .font(LuminaTheme.title)
+                        .foregroundStyle(LuminaTheme.ink)
+                    if hasPlaceholderSHA {
+                        Text("COMING SOON")
+                            .font(.system(size: 9, weight: .semibold))
+                            .tracking(1.5)
+                            .foregroundStyle(LuminaTheme.inkDim)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
+                    } else {
+                        Text("CATALOG")
+                            .font(.system(size: 9, weight: .semibold))
+                            .tracking(1.5)
+                            .foregroundStyle(LuminaTheme.accent)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .overlay(Rectangle().stroke(LuminaTheme.accent, lineWidth: 1))
+                    }
+                }
+                Text(entry.displayName)
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.inkDim)
+                Text(entry.summary)
+                    .font(LuminaTheme.caption)
+                    .foregroundStyle(LuminaTheme.ink)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 6) {
+                    Text("~\(formatMB(entry.approximateSize))")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkMute)
+                    if !entry.tags.isEmpty {
+                        Text("·")
+                            .font(LuminaTheme.caption)
+                            .foregroundStyle(LuminaTheme.inkMute)
+                        Text(entry.tags.joined(separator: ", "))
+                            .font(LuminaTheme.caption)
+                            .foregroundStyle(LuminaTheme.inkMute)
+                    }
+                }
+            }
+            Spacer()
+            pullButton
+        }
+        .padding(14)
+        .background(LuminaTheme.bg1)
+        .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+        .opacity(disabled ? 0.5 : 1.0)
+    }
+
+    private var hasPlaceholderSHA: Bool {
+        entry.sha256.lowercased() == String(repeating: "0", count: 64)
+    }
+
+    private var glyph: some View {
+        Image(systemName: hasPlaceholderSHA ? "cloud" : "cloud.fill")
+            .font(.system(size: 26, weight: .light))
+            .foregroundStyle(LuminaTheme.accent.opacity(hasPlaceholderSHA ? 0.4 : 1.0))
+            .frame(width: 40, height: 40)
+            .background(LuminaTheme.bg2)
+            .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+    }
+
+    private var pullButton: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            if isPulling {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Pulling…")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                }
+            } else {
+                Button {
+                    onPull()
+                } label: {
+                    Label(hasPlaceholderSHA ? "Pending" : "Pull",
+                          systemImage: hasPlaceholderSHA ? "clock" : "arrow.down.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(disabled)
+            }
+        }
+    }
+
+    private func formatMB(_ bytes: Int64) -> String {
+        let mb = Double(bytes) / (1024 * 1024)
+        if mb >= 1024 {
+            return String(format: "%.1f GB", mb / 1024)
+        }
+        return String(format: "%.0f MB", mb)
     }
 }
 
