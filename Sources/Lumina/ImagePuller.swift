@@ -12,17 +12,34 @@ public struct ImagePuller: Sendable {
     private let tag: String
     private let assetName: String
     private let imageStore: ImageStore
+    /// When set, download this URL directly instead of constructing
+    /// one from repo/tag/assetName. Used by `lumina images pull <id>`
+    /// against the catalog.
+    private let directURL: URL?
+    /// When set, verify the downloaded tarball matches this digest
+    /// before extraction. Refuses to install a mismatched tarball
+    /// even if --force is set.
+    private let expectedSHA256: String?
+    /// When set, install into ~/.lumina/images/<imageName>/ instead
+    /// of the default `default/`.
+    private let imageName: String?
 
     public init(
         repo: String = ImagePuller.defaultRepo,
         tag: String = ImagePuller.defaultTag,
         assetName: String = ImagePuller.defaultAssetName,
-        imageStore: ImageStore = ImageStore()
+        imageStore: ImageStore = ImageStore(),
+        directURL: URL? = nil,
+        expectedSHA256: String? = nil,
+        imageName: String? = nil
     ) {
         self.repo = repo
         self.tag = tag
         self.assetName = assetName
         self.imageStore = imageStore
+        self.directURL = directURL
+        self.expectedSHA256 = expectedSHA256
+        self.imageName = imageName
     }
 
     /// Check if the default image is already available.
@@ -33,11 +50,20 @@ public struct ImagePuller: Sendable {
     /// Pull the default image from GitHub Releases.
     /// Downloads the tarball, verifies integrity, extracts vmlinuz + initrd + rootfs.img.
     public func pull(
-        name: String = "default",
+        name requestedName: String = "default",
         progress: @Sendable (_ message: String) -> Void = { _ in }
     ) async throws(LuminaError) {
-        let releaseURL = "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)"
-        progress("Downloading \(assetName) from \(repo) (\(tag))...")
+        // Resolve destination name and download URL. Catalog pulls
+        // override both via init; defaults preserve v0.5.0 behaviour.
+        let name = imageName ?? requestedName
+        let releaseURL: String
+        if let directURL {
+            releaseURL = directURL.absoluteString
+            progress("Downloading \(directURL.lastPathComponent) → image '\(name)'...")
+        } else {
+            releaseURL = "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)"
+            progress("Downloading \(assetName) from \(repo) (\(tag))...")
+        }
 
         // 1. Download the tarball
         let downloadedFile: URL
@@ -64,9 +90,19 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 3. Compute SHA256 for verification logging
+        // 3. Compute SHA256 and verify against expected when set
+        //    (catalog pulls). Mismatch = refuse to install even if
+        //    the caller passed --force.
         let sha256 = hashFile(at: downloadedFile)
         progress("Downloaded \(formatBytes(fileSize)) (SHA256: \(sha256.prefix(12))...)")
+        if let expected = expectedSHA256 {
+            if sha256.lowercased() != expected.lowercased() {
+                throw .imageNotFound(
+                    "SHA-256 mismatch for downloaded tarball. expected=\(expected), actual=\(sha256). Refusing to install."
+                )
+            }
+            progress("SHA-256 verified against catalog entry.")
+        }
 
         // 4. Prepare image directory (clean if partial previous attempt)
         let imageDir = imageStore.baseDir.appendingPathComponent(name)
