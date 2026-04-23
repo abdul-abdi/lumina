@@ -5,6 +5,7 @@
 
 import ArgumentParser
 import Foundation
+import CryptoKit
 import Lumina
 import LuminaBootable
 
@@ -95,6 +96,10 @@ struct DesktopCreate: AsyncParsableCommand {
     @Flag(name: .customLong("force"), help: "Skip ARM64 architecture pre-flight check on the ISO.")
     var force = false
 
+    @Flag(name: .customLong("no-verify-iso"),
+          help: "Skip SHA-256 verification even when the ISO filename matches a DesktopOSCatalog entry. v0.7.1+: matched ISOs are verified by default.")
+    var noVerifyISO = false
+
     @Option(name: .customLong("network"),
             help: "Network attachment mode: 'nat' (default, vmnet NAT) or 'bridged' (join host LAN, guest DHCPs against your router — bypasses vmnet and fixes the Debian/Kali netcfg DHCP-race).")
     var networkMode: String = "nat"
@@ -140,6 +145,36 @@ struct DesktopCreate: AsyncParsableCommand {
                 FileHandle.standardError.write(Data(
                     "warning: could not detect ISO architecture for \(iso); proceeding anyway. Pass --force to silence this warning.\n".utf8
                 ))
+            }
+        }
+
+        // v0.7.1 M3: SHA-256 verification on catalog ISOs. The Desktop
+        // wizard has always done this; the CLI parity gap was tracked on
+        // the v0.7.2 runway. If the ISO filename matches a
+        // `DesktopOSCatalog` entry's URL filename, hash the file and
+        // compare. Mismatch = refuse to create (same contract the
+        // wizard ships). Non-matched ISOs (BYO distros, Windows MSA,
+        // Apple IPSWs) are silently skipped — there's no catalog
+        // digest to check against.
+        if let iso = isoPath, !noVerifyISO {
+            let isoURL = URL(fileURLWithPath: (iso as NSString).expandingTildeInPath)
+            if let entry = DesktopCreate.catalogEntryMatching(isoURL: isoURL) {
+                FileHandle.standardError.write(Data(
+                    "→ verifying \(entry.displayName) SHA-256 (\(entry.sha256.prefix(8))…)\n".utf8
+                ))
+                let actual = try DesktopCreate.sha256Hex(of: isoURL)
+                if actual.lowercased() != entry.sha256.lowercased() {
+                    FileHandle.standardError.write(Data("""
+                        error: SHA-256 mismatch for \(iso).
+                          expected \(entry.sha256)
+                          actual   \(actual)
+                        The file is corrupted, tampered with, or not the catalog version.
+                        Pass --no-verify-iso to skip (not recommended).
+                        \n
+                        """.utf8))
+                    throw ExitCode(2)
+                }
+                FileHandle.standardError.write(Data("✓ SHA-256 matches\n".utf8))
             }
         }
 
@@ -249,6 +284,40 @@ struct DesktopCreate: AsyncParsableCommand {
             print("  disk:      \(diskSize)")
             if let iso = isoPath { print("  iso:       \(iso) (staged for first boot)") }
         }
+    }
+
+    // MARK: - v0.7.1 M3: catalog ISO SHA-256 helpers
+
+    /// If the given ISO's filename matches the tail component of any
+    /// `DesktopOSCatalog` entry's URL, return that entry — this is the
+    /// wizard's "you picked a known catalog ISO" signal translated to
+    /// the CLI. No network I/O; pure filename comparison. Returns nil
+    /// for BYO ISOs (no catalog digest to check against).
+    static func catalogEntryMatching(isoURL: URL) -> DesktopOSEntry? {
+        let name = isoURL.lastPathComponent.lowercased()
+        return DesktopOSCatalog.all.first {
+            $0.isoURL.lastPathComponent.lowercased() == name
+        }
+    }
+
+    /// Stream-hash a file with SHA-256 in 4 MB chunks. Matches
+    /// `LuminaDesktopKit/ISOVerifier.verify` byte-for-byte; a deliberate
+    /// duplication because `ISOVerifier` is internal to DesktopKit and
+    /// promoting it to a shared target would touch 5 files + 2 tests
+    /// for no current caller-gain. If the wizard and CLI ever diverge,
+    /// consolidate then.
+    static func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 }
 
