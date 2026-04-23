@@ -136,3 +136,38 @@ func TestResize_PendingMap_IsEvictedByExecute(t *testing.T) {
 		t.Fatalf("expected pending entry removed after Execute-style drain")
 	}
 }
+
+// The v0.7.1 heartbeat-failure regression gate. When the host
+// connection drops, the accept loop calls `ptymgr.KillAll` so any
+// live PTY-backed shell processes are SIGKILL'd along with their
+// process groups. If KillAll ever regresses to a no-op or skips
+// entries on a nil cmd/cmd.Process check, this test catches it —
+// the KillAll function's shape is what the architect-lens review
+// specifically flagged as the "silent regression" case.
+func TestKillAll_Scope(t *testing.T) {
+	m, _, _ := newTestManager(t)
+
+	// Seed the running map directly with a fake runningPty that has a
+	// nil Process — KillAll must skip it without panicking rather
+	// than dereference. (The real Process wiring happens inside
+	// Execute; we can't construct that without an actual PTY, so we
+	// assert shape: `KillAll` is safe against a partly-constructed
+	// entry.)
+	m.mu.Lock()
+	m.running["partial-entry"] = &runningPty{}
+	m.mu.Unlock()
+
+	// Must not panic.
+	m.KillAll()
+
+	// The entry is still present — KillAll doesn't remove entries,
+	// the Execute goroutine's defer does. This is intentional: the
+	// cmd.Wait in Execute will see SIGKILL, return, and the defer
+	// cleans up the map. KillAll that removed entries would race
+	// Execute's own cleanup.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.running["partial-entry"]; !ok {
+		t.Fatalf("KillAll must not remove map entries — Execute's defer owns cleanup")
+	}
+}

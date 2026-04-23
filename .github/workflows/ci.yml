@@ -86,24 +86,35 @@ jobs:
           cd Guest/lumina-agent
           GOOS=linux GOARCH=arm64 go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
-          # Cross-compile every _test.go against linux/arm64 so a
-          # guest-only test that fails to build surfaces here instead
-          # of at the next runner upgrade. Binary discarded; this is
-          # a pure compile gate.
-          GOOS=linux GOARCH=arm64 go test -c -o /dev/null ./internal/portfwd ./internal/ptymgr
+          # Cross-compile every _test.go (including the Linux-only
+          # ptymgr suite) against linux/arm64 so guest-only test drift
+          # surfaces here. Binaries discarded; pure compile gate.
+          for pkg in ./internal/portfwd ./internal/ptymgr ./internal/execmgr ./internal/wire ./internal/protocol; do
+            GOOS=linux GOARCH=arm64 go test -c -o /dev/null "$pkg"
+          done
           echo "Guest agent: vet OK, build OK, tests cross-compile OK"
 
       - name: Run platform-neutral guest-agent tests
-        # Tests that don't depend on Linux-only syscalls (portfwd's
-        # port-allocation logic, protocol round-trips) run on the
-        # macOS runner with the default GOOS=darwin. Linux-gated
-        # tests (ptymgr PTY allocation, vsock Accept, execmgr exec
-        # lifecycle) compile-check above; they execute inside a
-        # Lumina VM via `make test-guest-in-vm` (local-dev target)
-        # until a dedicated ubuntu-arm64 runner lands.
+        # Tests for packages that don't depend on Linux-only syscalls
+        # (portfwd's port-allocation logic, execmgr's exec lifecycle
+        # over os/exec, wire NDJSON framer, protocol round-trips) run
+        # on the macOS runner with the default GOOS=darwin. The
+        # execmgr suite is the v0.7.1 heartbeat-failure regression
+        # gate — KillAll MUST tear down all in-flight commands, and
+        # that test runs here on every PR.
+        #
+        # Linux-only tests (ptymgr PTY allocation path, vsock Accept)
+        # compile-check above and execute inside a Lumina VM via
+        # `make test-guest-in-vm` (local-dev target) until a dedicated
+        # ubuntu-arm64 runner lands.
         run: |
           cd Guest/lumina-agent
-          go test ./internal/portfwd/... -count=1 -timeout 30s
+          go test \
+            ./internal/portfwd/... \
+            ./internal/execmgr/... \
+            ./internal/wire/... \
+            ./internal/protocol/... \
+            -count=1 -timeout 60s
 
       # Agent-boot regression gate — v0.7.0 discipline.
       #
