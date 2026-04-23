@@ -77,6 +77,12 @@ public final class LuminaDesktopSession: Identifiable {
     /// session is torn down.
     private var vmDelegate: VMStopForwarder?
 
+    /// Polling task that mirrors `VM.serialTail(...)` into
+    /// `serialDigest` for the booting / crashed tail UI. Lives for as
+    /// long as the VM actor is attached; cancelled in `shutdown()` /
+    /// `handleExternalStop()`.
+    private var serialMirrorTask: Task<Void, Never>?
+
     public init(bundle: VMBundle) {
         self.id = bundle.manifest.id
         self.bundle = bundle
@@ -193,6 +199,7 @@ public final class LuminaDesktopSession: Identifiable {
         let newVM = VM(options: opts)
         self.vm = newVM
         await newVM.setDelegate(forwarder)
+        startSerialMirror(for: newVM)
         do {
             try await newVM.boot()
             // Grab the VZ handle and publish it BEFORE flipping status
@@ -281,6 +288,22 @@ public final class LuminaDesktopSession: Identifiable {
         if case .shuttingDown = status { return }
         if case .stopped = status { return }
 
+        // Grab one final serial tail from the VM before we drop the
+        // actor reference. On a kernel panic or EFI→kernel handoff
+        // crash, this tail is the only diagnostic evidence the user
+        // has; capturing it here preserves it in `serialDigest` for
+        // the crashed screen.
+        if let vm = self.vm {
+            Task { [weak self] in
+                let tail = await vm.serialTail(lines: 24)
+                await MainActor.run { [weak self] in
+                    self?.serialDigest = tail
+                }
+            }
+        }
+        serialMirrorTask?.cancel()
+        serialMirrorTask = nil
+
         vmDelegate = nil
         vzMachine = nil
         vm = nil
@@ -292,6 +315,29 @@ public final class LuminaDesktopSession: Identifiable {
         }
     }
 
+    /// Poll the VM's serial console tail into `serialDigest` on a
+    /// ~250ms cadence. During `.booting` this feeds the bottom-docked
+    /// tail view — the only diagnostic available while the framebuffer
+    /// is blank (EFI → kernel handoff, early kernel messages before
+    /// the graphics driver claims the display). After the framebuffer
+    /// lights up the tail collapses in the UI but stays live so a
+    /// later crash preserves the last-known-good diagnostic lines.
+    private func startSerialMirror(for vm: VM) {
+        serialMirrorTask?.cancel()
+        serialMirrorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let tail = await vm.serialTail(lines: 12)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    if self.serialDigest != tail {
+                        self.serialDigest = tail
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
     public func shutdown() async {
         status = .shuttingDown
         // Clear the handle immediately so the view stops rendering
@@ -299,6 +345,8 @@ public final class LuminaDesktopSession: Identifiable {
         // branch falls back to the stopped screen in the same tick.
         vzMachine = nil
         vmDelegate = nil
+        serialMirrorTask?.cancel()
+        serialMirrorTask = nil
         if let vm = self.vm {
             await vm.setDelegate(nil)
             await vm.shutdown()

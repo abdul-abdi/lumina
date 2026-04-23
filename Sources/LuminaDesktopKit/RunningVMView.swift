@@ -127,6 +127,7 @@ public struct RunningVMView: View {
 
     private var bootingScreen: some View {
         VStack(spacing: 16) {
+            Spacer()
             // ASCII brand mark, big
             VStack(alignment: .leading, spacing: 0) {
                 Text("[ BOOTING ]")
@@ -147,9 +148,40 @@ public struct RunningVMView: View {
                     .font(LuminaTheme.caption)
                     .foregroundStyle(LuminaTheme.inkDim)
             }
+            Spacer()
+            serialTailStrip
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(LuminaTheme.bgInset)
+    }
+
+    /// Bottom-docked serial tail. Non-empty while the guest is writing
+    /// to /dev/hvc0 (kernel, initramfs, bootloader); empty during the
+    /// pre-kernel VZ window. Re-rendering is cheap — `serialDigest`
+    /// updates at ~4 Hz from the session's mirror task.
+    @ViewBuilder
+    private var serialTailStrip: some View {
+        if !session.serialDigest.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("SERIAL (tail)")
+                    .font(LuminaTheme.caption.smallCaps())
+                    .tracking(2)
+                    .foregroundStyle(LuminaTheme.inkDim)
+                ScrollView {
+                    Text(session.serialDigest)
+                        .font(LuminaTheme.monoSmall)
+                        .foregroundStyle(LuminaTheme.ink)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 120)
+                .padding(10)
+                .background(LuminaTheme.bg1)
+                .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+        }
     }
 
     private var connectingScreen: some View {
@@ -190,6 +222,27 @@ public struct RunningVMView: View {
                     .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
             }
             .frame(maxHeight: 200)
+
+            if !session.serialDigest.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("LAST SERIAL OUTPUT")
+                        .font(LuminaTheme.caption.smallCaps())
+                        .tracking(2)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                    ScrollView {
+                        Text(session.serialDigest)
+                            .font(LuminaTheme.monoSmall)
+                            .foregroundStyle(LuminaTheme.ink)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 160)
+                    .padding(10)
+                    .background(LuminaTheme.bg1)
+                    .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+                }
+                .frame(maxWidth: 520)
+            }
 
             HStack(spacing: 12) {
                 Button(action: {
