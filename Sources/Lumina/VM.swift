@@ -1418,7 +1418,6 @@ enum VMError: Error, Sendable {
 public struct BootPhases: Sendable, Equatable {
     public var configMs: Double = 0
     public var vzStartMs: Double = 0
-    public var agentReadyMs: Double = 0
     public var totalMs: Double = 0
 
     public init() {}
@@ -1474,17 +1473,26 @@ private func attachGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    // Virtio-GPU scanout: single display at the configured resolution.
-    // Works for Linux + Windows-on-ARM guests. macOS guests use a different
-    // VM type (VZMacOSVirtualMachine) and their own graphics class, landing
-    // in M5.
+    // Virtio-GPU scanouts: primary display plus any `additionalDisplays`.
+    // The SwiftUI running-VM window still renders display 0 only; extra
+    // scanouts are live on the VZ side (Linux guests see multiple
+    // framebuffers via `/sys/class/drm/`) for callers driving the VM from
+    // their own view layer. Multi-display UI in the Desktop app is
+    // follow-up work.
     let gfx = VZVirtioGraphicsDeviceConfiguration()
-    gfx.scanouts = [
+    var scanouts: [VZVirtioGraphicsScanoutConfiguration] = [
         VZVirtioGraphicsScanoutConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels
         )
     ]
+    for extra in graphics.additionalDisplays {
+        scanouts.append(VZVirtioGraphicsScanoutConfiguration(
+            widthInPixels: extra.widthInPixels,
+            heightInPixels: extra.heightInPixels
+        ))
+    }
+    gfx.scanouts = scanouts
     config.graphicsDevices = [gfx]
 
     // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic

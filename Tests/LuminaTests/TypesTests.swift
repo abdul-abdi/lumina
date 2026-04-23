@@ -286,7 +286,6 @@ import Testing
     let p = BootPhases()
     #expect(p.configMs == 0)
     #expect(p.vzStartMs == 0)
-    #expect(p.agentReadyMs == 0)
     #expect(p.totalMs == 0)
 }
 
