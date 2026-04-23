@@ -158,8 +158,12 @@ public actor VM {
         let phaseStart = ContinuousClock.now
         var phaseMark = phaseStart
 
-        // Clean orphans from previous crashes
-        DiskClone.cleanOrphans()
+        // Clean orphans from previous crashes. Detached — this sweeps
+        // ~/.lumina/runs/ for stale PID files and can take 10-50ms
+        // on a busy host (N stat calls, N kill(pid,0) calls). Moving
+        // it off the critical path shaves that off every cold boot;
+        // orphans get swept next time instead. v0.7.1 perf.
+        Task.detached { _ = DiskClone.cleanOrphans() }
 
         // Resolve image
         let imagePaths = try imageStore.resolve(name: options.image)

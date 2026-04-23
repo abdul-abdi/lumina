@@ -247,6 +247,18 @@ public struct Lumina {
 
     /// Lifecycle scope: creates a VM, runs the body, and always shuts down.
     /// One shutdown call site, guaranteed to run on every path.
+    ///
+    /// v0.7.1 perf: the happy-path shutdown is dispatched as a detached
+    /// Task rather than awaited. The VZ machine stops asynchronously and
+    /// the COW clone removal is ~1ms on APFS (cloneFile reference
+    /// decrement), so blocking the caller on shutdown just adds 20-40ms
+    /// to every disposable `lumina run` for no benefit on the success
+    /// path. `DiskClone.cleanOrphans()` sweeps at the next boot if the
+    /// process crashes before teardown completes.
+    ///
+    /// The error path still awaits shutdown — callers catching a
+    /// LuminaError likely want to retry, and racing a half-torn-down VM
+    /// against a fresh boot would produce VZErrorDomain Code 2.
     static func withVM<T: Sendable>(
         options: RunOptions,
         body: @Sendable (VM) async throws -> T
@@ -255,7 +267,7 @@ public struct Lumina {
         let vm = VM(options: vmOptions)
         do {
             let result = try await body(vm)
-            await vm.shutdown()
+            Task.detached { await vm.shutdown() }
             return result
         } catch {
             await vm.shutdown()
