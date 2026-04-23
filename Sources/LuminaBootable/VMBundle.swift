@@ -209,6 +209,22 @@ public struct VMBundle: Sendable, Equatable {
     /// run) but is surfaced on stderr so the user can see that the next
     /// cold boot will regenerate — the exact failure mode this method
     /// exists to prevent.
+    ///
+    /// **Concurrent-open race (accepted, not guarded):** two processes
+    /// that open the same pre-v0.7.1 bundle in the same sub-second window
+    /// each generate a distinct in-memory MAC; whichever writes
+    /// `manifest.json` last wins. Both boots that run under this race
+    /// use their own in-memory MAC for the current session (so
+    /// correctness holds — the DHCP lease just won't be stable between
+    /// them), and every subsequent cold boot sees a populated manifest
+    /// and skips generation entirely. Single-process-per-bundle is the
+    /// Lumina design norm (Desktop holds the bundle; CLI `desktop boot`
+    /// is invoked interactively). A scripted double-open is the only
+    /// way to hit this, and the first migration boot is the only boot
+    /// that matters — every boot after that is deterministic. If a use
+    /// case emerges that needs strict first-boot MAC stability across
+    /// concurrent callers, wrap the read-modify-write in an `flock(2)`
+    /// on `manifest.json`.
     @discardableResult
     public mutating func ensureMACAddress() -> String {
         if let existing = manifest.macAddress, !existing.isEmpty {
