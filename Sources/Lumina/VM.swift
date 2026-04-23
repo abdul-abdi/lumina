@@ -519,8 +519,8 @@ public actor VM {
                 if !FileManager.default.fileExists(atPath: url.path) {
                     FileManager.default.createFile(atPath: url.path, contents: nil)
                 }
-                let h = try? FileHandle(forWritingTo: url)
-                try? h?.seekToEnd()
+                guard let h = try? FileHandle(forWritingTo: url) else { return nil }
+                _ = try? h.seekToEnd()
                 return h
             }()
             if let h = persistHandle {
@@ -1268,6 +1268,41 @@ public actor VM {
 
     public var serialOutput: String {
         serialConsole.output
+    }
+
+    /// Last `lines` newline-terminated lines from the serial console
+    /// buffer, stripped of ANSI CSI sequences that terminals use for
+    /// cursor/color control. Designed for the desktop's boot-window
+    /// tail ticker: the framebuffer goes blank during EFI→kernel
+    /// handoff and during silent kernel panics, so the serial tail is
+    /// the only evidence a user can see when something's gone wrong.
+    public func serialTail(lines: Int = 12) -> String {
+        let raw = serialConsole.output
+        if raw.isEmpty { return "" }
+        // Strip CSI sequences (ESC [ … final-byte) that would garble a
+        // plain SwiftUI Text. This is lossy — non-CSI escape sequences
+        // (e.g., OSC for title changes) are left alone — but good
+        // enough for human-readable tail output.
+        var cleaned = ""
+        cleaned.reserveCapacity(raw.count)
+        var iter = raw.unicodeScalars.makeIterator()
+        while let c = iter.next() {
+            if c == "\u{1B}" {
+                // Swallow ESC + possible [ + parameter bytes + final.
+                if let next = iter.next(), next == "[" {
+                    while let p = iter.next() {
+                        if (0x40...0x7E).contains(p.value) { break }
+                    }
+                } // otherwise just drop the lone ESC
+                continue
+            }
+            cleaned.unicodeScalars.append(c)
+        }
+        let split = cleaned.split(
+            separator: "\n", omittingEmptySubsequences: false
+        )
+        let tail = split.suffix(lines)
+        return tail.joined(separator: "\n")
     }
 
     /// Sendable handle wrapping the underlying VZVirtualMachine for the

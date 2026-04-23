@@ -8,7 +8,7 @@ struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.7.0",
+        version: "0.7.1",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,

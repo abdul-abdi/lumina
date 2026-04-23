@@ -44,7 +44,7 @@ else
 fi
 echo "→ Entitlements: $(basename "$ENTITLEMENTS")"
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
 echo "→ Building LuminaDesktopApp (config=$CONFIG)"

@@ -70,14 +70,11 @@ struct MenuBarLabel: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        // Read status on every iterated session so @Observable tracking
-        // fires when any individual session's status flips — not just
-        // when the sessions dict itself mutates. Without this the label
-        // goes stale when a VM transitions stopped↔running and the
-        // dict's identity hasn't changed.
-        let running = model.sessions.values.reduce(into: 0) { count, session in
-            if session.status.isLive { count += 1 }
-        }
+        // `model.runningCount` is a computed property that touches each
+        // child session's `status` inside its scope, so `@Observable`
+        // tracks the transitive reads. Views get a plain Int value;
+        // reuse lands in AppModel, not in View bodies.
+        let running = model.runningCount
         HStack(spacing: 3) {
             // SF Symbol `square.on.square` — two offset squares,
             // shape-identical to the app icon's brand mark. Template
@@ -215,7 +212,7 @@ struct LuminaCommands: Commands {
             Button("About Lumina") {
                 NSApplication.shared.orderFrontStandardAboutPanel(options: [
                     .applicationName: "Lumina",
-                    .applicationVersion: "0.7.0",
+                    .applicationVersion: "0.7.1",
                     .credits: NSAttributedString(
                         string: "Native Apple Workload Runtime for Agents.\nBoot a VM. Run a command. Parse the JSON.",
                         attributes: [.foregroundColor: NSColor.secondaryLabelColor]
@@ -444,7 +441,7 @@ struct PreferencesView: View {
                 ))
             Text("Lumina Desktop")
                 .font(.title3.weight(.semibold))
-            Text("v0.7.0")
+            Text("v0.7.1")
                 .foregroundStyle(.secondary)
             Text("Native Apple Workload Runtime for Agents")
                 .font(.caption)

@@ -42,6 +42,7 @@ demo.tape
 # v0.7.0 M6: xcodegen-generated Xcode project (project.yml is the source of truth)
 Apps/LuminaDesktop/LuminaDesktop.xcodeproj/
 Apps/LuminaDesktop/LuminaDesktop.xcworkspace/
+Apps/LuminaDesktop/build/
 
 # Local design-source bundles (Claude Design handoffs, etc.)
 lumina-handoff.zip
