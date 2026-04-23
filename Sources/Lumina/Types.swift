@@ -156,17 +156,38 @@ public struct GraphicsConfig: Sendable {
     public var heightInPixels: Int
     public var keyboardKind: KeyboardKind
     public var pointingDeviceKind: PointingDeviceKind
+    /// Additional displays beyond the primary. Empty by default, which
+    /// preserves single-display v0.7.0 behavior. Each entry becomes a
+    /// second `VZVirtioGraphicsScanoutConfiguration` on the same
+    /// virtio-GPU device, or a second `VZMacGraphicsDisplayConfiguration`
+    /// on the macOS graphics device. The running-VM window still shows
+    /// the primary only; a multi-display UI is follow-up work.
+    public var additionalDisplays: [Display]
 
     public init(
         widthInPixels: Int = 1920,
         heightInPixels: Int = 1080,
         keyboardKind: KeyboardKind = .usb,
-        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate
+        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate,
+        additionalDisplays: [Display] = []
     ) {
         self.widthInPixels = widthInPixels
         self.heightInPixels = heightInPixels
         self.keyboardKind = keyboardKind
         self.pointingDeviceKind = pointingDeviceKind
+        self.additionalDisplays = additionalDisplays
+    }
+
+    /// A display spec. Resolution-only; future fields (ppi, position,
+    /// colorspace) go here without breaking callers.
+    public struct Display: Sendable, Equatable {
+        public var widthInPixels: Int
+        public var heightInPixels: Int
+
+        public init(widthInPixels: Int, heightInPixels: Int) {
+            self.widthInPixels = widthInPixels
+            self.heightInPixels = heightInPixels
+        }
     }
 }
 

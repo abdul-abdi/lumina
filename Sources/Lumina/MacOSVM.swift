@@ -308,13 +308,22 @@ private func attachMacGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    let display = VZMacGraphicsDisplayConfiguration(
-        widthInPixels: graphics.widthInPixels,
-        heightInPixels: graphics.heightInPixels,
-        pixelsPerInch: 220
-    )
+    var displays: [VZMacGraphicsDisplayConfiguration] = [
+        VZMacGraphicsDisplayConfiguration(
+            widthInPixels: graphics.widthInPixels,
+            heightInPixels: graphics.heightInPixels,
+            pixelsPerInch: 220
+        )
+    ]
+    for extra in graphics.additionalDisplays {
+        displays.append(VZMacGraphicsDisplayConfiguration(
+            widthInPixels: extra.widthInPixels,
+            heightInPixels: extra.heightInPixels,
+            pixelsPerInch: 220
+        ))
+    }
     let gpu = VZMacGraphicsDeviceConfiguration()
-    gpu.displays = [display]
+    gpu.displays = displays
     config.graphicsDevices = [gpu]
 
     config.keyboards = [VZMacKeyboardConfiguration()]
