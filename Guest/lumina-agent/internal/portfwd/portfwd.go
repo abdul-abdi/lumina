@@ -2,6 +2,12 @@
 // vsock. The host asks for a forward; we open a vsock listener,
 // reply with its port, and proxy each accepted connection to
 // 127.0.0.1:<guest_port> inside the VM.
+//
+// The vsock bind primitive is pluggable (see `listenFunc`) so
+// Manager's core logic — port allocation, recycling, collision
+// handling — is testable on any platform. The production wiring in
+// `New` uses the real `vsock` package; tests inject a net.Pipe-based
+// fake.
 package portfwd
 
 import (
@@ -14,7 +20,6 @@ import (
 	"time"
 
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/protocol"
-	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/vsock"
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/wire"
 )
 
@@ -22,23 +27,43 @@ import (
 // reserved for the primary agent listener and future system services.
 const firstDynamicPort = uint32(1025)
 
+// maxVsockPort is the 16-bit ceiling on vsock port numbers. Past this
+// we refuse to monotonically allocate; callers must wait for Stop to
+// return ports to the free list.
+const maxVsockPort = uint32(65535)
+
 // dialTimeout caps how long we wait for the local service before
 // dropping the proxied vsock connection.
 const dialTimeout = 5 * time.Second
+
+// listenFunc is the vsock bind primitive. Production uses vsock.Listen;
+// tests inject a net.Pipe-based fake so the port-allocation and
+// double-start logic can be exercised without a real kernel socket.
+type listenFunc func(port int) (net.Listener, error)
 
 // Manager tracks active forwards by guest TCP port.
 type Manager struct {
 	w *wire.Writer
 
-	mu            sync.Mutex
-	nextVsockPort uint32
-	active        map[int]*forward
+	// listen is the vsock bind primitive. Production uses vsock.Listen;
+	// tests inject a fake via NewWithListen.
+	listen listenFunc
+
+	mu             sync.Mutex
+	nextVsockPort  uint32
+	freeVsockPorts []uint32 // recycled from Stop; popped before nextVsockPort++
+	active         map[int]*forward
 }
 
-// New creates an empty Manager.
-func New(w *wire.Writer) *Manager {
+// NewWithListen creates an empty Manager with a pluggable vsock listener
+// factory. The production path is `New` which wires in `vsock.Listen`;
+// tests use this form to inject a net.Pipe-based listener so the
+// port-allocation and double-start paths can run on platforms that
+// don't support AF_VSOCK.
+func NewWithListen(w *wire.Writer, listen listenFunc) *Manager {
 	return &Manager{
 		w:             w,
+		listen:        listen,
 		nextVsockPort: firstDynamicPort,
 		active:        make(map[int]*forward),
 	}
@@ -46,33 +71,59 @@ func New(w *wire.Writer) *Manager {
 
 // forward is a single active mapping.
 type forward struct {
-	ln     net.Listener
-	cancel context.CancelFunc
+	ln        net.Listener
+	cancel    context.CancelFunc
+	vsockPort uint32 // captured so Stop can recycle it
 }
 
 // Start opens a vsock listener, registers it, and replies with
 // port_forward_ready so the host can start accepting on the matching
-// host-side local TCP socket.
+// host-side local TCP socket. A double-start for an already-forwarded
+// guest port emits a port_forward_error so the host can surface a
+// clear message to the caller instead of timing out.
 func (m *Manager) Start(guestPort int) {
 	m.mu.Lock()
 	if _, exists := m.active[guestPort]; exists {
 		m.mu.Unlock()
 		_, _ = fmt.Fprintf(os.Stderr, "port_forward: already active for guest_port=%d\n", guestPort)
+		_ = m.w.Send(protocol.PortForwardErrorMsg{
+			Type:      protocol.TypePortForwardError,
+			GuestPort: guestPort,
+			Reason:    "already active",
+		})
 		return
 	}
-	vsockPort := m.nextVsockPort
-	m.nextVsockPort++
+	vsockPort, ok := m.allocateVsockPortLocked()
+	if !ok {
+		m.mu.Unlock()
+		_, _ = fmt.Fprintf(os.Stderr, "port_forward: vsock port space exhausted\n")
+		_ = m.w.Send(protocol.PortForwardErrorMsg{
+			Type:      protocol.TypePortForwardError,
+			GuestPort: guestPort,
+			Reason:    "vsock port exhausted",
+		})
+		return
+	}
 	m.mu.Unlock()
 
-	ln, err := vsock.Listen(int(vsockPort))
+	ln, err := m.listen(int(vsockPort))
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "port_forward: vsock listen on %d failed: %v\n", vsockPort, err)
+		// Return the port to the free list — we never got to use it.
+		m.mu.Lock()
+		m.freeVsockPorts = append(m.freeVsockPorts, vsockPort)
+		m.mu.Unlock()
+		_ = m.w.Send(protocol.PortForwardErrorMsg{
+			Type:      protocol.TypePortForwardError,
+			GuestPort: guestPort,
+			Reason:    fmt.Sprintf("vsock listen: %v", err),
+		})
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
-	m.active[guestPort] = &forward{ln: ln, cancel: cancel}
+	m.active[guestPort] = &forward{ln: ln, cancel: cancel, vsockPort: vsockPort}
 	m.mu.Unlock()
 
 	// Reply BEFORE the accept goroutine launches. unix.Listen has
@@ -87,13 +138,18 @@ func (m *Manager) Start(guestPort int) {
 	go m.acceptLoop(ctx, ln, guestPort, vsockPort)
 }
 
-// Stop closes the listener and cancels the accept context. In-flight
-// proxy goroutines unblock via their deferred Close calls.
+// Stop closes the listener, cancels the accept context, and returns
+// the vsock port to the free list so a subsequent Start can reuse it.
+// In-flight proxy goroutines unblock via their deferred Close calls.
+// A long-running session that churns many forwards therefore stays
+// bounded in vsock-port consumption instead of leaking the 16-bit
+// space one port at a time.
 func (m *Manager) Stop(guestPort int) {
 	m.mu.Lock()
 	f, ok := m.active[guestPort]
 	if ok {
 		delete(m.active, guestPort)
+		m.freeVsockPorts = append(m.freeVsockPorts, f.vsockPort)
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -103,6 +159,26 @@ func (m *Manager) Stop(guestPort int) {
 	// in-flight proxy connections observe ctx.Done() and tear down.
 	_ = f.ln.Close()
 	f.cancel()
+}
+
+// allocateVsockPortLocked returns a vsock port to use for a new
+// forward. Prefers the free list over monotonically advancing, so a
+// start/stop/start cycle reuses the same port — keeps the 16-bit port
+// space bounded across long-running sessions. Caller must hold m.mu.
+// Returns (port, false) when both the free list is empty and the
+// monotonic cursor has passed maxVsockPort.
+func (m *Manager) allocateVsockPortLocked() (uint32, bool) {
+	if n := len(m.freeVsockPorts); n > 0 {
+		port := m.freeVsockPorts[n-1]
+		m.freeVsockPorts = m.freeVsockPorts[:n-1]
+		return port, true
+	}
+	if m.nextVsockPort > maxVsockPort {
+		return 0, false
+	}
+	port := m.nextVsockPort
+	m.nextVsockPort++
+	return port, true
 }
 
 // ── private ─────────────────────────────────────────────────────────

@@ -845,6 +845,17 @@ final class CommandRunner: @unchecked Sendable {
             let cont = portForwardContinuations.removeValue(forKey: guestPort)
             lock.unlock()
             cont?.resume(returning: vsockPort)
+        case .portForwardError(let guestPort, let reason):
+            // Guest refused the forward (double-start collision, vsock
+            // bind failure, port space exhausted). Resume the caller
+            // with a clear protocol error instead of letting them time
+            // out on a forward that will never arrive.
+            lock.lock()
+            let cont = portForwardContinuations.removeValue(forKey: guestPort)
+            lock.unlock()
+            cont?.resume(throwing: LuminaError.protocolError(
+                "port_forward refused by guest for guest_port=\(guestPort): \(reason)"
+            ))
         case .ready:
             // Unexpected ready during active connection — ignore
             break

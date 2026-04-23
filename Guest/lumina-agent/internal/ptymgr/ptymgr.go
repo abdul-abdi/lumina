@@ -29,6 +29,18 @@ const drainWindow = 5 * time.Millisecond
 // flushing mid-window.
 const readBufSize = 4096
 
+// pendingResizeTTL — a window_resize that arrives for a PTY id whose
+// pty_exec never lands (client crashed between the two messages, or
+// the exec was rejected by the session layer) sits in pendingResizes
+// forever. Bounded by unique IDs, but unbounded across agent lifetime
+// so a long-running session can leak memory at one small struct per
+// orphan. Evicting anything older than this window costs one
+// time.Now() per insert, keeps the map size at most "resizes received
+// in the last TTL" regardless of how long the agent has run. Chosen
+// to be long enough that a slow client placing resize-before-exec is
+// still correct.
+const pendingResizeTTL = 60 * time.Second
+
 // Manager tracks in-flight PTY sessions.
 type Manager struct {
 	w *wire.Writer
@@ -38,6 +50,10 @@ type Manager struct {
 
 	pendingMu      sync.Mutex
 	pendingResizes map[string]winsize
+
+	// now is the time source; real code uses time.Now, tests inject a
+	// fake so pendingResizeTTL is exercisable without sleeping.
+	now func() time.Time
 }
 
 // New creates an empty Manager.
@@ -46,6 +62,7 @@ func New(w *wire.Writer) *Manager {
 		w:              w,
 		running:        make(map[string]*runningPty),
 		pendingResizes: make(map[string]winsize),
+		now:            time.Now,
 	}
 }
 
@@ -56,7 +73,13 @@ type runningPty struct {
 	done     chan struct{}
 }
 
-type winsize struct{ cols, rows int }
+type winsize struct {
+	cols, rows int
+	// enqueuedAt is the moment Resize buffered this entry. Used by
+	// the TTL eviction pass on every insert to keep the pending map
+	// bounded across agent lifetime.
+	enqueuedAt time.Time
+}
 
 // HasActive reports whether a PTY with the given id is running.
 func (m *Manager) HasActive(id string) bool {
@@ -117,9 +140,20 @@ func (m *Manager) Resize(msg protocol.WindowResizeMsg) {
 		}
 		return
 	}
-	// Buffer for a PTY not yet allocated.
+	// Buffer for a PTY not yet allocated, and opportunistically sweep
+	// any stale entries older than pendingResizeTTL — this keeps the
+	// map bounded even if a stream of resize-before-exec messages from
+	// crashing clients never gets its matching pty_exec.
+	now := m.now()
 	m.pendingMu.Lock()
-	m.pendingResizes[msg.ID] = winsize{cols: msg.Cols, rows: msg.Rows}
+	for id, entry := range m.pendingResizes {
+		if now.Sub(entry.enqueuedAt) > pendingResizeTTL {
+			delete(m.pendingResizes, id)
+		}
+	}
+	m.pendingResizes[msg.ID] = winsize{
+		cols: msg.Cols, rows: msg.Rows, enqueuedAt: now,
+	}
 	m.pendingMu.Unlock()
 }
 

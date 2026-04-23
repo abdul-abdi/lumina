@@ -46,6 +46,7 @@ const (
 	TypePortForwardStart = "port_forward_start"
 	TypePortForwardStop  = "port_forward_stop"
 	TypePortForwardReady = "port_forward_ready"
+	TypePortForwardError = "port_forward_error"
 )
 
 // Stream names used in OutputMsg.
@@ -220,4 +221,20 @@ type PortForwardReadyMsg struct {
 	Type      string `json:"type"`
 	GuestPort int    `json:"guest_port"`
 	VsockPort int    `json:"vsock_port"`
+}
+
+// PortForwardErrorMsg signals the guest couldn't establish a forward.
+// Sent in response to a PortForwardStartMsg that collided with an
+// existing forward on the same guest port, or when the guest-side
+// vsock bind failed. The host dispatches this to the pending
+// portForwardContinuation and surfaces the reason to the caller.
+//
+// Reasons are human-readable strings — callers should not parse them,
+// they are for logs and error messages. Well-known values today:
+//   - "already active"    : host sent start twice for the same port
+//   - "vsock listen"      : guest-side vsock bind failed
+type PortForwardErrorMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+	Reason    string `json:"reason"`
 }

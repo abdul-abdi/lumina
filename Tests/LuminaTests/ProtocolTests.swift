@@ -361,3 +361,25 @@ import Testing
         try Protocol.decodeGuest(raw)
     }
 }
+
+@Test func decodePortForwardErrorMessage() throws {
+    let raw = Data(#"{"type":"port_forward_error","guest_port":3000,"reason":"already active"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .portForwardError(guestPort: 3000, reason: "already active"))
+}
+
+@Test func decodePortForwardErrorDefaultsReasonWhenMissing() throws {
+    // Guest-side backwards-compat: if a future refactor ever forgets the
+    // `reason` field, the host must still be able to route the error to
+    // the pending continuation rather than crashing on decode.
+    let raw = Data(#"{"type":"port_forward_error","guest_port":3000}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .portForwardError(guestPort: 3000, reason: "unspecified"))
+}
+
+@Test func decodePortForwardErrorMissingPortThrows() {
+    let raw = Data(#"{"type":"port_forward_error","reason":"already active"}"#.utf8)
+    #expect(throws: LuminaError.self) {
+        try Protocol.decodeGuest(raw)
+    }
+}

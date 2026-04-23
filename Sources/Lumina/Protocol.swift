@@ -57,6 +57,11 @@ public enum GuestMessage: Sendable, Equatable {
     /// `vsockPort` is the reverse-channel port the host should connect to for
     /// each new proxied TCP connection.
     case portForwardReady(guestPort: Int, vsockPort: Int)
+    /// Guest refused to establish a forward on `guestPort` for the attached
+    /// reason. Typically "already active" (double-start collision) or a
+    /// guest-side vsock bind failure. The host surfaces the reason to the
+    /// caller waiting on `requestPortForward(...)`.
+    case portForwardError(guestPort: Int, reason: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -190,6 +195,12 @@ enum LuminaProtocol {
                 throw LuminaError.protocolError("port_forward_ready missing fields")
             }
             return .portForwardReady(guestPort: guestPort, vsockPort: vsockPort)
+        case "port_forward_error":
+            guard let guestPort = json["guest_port"] as? Int else {
+                throw LuminaError.protocolError("port_forward_error missing guest_port")
+            }
+            let reason = json["reason"] as? String ?? "unspecified"
+            return .portForwardError(guestPort: guestPort, reason: reason)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }
