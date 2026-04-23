@@ -1,0 +1,41 @@
+# OpenClaw — pentest + binary-analysis toolchain.
+# Pairs with AgentImageCatalog.entry(id: "openclaw") once the built
+# tarball is published to a GitHub Release.
+apiVersion: lumina.dev/v1alpha1
+kind: AgentImage
+metadata:
+  name: openclaw
+  displayName: "OpenClaw — pentest toolchain"
+  tags: [agent, security, tooling]
+
+from: default
+
+# Alpine packages. Size target: ~500MB installed. Tools chosen for the
+# "agent running untrusted binary analysis against captured samples"
+# workflow. Anything pulling in systemd / X11 is deliberately excluded
+# to keep boot time under the v0.7.1 BootPhases budget.
+packages:
+  - build-base
+  - gdb
+  - lldb
+  - radare2
+  - binutils
+  - patchelf
+  - strace
+  - tcpdump
+  - nmap
+  - curl
+  - jq
+  - py3-pip
+  - git
+  - file
+
+# Post-install verification. Fails the build if any tool failed to
+# install cleanly.
+run:
+  - gdb --version | head -1
+  - radare2 -v | head -1
+  - nmap --version | head -1
+  - echo "openclaw image ready"
+
+rosetta: false

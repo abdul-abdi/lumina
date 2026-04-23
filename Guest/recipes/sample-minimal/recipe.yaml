@@ -1,0 +1,19 @@
+# Smallest useful recipe. Fork and edit. Good starting template.
+apiVersion: lumina.dev/v1alpha1
+kind: AgentImage
+metadata:
+  name: sample-minimal
+  displayName: "Sample minimal (edit me)"
+  tags: [agent, sample]
+
+from: default
+
+packages:
+  - curl
+  - jq
+
+run:
+  - curl --version | head -1
+  - echo "sample image built at $(date)"
+
+rosetta: false
