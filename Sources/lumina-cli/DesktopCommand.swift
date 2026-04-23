@@ -5,7 +5,6 @@
 
 import ArgumentParser
 import Foundation
-import CryptoKit
 import Lumina
 import LuminaBootable
 
@@ -150,7 +149,7 @@ struct DesktopCreate: AsyncParsableCommand {
 
         // v0.7.1 M3: SHA-256 verification on catalog ISOs. The Desktop
         // wizard has always done this; the CLI parity gap was tracked on
-        // the v0.7.2 runway. If the ISO filename matches a
+        // the v0.7.1 runway. If the ISO filename matches a
         // `DesktopOSCatalog` entry's URL filename, hash the file and
         // compare. Mismatch = refuse to create (same contract the
         // wizard ships). Non-matched ISOs (BYO distros, Windows MSA,
@@ -158,11 +157,11 @@ struct DesktopCreate: AsyncParsableCommand {
         // digest to check against.
         if let iso = isoPath, !noVerifyISO {
             let isoURL = URL(fileURLWithPath: (iso as NSString).expandingTildeInPath)
-            if let entry = DesktopCreate.catalogEntryMatching(isoURL: isoURL) {
+            if let entry = ISOVerifier.catalogEntry(matching: isoURL) {
                 FileHandle.standardError.write(Data(
                     "→ verifying \(entry.displayName) SHA-256 (\(entry.sha256.prefix(8))…)\n".utf8
                 ))
-                let actual = try DesktopCreate.sha256Hex(of: isoURL)
+                let actual = try ISOVerifier.sha256Hex(ofFileAt: isoURL)
                 if actual.lowercased() != entry.sha256.lowercased() {
                     FileHandle.standardError.write(Data("""
                         error: SHA-256 mismatch for \(iso).
@@ -286,39 +285,6 @@ struct DesktopCreate: AsyncParsableCommand {
         }
     }
 
-    // MARK: - v0.7.1 M3: catalog ISO SHA-256 helpers
-
-    /// If the given ISO's filename matches the tail component of any
-    /// `DesktopOSCatalog` entry's URL, return that entry — this is the
-    /// wizard's "you picked a known catalog ISO" signal translated to
-    /// the CLI. No network I/O; pure filename comparison. Returns nil
-    /// for BYO ISOs (no catalog digest to check against).
-    static func catalogEntryMatching(isoURL: URL) -> DesktopOSEntry? {
-        let name = isoURL.lastPathComponent.lowercased()
-        return DesktopOSCatalog.all.first {
-            $0.isoURL.lastPathComponent.lowercased() == name
-        }
-    }
-
-    /// Stream-hash a file with SHA-256 in 4 MB chunks. Matches
-    /// `LuminaDesktopKit/ISOVerifier.verify` byte-for-byte; a deliberate
-    /// duplication because `ISOVerifier` is internal to DesktopKit and
-    /// promoting it to a shared target would touch 5 files + 2 tests
-    /// for no current caller-gain. If the wizard and CLI ever diverge,
-    /// consolidate then.
-    static func sha256Hex(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        return hasher.finalize()
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
 }
 
 // MARK: - desktop boot

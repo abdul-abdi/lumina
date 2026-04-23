@@ -2,6 +2,7 @@
 import ArgumentParser
 import Foundation
 import Lumina
+import LuminaBootable
 
 @main
 struct LuminaCLI: AsyncParsableCommand {
@@ -12,7 +13,7 @@ struct LuminaCLI: AsyncParsableCommand {
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
-                      Desktop.self]
+                      Desktop.self, Doctor.self]
     )
 }
 
@@ -47,6 +48,9 @@ struct Run: AsyncParsableCommand {
 
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
+
+    @Flag(name: .customLong("no-wait-network"), help: "Skip the host-side wait for network_ready. Guest still configures the network concurrently; this just drops the barrier. Only use when you KNOW the command won't touch DNS/TCP in the first ~20ms. Default (await) is now ~50-150ms on v0.7.1+ so the speedup is small and the reliability cost is real.")
+    var noWaitNetwork: Bool = false
 
     func run() async throws {
         installSignalHandlers()
@@ -198,7 +202,8 @@ struct Run: AsyncParsableCommand {
             mounts: parsedMounts,
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
-            stdin: resolveStdin()
+            stdin: resolveStdin(),
+            awaitNetworkReady: !noWaitNetwork
         )
 
         let format = resolveOutputFormat()
@@ -459,6 +464,10 @@ private struct ResultJSON: Encodable {
     // v0.6.0: partial data on error
     var partial_stdout: String?
     var partial_stderr: String?
+    // v0.7.1: per-NIC counter snapshot from the guest. Absent when the
+    // command was shorter than the guest's first metrics tick or on
+    // pre-v0.7.1 agents.
+    var network_metrics: NetworkMetricsSummary?
 }
 
 private func printResultJSON(_ result: RunResult, durationMs: Int) {
@@ -468,7 +477,8 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
         stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
         stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
         exit_code: Int(result.exitCode),
-        duration_ms: durationMs
+        duration_ms: durationMs,
+        network_metrics: result.networkMetrics
     )
     encodeAndPrint(r)
 }
@@ -557,7 +567,8 @@ struct Pull: AsyncParsableCommand {
 struct Images: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Manage cached images",
-        subcommands: [ImageList.self, ImageCreate.self, ImageRemove.self, ImageInspect.self],
+        subcommands: [ImageList.self, ImageCreate.self, ImageRemove.self,
+                      ImageInspect.self, ImageCatalog.self, ImagePull.self],
         defaultSubcommand: ImageList.self
     )
 }
@@ -682,6 +693,137 @@ struct ImageInspect: ParsableCommand {
         if let data = try? encoder.encode(output),
            let str = String(data: data, encoding: .utf8) {
             print(str)
+        }
+    }
+}
+
+// MARK: - Images catalog (v0.7.1: curated agent-path images)
+
+struct ImageCatalog: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "catalog",
+        abstract: "List curated agent-path images publishable via GitHub Releases. See AgentImageCatalog for the canonical list."
+    )
+
+    @Option(name: .long, help: "Filter by tag (e.g. ml, security, baseline).")
+    var tag: String?
+
+    func run() throws {
+        let entries = tag.map { AgentImageCatalog.entries(withTag: $0) }
+            ?? AgentImageCatalog.all
+        let format = resolveOutputFormat()
+        switch format {
+        case .json:
+            struct Row: Encodable {
+                let id, displayName, summary: String
+                let url: String
+                let sha256: String
+                let approximateSize: Int64
+                let tags: [String]
+            }
+            let rows = entries.map { e in
+                Row(id: e.id, displayName: e.displayName, summary: e.summary,
+                    url: e.url.absoluteString, sha256: e.sha256,
+                    approximateSize: e.approximateSize, tags: e.tags)
+            }
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let data = try? enc.encode(rows),
+               let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+        case .text:
+            if entries.isEmpty {
+                print("No catalog entries match.")
+                return
+            }
+            for e in entries {
+                print("\(e.id)")
+                print("  \(e.displayName) · ~\(formatMB(e.approximateSize))")
+                print("  \(e.summary)")
+                if !e.tags.isEmpty {
+                    print("  tags: \(e.tags.joined(separator: ", "))")
+                }
+                print("")
+            }
+        }
+    }
+
+    private func formatMB(_ bytes: Int64) -> String {
+        let mb = Double(bytes) / (1024 * 1024)
+        return String(format: "%.0f MB", mb)
+    }
+}
+
+struct ImagePull: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "pull",
+        abstract: "Pull a curated image from the catalog by id (e.g. `lumina images pull default-baked`). Verifies SHA-256 against the catalog before extracting."
+    )
+
+    @Argument(help: "Catalog id (see `lumina images catalog`).")
+    var id: String
+
+    @Flag(name: .long, help: "Re-download even if the image already exists locally.")
+    var force = false
+
+    func run() async throws {
+        guard let entry = AgentImageCatalog.entry(id: id) else {
+            let ids = AgentImageCatalog.all.map { $0.id }.joined(separator: ", ")
+            FileHandle.standardError.write(Data(
+                "lumina: no catalog entry with id '\(id)'. Known: \(ids)\n".utf8
+            ))
+            throw ExitCode(2)
+        }
+
+        // Refuse to pull entries whose sha256 is still a placeholder —
+        // the catalog reserves identity before an artifact is
+        // published; pulling one before it exists would silently
+        // install a tarball whose integrity we can't verify.
+        let placeholder = String(repeating: "0", count: 64)
+        if entry.sha256.lowercased() == placeholder {
+            FileHandle.standardError.write(Data("""
+                lumina: catalog entry '\(id)' has a placeholder sha256 —
+                the artifact hasn't been published yet. The build-baked-
+                image.yml workflow will attach it to the next tag; until
+                then this pull would install an unverified tarball and
+                is refused.
+
+                """.utf8))
+            throw ExitCode(2)
+        }
+
+        let store = ImageStore()
+        if store.list().contains(id) && !force {
+            print("Image '\(id)' already installed. Use --force to re-pull.")
+            return
+        }
+        if force {
+            store.clean(name: id)
+        }
+
+        // Stream the entry URL through a one-off ImagePuller
+        // configured for THIS entry. Reuses the default puller's
+        // download + tar-hardening path (v0.7.1 flags
+        // --no-same-owner / --no-xattrs / --no-mac-metadata + the
+        // pre-scan for path-traversal members).
+        let puller = ImagePuller(
+            repo: "abdul-abdi/lumina",  // informational; URL is authoritative
+            tag: "catalog-\(entry.id)",
+            assetName: entry.url.lastPathComponent,
+            directURL: entry.url,
+            expectedSHA256: entry.sha256,
+            imageName: entry.id
+        )
+        do {
+            try await puller.pull { msg in
+                FileHandle.standardError.write(Data("\(msg)\n".utf8))
+            }
+            print("Installed '\(entry.id)' at ~/.lumina/images/\(entry.id)/")
+            print("Try: lumina run --image \(entry.id) 'uname -a'")
+        } catch {
+            FileHandle.standardError.write(Data("lumina pull: \(error)\n".utf8))
+            throw ExitCode.failure
         }
     }
 }

@@ -361,3 +361,127 @@ import Testing
         try Protocol.decodeGuest(raw)
     }
 }
+
+@Test func decodePortForwardErrorMessage() throws {
+    let raw = Data(#"{"type":"port_forward_error","guest_port":3000,"reason":"already active"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .portForwardError(guestPort: 3000, reason: "already active"))
+}
+
+@Test func decodePortForwardErrorDefaultsReasonWhenMissing() throws {
+    // Guest-side backwards-compat: if a future refactor ever forgets the
+    // `reason` field, the host must still be able to route the error to
+    // the pending continuation rather than crashing on decode.
+    let raw = Data(#"{"type":"port_forward_error","guest_port":3000}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .portForwardError(guestPort: 3000, reason: "unspecified"))
+}
+
+@Test func decodePortForwardErrorMissingPortThrows() {
+    let raw = Data(#"{"type":"port_forward_error","reason":"already active"}"#.utf8)
+    #expect(throws: LuminaError.self) {
+        try Protocol.decodeGuest(raw)
+    }
+}
+
+// MARK: - v0.7.1 network reliability wire types
+
+@Test func decodeNetworkReadyWithConfigMsAndStage() throws {
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","config_ms":127,"stage":"carrier"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 127, stage: "carrier"))
+}
+
+@Test func decodeNetworkReadyBackwardCompatOldAgent() throws {
+    // v0.7.1 agents emit the old shape without config_ms or stage.
+    // The host must still accept them — old images keep running after
+    // a host upgrade without needing to be rebuilt first.
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 0, stage: ""))
+}
+
+@Test func decodeNetworkReadyTimeoutAnywayStage() throws {
+    // The "timeout-anyway" stage means the guest couldn't verify
+    // carrier within its budget but the route IS installed; the host
+    // can log this as a warning. Explicit test so the string literal
+    // doesn't silently drift between guest + host.
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","stage":"timeout-anyway","config_ms":401}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 401, stage: "timeout-anyway"))
+}
+
+@Test func decodeNetworkErrorMessage() throws {
+    let raw = Data(#"{"type":"network_error","reason":"default route not installed after retries","attempts":3}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkError(reason: "default route not installed after retries", attempts: 3))
+}
+
+@Test func decodeNetworkErrorDefaults() throws {
+    // Missing fields default to "unspecified" / 0 rather than
+    // throwing — the host must still be able to route the error to
+    // the pending configureNetwork continuation even if the guest
+    // emits a degraded payload.
+    let raw = Data(#"{"type":"network_error"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkError(reason: "unspecified", attempts: 0))
+}
+
+// MARK: - v0.7.1 network metrics (4.2)
+
+@Test func decodeNetworkMetricsSingleInterface() throws {
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":1234,"tx_bytes":5678,"rx_errors":0,"tx_errors":2,"rx_packets":10,"tx_packets":8}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    let expected = InterfaceCounters(
+        rxBytes: 1234, txBytes: 5678,
+        rxErrors: 0, txErrors: 2,
+        rxPackets: 10, txPackets: 8
+    )
+    #expect(msg == .networkMetrics(interfaces: ["eth0": expected]))
+}
+
+@Test func decodeNetworkMetricsMultiInterface() throws {
+    // Multi-NIC VMs — the map shape is the reason `iface: String` was
+    // not used. If we ever grow past eth0, this is the test that
+    // proves the decode path handles it without a wire change.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":1,"tx_bytes":2},"eth1":{"rx_bytes":3,"tx_bytes":4}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    guard case .networkMetrics(let interfaces) = msg else {
+        Issue.record("expected networkMetrics case"); return
+    }
+    #expect(interfaces.count == 2)
+    #expect(interfaces["eth0"]?.rxBytes == 1)
+    #expect(interfaces["eth0"]?.txBytes == 2)
+    #expect(interfaces["eth1"]?.rxBytes == 3)
+    #expect(interfaces["eth1"]?.txBytes == 4)
+}
+
+@Test func decodeNetworkMetricsMissingFieldsDefaultToZero() throws {
+    // Forward-compat: a pre-packet-counter agent might ship only bytes
+    // and errors. Missing fields must default to 0, not throw.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":42}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    let expected = InterfaceCounters(rxBytes: 42)
+    #expect(msg == .networkMetrics(interfaces: ["eth0": expected]))
+}
+
+@Test func decodeNetworkMetricsEmptyInterfaces() throws {
+    // The guest legitimately emits an empty map when /proc/net/dev is
+    // read before any interface has come up (early boot race) — treat
+    // as a valid zero-sample, not an error.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkMetrics(interfaces: [:]))
+}
+
+@Test func decodeNetworkMetricsAcceptsLargeCounters() throws {
+    // UInt64 range: a busy long-running session can easily push past
+    // Int32. Verify the decoder doesn't truncate.
+    let big: UInt64 = 10_000_000_000
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":10000000000}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    guard case .networkMetrics(let interfaces) = msg else {
+        Issue.record("expected networkMetrics case"); return
+    }
+    #expect(interfaces["eth0"]?.rxBytes == big)
+}

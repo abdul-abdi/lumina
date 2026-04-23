@@ -148,6 +148,13 @@ public struct RunningVMView: View {
                     .font(LuminaTheme.caption)
                     .foregroundStyle(LuminaTheme.inkDim)
             }
+            // Live phase waterfall — fills in as each phase completes
+            // via the session's bootPhasesMirrorTask. The view itself
+            // renders nothing until the first phase lands, so no empty
+            // frame appears on sessions that boot in <150ms.
+            BootWaterfallView(phases: session.bootPhases)
+                .frame(maxWidth: 520)
+                .padding(.top, 4)
             Spacer()
             serialTailStrip
         }
@@ -243,6 +250,13 @@ public struct RunningVMView: View {
                 }
                 .frame(maxWidth: 520)
             }
+
+            // Post-mortem phase trace — shows which phase was running
+            // when the crash happened. Self-gates on `.isValid` so a
+            // pre-boot crash (disk flock, manifest corruption) renders
+            // nothing rather than a row of zeros.
+            BootWaterfallView(phases: session.bootPhases)
+                .frame(maxWidth: 520)
 
             HStack(spacing: 12) {
                 Button(action: {

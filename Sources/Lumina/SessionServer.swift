@@ -164,6 +164,28 @@ public final class SessionServer: @unchecked Sendable {
             serverFd = -1
             throw LuminaError.sessionFailed("Failed to listen on socket: \(errno)")
         }
+
+        // v0.7.1 isolation probe finding: the socket file inherits the
+        // process umask (0022 on macOS default), landing as 0755. Any
+        // other user on the host could then connect and inject exec
+        // messages into the session. Restrict to owner-only
+        // (rw-------, 0600) after bind. chmod-after-bind is the
+        // documented pattern on Linux/BSD for unix-domain-socket
+        // ACLs; on macOS the socket's filesystem perms are the
+        // authoritative gate for connect().
+        //
+        // Best-effort: a chmod failure is surfaced but not fatal — the
+        // server still works, just with the pre-v0.7.1 permissive
+        // perms on that socket. Paired with the 0700 mode on the
+        // enclosing session directory (see Session.writeMeta), even
+        // chmod failure keeps the socket unreachable from other
+        // users unless the directory's mode was explicitly changed.
+        if chmod(path, 0o600) != 0 {
+            let reason = String(cString: strerror(errno))
+            FileHandle.standardError.write(Data(
+                "lumina: warning: chmod 0600 on \(path) failed: \(reason). Session socket may be world-accessible; enclosing directory mode (0700) is still enforced.\n".utf8
+            ))
+        }
     }
 
     /// Accept a client connection. Blocks until a client connects.

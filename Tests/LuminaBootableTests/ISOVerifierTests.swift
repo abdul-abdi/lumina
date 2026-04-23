@@ -1,13 +1,18 @@
-// Tests/LuminaDesktopKitTests/ISOVerifierTests.swift
+// Tests/LuminaBootableTests/ISOVerifierTests.swift
 //
-// Unit tests for ISOVerifier — proves the wizard's SHA-256 check matches
+// Unit tests for ISOVerifier — proves the shared SHA-256 check matches
 // known-good inputs and rejects everything else. Without these, the
 // catalog's hardcoded digests would be decoration.
+//
+// Moved from LuminaDesktopKitTests in v0.7.1 when ISOVerifier was
+// promoted to LuminaBootable so the CLI (`lumina desktop create`) and
+// Desktop wizard share one implementation instead of maintaining two
+// byte-for-byte duplicates.
 
 import Foundation
 import CryptoKit
 import Testing
-@testable import LuminaDesktopKit
+@testable import LuminaBootable
 
 @Suite struct ISOVerifierTests {
     /// SHA-256 of an empty byte sequence.
@@ -74,6 +79,50 @@ import Testing
             .joined()
         let verdict = await ISOVerifier.verify(at: url, expectedSHA256: oneShot)
         #expect(isMatch(verdict), "12 MB streamed digest must match one-shot hash; got \(verdict)")
+    }
+
+    // MARK: - sha256Hex sync helper (CLI call-site ergonomics)
+
+    @Test func sha256HexMatchesKnownAbcVector() throws {
+        let url = try writeTempFile(data: Data("abc".utf8))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let hex = try ISOVerifier.sha256Hex(ofFileAt: url)
+        #expect(hex == abcDigest)
+    }
+
+    @Test func sha256HexThrowsOnMissingFile() {
+        let missing = URL(fileURLWithPath: "/tmp/definitely-not-a-real-file-\(UUID().uuidString)")
+        #expect(throws: (any Error).self) {
+            _ = try ISOVerifier.sha256Hex(ofFileAt: missing)
+        }
+    }
+
+    // MARK: - catalogEntry(matching:)
+
+    @Test func catalogEntryReturnsEntryForKnownFilename() {
+        // Any catalog entry suffices — the match is by URL tail.
+        guard let first = DesktopOSCatalog.all.first else {
+            Issue.record("catalog is empty; matching test cannot run")
+            return
+        }
+        let synthetic = URL(fileURLWithPath: "/tmp/downloads/\(first.isoURL.lastPathComponent)")
+        let match = ISOVerifier.catalogEntry(matching: synthetic)
+        #expect(match == first, "filename tail '\(first.isoURL.lastPathComponent)' should resolve to its entry")
+    }
+
+    @Test func catalogEntryIsCaseInsensitiveOnFilename() {
+        guard let first = DesktopOSCatalog.all.first else {
+            Issue.record("catalog is empty; matching test cannot run")
+            return
+        }
+        let uppercased = first.isoURL.lastPathComponent.uppercased()
+        let synthetic = URL(fileURLWithPath: "/tmp/\(uppercased)")
+        #expect(ISOVerifier.catalogEntry(matching: synthetic) == first)
+    }
+
+    @Test func catalogEntryReturnsNilForUnknownFilename() {
+        let synthetic = URL(fileURLWithPath: "/tmp/definitely-not-a-catalog-iso.iso")
+        #expect(ISOVerifier.catalogEntry(matching: synthetic) == nil)
     }
 
     // MARK: - helpers

@@ -86,6 +86,43 @@ public final class LuminaDesktopSession: Identifiable {
     public var lastError: String?
     public var bootDuration: Duration?
     public var serialDigest: String = ""
+    /// Per-phase breakdown of the most recent boot — populated from
+    /// `VM.bootPhases` in `boot()` at the success/crash transition.
+    /// `BootPhases()` when no boot has run yet. UI gates on
+    /// `.isValid` to avoid rendering empty rows.
+    public var bootPhases: BootPhases = BootPhases()
+
+    /// Atomic read of every observable session field as a single
+    /// `Sendable`, `Equatable` value. v0.7.1 #21: callers that want a
+    /// consistent view of session state (tests, debug dumps, future
+    /// `lumina ps --verbose`) read this instead of stitching together
+    /// four individual properties at different observation ticks.
+    public var snapshot: SessionSnapshot {
+        SessionSnapshot(
+            status: status,
+            lastError: lastError,
+            bootDuration: bootDuration,
+            serialDigest: serialDigest,
+            bootPhases: bootPhases
+        )
+    }
+
+    /// Atomically apply a snapshot — writes every observable field in
+    /// a single synchronous block so SwiftUI observers see one tick
+    /// containing the full transition, not four separate ticks where
+    /// status briefly desyncs from duration/error.
+    ///
+    /// Each field is only written when it actually differs from the
+    /// current value, so idempotent applies (applyAtomic of the
+    /// current snapshot) don't fire spurious observation ticks.
+    /// v0.7.1 #21.
+    public func applyAtomic(_ next: SessionSnapshot) {
+        if status != next.status { status = next.status }
+        if lastError != next.lastError { lastError = next.lastError }
+        if bootDuration != next.bootDuration { bootDuration = next.bootDuration }
+        if serialDigest != next.serialDigest { serialDigest = next.serialDigest }
+        if bootPhases != next.bootPhases { bootPhases = next.bootPhases }
+    }
 
     /// VZ machine handle, observable so `RunningVMView` renders the
     /// framebuffer the moment it's available. Owned by the session,
@@ -111,6 +148,15 @@ public final class LuminaDesktopSession: Identifiable {
     /// `handleExternalStop()`.
     private var serialMirrorTask: Task<Void, Never>?
 
+    /// Polling task that mirrors `VM.bootPhases` into `bootPhases` so
+    /// the waterfall UI renders phase bars as they complete, not just
+    /// as a post-boot snapshot. Lifecycle-scoped to a single boot: set
+    /// up at boot() entry, cancelled the moment boot() returns (success
+    /// or failure), because after boot completes the phases are frozen
+    /// and the final `applyAtomic` is the authoritative write.
+    /// v0.7.1 feature 3.2.
+    private var bootPhasesMirrorTask: Task<Void, Never>?
+
     public init(bundle: VMBundle) {
         self.id = bundle.manifest.id
         self.bundle = bundle
@@ -120,8 +166,17 @@ public final class LuminaDesktopSession: Identifiable {
         // Re-entry guard — see `Status.canBoot` for the full rationale.
         guard status.canBoot else { return }
 
-        status = .booting
-        lastError = nil
+        // Enter .booting with a clean error slate in a single tick.
+        // Two separate assignments previously meant observers could
+        // see `.booting` paired with a stale `lastError` from a prior
+        // crashed boot — tiny window but a real impossible-state.
+        applyAtomic(SessionSnapshot(
+            status: .booting,
+            lastError: nil,
+            bootDuration: bootDuration,
+            serialDigest: serialDigest,
+            bootPhases: BootPhases()
+        ))
         let start = ContinuousClock.now
 
         // Reload the bundle from disk so we see any manifest mutations
@@ -215,8 +270,13 @@ public final class LuminaDesktopSession: Identifiable {
         self.vm = newVM
         await newVM.setDelegate(forwarder)
         startSerialMirror(for: newVM)
+        startBootPhasesMirror(for: newVM)
         do {
             try await newVM.boot()
+            // Final authoritative phase snapshot; stop the poll task
+            // so the post-boot `applyAtomic` below is the last writer.
+            bootPhasesMirrorTask?.cancel()
+            bootPhasesMirrorTask = nil
             // Grab the VZ handle and publish it BEFORE flipping status
             // to `.running`. Observing views read `status` AND
             // `vzMachine` in the same body — if we flipped status
@@ -226,8 +286,21 @@ public final class LuminaDesktopSession: Identifiable {
             // land in the same observation tick.
             let handle = await newVM.vzMachine()
             self.vzMachine = handle.machine
-            self.status = .running
-            self.bootDuration = ContinuousClock.now - start
+            // Snapshot the per-phase boot timings so the waterfall UI
+            // has the full breakdown in the same tick status flips to
+            // `.running`. Agent path populates every phase; EFI path
+            // fills configMs/vzStartMs/totalMs and leaves the rest 0.
+            let phases = await newVM.bootPhases
+            // Land status + bootDuration + phases in a single observation
+            // tick so the UI never renders `.running` with a nil duration
+            // (or the previous run's phases).
+            applyAtomic(SessionSnapshot(
+                status: .running,
+                lastError: nil,
+                bootDuration: ContinuousClock.now - start,
+                serialDigest: serialDigest,
+                bootPhases: phases
+            ))
             // Persist lastBootedAt. On the very first successful boot we
             // also detach the installer ISO sidecar — the install has
             // completed and EFI now prefers the HDD, so keeping the CD-ROM
@@ -235,6 +308,11 @@ public final class LuminaDesktopSession: Identifiable {
             // forever. Both writes are non-fatal.
             persistBootRecord()
         } catch {
+            bootPhasesMirrorTask?.cancel()
+            bootPhasesMirrorTask = nil
+            // Best-effort phase snapshot before tearing down — useful
+            // diagnostic even on a crash. Zero-value on early failures.
+            let partialPhases = await self.vm?.bootPhases ?? BootPhases()
             self.vm = nil
             self.vmDelegate = nil
             self.vzMachine = nil
@@ -246,10 +324,21 @@ public final class LuminaDesktopSession: Identifiable {
                 // path has already torn down the VZ machine, released the
                 // disk `flock()`, and closed serial pipes. Treat this as a
                 // clean stop so the re-entry guard allows a retry.
-                self.status = .stopped
+                applyAtomic(SessionSnapshot(
+                    status: .stopped,
+                    lastError: nil,
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest,
+                    bootPhases: partialPhases
+                ))
             } else {
-                self.status = .crashed(reason: "\(error)")
-                self.lastError = "\(error)"
+                applyAtomic(SessionSnapshot(
+                    status: .crashed(reason: "\(error)"),
+                    lastError: "\(error)",
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest,
+                    bootPhases: partialPhases
+                ))
             }
         }
     }
@@ -318,15 +407,31 @@ public final class LuminaDesktopSession: Identifiable {
         }
         serialMirrorTask?.cancel()
         serialMirrorTask = nil
+        bootPhasesMirrorTask?.cancel()
+        bootPhasesMirrorTask = nil
 
         vmDelegate = nil
         vzMachine = nil
         vm = nil
+        // Atomic transition — crashed(reason) must not be observed
+        // without lastError populated, and stopped must not carry a
+        // stale lastError from a prior crash. Single observation tick.
         if let reason {
-            status = .crashed(reason: reason)
-            lastError = reason
+            applyAtomic(SessionSnapshot(
+                status: .crashed(reason: reason),
+                lastError: reason,
+                bootDuration: bootDuration,
+                serialDigest: serialDigest,
+                bootPhases: bootPhases
+            ))
         } else {
-            status = .stopped
+            applyAtomic(SessionSnapshot(
+                status: .stopped,
+                lastError: nil,
+                bootDuration: bootDuration,
+                serialDigest: serialDigest,
+                bootPhases: bootPhases
+            ))
         }
     }
 
@@ -337,18 +442,56 @@ public final class LuminaDesktopSession: Identifiable {
     /// the graphics driver claims the display). After the framebuffer
     /// lights up the tail collapses in the UI but stays live so a
     /// later crash preserves the last-known-good diagnostic lines.
+    ///
+    /// **Back-pressure:** the loop captures `VM.serialVersion` each tick
+    /// and short-circuits the tail+strip+publish pipeline when it hasn't
+    /// changed since the previous iteration. An idle VM (no new serial
+    /// output — common on a quiescent `.booting` waiting on DHCP or a
+    /// `.crashed` post-mortem) ends up doing one actor hop + one
+    /// `UInt64` read + one equality check per 250ms tick instead of
+    /// copying the megabyte ring buffer and running it through the ANSI
+    /// stripper. This keeps SwiftUI's differ from spinning on identical
+    /// strings for seconds at a time. Issue #27.
     private func startSerialMirror(for vm: VM) {
         serialMirrorTask?.cancel()
         serialMirrorTask = Task { [weak self] in
+            var lastVersion: UInt64 = 0
             while !Task.isCancelled {
-                let tail = await vm.serialTail(lines: 12)
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    if self.serialDigest != tail {
-                        self.serialDigest = tail
+                let version = await vm.serialVersion
+                if version != lastVersion {
+                    lastVersion = version
+                    let tail = await vm.serialTail(lines: 12)
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        if self.serialDigest != tail {
+                            self.serialDigest = tail
+                        }
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    /// Poll `VM.bootPhases` every 150ms and mirror non-empty snapshots
+    /// into `self.bootPhases` so the waterfall UI in the booting
+    /// screen fills in as each phase completes. 150ms gives the user
+    /// a noticeable "filling in" motion on a 680ms cold boot without
+    /// thrashing the actor. Exits cleanly on the first `applyAtomic`
+    /// that would overwrite with equal values (Equatable check inside
+    /// applyAtomic); caller cancels the task on boot completion.
+    private func startBootPhasesMirror(for vm: VM) {
+        bootPhasesMirrorTask?.cancel()
+        bootPhasesMirrorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let phases = await vm.bootPhases
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    if self.bootPhases != phases {
+                        self.bootPhases = phases
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(150))
             }
         }
     }
@@ -362,6 +505,8 @@ public final class LuminaDesktopSession: Identifiable {
         vmDelegate = nil
         serialMirrorTask?.cancel()
         serialMirrorTask = nil
+        bootPhasesMirrorTask?.cancel()
+        bootPhasesMirrorTask = nil
         if let vm = self.vm {
             await vm.setDelegate(nil)
             await vm.shutdown()

@@ -393,7 +393,7 @@ public struct VMCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .animation(.easeOut(duration: 0.14), value: isHovering)
         .onHover { isHovering = $0 }
-        .onTapGesture { openWindow() }
+        .onTapGesture { activate() }
         .onDisappear { stats.stop() }
         .contextMenu {
             Button("Open") { openWindow() }
@@ -404,6 +404,19 @@ public struct VMCard: View {
             Button("Move to Trash", role: .destructive) {
                 model.deleteBundle(bundle)
             }
+        }
+    }
+
+    /// Primary tap action on a card. Opens the VM window in every case;
+    /// when the VM is idle (`.stopped` or `.crashed`) also kicks off
+    /// `boot()` so the user doesn't have to click into a dedicated boot
+    /// screen first. Mirrors the behaviour of `VMActionButton`'s boot
+    /// path (open window first so the booting-screen → framebuffer
+    /// handoff is visible, then boot).
+    private func activate() {
+        openWindow()
+        if session.status.canBoot {
+            Task { await session.boot() }
         }
     }
 

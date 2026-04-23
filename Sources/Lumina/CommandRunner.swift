@@ -46,6 +46,13 @@ final class CommandRunner: @unchecked Sendable {
     // ── Network readiness: one-shot continuation for configure_network flow ──
     private var networkContinuation: CheckedContinuation<GuestMessage, Error>?
 
+    // ── Network metrics: latest snapshot from guest ticker ──
+    // Updated every time a `network_metrics` frame arrives. Read by
+    // exec() at return time so RunResult carries "what was the state when
+    // the command finished." nil means no metrics ever arrived (short
+    // command beat the ticker's 500ms initial delay, or legacy agent).
+    private var _latestNetworkMetrics: NetworkMetricsSummary?
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -59,6 +66,15 @@ final class CommandRunner: @unchecked Sendable {
     private static let vsockPort: UInt32 = 1024
     private static let maxRetries = 2000     // 2000 * 10ms = 20s max
     private static let retryInterval: UInt64 = 10_000_000  // 10ms — shaves ~10-15ms off cold boot (prev 20ms)
+
+    /// Latest network metrics snapshot seen on this connection. nil when no
+    /// metrics have arrived yet (short command + 500ms ticker delay, or
+    /// pre-v0.7.1 agent with no ticker). Thread-safe read.
+    var latestNetworkMetrics: NetworkMetricsSummary? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _latestNetworkMetrics
+    }
 
     var state: ConnectionState {
         lock.lock()
@@ -219,7 +235,8 @@ final class CommandRunner: @unchecked Sendable {
                     exitCode: code,
                     wallTime: .zero,
                     stdoutBytes: stdoutBytes,
-                    stderrBytes: stderrBytes
+                    stderrBytes: stderrBytes,
+                    networkMetrics: latestNetworkMetrics
                 )
             case .heartbeat:
                 continue
@@ -538,7 +555,12 @@ final class CommandRunner: @unchecked Sendable {
     /// Send network configuration to the guest and wait for network_ready.
     /// The guest applies IP/route/DNS synchronously, then polls carrier.
     /// Waiting ensures DNS is in place before any exec command starts.
-    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) {
+    /// Returns the guest's self-reported config duration and which gate
+    /// fired (`"operstate"`, `"carrier"`, or `"timeout-anyway"` — the
+    /// last meaning the route is verified but the carrier poll gave up
+    /// waiting). Old agents omit these fields; the decoder defaults
+    /// `configMs` to 0 and `stage` to "" in that case.
+    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) -> (configMs: Int, stage: String) {
         let msg = HostMessage.configureNetwork(ip: ip, gateway: gateway, dns: dns)
         let msgData: Data
         do {
@@ -548,12 +570,12 @@ final class CommandRunner: @unchecked Sendable {
         }
 
         // Register continuation BEFORE sending the message to avoid a race
-        // where the guest replies before we're ready to receive. We don't
-        // use the returned GuestMessage — just the synchronization — but
-        // the throwing continuation lets teardown surface as a real error
+        // where the guest replies before we're ready to receive. The
+        // throwing continuation lets teardown surface as a real error
         // instead of a synthetic `.networkReady(ip:"")` success.
+        let reply: GuestMessage
         do {
-            _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
+            reply = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
                 lock.lock()
                 networkContinuation = cont
                 lock.unlock()
@@ -574,6 +596,10 @@ final class CommandRunner: @unchecked Sendable {
             throw .connectionFailed
         }
         // network_ready received; DNS, route, and IP are now live on the guest.
+        if case .networkReady(_, let configMs, let stage) = reply {
+            return (configMs: configMs, stage: stage)
+        }
+        return (configMs: 0, stage: "")
     }
 
     // MARK: - Port Forwarding (host-driven)
@@ -840,11 +866,39 @@ final class CommandRunner: @unchecked Sendable {
             networkContinuation = nil
             lock.unlock()
             cont?.resume(returning: msg)
+        case .networkError(let reason, let attempts):
+            // Guest couldn't bring up eth0 even after retries — the
+            // route isn't installed, DNS won't resolve. Surface this
+            // as a typed error to the waiting configureNetwork()
+            // caller so the user sees "network setup failed: <reason>"
+            // instead of a silent success followed by exec errors.
+            lock.lock()
+            let cont = networkContinuation
+            networkContinuation = nil
+            lock.unlock()
+            cont?.resume(throwing: LuminaError.protocolError(
+                "guest network setup failed after \(attempts) attempt(s): \(reason)"
+            ))
+        case .networkMetrics(let interfaces):
+            lock.lock()
+            _latestNetworkMetrics = NetworkMetricsSummary(interfaces: interfaces)
+            lock.unlock()
         case .portForwardReady(let guestPort, let vsockPort):
             lock.lock()
             let cont = portForwardContinuations.removeValue(forKey: guestPort)
             lock.unlock()
             cont?.resume(returning: vsockPort)
+        case .portForwardError(let guestPort, let reason):
+            // Guest refused the forward (double-start collision, vsock
+            // bind failure, port space exhausted). Resume the caller
+            // with a clear protocol error instead of letting them time
+            // out on a forward that will never arrive.
+            lock.lock()
+            let cont = portForwardContinuations.removeValue(forKey: guestPort)
+            lock.unlock()
+            cont?.resume(throwing: LuminaError.protocolError(
+                "port_forward refused by guest for guest_port=\(guestPort): \(reason)"
+            ))
         case .ready:
             // Unexpected ready during active connection — ignore
             break

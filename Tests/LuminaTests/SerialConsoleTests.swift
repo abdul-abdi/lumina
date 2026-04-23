@@ -33,3 +33,46 @@ import Testing
     console.append(Data("lumina-agent starting\n".utf8))
     #expect(console.agentStarted)
 }
+
+@Test func serialConsoleVersionMonotonic() async {
+    let console = SerialConsole()
+    // Fresh console: version starts at 0.
+    #expect(console.version == 0)
+
+    console.append(Data("line 1\n".utf8))
+    let v1 = console.version
+    #expect(v1 == 1)
+
+    console.append(Data("line 2\n".utf8))
+    let v2 = console.version
+    #expect(v2 > v1)
+
+    // Empty appends must not bump the version — back-pressure
+    // contract: readers rely on `version` changing iff new bytes
+    // actually landed in the buffer. An empty append is a no-op,
+    // and a reader who polls between two no-ops should skip its
+    // whole pipeline.
+    console.append(Data())
+    #expect(console.version == v2)
+}
+
+@Test func serialConsoleVersionMonotonicUnderConcurrentAppend() async {
+    let console = SerialConsole()
+    let payload = Data("x\n".utf8)
+    let perTask = 250
+    let taskCount = 8
+
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<taskCount {
+            group.addTask {
+                for _ in 0..<perTask {
+                    console.append(payload)
+                }
+            }
+        }
+    }
+
+    // Every successful append bumped the counter exactly once.
+    // Under the lock, this is the exact append count and nothing less.
+    #expect(console.version == UInt64(taskCount * perTask))
+}

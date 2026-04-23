@@ -86,7 +86,35 @@ jobs:
           cd Guest/lumina-agent
           GOOS=linux GOARCH=arm64 go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /dev/null .
-          echo "Guest agent: vet OK, build OK"
+          # Cross-compile every _test.go (including the Linux-only
+          # ptymgr suite) against linux/arm64 so guest-only test drift
+          # surfaces here. Binaries discarded; pure compile gate.
+          for pkg in ./internal/portfwd ./internal/ptymgr ./internal/execmgr ./internal/wire ./internal/protocol; do
+            GOOS=linux GOARCH=arm64 go test -c -o /dev/null "$pkg"
+          done
+          echo "Guest agent: vet OK, build OK, tests cross-compile OK"
+
+      - name: Run platform-neutral guest-agent tests
+        # Tests for packages that don't depend on Linux-only syscalls
+        # (portfwd's port-allocation logic, execmgr's exec lifecycle
+        # over os/exec, wire NDJSON framer, protocol round-trips) run
+        # on the macOS runner with the default GOOS=darwin. The
+        # execmgr suite is the v0.7.1 heartbeat-failure regression
+        # gate — KillAll MUST tear down all in-flight commands, and
+        # that test runs here on every PR.
+        #
+        # Linux-only tests (ptymgr PTY allocation path, vsock Accept)
+        # compile-check above and execute inside a Lumina VM via
+        # `make test-guest-in-vm` (local-dev target) until a dedicated
+        # ubuntu-arm64 runner lands.
+        run: |
+          cd Guest/lumina-agent
+          go test \
+            ./internal/portfwd/... \
+            ./internal/execmgr/... \
+            ./internal/wire/... \
+            ./internal/protocol/... \
+            -count=1 -timeout 60s
 
       # Agent-boot regression gate — v0.7.0 discipline.
       #
@@ -186,3 +214,17 @@ jobs:
             exit 1
           fi
           echo "::notice::Agent-boot gate passed (${MEDIAN}ms / ${AGENT_BOOT_P50_MAX_MS}ms budget)."
+
+      # v0.7.1 #19: behaviour-level cancellation tests exist at
+      # Tests/LuminaTests/CancellationIntegrationTests.swift and can be
+      # run locally via `make test-cancellation`. They are NOT run in
+      # this CI workflow because the hosted macos-15 runner's test
+      # bundle loses its Virtualization entitlement during swift-test's
+      # implicit rebuild, causing VZErrorDomain Code 2 on every boot.
+      # A reliable CI run needs either:
+      #   - a self-hosted runner with persistent codesigned bundles, or
+      #   - a post-build hook that re-signs .build/debug/LuminaPackageTests.xctest
+      #     AFTER swift-test's rebuild-before-run pass (which the stock
+      #     SPM toolchain does not expose today).
+      # Tracked as a v0.7.2 follow-up. The tests still gate locally and
+      # on self-hosted runners via LUMINA_INTEGRATION_TESTS=1.

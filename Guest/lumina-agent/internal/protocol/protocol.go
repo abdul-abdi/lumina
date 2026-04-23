@@ -29,6 +29,8 @@ const (
 	TypeCancel           = "cancel"
 	TypeConfigureNetwork = "configure_network"
 	TypeNetworkReady     = "network_ready"
+	TypeNetworkError     = "network_error"
+	TypeNetworkMetrics   = "network_metrics"
 
 	TypeUpload        = "upload"
 	TypeUploadAck     = "upload_ack"
@@ -46,6 +48,7 @@ const (
 	TypePortForwardStart = "port_forward_start"
 	TypePortForwardStop  = "port_forward_stop"
 	TypePortForwardReady = "port_forward_ready"
+	TypePortForwardError = "port_forward_error"
 )
 
 // Stream names used in OutputMsg.
@@ -178,6 +181,56 @@ func NewExit(id string, code int) ExitMsg {
 type NetworkReadyMsg struct {
 	Type string `json:"type"`
 	IP   string `json:"ip"`
+	// ConfigMs is the wall-clock time from configure_network receipt
+	// to network_ready emission on the guest. Host uses this to
+	// populate BootPhases.networkReadyMs without round-trip jitter
+	// contaminating the measurement.
+	ConfigMs int `json:"config_ms,omitempty"`
+	// Stage annotates which readiness gate fired: "operstate",
+	// "carrier", "route-verified", or "timeout-anyway". "timeout-
+	// anyway" means the guest shipped network_ready on the
+	// defensive fallback; host should treat this as a warning
+	// signal, not a hard guarantee. Absent on pre-v0.7.1 agents.
+	Stage string `json:"stage,omitempty"`
+}
+
+// InterfaceCounters is the per-NIC counter snapshot shipped inside
+// NetworkMetricsMsg. Values are cumulative since interface-up, read
+// straight from /proc/net/dev — the same numbers `ifconfig`/`ip -s`
+// would show. Hosts compute deltas themselves if they want per-
+// interval throughput.
+type InterfaceCounters struct {
+	RxBytes   uint64 `json:"rx_bytes"`
+	TxBytes   uint64 `json:"tx_bytes"`
+	RxErrors  uint64 `json:"rx_errors"`
+	TxErrors  uint64 `json:"tx_errors"`
+	RxPackets uint64 `json:"rx_packets"`
+	TxPackets uint64 `json:"tx_packets"`
+}
+
+// NetworkMetricsMsg is a periodic snapshot of guest-side network
+// counters. The map-shaped `interfaces` field is intentional: multi-
+// NIC VMs are a foreseeable future, and renaming a singular `iface`
+// field later would break the protocol. `lo` is excluded — consumers
+// care about externally-visible traffic, not loopback.
+type NetworkMetricsMsg struct {
+	Type       string                       `json:"type"`
+	Interfaces map[string]InterfaceCounters `json:"interfaces"`
+}
+
+// NetworkErrorMsg signals the guest failed to bring up the network.
+// Sent when the `ip -batch` command failed AND the individual retry
+// attempts also failed — the interface is unusable. Host propagates
+// this to the waiting configureNetwork() caller as a typed error.
+// Distinct from "timeout-anyway" which means network_ready fired on
+// a softer guarantee; NetworkErrorMsg means the setup itself broke.
+type NetworkErrorMsg struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+	// Attempts is how many retries the guest made before giving up.
+	// Diagnostic only; host uses it for log prefix, not for retry
+	// logic.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 type UploadAckMsg struct {
@@ -220,4 +273,20 @@ type PortForwardReadyMsg struct {
 	Type      string `json:"type"`
 	GuestPort int    `json:"guest_port"`
 	VsockPort int    `json:"vsock_port"`
+}
+
+// PortForwardErrorMsg signals the guest couldn't establish a forward.
+// Sent in response to a PortForwardStartMsg that collided with an
+// existing forward on the same guest port, or when the guest-side
+// vsock bind failed. The host dispatches this to the pending
+// portForwardContinuation and surfaces the reason to the caller.
+//
+// Reasons are human-readable strings — callers should not parse them,
+// they are for logs and error messages. Well-known values today:
+//   - "already active"    : host sent start twice for the same port
+//   - "vsock listen"      : guest-side vsock bind failed
+type PortForwardErrorMsg struct {
+	Type      string `json:"type"`
+	GuestPort int    `json:"guest_port"`
+	Reason    string `json:"reason"`
 }

@@ -12,17 +12,34 @@ public struct ImagePuller: Sendable {
     private let tag: String
     private let assetName: String
     private let imageStore: ImageStore
+    /// When set, download this URL directly instead of constructing
+    /// one from repo/tag/assetName. Used by `lumina images pull <id>`
+    /// against the catalog.
+    private let directURL: URL?
+    /// When set, verify the downloaded tarball matches this digest
+    /// before extraction. Refuses to install a mismatched tarball
+    /// even if --force is set.
+    private let expectedSHA256: String?
+    /// When set, install into ~/.lumina/images/<imageName>/ instead
+    /// of the default `default/`.
+    private let imageName: String?
 
     public init(
         repo: String = ImagePuller.defaultRepo,
         tag: String = ImagePuller.defaultTag,
         assetName: String = ImagePuller.defaultAssetName,
-        imageStore: ImageStore = ImageStore()
+        imageStore: ImageStore = ImageStore(),
+        directURL: URL? = nil,
+        expectedSHA256: String? = nil,
+        imageName: String? = nil
     ) {
         self.repo = repo
         self.tag = tag
         self.assetName = assetName
         self.imageStore = imageStore
+        self.directURL = directURL
+        self.expectedSHA256 = expectedSHA256
+        self.imageName = imageName
     }
 
     /// Check if the default image is already available.
@@ -33,11 +50,20 @@ public struct ImagePuller: Sendable {
     /// Pull the default image from GitHub Releases.
     /// Downloads the tarball, verifies integrity, extracts vmlinuz + initrd + rootfs.img.
     public func pull(
-        name: String = "default",
+        name requestedName: String = "default",
         progress: @Sendable (_ message: String) -> Void = { _ in }
     ) async throws(LuminaError) {
-        let releaseURL = "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)"
-        progress("Downloading \(assetName) from \(repo) (\(tag))...")
+        // Resolve destination name and download URL. Catalog pulls
+        // override both via init; defaults preserve v0.5.0 behaviour.
+        let name = imageName ?? requestedName
+        let releaseURL: String
+        if let directURL {
+            releaseURL = directURL.absoluteString
+            progress("Downloading \(directURL.lastPathComponent) → image '\(name)'...")
+        } else {
+            releaseURL = "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)"
+            progress("Downloading \(assetName) from \(repo) (\(tag))...")
+        }
 
         // 1. Download the tarball
         let downloadedFile: URL
@@ -64,9 +90,19 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 3. Compute SHA256 for verification logging
+        // 3. Compute SHA256 and verify against expected when set
+        //    (catalog pulls). Mismatch = refuse to install even if
+        //    the caller passed --force.
         let sha256 = hashFile(at: downloadedFile)
         progress("Downloaded \(formatBytes(fileSize)) (SHA256: \(sha256.prefix(12))...)")
+        if let expected = expectedSHA256 {
+            if sha256.lowercased() != expected.lowercased() {
+                throw .imageNotFound(
+                    "SHA-256 mismatch for downloaded tarball. expected=\(expected), actual=\(sha256). Refusing to install."
+                )
+            }
+            progress("SHA-256 verified against catalog entry.")
+        }
 
         // 4. Prepare image directory (clean if partial previous attempt)
         let imageDir = imageStore.baseDir.appendingPathComponent(name)
@@ -79,10 +115,63 @@ public struct ImagePuller: Sendable {
             throw .imageNotFound("Cannot create image directory: \(error.localizedDescription)")
         }
 
-        // 5. Extract tarball
+        // 5. Pre-scan tarball for path-traversal attempts before extraction.
+        //    BSD tar on macOS rejects `..` members by default, but relying on
+        //    the default is defence-in-depth-zero. List the archive first
+        //    and refuse any member whose normalised path escapes imageDir.
+        //    Cheap: `tar -tzf` reads the member list without extracting;
+        //    bounded by the number of members (a few for an image tarball).
+        progress("Verifying tarball members...")
+        let listResult = runProcess(
+            "/usr/bin/tar", arguments: ["-tzf", downloadedFile.path]
+        )
+        guard listResult.exitCode == 0 else {
+            try? FileManager.default.removeItem(at: imageDir)
+            throw .imageNotFound(
+                "Tarball listing failed (exit \(listResult.exitCode)): \(listResult.stderr)"
+            )
+        }
+        for member in listResult.stdout.split(separator: "\n") {
+            // Reject absolute paths and any member containing `..` segments.
+            let path = String(member).trimmingCharacters(in: .whitespaces)
+            if path.isEmpty { continue }
+            if path.hasPrefix("/") {
+                try? FileManager.default.removeItem(at: imageDir)
+                throw .imageNotFound(
+                    "Tarball contains absolute path: \(path). Refusing to extract."
+                )
+            }
+            // Split on `/` and reject any `..` component after normalisation.
+            let parts = path.split(separator: "/")
+            if parts.contains(where: { $0 == ".." }) {
+                try? FileManager.default.removeItem(at: imageDir)
+                throw .imageNotFound(
+                    "Tarball contains path-traversal member: \(path). Refusing to extract."
+                )
+            }
+        }
+
+        // 6. Extract tarball. Belt-and-suspenders flags:
+        //    --no-same-owner    — drop uid/gid from archive; ignores root-
+        //                         owned members shipped in the tarball.
+        //    --no-xattrs        — strip extended attributes (no SELinux
+        //                         labels, no immutable flags leaking in).
+        //    --no-mac-metadata  — drop macOS-specific AppleDouble/resource-
+        //                         fork metadata (irrelevant for a Linux
+        //                         image anyway).
+        //    Plus the path-traversal pre-scan above, this closes the
+        //    trust-boundary surface called out in the v0.7.1 isolation
+        //    probe findings.
         progress("Extracting to \(imageDir.path)...")
         let tarResult = runProcess(
-            "/usr/bin/tar", arguments: ["xzf", downloadedFile.path, "-C", imageDir.path]
+            "/usr/bin/tar",
+            arguments: [
+                "xzf", downloadedFile.path,
+                "-C", imageDir.path,
+                "--no-same-owner",
+                "--no-xattrs",
+                "--no-mac-metadata",
+            ]
         )
 
         guard tarResult.exitCode == 0 else {
@@ -185,21 +274,25 @@ public struct ImagePuller: Sendable {
 
     private func runProcess(
         _ path: String, arguments: [String]
-    ) -> (exitCode: Int32, stderr: String) {
+    ) -> (exitCode: Int32, stderr: String, stdout: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
         let stderrPipe = Pipe()
+        let stdoutPipe = Pipe()
         process.standardError = stderrPipe
+        process.standardOutput = stdoutPipe
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
-            return (-1, error.localizedDescription)
+            return (-1, error.localizedDescription, "")
         }
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
         let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-        return (process.terminationStatus, stderr)
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        return (process.terminationStatus, stderr, stdout)
     }
 
     private func formatBytes(_ bytes: Int) -> String {

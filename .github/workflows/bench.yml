@@ -1,0 +1,246 @@
+name: Bench (trend)
+
+# Boot-time performance trend tracker. Runs on schedule + workflow_dispatch
+# + push to main. Collects P50/P95/P99 over 20 iterations of `lumina run`
+# in two modes (default-await-network, --no-wait-network) and appends a
+# JSONL row to the `gh-pages` branch at `metrics.jsonl`.
+#
+# This is INFORMATIONAL-ONLY. It does not gate PRs — the hard regression
+# gate lives in ci.yml (median-of-5 under 2000ms). This workflow tracks
+# drift over time so we can see the 680ms-class numbers trend the way
+# we expect on the canonical runner.
+#
+# Methodology caveats (intentionally explicit):
+#   - GitHub-hosted macos-15 runners are shared VMs; run-to-run variance
+#     is 20-30% even on the same commit. Treat single-run deltas as
+#     noise; look at weekly windows.
+#   - P99 at n=20 is fragile. It's published to show the long-tail
+#     shape, not as a metric to tune against.
+
+on:
+  schedule:
+    # Weekly, Monday 08:00 UTC. Runs after weekend noise settles;
+    # early enough in the UK work day to catch a regression before
+    # the week's merges pile up.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Only trigger on changes that could move boot time. Avoids
+    # wasting runner minutes on README/test-only commits.
+    paths:
+      - "Sources/**"
+      - "Guest/lumina-agent/**"
+      - "Package.swift"
+      - ".github/workflows/bench.yml"
+
+concurrency:
+  # Single-run queue. Sequential push to gh-pages would conflict under
+  # concurrency; the queue makes the append serial.
+  group: bench-main
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: Cold-boot trend
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      LUMINA_BASELINE_IMAGE_URL: "https://github.com/abdul-abdi/lumina/releases/download/lumina-v0.6.0/lumina-image-default.tar.gz"
+      BENCH_ITERATIONS: "20"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+            .build
+          key: spm-bench-${{ runner.os }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
+          restore-keys: |
+            spm-bench-${{ runner.os }}-
+            spm-${{ runner.os }}-
+
+      - name: Build release + codesign
+        run: |
+          swift build -c release
+          BIN_PATH=$(swift build -c release --show-bin-path)/lumina
+          codesign --entitlements lumina.entitlements --force -s - "$BIN_PATH"
+          echo "BIN_PATH=$BIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Download baseline image
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/lumina-image.tar.gz "$LUMINA_BASELINE_IMAGE_URL"
+          mkdir -p "$HOME/.lumina/images/default"
+          tar xzf /tmp/lumina-image.tar.gz -C "$HOME/.lumina/images/default"
+
+      - name: Verify runner is VZ-capable
+        id: probe
+        run: |
+          set -euo pipefail
+          # Same capability probe ci.yml uses — if this runner can't nest
+          # VZ we skip the bench entirely rather than publishing nonsense.
+          OUT="$("$BIN_PATH" run "true" 2>&1 || true)"
+          SUCCESS_MS="$(printf '%s' "$OUT" | jq -r '
+            select((.error // null) == null and (.exit_code // -1) == 0)
+            | .duration_ms // empty
+          ' 2>/dev/null || true)"
+          if [ -z "$SUCCESS_MS" ]; then
+            echo "::notice::Bench skipped: Virtualization unavailable on this runner."
+            printf '%s\n' "$OUT" | head -20
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect samples
+        if: steps.probe.outputs.skip != '1'
+        id: samples
+        run: |
+          set -euo pipefail
+
+          collect() {
+            # Usage: collect <mode-label> <extra-flags...>
+            # Emits one line per iteration: "<ms>" to stdout.
+            local label="$1"; shift
+            local extra=("$@")
+            for i in $(seq 1 "$BENCH_ITERATIONS"); do
+              OUT="$("$BIN_PATH" run "${extra[@]}" "true" 2>&1 || true)"
+              MS="$(printf '%s' "$OUT" | jq -r '
+                select((.error // null) == null and (.exit_code // -1) == 0)
+                | .duration_ms // empty
+              ' 2>/dev/null || true)"
+              if [ -z "$MS" ]; then
+                echo "::error::[$label] iter $i: boot failed" >&2
+                printf '%s\n' "$OUT" | head -10 >&2
+                return 1
+              fi
+              echo "$MS"
+            done
+          }
+
+          # Two modes, distinct distributions. Store samples so the
+          # percentile step can compute independently for each.
+          collect default > /tmp/samples-default.txt
+          collect no-wait --no-wait-network > /tmp/samples-no-wait.txt
+
+          echo "default samples:"
+          cat /tmp/samples-default.txt
+          echo "no-wait samples:"
+          cat /tmp/samples-no-wait.txt
+
+      - name: Compute percentiles + build JSONL row
+        if: steps.probe.outputs.skip != '1'
+        id: metrics
+        run: |
+          set -euo pipefail
+
+          # percentile <file> <p>  where p ∈ [0, 100]
+          # nearest-rank method (no interpolation) — conservative, matches
+          # what most ops dashboards report. With n=20, distinct rank per
+          # percentile: p50 → rank 10, p95 → rank 19, p99 → rank 20.
+          percentile() {
+            local file="$1" p="$2"
+            local n
+            n=$(wc -l < "$file" | tr -d ' ')
+            # rank = ceil(p/100 * n), 1-indexed into the sorted list
+            local rank
+            rank=$(awk -v p="$p" -v n="$n" 'BEGIN{
+              r = int((p/100)*n + 0.9999999);
+              if (r < 1) r = 1;
+              if (r > n) r = n;
+              print r;
+            }')
+            sort -n "$file" | sed -n "${rank}p"
+          }
+
+          D_P50="$(percentile /tmp/samples-default.txt 50)"
+          D_P95="$(percentile /tmp/samples-default.txt 95)"
+          D_P99="$(percentile /tmp/samples-default.txt 99)"
+          N_P50="$(percentile /tmp/samples-no-wait.txt 50)"
+          N_P95="$(percentile /tmp/samples-no-wait.txt 95)"
+          N_P99="$(percentile /tmp/samples-no-wait.txt 99)"
+
+          COMMIT="${GITHUB_SHA}"
+          SHORT="${COMMIT:0:7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          RUNNER="macos-15"
+
+          # One JSONL row, both modes nested. Compact form — downstream
+          # visualizations can split on .mode if needed.
+          ROW=$(jq -nc \
+            --arg date "$DATE" --arg commit "$COMMIT" --arg short "$SHORT" \
+            --arg runner "$RUNNER" --argjson iters "$BENCH_ITERATIONS" \
+            --argjson dP50 "$D_P50" --argjson dP95 "$D_P95" --argjson dP99 "$D_P99" \
+            --argjson nP50 "$N_P50" --argjson nP95 "$N_P95" --argjson nP99 "$N_P99" \
+            '{
+              date: $date, commit: $commit, short: $short, runner: $runner, n: $iters,
+              default_await: { p50: $dP50, p95: $dP95, p99: $dP99 },
+              no_wait_network: { p50: $nP50, p95: $nP95, p99: $nP99 }
+            }')
+
+          echo "row=$ROW" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "::notice::Bench row: $ROW"
+
+      - name: Publish to gh-pages
+        if: steps.probe.outputs.skip != '1'
+        env:
+          ROW: ${{ steps.metrics.outputs.row }}
+          REPO_URL: "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+        run: |
+          set -euo pipefail
+
+          TMPDIR="$(mktemp -d)"
+          cd "$TMPDIR"
+
+          # Distinguish "branch doesn't exist" from "network/auth broke"
+          # with an explicit remote query. A fallback on any clone
+          # failure could mis-seed an orphan on a transient glitch;
+          # ls-remote makes the intent explicit and errors early.
+          if git ls-remote --heads "$REPO_URL" gh-pages | grep -q refs/heads/gh-pages; then
+            echo "gh-pages exists; cloning for append."
+            git clone --depth 1 --branch gh-pages "$REPO_URL" pages
+            cd pages
+          else
+            echo "gh-pages missing; seeding orphan branch (first-run)."
+            git clone "$REPO_URL" pages
+            cd pages
+            git checkout --orphan gh-pages
+            git rm -rf . 2>/dev/null || true
+            cat > README.md <<'EOF'
+          # Lumina bench data
+
+          This branch holds append-only boot-time trend data published by
+          `.github/workflows/bench.yml`. See `metrics.jsonl` (one JSON
+          object per line).
+          EOF
+            : > metrics.jsonl
+          fi
+
+          git config user.name "lumina-bench-bot"
+          git config user.email "lumina-bench@users.noreply.github.com"
+
+          printf '%s\n' "$ROW" >> metrics.jsonl
+          git add metrics.jsonl
+          if [ -f README.md ]; then
+            git add README.md || true
+          fi
+          if git diff --staged --quiet; then
+            echo "No changes to commit (row was empty?)."
+            exit 0
+          fi
+          git commit -m "bench: ${{ github.sha }} ($(date -u +%Y-%m-%d))"
+
+          # Retry push once — concurrency group serializes this workflow
+          # but a manual push to gh-pages between ls-remote and push
+          # would race; rebase covers that edge.
+          if ! git push origin gh-pages; then
+            echo "Push failed; pulling + retrying once..."
+            git pull --rebase origin gh-pages
+            git push origin gh-pages
+          fi

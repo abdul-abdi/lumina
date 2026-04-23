@@ -49,7 +49,24 @@ public enum GuestMessage: Sendable, Equatable {
     case uploadError(path: String, error: String)
     case downloadData(path: String, data: String, seq: Int, eof: Bool)
     case downloadError(path: String, error: String)
-    case networkReady(ip: String)
+    /// Guest network is live. `configMs` is the guest-side setup
+    /// duration (from configure_network receipt to ready emission);
+    /// `stage` annotates which gate fired — "operstate", "carrier",
+    /// or "timeout-anyway" (the defensive fallback where route is
+    /// verified but carrier poll timed out). Old-agent compatibility:
+    /// configMs defaults to 0 and stage to empty when absent.
+    case networkReady(ip: String, configMs: Int, stage: String)
+    /// Guest failed to bring up the network. `reason` is a human-
+    /// readable diagnostic; `attempts` counts how many ip-command
+    /// retries ran before giving up. The host propagates this to
+    /// the pending `configureNetwork` caller as a typed
+    /// `LuminaError.networkConfigFailed`.
+    case networkError(reason: String, attempts: Int)
+    /// Periodic per-NIC counter snapshot from the guest. Map is
+    /// keyed by interface name (e.g. `"eth0"`); loopback is excluded
+    /// guest-side. Counters are cumulative since interface-up —
+    /// hosts compute deltas themselves if they want throughput.
+    case networkMetrics(interfaces: [String: InterfaceCounters])
     /// PTY-backed output (merged stdout+stderr). `data` is the base64-encoded raw bytes
     /// read from the PTY master. Exit is delivered via the shared `.exit(id:code:)` case.
     case ptyOutput(id: String, data: String)
@@ -57,11 +74,54 @@ public enum GuestMessage: Sendable, Equatable {
     /// `vsockPort` is the reverse-channel port the host should connect to for
     /// each new proxied TCP connection.
     case portForwardReady(guestPort: Int, vsockPort: Int)
+    /// Guest refused to establish a forward on `guestPort` for the attached
+    /// reason. Typically "already active" (double-start collision) or a
+    /// guest-side vsock bind failure. The host surfaces the reason to the
+    /// caller waiting on `requestPortForward(...)`.
+    case portForwardError(guestPort: Int, reason: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
     case stdout
     case stderr
+}
+
+/// Per-NIC counter snapshot. Wire format carries `rx_bytes` / `tx_bytes` /
+/// `rx_errors` / `tx_errors` / `rx_packets` / `tx_packets` — all cumulative
+/// since the interface came up on the guest. Missing fields default to 0 for
+/// forward compatibility with older agents that may ship a subset.
+public struct InterfaceCounters: Sendable, Equatable, Codable {
+    public let rxBytes: UInt64
+    public let txBytes: UInt64
+    public let rxErrors: UInt64
+    public let txErrors: UInt64
+    public let rxPackets: UInt64
+    public let txPackets: UInt64
+
+    public init(
+        rxBytes: UInt64 = 0,
+        txBytes: UInt64 = 0,
+        rxErrors: UInt64 = 0,
+        txErrors: UInt64 = 0,
+        rxPackets: UInt64 = 0,
+        txPackets: UInt64 = 0
+    ) {
+        self.rxBytes = rxBytes
+        self.txBytes = txBytes
+        self.rxErrors = rxErrors
+        self.txErrors = txErrors
+        self.rxPackets = rxPackets
+        self.txPackets = txPackets
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rxBytes = "rx_bytes"
+        case txBytes = "tx_bytes"
+        case rxErrors = "rx_errors"
+        case txErrors = "tx_errors"
+        case rxPackets = "rx_packets"
+        case txPackets = "tx_packets"
+    }
 }
 
 // MARK: - Wire Format
@@ -177,7 +237,33 @@ enum LuminaProtocol {
             return .downloadError(path: path, error: errorStr)
         case "network_ready":
             let ip = json["ip"] as? String ?? ""
-            return .networkReady(ip: ip)
+            let configMs = json["config_ms"] as? Int ?? 0
+            let stage = json["stage"] as? String ?? ""
+            return .networkReady(ip: ip, configMs: configMs, stage: stage)
+        case "network_error":
+            let reason = json["reason"] as? String ?? "unspecified"
+            let attempts = json["attempts"] as? Int ?? 0
+            return .networkError(reason: reason, attempts: attempts)
+        case "network_metrics":
+            let raw = json["interfaces"] as? [String: [String: Any]] ?? [:]
+            var ifaces: [String: InterfaceCounters] = [:]
+            for (name, fields) in raw {
+                func u64(_ key: String) -> UInt64 {
+                    if let v = fields[key] as? UInt64 { return v }
+                    if let v = fields[key] as? Int, v >= 0 { return UInt64(v) }
+                    if let v = fields[key] as? NSNumber { return v.uint64Value }
+                    return 0
+                }
+                ifaces[name] = InterfaceCounters(
+                    rxBytes: u64("rx_bytes"),
+                    txBytes: u64("tx_bytes"),
+                    rxErrors: u64("rx_errors"),
+                    txErrors: u64("tx_errors"),
+                    rxPackets: u64("rx_packets"),
+                    txPackets: u64("tx_packets")
+                )
+            }
+            return .networkMetrics(interfaces: ifaces)
         case "pty_output":
             guard let id = json["id"] as? String,
                   let outputData = json["data"] as? String else {
@@ -190,6 +276,12 @@ enum LuminaProtocol {
                 throw LuminaError.protocolError("port_forward_ready missing fields")
             }
             return .portForwardReady(guestPort: guestPort, vsockPort: vsockPort)
+        case "port_forward_error":
+            guard let guestPort = json["guest_port"] as? Int else {
+                throw LuminaError.protocolError("port_forward_error missing guest_port")
+            }
+            let reason = json["reason"] as? String ?? "unspecified"
+            return .portForwardError(guestPort: guestPort, reason: reason)
         default:
             throw LuminaError.protocolError("Unknown message type: \(type)")
         }

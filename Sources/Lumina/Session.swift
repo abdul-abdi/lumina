@@ -22,10 +22,30 @@ public struct SessionPaths: Sendable {
     }
 
     /// Write session metadata to disk.
+    ///
+    /// Creates the session directory with mode 0700 so the control
+    /// socket + meta.json inside are shielded from other users on the
+    /// host even if umask widens file perms. The enclosing
+    /// `~/.lumina/sessions` parent inherits whatever mode the user set
+    /// on their home layout — we only own the per-session directory's
+    /// mode. See v0.7.1 isolation probe findings for the full
+    /// rationale; paired with the chmod-0600 on control.sock in
+    /// `SessionServer.bind`.
     public func writeMeta(_ info: SessionInfo) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // If the directory already existed (e.g. same-SID reuse, unlikely
+        // but possible across crashes), re-chmod it. createDirectory does
+        // NOT alter existing permissions.
+        _ = chmod(directory.path, 0o700)
         let data = try JSONEncoder().encode(info)
         try data.write(to: metaFile)
+        // Meta file too — no session secrets in it today, but pid + image
+        // name should not be a readable signal for other users.
+        _ = chmod(metaFile.path, 0o600)
     }
 
     /// Read session metadata from disk. Returns nil if file doesn't exist.

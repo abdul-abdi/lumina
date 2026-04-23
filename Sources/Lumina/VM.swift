@@ -89,7 +89,9 @@ public actor VM {
 
     /// Latest boot-phase timings, populated by `recordPhase(…)` during
     /// `boot()`. Surfaced via `bootPhases` for instrumentation and the
-    /// upcoming cold-boot regression bench. Zero-cost when unused.
+    /// cold-boot regression bench. Cost is unconditional and
+    /// sub-microsecond per boot — see the `recordPhase` comment in
+    /// `boot()` for the breakdown.
     private var _bootPhases = BootPhases()
 
     public var bootPhases: BootPhases { _bootPhases }
@@ -149,11 +151,26 @@ public actor VM {
             ))
         }
 
-        // Clean orphans from previous crashes
-        DiskClone.cleanOrphans()
+        // Phase instrumentation — each recordPhase() resets the phase
+        // cursor to now so the next phase's timing starts at this line.
+        // Cost is unconditional (regardless of `LUMINA_BOOT_TRACE`):
+        // ~50ns per `ContinuousClock.now` call × ~7 phases + a Double
+        // add each, i.e. sub-microsecond on M3 — 0.0001% of a 680ms
+        // boot. The CI agent-boot P50 gate guards against this
+        // regressing the 2000ms budget.
+        let phaseStart = ContinuousClock.now
+        var phaseMark = phaseStart
+
+        // Clean orphans from previous crashes. Detached — this sweeps
+        // ~/.lumina/runs/ for stale PID files and can take 10-50ms
+        // on a busy host (N stat calls, N kill(pid,0) calls). Moving
+        // it off the critical path shaves that off every cold boot;
+        // orphans get swept next time instead. v0.7.1 perf.
+        Task.detached { _ = DiskClone.cleanOrphans() }
 
         // Resolve image
         let imagePaths = try imageStore.resolve(name: options.image)
+        phaseMark = recordPhase(\.imageResolveMs, since: phaseMark)
 
         // Create COW clone (and resize if requested)
         let diskClone = try DiskClone.create(from: imagePaths.rootfs)
@@ -161,6 +178,7 @@ public actor VM {
             try diskClone.resize(to: diskSize)
         }
         self.clone = diskClone
+        phaseMark = recordPhase(\.cloneMs, since: phaseMark)
 
         // Configure VM
         let config = VZVirtualMachineConfiguration()
@@ -391,6 +409,8 @@ public actor VM {
             vm.delegate = d
         }
 
+        phaseMark = recordPhase(\.configMs, since: phaseMark)
+
         do {
             try Task.checkCancellation()
             let vmBox = UncheckedSendable(vm)
@@ -425,6 +445,7 @@ public actor VM {
             }
             throw .bootFailed(underlying: error)
         }
+        phaseMark = recordPhase(\.vzStartMs, since: phaseMark)
 
         // Connect CommandRunner via vsock
         let socketDevice: VZVirtioSocketDevice
@@ -444,6 +465,7 @@ public actor VM {
             await shutdownVM()
             throw .bootFailed(underlying: error)
         }
+        phaseMark = recordPhase(\.vsockConnectMs, since: phaseMark)
 
         let runner = CommandRunner(socketDevice: socketDevice, queue: queue)
         do {
@@ -456,8 +478,19 @@ public actor VM {
             }
             throw error
         }
+        _ = recordPhase(\.runnerReadyMs, since: phaseMark)
+        _bootPhases.totalMs = msSince(phaseStart)
+
         self.commandRunner = runner
         _state = .ready
+
+        // Publish the trace if the caller opted in. Stderr so it stays
+        // out of the piped JSON envelope and agents consuming stdout
+        // aren't polluted. `BootPhases.formatTrace()` skips zero-valued
+        // phases, so the EFI path's subset shows cleanly too.
+        if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
+            FileHandle.standardError.write(Data((_bootPhases.formatTrace() + "\n").utf8))
+        }
     }
 
     // MARK: - EFI Boot Path (v0.7.0 M3)
@@ -635,6 +668,10 @@ public actor VM {
             _bootPhases.totalMs = msSince(phaseStart)
 
             _state = .ready
+
+            if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
+                FileHandle.standardError.write(Data((_bootPhases.formatTrace() + "\n").utf8))
+            }
         } catch {
             await shutdownVM()
             _state = .idle
@@ -854,7 +891,8 @@ public actor VM {
             exitCode: result.exitCode,
             wallTime: wallTime,
             stdoutBytes: result.stdoutBytes,
-            stderrBytes: result.stderrBytes
+            stderrBytes: result.stderrBytes,
+            networkMetrics: result.networkMetrics
         )
     }
 
@@ -1122,7 +1160,22 @@ public actor VM {
         let hostNum = (Int(lastByte) % 253) + 2
         let ip = "\(subnetPrefix).\(hostNum)/24"
 
-        try await runner.configureNetwork(ip: ip, gateway: gateway, dns: gateway)
+        let result = try await runner.configureNetwork(ip: ip, gateway: gateway, dns: gateway)
+
+        // Capture the guest's self-reported config duration + stage so
+        // LUMINA_BOOT_TRACE=1 (and UI consumers of `bootPhases`) see
+        // which gate actually fired. Warn loudly on `timeout-anyway` —
+        // the route is verified but the guest never saw carrier come
+        // up, which means first-packet latency will include the TCP
+        // retry the kernel has to do. Silent today == silently slow
+        // tomorrow when a user files a "lumina run is slow" issue.
+        _bootPhases.networkConfigMs = Double(result.configMs)
+        _bootPhases.networkStage = result.stage
+        if result.stage == "timeout-anyway" {
+            FileHandle.standardError.write(Data(
+                "[lumina] warning: guest network carrier did not come up within 400ms; route is installed and traffic should flow, but first packets may be delayed. See `lumina doctor` if this persists.\n".utf8
+            ))
+        }
     }
 
     /// Find the IPv4 address of the host-side vmnet bridge (bridge100, bridge101, …).
@@ -1270,6 +1323,15 @@ public actor VM {
         serialConsole.output
     }
 
+    /// Monotonic version counter bumped by `SerialConsole.append`.
+    /// Exposed so Desktop-app polling loops can skip the full
+    /// `serialTail` pipeline when nothing new arrived since the last
+    /// tick. Agent-path callers have no use for this — the agent path
+    /// doesn't poll the serial console.
+    public var serialVersion: UInt64 {
+        serialConsole.version
+    }
+
     /// Last `lines` newline-terminated lines from the serial console
     /// buffer, stripped of ANSI CSI sequences that terminals use for
     /// cursor/color control. Designed for the desktop's boot-window
@@ -1413,14 +1475,106 @@ enum VMError: Error, Sendable {
 /// All fields default to zero — zero-cost when unused.
 ///
 /// Consumed by the cold-boot regression bench (see `Tests/LuminaTests/
-/// BootPhaseTests.swift`) and by the `LUMINA_BOOT_TRACE=1` CLI hook
-/// which prints the struct to stderr after `boot()` returns.
+/// BootPhaseTests.swift`) and by the `LUMINA_BOOT_TRACE=1` environment
+/// variable which prints the struct to stderr after `boot()` returns.
+///
+/// **Phase coverage:**
+///   - `imageResolveMs` — `ImageStore.resolve()` (agent path only)
+///   - `cloneMs`        — `DiskClone.create()` + optional resize (agent path only)
+///   - `configMs`       — `VZVirtualMachineConfiguration` build + validate (both)
+///   - `vzStartMs`      — VZ `start()` callback from queue.async to completion (both)
+///   - `vsockConnectMs` — `connect(toPort: 1024)` on the socket device (agent path only)
+///   - `runnerReadyMs`  — wait for the guest agent's `ready` frame (agent path only)
+///   - `totalMs`        — wall-clock from `boot()` entry to `.ready`
+///
+/// **Agent-path vs EFI-path:** The agent path populates every field;
+/// the EFI path writes `configMs`, `vzStartMs`, `totalMs` only
+/// (EFI guests have no agent to hand-shake with). Fields unrelated
+/// to the chosen path stay zero — that's intentional and an
+/// `isValid` struct may still have sub-field zeros.
 public struct BootPhases: Sendable, Equatable {
+    /// Time to resolve the image name → on-disk paths. Agent path only.
+    public var imageResolveMs: Double = 0
+    /// Time to COW-clone the rootfs and apply any `diskSize` resize.
+    /// Agent path only.
+    public var cloneMs: Double = 0
+    /// Time to build + validate `VZVirtualMachineConfiguration`. Both paths.
     public var configMs: Double = 0
+    /// Time from VZ `start()` dispatch to the success callback. Both paths.
     public var vzStartMs: Double = 0
+    /// Time to open the vsock connection to the guest agent on port 1024.
+    /// Agent path only.
+    public var vsockConnectMs: Double = 0
+    /// Time from vsock open to the guest agent emitting `{"type":"ready"}`.
+    /// Agent path only; this is "how long did guest userspace take to boot".
+    public var runnerReadyMs: Double = 0
+    /// Guest-reported time to apply `configure_network` (link + addr +
+    /// route + carrier). Populated by `VM.configureNetwork()` from the
+    /// `network_ready.config_ms` field. Zero on EFI path, zero on old
+    /// guest agents that don't emit the field.
+    public var networkConfigMs: Double = 0
+    /// Which gate fired for `network_ready`:
+    ///   - `"operstate"`     — eth0 reports `up`/`unknown` (fast path)
+    ///   - `"carrier"`       — eth0 reports carrier=1 but operstate didn't transition
+    ///   - `"timeout-anyway"`— 400ms carrier ceiling hit; route is verified
+    ///                         but link-carrier was never observed. Usable
+    ///                         but TCP will pay a retry on first packet.
+    ///   - `""`              — field absent (old agent, or `configureNetwork`
+    ///                         wasn't called on this boot).
+    public var networkStage: String = ""
+    /// Wall-clock from `boot()` entry to `.ready`.
     public var totalMs: Double = 0
 
     public init() {}
+
+    /// True when any boot phase was observed — i.e. `VM.boot()` ran
+    /// far enough to populate at least one timing field. Returns
+    /// false on a VM that was attached rather than booted here
+    /// (all fields remain zero). UI code rendering boot timings
+    /// should gate on this to avoid "0 ms" rows.
+    public var isValid: Bool {
+        imageResolveMs > 0
+            || cloneMs > 0
+            || configMs > 0
+            || vzStartMs > 0
+            || vsockConnectMs > 0
+            || runnerReadyMs > 0
+            || networkConfigMs > 0
+            || totalMs > 0
+    }
+
+    /// Human-readable one-phase-per-line formatter used by the
+    /// `LUMINA_BOOT_TRACE=1` stderr hook. Phases with zero values are
+    /// omitted so EFI-path traces don't render empty rows.
+    public func formatTrace() -> String {
+        var lines: [String] = []
+        func emit(_ name: String, _ value: Double) {
+            guard value > 0 else { return }
+            // Pad the label to 18 chars manually — `%s` in Swift's
+            // String(format:) takes a C string pointer (crashes on a
+            // Swift String), and `%@` is Objective-C only. Manual
+            // padding is portable and avoids the unsafe-pointer
+            // conversion entirely.
+            let padded = name.padding(toLength: 18, withPad: " ", startingAt: 0)
+            let ms = String(format: "%7.1f", value)
+            lines.append("  \(padded) \(ms) ms")
+        }
+        emit("image resolve:", imageResolveMs)
+        emit("disk clone:", cloneMs)
+        emit("config build:", configMs)
+        emit("vz start:", vzStartMs)
+        emit("vsock connect:", vsockConnectMs)
+        emit("guest agent ready:", runnerReadyMs)
+        emit("guest network:", networkConfigMs)
+        if !networkStage.isEmpty {
+            let padded = "network stage:".padding(toLength: 18, withPad: " ", startingAt: 0)
+            lines.append("  \(padded) \(networkStage)")
+        }
+        let paddedTotal = "total:".padding(toLength: 18, withPad: " ", startingAt: 0)
+        let totalMsStr = String(format: "%7.1f", totalMs)
+        lines.append("  \(paddedTotal) \(totalMsStr) ms")
+        return "[lumina boot trace]\n" + lines.joined(separator: "\n")
+    }
 }
 
 // MARK: - Sendable crossing shim

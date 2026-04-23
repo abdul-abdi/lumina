@@ -1,0 +1,116 @@
+name: Build baked image
+
+# Builds a custom minimal Linux kernel + baked-mode rootfs for Lumina's
+# agent-path. Baked images skip initrd + module loading → ~150ms
+# kernel-boot savings vs. the legacy Alpine virt image.
+#
+# Triggers:
+#   - Manual via `workflow_dispatch` (for v0.7.1 rebuild with new agent)
+#   - On tag push `v*` (publish artifact alongside the GitHub Release)
+#
+# Runner:
+#   - `ubuntu-24.04-arm` (native ARM64; no QEMU emulation)
+#   - Alternative for non-ARM runners: `qemu-user-static` + --platform;
+#     native is ~4× faster, which matters for a 10-min kernel build.
+#
+# Output:
+#   - `vmlinuz` (custom kernel, CONFIG_MODULES=n, ~8MB)
+#   - `rootfs.img` (ext4, ~1GB, contains agent + init)
+#   - Packaged as `lumina-image-default-baked.tar.gz` release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_as_release_asset:
+        description: "Attach to latest GitHub Release"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Kernel + baked image
+    # ubuntu-24.04-arm: public preview GA'd 2025; check availability in
+    # your org's runner allowlist. Fallback = `ubuntu-latest` + qemu.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison bc \
+            libelf-dev libssl-dev libncurses-dev \
+            curl e2fsprogs
+          echo "Installed: $(gcc --version | head -1)"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache-dependency-path: Guest/lumina-agent/go.sum
+
+      - name: Build guest agent
+        run: |
+          cd Guest/lumina-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+            -ldflags="-s -w" -o lumina-agent .
+          ls -la lumina-agent
+
+      - name: Build custom kernel (Linux arm64, CONFIG_MODULES=n)
+        run: |
+          mkdir -p /tmp/lumina-kernel
+          bash Guest/build-kernel.sh /tmp/lumina-kernel/vmlinuz
+          ls -la /tmp/lumina-kernel/
+          du -h /tmp/lumina-kernel/vmlinuz
+
+      - name: Build baked image (custom kernel + baked rootfs)
+        run: |
+          mkdir -p /tmp/lumina-image-out
+          LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz \
+            bash Guest/build-image.sh /tmp/lumina-image-out
+          ls -la /tmp/lumina-image-out/
+          # Baked-mode output is 2 files: vmlinuz + rootfs.img.
+          # No initrd, no modules/ dir.
+
+      - name: Package as release asset
+        run: |
+          cd /tmp/lumina-image-out
+          tar czf /tmp/lumina-image-default-baked.tar.gz vmlinuz rootfs.img
+          ls -la /tmp/lumina-image-default-baked.tar.gz
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumina-image-default-baked
+          path: /tmp/lumina-image-default-baked.tar.gz
+          retention-days: 30
+
+      # Tag-triggered: attach to the release.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            /tmp/lumina-image-default-baked.tar.gz \
+            --clobber
+
+      # Manual trigger with publish_as_release_asset=true
+      - name: Attach to latest release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_as_release_asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName')
+          if [ -z "$LATEST" ]; then
+            echo "::error::No releases to attach to"
+            exit 1
+          fi
+          gh release upload "$LATEST" \
+            /tmp/lumina-image-default-baked.tar.gz \
+            --clobber
