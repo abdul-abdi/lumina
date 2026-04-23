@@ -34,7 +34,7 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 - 🍎 **macOS guests** — IPSW-restored `VZMacOSVirtualMachine` (needs Apple Silicon host)
 - 🖥 **Lumina Desktop.app** — a SwiftUI library + wizard + per-VM windows, with ⌘K fuzzy launcher, live per-card disk sparklines, drag-drop ISOs, native fullscreen, and a brand-aware look per guest OS (Ubuntu orange, Kali cyber blue, Windows MS blue, macOS silver, …)
 - 🔒 **Catalog ISO integrity** — the wizard streams user-picked catalog ISOs through SHA-256 before creating the VM and refuses partial or tampered downloads
-- 🎨 **Ad-hoc signed build** — no Apple Developer Program account required; notarization is a v0.7.1 upgrade
+- 🎨 **Ad-hoc signed build** — no Apple Developer Program account required. Notarization scaffolding is in place (per-cert-class entitlement selection in `scripts/build-app.sh`); the hosted CI switch from ad-hoc to notarized Developer ID waits on Apple Developer Program enrollment and is tracked as a v0.7.2 follow-up.
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
@@ -64,7 +64,7 @@ lumina run "echo hello world"       # image auto-pulls on first run
 bash scripts/build-app.sh --install  # builds .app, signs ad-hoc, installs to /Applications, launches
 ```
 
-On first launch macOS will warn "from an unidentified developer" — right-click `Lumina.app` in `/Applications` → Open, then confirm. Notarization ships in v0.7.1.
+On first launch macOS will warn "from an unidentified developer" — right-click `Lumina.app` in `/Applications` → Open, then confirm. Notarization ships in a later release once the Apple Developer Program account is wired into CI (tracked as a v0.7.2 task; see ROADMAP).
 
 Pre-built binary + image from the latest [release](https://github.com/abdul-abdi/lumina/releases/latest):
 
