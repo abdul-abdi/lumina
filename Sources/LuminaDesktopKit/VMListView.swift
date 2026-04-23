@@ -44,15 +44,25 @@ public struct VMListView: View {
                 LazyVStack(spacing: 1) {
                     ForEach(bundles, id: \.manifest.id) { bundle in
                         VMRow(model: model, bundle: bundle)
-                            .onTapGesture {
-                                openWindow(id: "vm-window", value: bundle.manifest.id)
-                            }
+                            .onTapGesture { activate(bundle) }
                     }
                 }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 20)
+        }
+    }
+
+    /// Primary tap action on a row. Opens the VM window in every case;
+    /// when the VM is idle (`.stopped` or `.crashed`) also kicks off
+    /// `boot()` so the user doesn't land on a separate boot screen.
+    /// Parity with VMCard's activate().
+    private func activate(_ bundle: VMBundle) {
+        openWindow(id: "vm-window", value: bundle.manifest.id)
+        let session = model.session(for: bundle)
+        if session.status.canBoot {
+            Task { await session.boot() }
         }
     }
 
