@@ -273,7 +273,7 @@ public struct LibraryView: View {
         ZStack {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
             if section == .agentImages {
-                CustomImagesView()
+                CustomImagesView(layout: layout)
             } else if filteredForSection.isEmpty && model.bundles.isEmpty {
                 EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {
