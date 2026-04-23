@@ -30,13 +30,26 @@ const maxCarrierWait = 400 * time.Millisecond
 // measurably costing anything (open(2)+read(2)+close(2) = ~5µs).
 const carrierPollInterval = 5 * time.Millisecond
 
-// ipRetryAttempts is how many times we retry a single `ip` command
-// if it fails. Individual retries make the setup robust against
-// transient EBUSY from the kernel during concurrent netlink ops.
+// ipRetryAttempts is the maximum number of post-verification retry
+// iterations if `ip -batch` succeeds but the default route isn't
+// committed (transient EBUSY on concurrent netlink ops). On a
+// batch-fail path the same cap applies: one batch attempt + up to
+// (ipRetryAttempts - 1) individual retries.
 const ipRetryAttempts = 3
 
 // ipRetryBackoff is the linear backoff between ip retries.
 const ipRetryBackoff = 20 * time.Millisecond
+
+// Injection points for tests. These are package-level vars rather
+// than struct fields because Configure is a free function; tests
+// substitute them directly. In production they always point at the
+// defaults below.
+var (
+	runIP         func(args ...string) error                = defaultRunIP
+	runIPBatch    func(ip, gateway string) (bool, string)   = defaultRunIPBatch
+	readRouteFile func() ([]byte, error)                    = defaultReadRouteFile
+	clock         func() time.Time                          = time.Now
+)
 
 // Configure applies msg to eth0 (IP/route/DNS) with retries, verifies
 // the routing table reflects the requested default route, then polls
@@ -45,7 +58,7 @@ const ipRetryBackoff = 20 * time.Millisecond
 // returns — the host-side caller sees a typed error, not a silent
 // best-effort success.
 func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
-	started := time.Now()
+	started := clock()
 	_, _ = fmt.Fprintf(os.Stderr, "configuring network: ip=%s gw=%s dns=%s\n", msg.IP, msg.Gateway, msg.DNS)
 
 	// VZ NAT is IPv4-only; disable IPv6 so the guest doesn't waste
@@ -59,9 +72,17 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// or if post-verification shows the route didn't land.
 	attempts := 0
 	var lastErr error
-	batchOK := runIPBatch(msg.IP, msg.Gateway)
+	batchOK, batchStderr := runIPBatch(msg.IP, msg.Gateway)
 	if !batchOK {
 		attempts++
+		// Carry the batch failure into lastErr so a subsequent
+		// all-retries-fail path surfaces the root cause on the
+		// wire, not just the last individual retry.
+		if batchStderr != "" {
+			lastErr = fmt.Errorf("ip -batch: %s", strings.TrimSpace(batchStderr))
+		} else {
+			lastErr = fmt.Errorf("ip -batch failed")
+		}
 	}
 	// Post-verification: the batch nominally succeeded, but verify
 	// the routing table actually reflects our gateway. On some
@@ -112,25 +133,25 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// "link is actually carrying" check before we tell the host
 	// packets can flow.
 	deadline := started.Add(maxCarrierWait)
-	for time.Now().Before(deadline) {
+	for clock().Before(deadline) {
 		if operstateReady() {
-			elapsed := time.Since(started)
+			elapsed := clock().Sub(started)
 			_, _ = fmt.Fprintf(os.Stderr, "network operstate up after %s\n", elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
 				IP:       bareIP,
-				ConfigMs: int(elapsed / time.Millisecond),
+				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "operstate",
 			})
 			return
 		}
 		if carrierUp() {
-			elapsed := time.Since(started)
+			elapsed := clock().Sub(started)
 			_, _ = fmt.Fprintf(os.Stderr, "network carrier up after %s\n", elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
 				IP:       bareIP,
-				ConfigMs: int(elapsed / time.Millisecond),
+				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "carrier",
 			})
 			return
@@ -143,19 +164,20 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// stacks retry on send-failure, so first-packet latency absorbs
 	// any remaining lag. Emit network_ready with Stage="timeout-
 	// anyway" so the host can surface a soft warning if desired.
-	elapsed := time.Since(started)
+	elapsed := clock().Sub(started)
 	_, _ = fmt.Fprintf(os.Stderr, "network readiness timeout after %s; route verified, shipping network_ready (stage=timeout-anyway)\n", elapsed)
 	_ = w.Send(protocol.NetworkReadyMsg{
 		Type:     protocol.TypeNetworkReady,
 		IP:       bareIP,
-		ConfigMs: int(elapsed / time.Millisecond),
+		ConfigMs: int(elapsed.Milliseconds()),
 		Stage:    "timeout-anyway",
 	})
 }
 
-// runIPBatch runs link-set / addr-add / route-replace as a single
-// `ip -batch -` process. Returns true if the batch exited 0.
-func runIPBatch(ip, gateway string) bool {
+// defaultRunIPBatch runs link-set / addr-add / route-replace as a single
+// `ip -batch -` process. Returns (exitedZero, stderr); stderr is
+// captured so the caller can surface the root cause in network_error.
+func defaultRunIPBatch(ip, gateway string) (bool, string) {
 	batch := strings.NewReader(
 		"link set eth0 up\n" +
 			"addr add " + ip + " dev eth0\n" +
@@ -167,14 +189,14 @@ func runIPBatch(ip, gateway string) bool {
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "ip -batch: %v; stderr=%s\n", err, errBuf.String())
-		return false
+		return false, errBuf.String()
 	}
-	return true
+	return true, ""
 }
 
-// runIP runs a single `ip` command and returns any error along with
+// defaultRunIP runs a single `ip` command and returns any error along with
 // stderr context for diagnostics.
-func runIP(args ...string) error {
+func defaultRunIP(args ...string) error {
 	cmd := exec.Command("ip", args...)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
@@ -185,17 +207,25 @@ func runIP(args ...string) error {
 	return nil
 }
 
+// defaultReadRouteFile reads /proc/net/route. Split out so tests can
+// supply a synthetic route table.
+func defaultReadRouteFile() ([]byte, error) {
+	return os.ReadFile("/proc/net/route")
+}
+
 // routeVerified checks that the default route in the kernel's
 // routing table points to `gateway`. Reads /proc/net/route rather
 // than spawning `ip route` for a ~3× speedup (no fork/exec).
 //
 // The file format is:
-//   Iface  Destination  Gateway   Flags  RefCnt  Use  Metric  Mask  MTU  Window  IRTT
-//   eth0   00000000     0140A8C0  0003   0       0    0       00000000  0    0       0
+//
+//	Iface  Destination  Gateway   Flags  RefCnt  Use  Metric  Mask  MTU  Window  IRTT
+//	eth0   00000000     0140A8C0  0003   0       0    0       00000000  0    0       0
+//
 // Destination=00000000 is the default (0.0.0.0) route; Gateway is
 // little-endian hex (0140A8C0 → 192.168.64.1).
 func routeVerified(gateway string) bool {
-	data, err := os.ReadFile("/proc/net/route")
+	data, err := readRouteFile()
 	if err != nil {
 		return false
 	}
@@ -203,23 +233,21 @@ func routeVerified(gateway string) bool {
 	if wantHex == "" {
 		return false
 	}
-	scanner := bytes.NewReader(data)
-	// Hand-roll the scan — /proc/net/route is small (<1KB) and
-	// bufio.Scanner would need an allocation per call.
-	buf := make([]byte, scanner.Len())
-	_, _ = scanner.Read(buf)
-	lines := strings.Split(string(buf), "\n")
-	for i, line := range lines {
-		if i == 0 || line == "" {
+	// /proc/net/route is typically <1KB. bytes.Split + bytes.Fields
+	// is one allocation (the line slice) with no string copies of
+	// the file body — simpler than wrapping in bytes.NewReader.
+	for i, line := range bytes.Split(data, []byte{'\n'}) {
+		if i == 0 || len(line) == 0 {
 			continue // header or trailing blank
 		}
-		fields := strings.Fields(line)
+		fields := bytes.Fields(line)
 		if len(fields) < 3 {
 			continue
 		}
 		// Destination (col 1) = "00000000" means default; Gateway (col 2)
 		// is our target.
-		if fields[1] == "00000000" && strings.EqualFold(fields[2], wantHex) {
+		if bytes.Equal(fields[1], []byte("00000000")) &&
+			bytes.EqualFold(fields[2], []byte(wantHex)) {
 			return true
 		}
 	}
@@ -236,8 +264,16 @@ func ipv4ToLittleEndianHex(ip string) string {
 	}
 	b := make([]byte, 4)
 	for i, part := range parts {
+		if part == "" {
+			return ""
+		}
 		var val int
 		if _, err := fmt.Sscanf(part, "%d", &val); err != nil || val < 0 || val > 255 {
+			return ""
+		}
+		// Reject leading-zero or trailing-junk inputs that Sscanf
+		// accepts but aren't valid dotted-quad octets.
+		if fmt.Sprintf("%d", val) != part {
 			return ""
 		}
 		b[3-i] = byte(val) // little-endian
