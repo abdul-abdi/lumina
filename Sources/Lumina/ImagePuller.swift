@@ -79,10 +79,63 @@ public struct ImagePuller: Sendable {
             throw .imageNotFound("Cannot create image directory: \(error.localizedDescription)")
         }
 
-        // 5. Extract tarball
+        // 5. Pre-scan tarball for path-traversal attempts before extraction.
+        //    BSD tar on macOS rejects `..` members by default, but relying on
+        //    the default is defence-in-depth-zero. List the archive first
+        //    and refuse any member whose normalised path escapes imageDir.
+        //    Cheap: `tar -tzf` reads the member list without extracting;
+        //    bounded by the number of members (a few for an image tarball).
+        progress("Verifying tarball members...")
+        let listResult = runProcess(
+            "/usr/bin/tar", arguments: ["-tzf", downloadedFile.path]
+        )
+        guard listResult.exitCode == 0 else {
+            try? FileManager.default.removeItem(at: imageDir)
+            throw .imageNotFound(
+                "Tarball listing failed (exit \(listResult.exitCode)): \(listResult.stderr)"
+            )
+        }
+        for member in listResult.stdout.split(separator: "\n") {
+            // Reject absolute paths and any member containing `..` segments.
+            let path = String(member).trimmingCharacters(in: .whitespaces)
+            if path.isEmpty { continue }
+            if path.hasPrefix("/") {
+                try? FileManager.default.removeItem(at: imageDir)
+                throw .imageNotFound(
+                    "Tarball contains absolute path: \(path). Refusing to extract."
+                )
+            }
+            // Split on `/` and reject any `..` component after normalisation.
+            let parts = path.split(separator: "/")
+            if parts.contains(where: { $0 == ".." }) {
+                try? FileManager.default.removeItem(at: imageDir)
+                throw .imageNotFound(
+                    "Tarball contains path-traversal member: \(path). Refusing to extract."
+                )
+            }
+        }
+
+        // 6. Extract tarball. Belt-and-suspenders flags:
+        //    --no-same-owner    — drop uid/gid from archive; ignores root-
+        //                         owned members shipped in the tarball.
+        //    --no-xattrs        — strip extended attributes (no SELinux
+        //                         labels, no immutable flags leaking in).
+        //    --no-mac-metadata  — drop macOS-specific AppleDouble/resource-
+        //                         fork metadata (irrelevant for a Linux
+        //                         image anyway).
+        //    Plus the path-traversal pre-scan above, this closes the
+        //    trust-boundary surface called out in the v0.7.1 isolation
+        //    probe findings.
         progress("Extracting to \(imageDir.path)...")
         let tarResult = runProcess(
-            "/usr/bin/tar", arguments: ["xzf", downloadedFile.path, "-C", imageDir.path]
+            "/usr/bin/tar",
+            arguments: [
+                "xzf", downloadedFile.path,
+                "-C", imageDir.path,
+                "--no-same-owner",
+                "--no-xattrs",
+                "--no-mac-metadata",
+            ]
         )
 
         guard tarResult.exitCode == 0 else {
@@ -185,21 +238,25 @@ public struct ImagePuller: Sendable {
 
     private func runProcess(
         _ path: String, arguments: [String]
-    ) -> (exitCode: Int32, stderr: String) {
+    ) -> (exitCode: Int32, stderr: String, stdout: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
         let stderrPipe = Pipe()
+        let stdoutPipe = Pipe()
         process.standardError = stderrPipe
+        process.standardOutput = stdoutPipe
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
-            return (-1, error.localizedDescription)
+            return (-1, error.localizedDescription, "")
         }
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
         let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-        return (process.terminationStatus, stderr)
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        return (process.terminationStatus, stderr, stdout)
     }
 
     private func formatBytes(_ bytes: Int) -> String {
