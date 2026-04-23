@@ -18,6 +18,7 @@ import Lumina
 public struct CustomImagesView: View {
     @State private var images: [CustomImageEntry] = []
     @State private var error: String?
+    @State private var launchNotice: LaunchNotice?
 
     public init() {}
 
@@ -38,6 +39,26 @@ public struct CustomImagesView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(MaterialBackground(material: .contentBackground))
         .onAppear { refresh() }
+        .alert(
+            launchNotice?.title ?? "",
+            isPresented: Binding(
+                get: { launchNotice != nil },
+                set: { if !$0 { launchNotice = nil } }
+            )
+        ) {
+            Button("OK") { launchNotice = nil }
+        } message: {
+            Text(launchNotice?.message ?? "")
+        }
+    }
+
+    /// Alert payload surfaced after a launch attempt. `.info` is a
+    /// success-ish case (pasteboard fallback used); `.error` is a hard
+    /// failure the user must fix.
+    struct LaunchNotice: Equatable {
+        let title: String
+        let message: String
+        let isError: Bool
     }
 
     private var header: some View {
@@ -82,13 +103,40 @@ public struct CustomImagesView: View {
         ScrollView {
             LazyVStack(spacing: 8) {
                 ForEach(images, id: \.name) { img in
-                    ImageRow(entry: img, onRemove: {
-                        remove(img.name)
-                    })
+                    ImageRow(
+                        entry: img,
+                        onRemove: { remove(img.name) },
+                        onLaunchOutcome: { outcome in
+                            launchNotice = noticeFor(outcome: outcome)
+                        }
+                    )
                 }
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
+        }
+    }
+
+    /// Translate a launch outcome into a user-facing alert payload.
+    /// Silent on `.executed` (the terminal window itself is the
+    /// feedback); surfaces a helpful hint on the pasteboard-fallback
+    /// path; surfaces an error on hard failure.
+    private func noticeFor(outcome: TerminalLaunchOutcome) -> LaunchNotice? {
+        switch outcome {
+        case .executed:
+            return nil
+        case .copiedAndOpened(let terminal):
+            return LaunchNotice(
+                title: "Opened in \(terminal.displayName)",
+                message: "The `lumina session start` command was copied to your clipboard. Paste with ⌘V in the new window to run it.",
+                isError: false
+            )
+        case .failed(let reason):
+            return LaunchNotice(
+                title: "Couldn't open terminal",
+                message: reason,
+                isError: true
+            )
         }
     }
 
@@ -135,6 +183,7 @@ struct CustomImageEntry: Sendable {
 private struct ImageRow: View {
     let entry: CustomImageEntry
     let onRemove: () -> Void
+    let onLaunchOutcome: (TerminalLaunchOutcome) -> Void
 
     @State private var copiedFlash: Bool = false
 
@@ -240,23 +289,16 @@ private struct ImageRow: View {
     }
 
     private func openInTerminal() {
-        // Open Terminal.app with `lumina session start --image <name>`
-        // pre-filled. AppleScript is the least-fragile way — it handles
-        // new-window-or-reuse, focus-front, and typing with proper
-        // keyboard events. The command itself doesn't escape the image
-        // name because ImageStore names are filesystem-safe by construction
-        // (no spaces, no quotes).
+        // Route through TerminalLauncher — detects iTerm2/Ghostty/Warp
+        // from the user's pref or install order, falls back to
+        // Terminal.app, and surfaces a visible error instead of the
+        // previous `try?`-swallowed failure. ImageStore names are
+        // filesystem-safe by construction (no spaces, no quotes), so
+        // the command doesn't need shell-escaping beyond what the
+        // launcher already does.
         let cmd = "lumina session start --image \(entry.name)"
-        let script = """
-            tell application "Terminal"
-                activate
-                do script "\(cmd)"
-            end tell
-        """
-        let task = Process()
-        task.launchPath = "/usr/bin/osascript"
-        task.arguments = ["-e", script]
-        try? task.run()
+        let outcome = TerminalLauncher().launch(command: cmd)
+        onLaunchOutcome(outcome)
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
