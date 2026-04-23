@@ -90,6 +90,23 @@ public struct RunOptions: Sendable {
     public var diskSize: UInt64?
     /// Stdin source. Default `.closed` sends EOF immediately.
     public var stdin: Stdin
+    /// When true (default), `Lumina.run`/`Lumina.stream` block on
+    /// `network_ready` before invoking exec. This is the reliability
+    /// guarantee — commands that send a packet in the first ~20 ms of
+    /// exec (curl, ping, apt, DNS lookups) always see a usable network.
+    ///
+    /// v0.7.2 perf: the cost of this guarantee dropped from ~2.5 s to
+    /// ~50–150 ms after shrinking the guest's carrier-wait timeout,
+    /// batching the `ip` setup, and switching to netlink-based carrier
+    /// notification. The default is now both safe and fast — users no
+    /// longer have to choose.
+    ///
+    /// Set to `false` to skip the host-side barrier (guest still runs
+    /// `configure_network` in a goroutine concurrently). Use this only
+    /// for workloads that KNOW they won't touch the network in the
+    /// first milliseconds of exec. Documented as `--no-wait-network`
+    /// on the CLI.
+    public var awaitNetworkReady: Bool
 
     public static let `default` = RunOptions()
 
@@ -106,7 +123,8 @@ public struct RunOptions: Sendable {
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
         diskSize: UInt64? = nil,
-        stdin: Stdin = .closed
+        stdin: Stdin = .closed,
+        awaitNetworkReady: Bool = true
     ) {
         self.timeout = timeout
         self.memory = memory
@@ -121,6 +139,7 @@ public struct RunOptions: Sendable {
         self.workingDirectory = workingDirectory
         self.diskSize = diskSize
         self.stdin = stdin
+        self.awaitNetworkReady = awaitNetworkReady
     }
 }
 

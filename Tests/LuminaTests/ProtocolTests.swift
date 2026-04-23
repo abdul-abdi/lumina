@@ -383,3 +383,46 @@ import Testing
         try Protocol.decodeGuest(raw)
     }
 }
+
+// MARK: - v0.7.2 network reliability wire types
+
+@Test func decodeNetworkReadyWithConfigMsAndStage() throws {
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","config_ms":127,"stage":"carrier"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 127, stage: "carrier"))
+}
+
+@Test func decodeNetworkReadyBackwardCompatOldAgent() throws {
+    // v0.7.1 agents emit the old shape without config_ms or stage.
+    // The host must still accept them — old images keep running after
+    // a host upgrade without needing to be rebuilt first.
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 0, stage: ""))
+}
+
+@Test func decodeNetworkReadyTimeoutAnywayStage() throws {
+    // The "timeout-anyway" stage means the guest couldn't verify
+    // carrier within its budget but the route IS installed; the host
+    // can log this as a warning. Explicit test so the string literal
+    // doesn't silently drift between guest + host.
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","stage":"timeout-anyway","config_ms":401}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 401, stage: "timeout-anyway"))
+}
+
+@Test func decodeNetworkErrorMessage() throws {
+    let raw = Data(#"{"type":"network_error","reason":"default route not installed after retries","attempts":3}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkError(reason: "default route not installed after retries", attempts: 3))
+}
+
+@Test func decodeNetworkErrorDefaults() throws {
+    // Missing fields default to "unspecified" / 0 rather than
+    // throwing — the host must still be able to route the error to
+    // the pending configureNetwork continuation even if the guest
+    // emits a degraded payload.
+    let raw = Data(#"{"type":"network_error"}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkError(reason: "unspecified", attempts: 0))
+}

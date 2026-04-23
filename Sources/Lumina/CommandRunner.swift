@@ -840,6 +840,19 @@ final class CommandRunner: @unchecked Sendable {
             networkContinuation = nil
             lock.unlock()
             cont?.resume(returning: msg)
+        case .networkError(let reason, let attempts):
+            // Guest couldn't bring up eth0 even after retries — the
+            // route isn't installed, DNS won't resolve. Surface this
+            // as a typed error to the waiting configureNetwork()
+            // caller so the user sees "network setup failed: <reason>"
+            // instead of a silent success followed by exec errors.
+            lock.lock()
+            let cont = networkContinuation
+            networkContinuation = nil
+            lock.unlock()
+            cont?.resume(throwing: LuminaError.protocolError(
+                "guest network setup failed after \(attempts) attempt(s): \(reason)"
+            ))
         case .portForwardReady(let guestPort, let vsockPort):
             lock.lock()
             let cont = portForwardContinuations.removeValue(forKey: guestPort)

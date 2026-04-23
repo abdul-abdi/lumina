@@ -48,6 +48,9 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
 
+    @Flag(name: .customLong("no-wait-network"), help: "Skip the host-side wait for network_ready. Guest still configures the network concurrently; this just drops the barrier. Only use when you KNOW the command won't touch DNS/TCP in the first ~20ms. Default (await) is now ~50-150ms on v0.7.2+ so the speedup is small and the reliability cost is real.")
+    var noWaitNetwork: Bool = false
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -198,7 +201,8 @@ struct Run: AsyncParsableCommand {
             mounts: parsedMounts,
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
-            stdin: resolveStdin()
+            stdin: resolveStdin(),
+            awaitNetworkReady: !noWaitNetwork
         )
 
         let format = resolveOutputFormat()

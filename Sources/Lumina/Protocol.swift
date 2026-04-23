@@ -49,7 +49,19 @@ public enum GuestMessage: Sendable, Equatable {
     case uploadError(path: String, error: String)
     case downloadData(path: String, data: String, seq: Int, eof: Bool)
     case downloadError(path: String, error: String)
-    case networkReady(ip: String)
+    /// Guest network is live. `configMs` is the guest-side setup
+    /// duration (from configure_network receipt to ready emission);
+    /// `stage` annotates which gate fired — "operstate", "carrier",
+    /// or "timeout-anyway" (the defensive fallback where route is
+    /// verified but carrier poll timed out). Old-agent compatibility:
+    /// configMs defaults to 0 and stage to empty when absent.
+    case networkReady(ip: String, configMs: Int, stage: String)
+    /// Guest failed to bring up the network. `reason` is a human-
+    /// readable diagnostic; `attempts` counts how many ip-command
+    /// retries ran before giving up. The host propagates this to
+    /// the pending `configureNetwork` caller as a typed
+    /// `LuminaError.networkConfigFailed`.
+    case networkError(reason: String, attempts: Int)
     /// PTY-backed output (merged stdout+stderr). `data` is the base64-encoded raw bytes
     /// read from the PTY master. Exit is delivered via the shared `.exit(id:code:)` case.
     case ptyOutput(id: String, data: String)
@@ -182,7 +194,13 @@ enum LuminaProtocol {
             return .downloadError(path: path, error: errorStr)
         case "network_ready":
             let ip = json["ip"] as? String ?? ""
-            return .networkReady(ip: ip)
+            let configMs = json["config_ms"] as? Int ?? 0
+            let stage = json["stage"] as? String ?? ""
+            return .networkReady(ip: ip, configMs: configMs, stage: stage)
+        case "network_error":
+            let reason = json["reason"] as? String ?? "unspecified"
+            let attempts = json["attempts"] as? Int ?? 0
+            return .networkError(reason: reason, attempts: attempts)
         case "pty_output":
             guard let id = json["id"] as? String,
                   let outputData = json["data"] as? String else {

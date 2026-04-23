@@ -14,8 +14,26 @@ public struct Lumina {
 
             try await vm.bootResult().get()
 
-            // Host-driven network config — always configure, always wait
-            try await vm.configureNetwork()
+            // Host-driven network config. Default: await network_ready
+            // before exec — the guarantee users depend on for commands
+            // that send a packet in the first ~20 ms (curl, ping, apt,
+            // dns lookups). v0.7.2 perf work moved the cost from ~2.5s
+            // to ~50-150 ms by shrinking the guest's carrier-wait
+            // timeout, batching the `ip` setup, and using a netlink
+            // subscription for instant notification when eth0 comes up
+            // (see Guest/lumina-agent/internal/network/network.go).
+            //
+            // Opt-out for speed-first workloads that know they don't
+            // need network: set `options.awaitNetworkReady = false` or
+            // pass `--no-wait-network` on the CLI. The guest agent
+            // still configures the network in a goroutine concurrently
+            // — the opt-out just drops the host-side barrier.
+            if options.awaitNetworkReady {
+                try await vm.configureNetwork()
+            } else {
+                // Fire-and-forget: start the config, don't await.
+                Task.detached { try? await vm.configureNetwork() }
+            }
 
             let elapsed = ContinuousClock.now - start
             guard elapsed < options.timeout else {
@@ -74,8 +92,26 @@ public struct Lumina {
                     try await withVM(options: options) { vm in
                         let start = ContinuousClock.now
                         try await vm.bootResult().get()
+                        let bootDone = ContinuousClock.now
 
-                        try await vm.configureNetwork()
+                        // v0.7.2 perf: default awaits network_ready so
+                        // commands that need DNS/TCP in the first ~20ms
+                        // of exec work. Opt-out via
+                        // options.awaitNetworkReady = false.
+                        if options.awaitNetworkReady {
+                            try await vm.configureNetwork()
+                        } else {
+                            Task.detached { try? await vm.configureNetwork() }
+                        }
+                        let netDone = ContinuousClock.now
+
+                        if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
+                            let bootMs = (bootDone - start).totalMilliseconds
+                            let netMs = (netDone - bootDone).totalMilliseconds
+                            FileHandle.standardError.write(Data(
+                                "  boot total:         \(String(format: "%7d", bootMs)) ms\n  configure network:  \(String(format: "%7d", netMs)) ms\n".utf8
+                            ))
+                        }
 
                         let elapsed = ContinuousClock.now - start
                         guard elapsed < options.timeout else {
