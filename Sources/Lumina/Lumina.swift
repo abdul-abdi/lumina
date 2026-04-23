@@ -253,8 +253,18 @@ public struct Lumina {
     /// the COW clone removal is ~1ms on APFS (cloneFile reference
     /// decrement), so blocking the caller on shutdown just adds 20-40ms
     /// to every disposable `lumina run` for no benefit on the success
-    /// path. `DiskClone.cleanOrphans()` sweeps at the next boot if the
-    /// process crashes before teardown completes.
+    /// path.
+    ///
+    /// **Contract:** when `withVM` (and therefore `Lumina.run`) returns
+    /// on the success path, the command has finished but the VM may
+    /// still be shutting down. Teardown is *eventual*, not synchronous.
+    /// If the caller process exits before the detached task completes
+    /// (the common CLI case), the COW clone dir under `~/.lumina/runs/`
+    /// can be left behind — the compensating mechanism is the
+    /// `atexit`-registered sweep in `Sources/lumina-cli/CLI.swift` plus
+    /// the boot-time `DiskClone.cleanOrphans()` sweep started from
+    /// `VM.boot()`. Worst case: the dir lives until the next
+    /// `lumina run`, then gets reaped.
     ///
     /// The error path still awaits shutdown — callers catching a
     /// LuminaError likely want to retry, and racing a half-torn-down VM

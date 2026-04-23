@@ -429,15 +429,16 @@ struct Doctor: AsyncParsableCommand {
         if fix {
             removed = DiskClone.cleanOrphans()
         } else {
-            // Dry-run: count dirs that would be removed without actually
-            // removing them. cleanOrphans doesn't expose a dry-run mode,
-            // so we approximate by listing the runs dir.
+            // Dry-run: we don't actually call cleanOrphans (no dry-run
+            // mode on the store), so this counts every entry in runs/
+            // including live in-flight runs from other processes. The
+            // wording below makes that upper-bound explicit.
             let home = FileManager.default.homeDirectoryForCurrentUser
             let runsDir = home.appendingPathComponent(".lumina/runs")
             let entries = (try? FileManager.default.contentsOfDirectory(
                 at: runsDir, includingPropertiesForKeys: nil
             )) ?? []
-            removed = entries.count  // upper bound
+            removed = entries.count
         }
         if removed == 0 {
             return DoctorCheck(
@@ -447,13 +448,19 @@ struct Doctor: AsyncParsableCommand {
                 detail: "~/.lumina/runs/ is clean."
             )
         }
-        let verb = fix ? "Cleaned" : "Found"
-        let hint = fix ? "" : " Pass --fix to remove."
+        if fix {
+            return DoctorCheck(
+                id: "run-orphans",
+                severity: .warning,
+                title: "Cleaned \(removed) orphan run director\(removed == 1 ? "y" : "ies")",
+                detail: "These accumulated from crashed `lumina run` invocations."
+            )
+        }
         return DoctorCheck(
             id: "run-orphans",
             severity: .warning,
-            title: "\(verb) \(removed) orphan run director(y|ies)",
-            detail: "These accumulate from crashed `lumina run` invocations.\(hint)"
+            title: "Up to \(removed) run director\(removed == 1 ? "y" : "ies") in ~/.lumina/runs/",
+            detail: "Some may be live runs from other processes; pass --fix to sweep only the ones whose owning `lumina run` has exited."
         )
     }
 
