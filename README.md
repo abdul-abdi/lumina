@@ -40,7 +40,7 @@ The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "tr
 
 ### v0.7.1 — desktop boot reliability + network speed (current)
 
-Four hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real, plus a complete rewrite of the agent-path network configure for both reliability and speed. Each is unit-tested; end-to-end installer validation is the current open item.
+Hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real, plus a complete rewrite of the agent-path network configure for both reliability and speed, plus a visible boot story and agent-facing observability. Each is unit-tested; end-to-end installer validation is the current open item.
 
 **Network reliability + speed (new):**
 
@@ -48,6 +48,17 @@ Four hardening changes that make "every ARM64 OS boots cleanly, every time" clos
 - **Carrier-wait shrunk 2s → 400ms.** Profiling on M3 Pro shows VZ NAT brings `eth0` up in 40–80ms (P95 ~120ms); 2s was a defensive floor that cost every disposable `lumina run` ~1.5s for nothing. The 400ms ceiling still covers worst-case observed, and `timeout-anyway` is an explicit fallback path rather than an invisible one.
 - **`--no-wait-network` opt-out.** For workloads that know they won't touch DNS/TCP in the first ~20ms (benchmarks, `echo`, pure-CPU tools), skip the host-side barrier and save another ~400ms. Default stays await-network — reliability is the guarantee.
 - **`LUMINA_BOOT_TRACE=1` stderr instrumentation.** New `BootPhases` fields (`imageResolveMs`, `cloneMs`, `vsockConnectMs`, `runnerReadyMs`) populate on the agent path; setting the env var prints the full waterfall to stderr after every `lumina run`. Zero-cost when unset.
+- **Network metrics in RunResult / JSON envelope (new).** Guest emits `network_metrics { interfaces: {eth0: {rx_bytes, tx_bytes, rx_errors, tx_errors, rx_packets, tx_packets}} }` every 2s (first sample 500ms after connect); piped `lumina run` includes the latest snapshot as a `network_metrics` field in the JSON envelope, Swift callers read `RunResult.networkMetrics`. Diagnosing a flaky `apt` / `curl`? Now you can see the per-NIC error counters, not just guess.
+
+**Desktop UX (new):**
+
+- **Tap a VM card → it boots.** Clicking a stopped or crashed VM in the library opens its window and kicks off `boot()` in one gesture — no intermediate "click BOOT" screen. Same behavior on grid cards and list rows. The "Create VM" wizard auto-boots on completion — finish the wizard, the VM window is already open and booting.
+- **Live boot-phase waterfall.** During `.booting`, a SwiftUI waterfall renders each boot phase as a proportional colored bar, filling in live as phases complete (polled at 150ms). Post-mortem version on the crashed screen shows which phase was running when the VM fell over. EFI guests render a 3-bar subset; the view auto-elides zero-ms phases.
+- **Agent Images parity.** The Agent Images section now follows the same grid/list toggle as the VM library. Click any installed image → opens `lumina session start --image <name>` in your preferred terminal. Click a catalog entry → pulls with SHA-256 verification. Hover reveals the action button; cards match `VMCard` visual weight.
+
+**Operations (new):**
+
+- **CI P99 trend dashboard.** `.github/workflows/bench.yml` runs 20 iterations of `lumina run "true"` in two modes (default-await, `--no-wait-network`) on every push to main + weekly schedule, and appends P50/P95/P99 rows to a `gh-pages:metrics.jsonl` branch. Informational-only — the hard median-≤-2000ms regression gate stays in `ci.yml`.
 
 **Desktop boot reliability (also in v0.7.1):**
 
@@ -205,7 +216,8 @@ Open `/Applications/Lumina.app` — or press **⌘K** once it's running to fuzzy
 | Shortcut | Action |
 |---|---|
 | ⌘K | Command launcher — type a VM name, hit Enter, it boots |
-| ⌘N | New VM wizard |
+| ⌘N | New VM wizard (v0.7.1: auto-boots the VM on completion) |
+| Click card | Open VM window + boot it in one action (v0.7.1) |
 | ⌘B / ⌘. | Boot / Stop selected VM |
 | ⌘R | Restart selected VM |
 | ⌘T | Take snapshot |
@@ -228,6 +240,13 @@ Piped JSON is a single envelope. TTY is human-readable text.
 
 ```json
 {"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 668}
+```
+
+v0.7.1+ envelopes may additionally carry `network_metrics` with the latest per-NIC counter snapshot captured from the guest during the run (absent on commands shorter than the 500ms first-sample tick, and on pre-v0.7.1 agents):
+
+```json
+{"stdout":"...","stderr":"","exit_code":0,"duration_ms":1842,
+ "network_metrics":{"interfaces":{"eth0":{"rx_bytes":124567,"tx_bytes":8932,"rx_packets":87,"tx_packets":42,"rx_errors":0,"tx_errors":0}}}}
 ```
 
 **Error** — `error` is set, `exit_code` absent, `partial_stdout` / `partial_stderr` present when the command actually ran:
@@ -325,7 +344,7 @@ Deeper patterns — `MacOSVM` actor, `IPSWCatalog`, snapshots, `withNetwork`, cu
 
 ```bash
 make build                        # debug + codesign
-make test                         # 289 unit + 36 integration tests
+make test                         # ~370 unit (Swift + desktop kit) + 36 integration tests
 make release                      # optimized + codesign
 make install                      # -> ~/.local/bin/lumina
 make test-desktop                 # Alpine ARM64 EFI smoke test
