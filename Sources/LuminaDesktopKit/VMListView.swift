@@ -72,13 +72,15 @@ public struct VMRow: View {
     let bundle: VMBundle
     @Environment(\.openWindow) private var openWindow
     @State private var isHovering = false
-    @State private var stats: VMLiveStats
 
     public init(model: AppModel, bundle: VMBundle) {
         self.model = model
         self.bundle = bundle
-        _stats = State(initialValue: VMLiveStats(bundle: bundle))
     }
+
+    // Stats are model-owned (issue #11). Shared with VMCard when the
+    // user swaps grid ↔ list on the same bundle.
+    private var stats: VMLiveStats { model.liveStats(for: bundle) }
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)

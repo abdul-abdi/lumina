@@ -259,3 +259,42 @@ import Testing
     let plainMeta = store.readMeta(name: "plain-img")
     #expect(plainMeta == nil) // no meta.json → nil
 }
+
+// MARK: - LuminaError.isCancellation
+
+@Test func luminaError_isCancellation_detectsVMErrorCancelled() {
+    let err = LuminaError.bootFailed(underlying: VMError.cancelled)
+    #expect(err.isCancellation)
+}
+
+@Test func luminaError_isCancellation_falseForOtherVMErrors() {
+    #expect(!LuminaError.bootFailed(underlying: VMError.pipeFailed).isCancellation)
+    #expect(!LuminaError.bootFailed(underlying: VMError.noSocketDevice).isCancellation)
+    #expect(!LuminaError.bootFailed(underlying: VMError.invalidState("x")).isCancellation)
+}
+
+@Test func luminaError_isCancellation_falseForNonBootFailed() {
+    #expect(!LuminaError.connectionFailed.isCancellation)
+    #expect(!LuminaError.timeout.isCancellation)
+    #expect(!LuminaError.guestCrashed(serialOutput: "panic").isCancellation)
+    #expect(!LuminaError.imageNotFound("x").isCancellation)
+}
+
+// MARK: - BootPhases
+
+@Test func bootPhases_defaultsToZero() {
+    let p = BootPhases()
+    #expect(p.configMs == 0)
+    #expect(p.vzStartMs == 0)
+    #expect(p.totalMs == 0)
+}
+
+@Test func bootPhases_isEquatable() {
+    var a = BootPhases()
+    var b = BootPhases()
+    #expect(a == b)
+    a.vzStartMs = 42
+    #expect(a != b)
+    b.vzStartMs = 42
+    #expect(a == b)
+}

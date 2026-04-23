@@ -12,16 +12,17 @@ import LuminaBootable
 struct LuminaDesktopApp: App {
     @State private var model = AppModel()
     @State private var uiState = AppUIState.shared
+    @State private var coordinator = LauncherCoordinator()
 
     var body: some Scene {
         WindowGroup("Lumina", id: "library") {
-            LibraryView(model: model)
+            LibraryView(model: model, coordinator: coordinator)
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1200, height: 720)
         .commands {
-            LuminaCommands(model: model, uiState: uiState)
+            LuminaCommands(model: model, uiState: uiState, coordinator: coordinator)
         }
 
         WindowGroup(id: "vm-window", for: UUID.self) { $vmID in
@@ -54,7 +55,7 @@ struct LuminaDesktopApp: App {
         // a dropdown with quick actions. Works even when the main
         // window is hidden or the app is in fullscreen.
         MenuBarExtra {
-            MenuBarContent(model: model)
+            MenuBarContent(model: model, coordinator: coordinator)
         } label: {
             MenuBarLabel(model: model)
         }
@@ -69,14 +70,11 @@ struct MenuBarLabel: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        // Read status on every iterated session so @Observable tracking
-        // fires when any individual session's status flips — not just
-        // when the sessions dict itself mutates. Without this the label
-        // goes stale when a VM transitions stopped↔running and the
-        // dict's identity hasn't changed.
-        let running = model.sessions.values.reduce(into: 0) { count, session in
-            if session.status.isLive { count += 1 }
-        }
+        // `model.runningCount` is a computed property that touches each
+        // child session's `status` inside its scope, so `@Observable`
+        // tracks the transitive reads. Views get a plain Int value;
+        // reuse lands in AppModel, not in View bodies.
+        let running = model.runningCount
         HStack(spacing: 3) {
             // SF Symbol `square.on.square` — two offset squares,
             // shape-identical to the app icon's brand mark. Template
@@ -94,6 +92,7 @@ struct MenuBarLabel: View {
 @MainActor
 struct MenuBarContent: View {
     @Bindable var model: AppModel
+    @Bindable var coordinator: LauncherCoordinator
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -143,14 +142,14 @@ struct MenuBarContent: View {
         Button("New VM…") {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "library")
-            NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+            coordinator.openWizard(preselecting: "ubuntu-24.04")
         }
         .keyboardShortcut("n", modifiers: .command)
 
         Button("Command Launcher (⌘K)") {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "library")
-            NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+            coordinator.showLauncher()
         }
 
         Divider()
@@ -205,6 +204,7 @@ final class AppUIState {
 struct LuminaCommands: Commands {
     @Bindable var model: AppModel
     @Bindable var uiState: AppUIState
+    @Bindable var coordinator: LauncherCoordinator
 
     var body: some Commands {
         // ── Lumina menu (app menu) ──
@@ -212,7 +212,7 @@ struct LuminaCommands: Commands {
             Button("About Lumina") {
                 NSApplication.shared.orderFrontStandardAboutPanel(options: [
                     .applicationName: "Lumina",
-                    .applicationVersion: "0.7.0",
+                    .applicationVersion: "0.7.1",
                     .credits: NSAttributedString(
                         string: "Native Apple Workload Runtime for Agents.\nBoot a VM. Run a command. Parse the JSON.",
                         attributes: [.foregroundColor: NSColor.secondaryLabelColor]
@@ -224,7 +224,7 @@ struct LuminaCommands: Commands {
         // ── File menu ──
         CommandGroup(replacing: .newItem) {
             Button("New VM…") {
-                NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: "ubuntu-24.04")
+                coordinator.openWizard(preselecting: "ubuntu-24.04")
             }
             .keyboardShortcut("n", modifiers: .command)
 
@@ -298,7 +298,7 @@ struct LuminaCommands: Commands {
         // ── View menu ──
         CommandGroup(after: .toolbar) {
             Button("Open Command Launcher") {
-                NotificationCenter.default.post(name: .luminaShowLauncher, object: nil)
+                coordinator.showLauncher()
             }
             .keyboardShortcut("k", modifiers: .command)
             Divider()
@@ -324,7 +324,7 @@ struct LuminaCommands: Commands {
                 NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki")!)
             }
             Button("Keyboard Shortcuts") {
-                NotificationCenter.default.post(name: .luminaShowShortcuts, object: nil)
+                NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki/Keyboard-Shortcuts")!)
             }
             .keyboardShortcut("/", modifiers: .command)
             Divider()
@@ -371,7 +371,7 @@ struct LuminaCommands: Commands {
     }
 
     private func openWizard(tile: String) {
-        NotificationCenter.default.post(name: .luminaLauncherOpenWizard, object: tile)
+        coordinator.openWizard(preselecting: tile)
     }
 
     private func setAppearance(_ raw: String) {
@@ -383,11 +383,6 @@ struct LuminaCommands: Commands {
             w.toggleFullScreen(nil)
         }
     }
-}
-
-public extension Notification.Name {
-    static let luminaShowLauncher = Notification.Name("LuminaShowLauncher")
-    static let luminaShowShortcuts = Notification.Name("LuminaShowShortcuts")
 }
 
 @MainActor
@@ -446,7 +441,7 @@ struct PreferencesView: View {
                 ))
             Text("Lumina Desktop")
                 .font(.title3.weight(.semibold))
-            Text("v0.7.0")
+            Text("v0.7.1")
                 .foregroundStyle(.secondary)
             Text("Native Apple Workload Runtime for Agents")
                 .font(.caption)

@@ -46,6 +46,67 @@ import Testing
         #expect(model.filteredBundles[0].manifest.name == "Kali Box")
     }
 
+    @Test func runningCountIsZeroWithNoSessions() throws {
+        let bundle = try VMBundle.create(
+            at: tmp.appendingPathComponent(UUID().uuidString),
+            name: "Empty",
+            osFamily: .linux,
+            osVariant: "ubuntu-24.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        let model = AppModel(store: VMStore(rootURL: tmp))
+        // Session exists but status is .stopped (default).
+        _ = model.session(for: bundle)
+        #expect(model.runningCount == 0)
+    }
+
+    @Test func liveStatsAreCachedByBundleID() throws {
+        let bundle = try VMBundle.create(
+            at: tmp.appendingPathComponent(UUID().uuidString),
+            name: "Stats",
+            osFamily: .linux,
+            osVariant: "ubuntu-24.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        let model = AppModel(store: VMStore(rootURL: tmp))
+        let a = model.liveStats(for: bundle)
+        let b = model.liveStats(for: bundle)
+        #expect(a === b)
+        model.retireLiveStats(for: bundle.manifest.id)
+        let c = model.liveStats(for: bundle)
+        #expect(c !== a)
+    }
+
+    @Test func reaperEvictsIdleStoppedSessionsAfterThreshold() throws {
+        let bundle = try VMBundle.create(
+            at: tmp.appendingPathComponent(UUID().uuidString),
+            name: "Reap",
+            osFamily: .linux,
+            osVariant: "ubuntu-24.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        let model = AppModel(store: VMStore(rootURL: tmp))
+        // Session is created in .stopped state (default).
+        _ = model.session(for: bundle)
+        #expect(model.sessions.count == 1)
+
+        // First reaper pass: marks the session as inactive, doesn't evict.
+        let now = Date()
+        model.reapIdleSessions(now: now)
+        #expect(model.sessions.count == 1)
+
+        // Jump forward past the idle threshold (300s default).
+        let future = now.addingTimeInterval(400)
+        model.reapIdleSessions(now: future)
+        #expect(model.sessions.count == 0)
+    }
+
     @Test func sessionIsCreatedOnceAndCached() throws {
         let bundle = try VMBundle.create(
             at: tmp.appendingPathComponent(UUID().uuidString),

@@ -27,7 +27,7 @@ settings:
     SWIFT_VERSION: 6.0
     MACOSX_DEPLOYMENT_TARGET: 14.0
     PRODUCT_NAME: Lumina
-    MARKETING_VERSION: 0.7.0
+    MARKETING_VERSION: 0.7.1
     CURRENT_PROJECT_VERSION: 1
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_IDENTITY: "-"
@@ -43,6 +43,16 @@ targets:
   LuminaDesktop:
     type: application
     platform: macOS
+    settings:
+      base:
+        # Keep PRODUCT_NAME = "Lumina" (user-facing app name) but give
+        # the Swift module a distinct name so it does not collide with
+        # the `Lumina` product exported by the SPM package at ../.. .
+        # Without this override the xcodeproj emits a Lumina.swiftmodule
+        # alongside the package's own and the build fails with
+        # "Multiple commands produce Lumina.swiftmodule".
+        PRODUCT_MODULE_NAME: LuminaDesktopApp
+        SWIFT_MODULE_NAME: LuminaDesktopApp
     sources:
       - path: LuminaDesktop
     info:
@@ -76,6 +86,17 @@ targets:
         com.apple.security.virtualization: true
         com.apple.security.hypervisor: true
         com.apple.security.network.client: true
+        # com.apple.vm.networking (for VZBridgedNetworkDeviceAttachment /
+        # NetworkMode.bridged) is NOT declared by default: Apple's free
+        # Personal Team cannot provision it and Xcode signing fails
+        # with "Entitlement com.apple.vm.networking not found and could
+        # not be included in profile." To unlock bridged networking,
+        # enroll in the paid Apple Developer Program ($99/yr), select
+        # your team here, and add `com.apple.vm.networking: true` back
+        # to this file. ad-hoc /Applications installs additionally
+        # require omitting this key (macOS 14+ refuses to launch
+        # ad-hoc binaries that declare it). Both paths handled by
+        # scripts/build-app.sh via LuminaDesktop-adhoc.entitlements.
     dependencies:
       - package: Lumina
         product: Lumina

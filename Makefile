@@ -1,4 +1,4 @@
-.PHONY: build release sign test test-integration test-desktop clean run
+.PHONY: build release sign test test-integration test-desktop clean run dev-app doctor-signing
 
 BINARY_DEBUG = $(shell swift build --show-bin-path)/lumina
 BINARY_RELEASE = $(shell swift build -c release --show-bin-path)/lumina
@@ -57,3 +57,46 @@ install: release
 clean:
 	swift package clean
 	rm -rf .build
+
+# Build + install the desktop app using the first available developer
+# signing identity (Apple Development / Personal Team / Developer ID).
+# Enables NetworkMode.bridged by signing with the full entitlements set
+# (com.apple.vm.networking) — required for VZBridgedNetworkDeviceAttachment
+# on macOS 14+. Prerequisite: Xcode > Settings > Accounts > Apple ID.
+# If no identity is found, prints setup instructions and exits.
+dev-app:
+	@IDENT=$$(security find-identity -p codesigning -v 2>/dev/null | awk -F'"' '/Apple Development|Developer ID Application|Apple Distribution/ {print $$2; exit}'); \
+	if [ -z "$$IDENT" ]; then \
+		echo "error: no developer codesigning identity found."; \
+		echo ""; \
+		echo "Set up a free Personal Team (5 minutes):"; \
+		echo "  1. Open Xcode, go to Settings > Accounts"; \
+		echo "  2. Click + > Apple ID, sign in with any Apple ID"; \
+		echo "  3. A 'Personal Team' is created automatically"; \
+		echo "  4. Re-run: make dev-app"; \
+		echo ""; \
+		echo "Alternatively, \$$99/year Apple Developer Program gets you a"; \
+		echo "Developer ID for distribution-grade signing + notarization."; \
+		exit 2; \
+	fi; \
+	echo "→ Signing with: $$IDENT"; \
+	LUMINA_SIGN_IDENTITY="$$IDENT" bash scripts/build-app.sh --install
+
+# Inspect the local signing environment. Prints certs, Xcode teams,
+# whether bridged networking is usable.
+doctor-signing:
+	@echo "=== Codesigning identities ==="
+	@security find-identity -p codesigning -v 2>/dev/null || echo "(none)"
+	@echo ""
+	@echo "=== Team identifiers on codesigning certs ==="
+	@security find-identity -p codesigning -v 2>/dev/null | grep -oE '\([A-Z0-9]+\)' | sort -u | tr -d '()' | sed 's/^/  /' || echo "  (none)"
+	@echo ""
+	@echo "=== Currently installed /Applications/Lumina.app entitlements ==="
+	@codesign -d --entitlements - /Applications/Lumina.app 2>&1 | grep -E 'virtualization|hypervisor|networking|network.client' || echo "(Lumina.app not installed)"
+	@echo ""
+	@echo "=== NetworkMode.bridged availability ==="
+	@if codesign -d --entitlements - /Applications/Lumina.app 2>&1 | grep -q 'com.apple.vm.networking'; then \
+		echo "✓ bridged networking available (app signed with com.apple.vm.networking)"; \
+	else \
+		echo "✗ bridged networking NOT available — run 'make dev-app' after setting up Xcode Apple ID"; \
+	fi

@@ -8,7 +8,7 @@ struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.7.0",
+        version: "0.7.1",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
@@ -731,6 +731,9 @@ struct SessionStart: AsyncParsableCommand {
     @Option(name: .long, help: "Forward port (host:guest, repeatable). Host side binds 127.0.0.1 only.")
     var forward: [String] = []
 
+    @Option(name: .long, help: "Idle TTL (e.g. 30m, 1h). Session auto-stops after this long with no client activity and no active execs. Default: 0 (never auto-stop).")
+    var ttl: String = "0"
+
     func run() async throws {
         // Check if requested image exists before spawning background process
         let puller = ImagePuller()
@@ -823,6 +826,9 @@ struct SessionStart: AsyncParsableCommand {
         }
         for spec in forward {
             process.arguments! += ["--forward", spec]
+        }
+        if ttl != "0" {
+            process.arguments! += ["--ttl", ttl]
         }
 
         // Capture stderr from child process so boot failures are surfaced

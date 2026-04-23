@@ -4,19 +4,31 @@ Forward-looking plan. Shipped milestones move to [the release history](https://g
 
 ## Shipped
 
-- **v0.7.0** (2026-04-20) — Lumina Desktop: full-OS guests (Linux ISO, Windows 11 ARM, macOS IPSW) + SwiftUI app + clipboard scaffolding + ARM64 ISO pre-flight + virtio sound + Rosetta-at-runtime for desktop guests + **fail-closed SHA-256 verification** of catalog ISOs in the wizard (real per-vendor digests baked into `DesktopOSCatalog`) + concurrent-boot re-entry guard for first-boot reliability. Ad-hoc signed; notarization deferred to v0.7.1.
+- **v0.7.0** (2026-04-20) — Lumina Desktop: full-OS guests (Linux ISO, Windows 11 ARM, macOS IPSW) + SwiftUI app + clipboard scaffolding + ARM64 ISO pre-flight + virtio sound + Rosetta-at-runtime for desktop guests + **fail-closed SHA-256 verification** of catalog ISOs in the wizard (real per-vendor digests baked into `DesktopOSCatalog`) + concurrent-boot re-entry guard for first-boot reliability. Ad-hoc signed; notarization on the v0.7.2 runway (Apple Developer Program enrollment + CI secret plumbing).
 - **v0.6.0** (2026-04-20) — Interactive agent sessions: PTY, port forwarding, unified JSON envelope, `lumina ps`, typed exec errors.
 - v0.5.0 — Agent-grade VM execution: concurrent exec, stdin piping, pre-warmed pools, unified NDJSON (pre-unified-envelope).
 - v0.4.x and earlier — initial runtime, sessions, images, volumes.
 
-## v0.7.1 candidates (post-v0.7 follow-ups)
+## v0.7.1 — desktop boot reliability (shipped on `refactor/idiomatic-pass`)
 
-- **Notarization** — once Apple Developer Program account is set up, swap ad-hoc signing for Developer ID + notarytool.
-- **Lumina Guest Additions repo** — publish .deb/.rpm packages at https://guest.lumina.app/ so the cloud-init seed actually finishes the clipboard install. M7 ships the host-side scaffolding; this completes the loop.
+Reliability-first release. Three headline fixes:
+
+- **Stable MAC per `.luminaVM` bundle.** Backfilled lazily on first boot; kills the vmnet DHCP-churn class of failures.
+- **Cancel-during-boot → clean retry.** `withTaskCancellationHandler` wrapping `vm.start(…)` releases the `flock()` on `disk.img` + `efi.vars` so the next boot starts cold.
+- **Pre-start delegate install.** Guest crashes in the 300–500 ms kernel-boot window now surface as `.crashed(reason:)` instead of hanging the UI at `.running`.
+
+Plus: USB mass-storage CD-ROM for Windows 11 ARM + install-phase disk-cache tuning (~2× faster partman), guest-agent Manager split + PTY leak fix on connection drop, cooperative-pool starvation regression gate, idle-TTL for orphaned sessions, serial tail in the Desktop boot window (no more framebuffer blind spot), custom agent images visible in the Desktop library, `AppModel.runningCount` as a named computed property.
+
+## v0.7.2 candidates (post-v0.7.1 follow-ups)
+
+- **Notarization** — Apple Developer Program enrollment + CI secret plumbing. `scripts/build-app.sh` already selects the right entitlements per cert class; `release.yml` needs `notarytool submit --wait` + staple + DMG.
+- **Lumina Guest Additions repo** — publish .deb/.rpm packages at https://guest.lumina.app/ so the cloud-init seed actually finishes the clipboard install.
 - **Automated catalog re-scrape** — weekly cron (`drift.yml`) already HEADs each `DesktopOSCatalog` URL; promote to auto-PR when a vendor filename drifts so the baked SHA-256 never goes stale for long.
 - **CLI-side ISO SHA-256 verification** — `lumina desktop create --iso` currently does arch pre-flight but not digest verification; the app wizard does. Mirror the verification into the CLI.
-- **Windows scancode remap at runtime** — apply `WindowsInputQuirks` table inside the running-VM input layer for Windows guests.
+- **Windows scancode remap at runtime** — apply `WindowsInputQuirks` table inside the running-VM input layer.
 - **Multi-display per VM** — `VZGraphicsDeviceConfiguration.displays` accepts arrays.
+- **Agent-path `BootPhases` instrumentation** — v0.7.1 wired `BootPhases` for the EFI path; the agent path still reports zeros. Either fill in the phase recording or delete the unused `agentReadyMs` field.
+- **Go integration tests for the guest agent** — v0.7.1 refactored the agent into per-responsibility packages but shipped without a test harness. A faked vsock peer + per-Manager tests would catch regressions manual smoke can't.
 
 ## In progress (none — v0.7.0 was the last in-progress release)
 

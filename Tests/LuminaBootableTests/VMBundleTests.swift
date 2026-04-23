@@ -98,6 +98,88 @@ import Testing
         }
     }
 
+    @Test func macAddressIsPopulatedOnCreate() throws {
+        let path = root.appendingPathComponent(UUID().uuidString)
+        let bundle = try VMBundle.create(
+            at: path,
+            name: "MACTest",
+            osFamily: .linux,
+            osVariant: "kali-rolling",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        guard let mac = bundle.manifest.macAddress else {
+            Issue.record("Expected macAddress to be populated on create")
+            return
+        }
+        // xx:xx:xx:xx:xx:xx form, 17 chars, 6 hex octets.
+        #expect(mac.count == 17)
+        let octets = mac.split(separator: ":")
+        #expect(octets.count == 6)
+        for octet in octets { #expect(octet.count == 2) }
+        // First octet must be locally-administered (bit 1 set) and
+        // unicast (bit 0 cleared). That's the whole point of the
+        // randomLocallyAdministered contract.
+        guard let firstByte = UInt8(octets[0], radix: 16) else {
+            Issue.record("First octet \(octets[0]) is not a valid hex byte")
+            return
+        }
+        #expect((firstByte & 0x02) == 0x02)
+        #expect((firstByte & 0x01) == 0x00)
+    }
+
+    @Test func ensureMACAddressIsIdempotentAcrossBootAndReload() throws {
+        let path = root.appendingPathComponent(UUID().uuidString)
+        var bundle = try VMBundle.create(
+            at: path,
+            name: "Stable",
+            osFamily: .linux,
+            osVariant: "ubuntu-24.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024
+        )
+        let first = bundle.ensureMACAddress()
+        let second = bundle.ensureMACAddress()
+        #expect(first == second)
+        // Survives a reload from disk.
+        let reloaded = try VMBundle.load(from: path)
+        #expect(reloaded.manifest.macAddress == first)
+    }
+
+    @Test func ensureMACAddressBackfillsLegacyManifest() throws {
+        // Simulate a pre-v0.7.1 bundle that predates macAddress persistence
+        // by building one with macAddress: nil directly on disk.
+        let path = root.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        let legacy = VMBundleManifest(
+            id: UUID(),
+            name: "Legacy",
+            osFamily: .linux,
+            osVariant: "ubuntu-22.04",
+            memoryBytes: 1024 * 1024 * 1024,
+            cpuCount: 1,
+            diskBytes: 1024 * 1024 * 1024,
+            createdAt: Date(),
+            lastBootedAt: nil,
+            macAddress: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(legacy)
+        try data.write(to: path.appendingPathComponent("manifest.json"))
+
+        var bundle = try VMBundle.load(from: path)
+        #expect(bundle.manifest.macAddress == nil)
+        let backfilled = bundle.ensureMACAddress()
+        #expect(!backfilled.isEmpty)
+        #expect(bundle.manifest.macAddress == backfilled)
+        // Re-loaded manifest has the persisted backfill.
+        let reloaded = try VMBundle.load(from: path)
+        #expect(reloaded.manifest.macAddress == backfilled)
+    }
+
     @Test func bundle_save_writesUpdatedManifest() throws {
         let path = root.appendingPathComponent(UUID().uuidString)
         var bundle = try VMBundle.create(

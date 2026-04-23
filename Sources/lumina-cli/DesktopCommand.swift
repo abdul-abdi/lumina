@@ -5,6 +5,7 @@
 
 import ArgumentParser
 import Foundation
+import CryptoKit
 import Lumina
 import LuminaBootable
 
@@ -95,6 +96,18 @@ struct DesktopCreate: AsyncParsableCommand {
     @Flag(name: .customLong("force"), help: "Skip ARM64 architecture pre-flight check on the ISO.")
     var force = false
 
+    @Flag(name: .customLong("no-verify-iso"),
+          help: "Skip SHA-256 verification even when the ISO filename matches a DesktopOSCatalog entry. v0.7.1+: matched ISOs are verified by default.")
+    var noVerifyISO = false
+
+    @Option(name: .customLong("network"),
+            help: "Network attachment mode: 'nat' (default, vmnet NAT) or 'bridged' (join host LAN, guest DHCPs against your router — bypasses vmnet and fixes the Debian/Kali netcfg DHCP-race).")
+    var networkMode: String = "nat"
+
+    @Option(name: .customLong("bridge-interface"),
+            help: "Host interface to bridge against when --network=bridged (e.g. 'en0'). Defaults to the first bridgeable interface.")
+    var bridgeInterface: String?
+
     mutating func run() async throws {
         let memBytes = DesktopHelpers.parseMemoryOrExit(memory)
         let diskBytes = DesktopHelpers.parseDiskOrExit(diskSize)
@@ -135,6 +148,36 @@ struct DesktopCreate: AsyncParsableCommand {
             }
         }
 
+        // v0.7.1 M3: SHA-256 verification on catalog ISOs. The Desktop
+        // wizard has always done this; the CLI parity gap was tracked on
+        // the v0.7.2 runway. If the ISO filename matches a
+        // `DesktopOSCatalog` entry's URL filename, hash the file and
+        // compare. Mismatch = refuse to create (same contract the
+        // wizard ships). Non-matched ISOs (BYO distros, Windows MSA,
+        // Apple IPSWs) are silently skipped — there's no catalog
+        // digest to check against.
+        if let iso = isoPath, !noVerifyISO {
+            let isoURL = URL(fileURLWithPath: (iso as NSString).expandingTildeInPath)
+            if let entry = DesktopCreate.catalogEntryMatching(isoURL: isoURL) {
+                FileHandle.standardError.write(Data(
+                    "→ verifying \(entry.displayName) SHA-256 (\(entry.sha256.prefix(8))…)\n".utf8
+                ))
+                let actual = try DesktopCreate.sha256Hex(of: isoURL)
+                if actual.lowercased() != entry.sha256.lowercased() {
+                    FileHandle.standardError.write(Data("""
+                        error: SHA-256 mismatch for \(iso).
+                          expected \(entry.sha256)
+                          actual   \(actual)
+                        The file is corrupted, tampered with, or not the catalog version.
+                        Pass --no-verify-iso to skip (not recommended).
+                        \n
+                        """.utf8))
+                    throw ExitCode(2)
+                }
+                FileHandle.standardError.write(Data("✓ SHA-256 matches\n".utf8))
+            }
+        }
+
         let osFamily: OSFamily
         switch osVariant.lowercased() {
         case let v where v.hasPrefix("ubuntu"), let v where v.hasPrefix("kali"),
@@ -159,7 +202,23 @@ struct DesktopCreate: AsyncParsableCommand {
             rootURL = base.appendingPathComponent(id.uuidString)
         }
 
-        let bundle: VMBundle
+        // Parse --network. Unknown values are a hard error rather than
+        // silent fallback to nat — the user explicitly chose bridged and
+        // should know when a typo prevents that.
+        let parsedNetworkMode: NetworkMode
+        switch networkMode.lowercased() {
+        case "nat":
+            parsedNetworkMode = .nat
+        case "bridged":
+            parsedNetworkMode = .bridged(interface: bridgeInterface)
+        default:
+            FileHandle.standardError.write(Data(
+                "error: --network must be 'nat' or 'bridged' (got '\(networkMode)')\n".utf8
+            ))
+            throw ExitCode(2)
+        }
+
+        var bundle: VMBundle
         do {
             bundle = try VMBundle.create(
                 at: rootURL,
@@ -177,6 +236,18 @@ struct DesktopCreate: AsyncParsableCommand {
         } catch {
             FileHandle.standardError.write(Data("error: failed to create bundle: \(error)\n".utf8))
             throw ExitCode(1)
+        }
+
+        // Persist the chosen network mode. Default (`.nat`) is left as
+        // nil so the manifest stays minimal for the common case; explicit
+        // `.bridged` is written so the boot layer picks it up on every
+        // subsequent invocation.
+        switch parsedNetworkMode {
+        case .nat:
+            break
+        case .bridged:
+            bundle.manifest.networkMode = parsedNetworkMode
+            try? bundle.save()
         }
 
         // Allocate the primary disk.
@@ -214,6 +285,40 @@ struct DesktopCreate: AsyncParsableCommand {
             if let iso = isoPath { print("  iso:       \(iso) (staged for first boot)") }
         }
     }
+
+    // MARK: - v0.7.1 M3: catalog ISO SHA-256 helpers
+
+    /// If the given ISO's filename matches the tail component of any
+    /// `DesktopOSCatalog` entry's URL, return that entry — this is the
+    /// wizard's "you picked a known catalog ISO" signal translated to
+    /// the CLI. No network I/O; pure filename comparison. Returns nil
+    /// for BYO ISOs (no catalog digest to check against).
+    static func catalogEntryMatching(isoURL: URL) -> DesktopOSEntry? {
+        let name = isoURL.lastPathComponent.lowercased()
+        return DesktopOSCatalog.all.first {
+            $0.isoURL.lastPathComponent.lowercased() == name
+        }
+    }
+
+    /// Stream-hash a file with SHA-256 in 4 MB chunks. Matches
+    /// `LuminaDesktopKit/ISOVerifier.verify` byte-for-byte; a deliberate
+    /// duplication because `ISOVerifier` is internal to DesktopKit and
+    /// promoting it to a shared target would touch 5 files + 2 tests
+    /// for no current caller-gain. If the wizard and CLI ever diverge,
+    /// consolidate then.
+    static func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = try handle.read(upToCount: 4 * 1024 * 1024) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
 }
 
 // MARK: - desktop boot
@@ -250,13 +355,36 @@ struct DesktopBoot: AsyncParsableCommand {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
+        // Ensure + persist a stable MAC on first boot. See
+        // `LuminaDesktopSession.boot()` for the full rationale.
+        let stableMAC = bundle.ensureMACAddress()
+
+        let isWindows = bundle.manifest.osFamily == .windows
+        let isInstallPhase = bundle.manifest.lastBootedAt == nil
+
         var opts = VMOptions.default
         opts.memory = bundle.manifest.memoryBytes
         opts.cpuCount = bundle.manifest.cpuCount
+        opts.macAddress = stableMAC
+        // Respect the manifest's network mode — .bridged here flows to
+        // VZBridgedNetworkDeviceAttachment which delegates DHCP to the
+        // user's LAN router instead of vmnet's bootpd.
+        switch bundle.manifest.networkMode ?? .nat {
+        case .nat:
+            opts.networkProvider = NATNetworkProvider()
+        case .bridged(let iface):
+            opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
+        }
+        // Serial log to bundle/logs/serial.log so failures are
+        // post-mortem diagnosable without retrying the boot.
+        opts.serialLogURL = bundle.logsDirectory
+            .appendingPathComponent("serial.log")
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
-            cdromISO: cdromURL
+            cdromISO: cdromURL,
+            preferUSBCDROM: isWindows,
+            installPhase: isInstallPhase
         ))
         if !headless {
             opts.graphics = GraphicsConfig(
@@ -432,13 +560,17 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
     var cpus: Int = 4
 
     mutating func run() async throws {
-        let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
+        var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
         let ipswURL = URL(fileURLWithPath: (ipswPath as NSString).expandingTildeInPath)
 
         guard FileManager.default.fileExists(atPath: ipswURL.path) else {
             FileHandle.standardError.write(Data("error: IPSW not found: \(ipswPath)\n".utf8))
             throw ExitCode(2)
         }
+
+        // Ensure the bundle has a persisted MAC before install so regular
+        // boots after install match what VZ saw during the install run.
+        let stableMAC = bundle.ensureMACAddress()
 
         let cfg = MacOSBootConfig(
             ipsw: ipswURL,
@@ -448,7 +580,8 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
         let vm = MacOSVM(
             bootConfig: cfg,
             memoryBytes: DesktopHelpers.parseMemoryOrExit(memory),
-            cpuCount: cpus
+            cpuCount: cpus,
+            macAddress: stableMAC
         )
 
         print("Restoring macOS from \(ipswPath) into \(bundle.rootURL.path)")

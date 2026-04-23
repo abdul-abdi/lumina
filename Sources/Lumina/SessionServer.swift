@@ -52,10 +52,59 @@ public final class SessionServer: @unchecked Sendable {
         ptyLock.withLock { activePtyId }
     }
 
+    /// Wall-clock instant of the most recent client activity. Used by the
+    /// idle-TTL watchdog. Guarded by `lock`. Seeded to `bootTime` so the
+    /// TTL is measured from the server coming up, not from a distant past.
+    private var lastActivity: Date
+
+    private func touchActivity() {
+        lock.withLock { lastActivity = Date() }
+    }
+
     public init(socketPath: URL, imageName: String = "unknown", bootTime: Date = Date()) {
         self.socketPath = socketPath
         self.imageName = imageName
         self.bootTime = bootTime
+        self.lastActivity = bootTime
+    }
+
+    /// Poll every `ttl/4` seconds. If the server has been idle (no recent
+    /// accept AND no active execs on the VM) for at least `ttl`, close the
+    /// listening fd so the serve() accept loop exits. This is best-effort —
+    /// a client that's mid-read will still get torn down when handleConnection
+    /// sees its socket close.
+    private func runIdleWatchdog(ttl: TimeInterval, vm: VM) async {
+        // Poll at ttl/4, clamped to [5s, 5min]. Short TTLs (testing) get
+        // prompt teardown; long TTLs (30m production) avoid wasteful churn.
+        let pollInterval = min(max(ttl / 4, 5.0), 300.0)
+        while !Task.isCancelled {
+            let pollNanos = UInt64(pollInterval * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: pollNanos)
+            if Task.isCancelled { return }
+
+            let (lastSeen, fdOpen): (Date, Bool) = lock.withLock {
+                (self.lastActivity, self.serverFd >= 0)
+            }
+            guard fdOpen else { return }
+
+            // Only shut down when truly idle: no active execs on the VM.
+            // active-execs includes PTYs; a live interactive session is
+            // never auto-terminated.
+            let activeExecs = await vm.activeExecCount
+            if activeExecs > 0 { continue }
+
+            if Date().timeIntervalSince(lastSeen) >= ttl {
+                NSLog("[Lumina.Session] Idle TTL reached (%.0fs), auto-shutting down", ttl)
+                // Close the listening fd so accept() returns and serve() exits.
+                lock.withLock {
+                    if serverFd >= 0 {
+                        Darwin.close(serverFd)
+                        serverFd = -1
+                    }
+                }
+                return
+            }
+        }
     }
 
     /// Bind and listen on the Unix domain socket.
@@ -84,9 +133,12 @@ public final class SessionServer: @unchecked Sendable {
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
                 pathBytes.withUnsafeBufferPointer { src in
-                    // Guard above ensures src.count <= 104; min is a safety backstop.
+                    // src.baseAddress is nil only for an empty buffer; the guard
+                    // above requires a non-empty path (count <= 103) so this is
+                    // defensive, not expected.
+                    guard let base = src.baseAddress else { return }
                     let count = min(src.count, 104)
-                    dest.update(from: src.baseAddress!, count: count)
+                    dest.update(from: base, count: count)
                 }
             }
         }
@@ -102,7 +154,12 @@ public final class SessionServer: @unchecked Sendable {
             throw LuminaError.sessionFailed("Failed to bind socket: \(errno)")
         }
 
-        guard listen(serverFd, 5) == 0 else {
+        // Use SOMAXCONN (128 on macOS). A larger backlog has no cost on a
+        // Unix domain socket and prevents parallel CLI clients from hanging
+        // when their connect() is deferred past the accept queue. The
+        // previous value of 5 was observed to hang at ~8 concurrent
+        // `lumina exec` invocations against a single session.
+        guard listen(serverFd, Int32(SOMAXCONN)) == 0 else {
             Darwin.close(serverFd)
             serverFd = -1
             throw LuminaError.sessionFailed("Failed to listen on socket: \(errno)")
@@ -125,7 +182,16 @@ public final class SessionServer: @unchecked Sendable {
     /// Read one NDJSON line from a file handle.
     /// Uses the caller-provided buffer to retain leftover bytes when multiple
     /// frames arrive in a single read (coalesced NDJSON).
-    public func readMessage(from handle: FileHandle, buffer: inout Data) throws -> Data {
+    ///
+    /// The blocking `read(2)` runs on a dedicated GCD queue via a checked
+    /// continuation so it does **not** hold a Swift cooperative-pool thread
+    /// while waiting. Previously this used `FileHandle.availableData`, which
+    /// is synchronous: with one connection per cooperative thread blocked in
+    /// `read`, the pool was exhausted around CPU-count connections and the
+    /// accept loop starved, hanging ~8+ parallel CLI clients. Moving the
+    /// read to a GCD queue and suspending the Task at the await boundary
+    /// frees cooperative threads for dispatch.
+    public func readMessage(from handle: FileHandle, buffer: inout Data) async throws -> Data {
         while true {
             // Check if buffer already has a complete line
             if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
@@ -135,7 +201,7 @@ public final class SessionServer: @unchecked Sendable {
                 return line
             }
 
-            let chunk = handle.availableData
+            let chunk = await Self.asyncReadChunk(fd: handle.fileDescriptor)
             if chunk.isEmpty {
                 if buffer.isEmpty { throw LuminaError.connectionFailed }
                 let remaining = buffer
@@ -146,6 +212,38 @@ public final class SessionServer: @unchecked Sendable {
             if buffer.count > SessionProtocol.maxMessageSize {
                 buffer = Data()
                 throw LuminaError.protocolError("Session message exceeds 64KB")
+            }
+        }
+    }
+
+    /// Concurrent GCD queue for blocking socket reads. Deliberately **not**
+    /// the Swift cooperative pool — we want these reads off the pool so
+    /// many parked connections cannot starve scheduler threads. Concurrent
+    /// attribute lets GCD scale threads as connections pile up.
+    private static let readQueue = DispatchQueue(
+        label: "com.lumina.session.read",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// Issue one `read(2)` and return the bytes as `Data`. Returns empty
+    /// `Data` on EOF or error; callers distinguish via buffer state.
+    /// EINTR is retried transparently. 8 KiB read chunk — anything larger
+    /// than that gets rebuffered by the NDJSON framer.
+    private static func asyncReadChunk(fd: Int32) async -> Data {
+        await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
+            readQueue.async {
+                var buf = [UInt8](repeating: 0, count: 8192)
+                let n: ssize_t = buf.withUnsafeMutableBufferPointer { ptr in
+                    var r: ssize_t
+                    repeat { r = Darwin.read(fd, ptr.baseAddress, ptr.count) } while r < 0 && errno == EINTR
+                    return r
+                }
+                if n <= 0 {
+                    cont.resume(returning: Data())
+                } else {
+                    cont.resume(returning: Data(buf[0..<Int(n)]))
+                }
             }
         }
     }
@@ -193,7 +291,28 @@ public final class SessionServer: @unchecked Sendable {
     /// The enclosing TaskGroup awaits all in-flight connection tasks on scope
     /// exit, so a shutdown on one client still lets other clients finish
     /// their pending response before the serve call returns.
-    public func serve(vm: VM, onShutdown: (@Sendable () async -> Void)? = nil) async {
+    ///
+    /// `idleTTL`: if non-nil and > 0, the server auto-shuts down when it
+    /// has been idle (zero accepted-then-closed connections AND zero active
+    /// execs on the VM) for at least the TTL. Set to nil or 0 to disable.
+    public func serve(
+        vm: VM,
+        idleTTL: TimeInterval? = nil,
+        onShutdown: (@Sendable () async -> Void)? = nil
+    ) async {
+        // Spawn the idle watchdog before the accept loop so it can close the
+        // serverFd from underneath us — which makes accept() return and the
+        // loop exits through the serverFd < 0 branch.
+        let watchdog: Task<Void, Never>?
+        if let ttl = idleTTL, ttl > 0 {
+            watchdog = Task.detached { [weak self] in
+                await self?.runIdleWatchdog(ttl: ttl, vm: vm)
+            }
+        } else {
+            watchdog = nil
+        }
+        defer { watchdog?.cancel() }
+
         await withTaskGroup(of: Void.self) { group in
             while serverFd >= 0 {
                 let handles: (read: FileHandle, write: FileHandle)
@@ -203,6 +322,7 @@ public final class SessionServer: @unchecked Sendable {
                     if serverFd < 0 { break } // server was closed
                     continue
                 }
+                touchActivity()
 
                 group.addTask { [weak self] in
                     await self?.handleConnection(handles: handles, vm: vm, onShutdown: onShutdown)
@@ -233,7 +353,7 @@ public final class SessionServer: @unchecked Sendable {
         while true {
             let msgData: Data
             do {
-                msgData = try readMessage(from: handles.read, buffer: &readBuf)
+                msgData = try await readMessage(from: handles.read, buffer: &readBuf)
             } catch {
                 break // client disconnected
             }
@@ -388,7 +508,7 @@ public final class SessionServer: @unchecked Sendable {
                 while !Task.isCancelled {
                     let msgData: Data
                     do {
-                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
                     } catch {
                         break // socket closed or shut down
                     }
@@ -488,7 +608,7 @@ public final class SessionServer: @unchecked Sendable {
                 while !Task.isCancelled {
                     let msgData: Data
                     do {
-                        msgData = try self.readMessage(from: readHandle, buffer: &buf)
+                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
                     } catch {
                         break // socket closed or shut down
                     }

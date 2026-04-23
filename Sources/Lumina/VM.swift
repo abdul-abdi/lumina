@@ -75,6 +75,29 @@ public actor VM {
     private var clone: DiskClone?
     private var _state: VMState = .idle
     private var pipeHandles: [FileHandle] = []
+
+    /// Delegate to install on the VZ machine as soon as it exists but
+    /// before `vm.start(…)` is invoked. Callers register it via
+    /// `setDelegate(_:)` prior to `boot()`; the boot path then applies it
+    /// synchronously on the executor queue just after
+    /// `VZVirtualMachine(configuration:queue:)` returns, so any crash in
+    /// the 300–500 ms kernel→init window fires `guestDidStop` /
+    /// `didStopWithError` into a live observer instead of a nil delegate.
+    /// Delegate install is also idempotent post-boot through the same
+    /// accessor so existing post-boot callers keep working.
+    private var pendingDelegate: (any VZVirtualMachineDelegate)?
+
+    /// Latest boot-phase timings, populated by `recordPhase(…)` during
+    /// `boot()`. Surfaced via `bootPhases` for instrumentation and the
+    /// upcoming cold-boot regression bench. Zero-cost when unused.
+    private var _bootPhases = BootPhases()
+
+    public var bootPhases: BootPhases { _bootPhases }
+
+    /// Background tasks reading serial console output. Retained so
+    /// `shutdownVM()` can cancel them explicitly rather than relying
+    /// on EOF-from-pipe-close as the termination signal.
+    private var serialReadTasks: [Task<Void, Never>] = []
     private var macLastByte: UInt8?  // Last byte of MAC for IP derivation
 
     /// The actor executor, backed by a serial DispatchQueue.
@@ -218,16 +241,19 @@ public actor VM {
         config.serialPorts = [serialPort]
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
-        // Start reading serial output in background
+        // Drain serial output in the background. Retained so teardown can
+        // cancel explicitly; the blocking `availableData` read still
+        // unblocks via pipe-close EOF, but cooperative cancellation is
+        // now expressed in the loop condition rather than implicit.
         let console = self.serialConsole
-        Task.detached {
+        serialReadTasks.append(Task.detached {
             let handle = guestToHostRead
-            while true {
+            while !Task.isCancelled {
                 let data = handle.availableData
                 if data.isEmpty { break }
                 console.append(data)
             }
-        }
+        })
 
         // Network (pluggable via NetworkProvider protocol)
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
@@ -237,6 +263,15 @@ public actor VM {
             clone?.remove()
             _state = .idle
             throw .bootFailed(underlying: error)
+        }
+        // Pin the MAC if the caller provided one. Desktop bundles persist a
+        // stable MAC in their manifest so every boot uses the same L2 id —
+        // vmnet's DHCP lease stays hot and the guest's IP is reproducible.
+        // A malformed string silently falls through to VZ's default (random
+        // locally-administered on every boot).
+        if let macString = options.macAddress,
+           let mac = VZMACAddress(string: macString) {
+            networkDevice.macAddress = mac
         }
         self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
         var networkDevices: [VZVirtioNetworkDeviceConfiguration] = [networkDevice]
@@ -348,18 +383,46 @@ public actor VM {
         let vm = VZVirtualMachine(configuration: config, queue: queue)
         self.virtualMachine = vm
 
+        // Install the delegate BEFORE `vm.start(…)` so crashes in the
+        // kernel-boot window fire `didStopWithError` into a live observer
+        // instead of a nil delegate. See `setDelegate(_:)` for full
+        // rationale.
+        if let d = pendingDelegate {
+            vm.delegate = d
+        }
+
         do {
+            try Task.checkCancellation()
             let vmBox = UncheckedSendable(vm)
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-                queue.async {
-                    vmBox.value.start { result in
-                        cont.resume(with: result)
+            let startQueue = queue
+            // Cooperative cancellation: an outer Task cancel (UI Stop
+            // mid-boot) triggers `onCancel`, which calls `vm.stop(…)` on
+            // the executor queue. That resumes the `start` completion
+            // with an error, the `catch` below funnels through
+            // `shutdownVM()`, the `flock()` on `disk.img` is released,
+            // and the next `boot()` starts cleanly.
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                        startQueue.async {
+                            vmBox.value.start { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
                     }
                 }
-            }
+            )
         } catch {
-            clone?.remove()
+            await shutdownVM()
             _state = .idle
+            if error is CancellationError {
+                throw .bootFailed(underlying: VMError.cancelled)
+            }
             throw .bootFailed(underlying: error)
         }
 
@@ -408,111 +471,195 @@ public actor VM {
     /// not this boot pipeline.
     ///
     /// The state machine: `.idle` → `.booting` → `.ready` (VM started, no
-    /// command connection). Shutdown works through the shared `shutdownVM`
-    /// helper because `clone` stays nil and `pipeHandles` is populated with
-    /// just the serial capture pair.
+    /// command connection). All failure paths — configuration errors, VZ
+    /// validation, failed `start(…)`, and Task cancellation — funnel into a
+    /// single `catch` that calls `shutdownVM()` to tear down pipes, serial
+    /// drain tasks, and the VZ machine if it was already instantiated.
+    /// That way a cancelled boot (user clicks Stop at any phase) releases
+    /// the `flock()` on `disk.img` + `efi.vars` and the next `boot()`
+    /// succeeds cold — the prior design leaked those locks and produced
+    /// `VZErrorDomain Code 2` on retry.
     private func bootEFIPath(cfg: EFIBootConfig) async throws(LuminaError) {
-        let config = VZVirtualMachineConfiguration()
-        config.cpuCount = options.cpuCount
-        config.memorySize = options.memory
+        let phaseStart = ContinuousClock.now
+        var phaseMark = phaseStart
 
-        // Boot loader + storage: delegated to EFIBootable.
         do {
+            let config = VZVirtualMachineConfiguration()
+            config.cpuCount = options.cpuCount
+            config.memorySize = options.memory
+
+            // Boot loader + storage.
             try EFIBootable(config: cfg).apply(to: config)
-        } catch {
-            _state = .idle
-            throw .bootFailed(underlying: error)
-        }
+            phaseMark = recordPhase(\.configMs, since: phaseMark)
 
-        // Serial console — capture guest output for diagnostics.
-        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
-        let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
-        let (guestToHostRead, guestToHostWrite) = try createPipePair()
-        serialPort.attachment = VZFileHandleSerialPortAttachment(
-            fileHandleForReading: hostToGuestRead,
-            fileHandleForWriting: guestToHostWrite
-        )
-        config.serialPorts = [serialPort]
-        pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
+            // Serial console — capture guest output for diagnostics.
+            let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+            let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
+            let (guestToHostRead, guestToHostWrite) = try createPipePair()
+            serialPort.attachment = VZFileHandleSerialPortAttachment(
+                fileHandleForReading: hostToGuestRead,
+                fileHandleForWriting: guestToHostWrite
+            )
+            config.serialPorts = [serialPort]
+            pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
-        let console = self.serialConsole
-        Task.detached {
-            let handle = guestToHostRead
-            while true {
-                let data = handle.availableData
-                if data.isEmpty { break }
-                console.append(data)
-            }
-        }
-
-        // Network — same pluggable provider as the agent path.
-        let networkDevice = VZVirtioNetworkDeviceConfiguration()
-        do {
-            networkDevice.attachment = try options.networkProvider.createAttachment()
-        } catch {
-            _state = .idle
-            throw .bootFailed(underlying: error)
-        }
-        self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
-        config.networkDevices = [networkDevice]
-
-        // Entropy — same as agent path.
-        config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-
-        // Graphics + input — same opt-in wiring as agent path. When
-        // `options.graphics == nil` this is a no-op (agent-path guarantee
-        // preserved for EFI runs that happen to be headless).
-        if let graphics = options.graphics {
-            attachGraphicsDevices(to: config, graphics: graphics)
-        }
-        if let sound = options.sound, sound.enabled {
-            attachSoundDevice(to: config, sound: sound)
-        }
-
-        // v0.7.0 M8: optional Rosetta directory share — Linux guests can
-        // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
-        // as the agent path; gated behind options.rosetta.
-        if options.rosetta {
-            if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
-                if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
-                    let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
-                    device.share = rosettaShare
-                    var sharing = config.directorySharingDevices
-                    sharing.append(device)
-                    config.directorySharingDevices = sharing
+            let console = self.serialConsole
+            // Optional on-disk serial log. Opened in append mode so
+            // re-boots of the same bundle accumulate history (useful for
+            // diagnosing "install went further this time" regressions).
+            // Create the parent directory if the bundle shipped without
+            // one — non-fatal if either step fails; the in-memory
+            // SerialConsole is unaffected.
+            let persistHandle: FileHandle? = {
+                guard let url = options.serialLogURL else { return nil }
+                let dir = url.deletingLastPathComponent()
+                try? FileManager.default.createDirectory(
+                    at: dir, withIntermediateDirectories: true
+                )
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
                 }
+                guard let h = try? FileHandle(forWritingTo: url) else { return nil }
+                _ = try? h.seekToEnd()
+                return h
+            }()
+            if let h = persistHandle {
+                // Record a boot-delimiter marker so humans reading the
+                // file can tell where one boot ends and the next begins.
+                let marker = "\n--- lumina boot \(ISO8601DateFormatter().string(from: Date())) ---\n"
+                do { try h.write(contentsOf: Data(marker.utf8)) } catch { /* non-fatal */ }
+                pipeHandles.append(h)
             }
-        }
 
-        // Validate + start.
-        do {
-            try config.validate()
-        } catch {
-            _state = .idle
-            throw .bootFailed(underlying: error)
-        }
+            serialReadTasks.append(Task.detached {
+                let handle = guestToHostRead
+                while !Task.isCancelled {
+                    let data = handle.availableData
+                    if data.isEmpty { break }
+                    console.append(data)
+                    if let h = persistHandle {
+                        _ = try? h.write(contentsOf: data)
+                    }
+                }
+            })
 
-        let queue = executor.queue
-        let vm = VZVirtualMachine(configuration: config, queue: queue)
-        self.virtualMachine = vm
+            // Network — same pluggable provider as the agent path, plus the
+            // same MAC-pinning behavior so desktop .luminaVM bundles present a
+            // stable L2 identity to vmnet on every boot. Without this, VZ picks
+            // a fresh random MAC each boot; vmnet then issues a new DHCP lease,
+            // which in turn produces the "Network autoconfiguration failed"
+            // race observed in the Kali installer when netcfg probes before
+            // the fresh lease is recorded host-side.
+            let networkDevice = VZVirtioNetworkDeviceConfiguration()
+            networkDevice.attachment = try options.networkProvider.createAttachment()
+            if let macString = options.macAddress,
+               let mac = VZMACAddress(string: macString) {
+                networkDevice.macAddress = mac
+            }
+            self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
+            config.networkDevices = [networkDevice]
 
-        do {
-            let vmBox = UncheckedSendable(vm)
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-                queue.async {
-                    vmBox.value.start { result in
-                        cont.resume(with: result)
+            // Entropy — load-bearing for reliability. systemd-random-seed
+            // and Windows TPM-less RNG stall boot 30s+ waiting for entropy
+            // without a virtio-rng device.
+            config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+            // Graphics + input — same opt-in wiring as agent path. When
+            // `options.graphics == nil` this is a no-op (agent-path guarantee
+            // preserved for EFI runs that happen to be headless).
+            if let graphics = options.graphics {
+                attachGraphicsDevices(to: config, graphics: graphics)
+            }
+            if let sound = options.sound, sound.enabled {
+                attachSoundDevice(to: config, sound: sound)
+            }
+
+            // v0.7.0 M8: optional Rosetta directory share — Linux guests can
+            // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
+            // as the agent path; gated behind options.rosetta.
+            if options.rosetta {
+                if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
+                    if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
+                        let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                        device.share = rosettaShare
+                        var sharing = config.directorySharingDevices
+                        sharing.append(device)
+                        config.directorySharingDevices = sharing
                     }
                 }
             }
+
+            try config.validate()
+            try Task.checkCancellation()
+
+            let queue = executor.queue
+            let vm = VZVirtualMachine(configuration: config, queue: queue)
+            self.virtualMachine = vm
+
+            // Install the delegate BEFORE `vm.start(…)` so guest crashes
+            // during the kernel boot window surface as delegate callbacks
+            // rather than silent hangs at `.running`.
+            if let d = pendingDelegate {
+                vm.delegate = d
+            }
+
+            try Task.checkCancellation()
+            phaseMark = recordPhase(\.configMs, since: phaseMark)
+
+            // Start — with cooperative cancellation. If the outer Task is
+            // cancelled (user clicked Stop mid-boot, window closed, host
+            // shutdown), the `onCancel` block calls `vm.stop(…)` on the
+            // executor queue. That causes the `start` completion to fire
+            // with an error, resuming the continuation and unwinding cleanly
+            // into the outer `catch` — no orphaned continuations, no leaked
+            // `flock()`.
+            let vmBox = UncheckedSendable(vm)
+            let startQueue = queue
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                        startQueue.async {
+                            vmBox.value.start { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
+                    }
+                }
+            )
+            phaseMark = recordPhase(\.vzStartMs, since: phaseMark)
+            _bootPhases.totalMs = msSince(phaseStart)
+
+            _state = .ready
         } catch {
+            await shutdownVM()
             _state = .idle
+            if error is CancellationError {
+                throw .bootFailed(underlying: VMError.cancelled)
+            }
             throw .bootFailed(underlying: error)
         }
+    }
 
-        // No CommandRunner for EFI guests. State is .ready meaning "VM is
-        // running." Exec operations will throw invalidState.
-        _state = .ready
+    // Elapsed-ms helper keeping the boot path free of Duration conversion
+    // noise. Returns the phase boundary for chaining.
+    private func msSince(_ start: ContinuousClock.Instant) -> Double {
+        let delta = ContinuousClock.now - start
+        let comps = delta.components
+        return Double(comps.seconds) * 1000 + Double(comps.attoseconds) / 1e15
+    }
+
+    private func recordPhase(
+        _ keyPath: WritableKeyPath<BootPhases, Double>,
+        since: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant {
+        let now = ContinuousClock.now
+        _bootPhases[keyPath: keyPath] += msSince(since)
+        return now
     }
 
     // MARK: - Internal Result API
@@ -1123,6 +1270,41 @@ public actor VM {
         serialConsole.output
     }
 
+    /// Last `lines` newline-terminated lines from the serial console
+    /// buffer, stripped of ANSI CSI sequences that terminals use for
+    /// cursor/color control. Designed for the desktop's boot-window
+    /// tail ticker: the framebuffer goes blank during EFI→kernel
+    /// handoff and during silent kernel panics, so the serial tail is
+    /// the only evidence a user can see when something's gone wrong.
+    public func serialTail(lines: Int = 12) -> String {
+        let raw = serialConsole.output
+        if raw.isEmpty { return "" }
+        // Strip CSI sequences (ESC [ … final-byte) that would garble a
+        // plain SwiftUI Text. This is lossy — non-CSI escape sequences
+        // (e.g., OSC for title changes) are left alone — but good
+        // enough for human-readable tail output.
+        var cleaned = ""
+        cleaned.reserveCapacity(raw.count)
+        var iter = raw.unicodeScalars.makeIterator()
+        while let c = iter.next() {
+            if c == "\u{1B}" {
+                // Swallow ESC + possible [ + parameter bytes + final.
+                if let next = iter.next(), next == "[" {
+                    while let p = iter.next() {
+                        if (0x40...0x7E).contains(p.value) { break }
+                    }
+                } // otherwise just drop the lone ESC
+                continue
+            }
+            cleaned.unicodeScalars.append(c)
+        }
+        let split = cleaned.split(
+            separator: "\n", omittingEmptySubsequences: false
+        )
+        let tail = split.suffix(lines)
+        return tail.joined(separator: "\n")
+    }
+
     /// Sendable handle wrapping the underlying VZVirtualMachine for the
     /// SwiftUI display layer. VZ's class is not Sendable; this opt-in
     /// `@unchecked Sendable` wrapper lets us cross the actor boundary
@@ -1139,10 +1321,23 @@ public actor VM {
         VZMachineHandle(machine: virtualMachine)
     }
 
-    /// Install a `VZVirtualMachineDelegate` on the underlying VM so
-    /// callers can be notified of guest-initiated stops and errors.
+    /// Install a `VZVirtualMachineDelegate`. Safe to call before or
+    /// after `boot()`:
+    ///
+    /// - **Before boot:** the delegate is stored and applied to the VZ
+    ///   machine the moment it is created, *before* `vm.start(…)`. This
+    ///   is the correct call site because any guest crash during kernel
+    ///   boot (panic, dracut timeout, missing hardware model) fires
+    ///   `didStopWithError` — which today is lost if the delegate
+    ///   hasn't been wired yet. With pre-start install the crash flows
+    ///   through the delegate and the session transitions to
+    ///   `.crashed(reason:)` instead of hanging at `.running`.
+    /// - **After boot:** applied immediately to the existing VZ machine;
+    ///   preserved for identical behavior for pre-existing callers.
+    ///
     /// The delegate is weakly held by VZ; the caller owns retention.
     public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
+        pendingDelegate = delegate
         virtualMachine?.delegate = delegate
     }
 
@@ -1162,6 +1357,11 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
+        // Cancel serial drain tasks before closing handles so the cooperative
+        // cancellation signal arrives first; the handle close then delivers
+        // the EOF that unblocks any in-flight `availableData` read.
+        for task in serialReadTasks { task.cancel() }
+        serialReadTasks = []
         for handle in pipeHandles {
             try? handle.close()
         }
@@ -1202,6 +1402,25 @@ enum VMError: Error, Sendable {
     case invalidState(String)
     case noSocketDevice
     case pipeFailed
+    case cancelled
+}
+
+/// Host-side boot-phase timings in milliseconds. Populated during
+/// `VM.boot()` and accessible via `VM.bootPhases`. `totalMs` is the
+/// wall-clock from `boot()` entry to `.ready`; the per-phase fields are
+/// host-side only (guest userspace is observed through the agent-path
+/// `CommandRunner` handshake or the EFI-path serial-console first-byte).
+/// All fields default to zero — zero-cost when unused.
+///
+/// Consumed by the cold-boot regression bench (see `Tests/LuminaTests/
+/// BootPhaseTests.swift`) and by the `LUMINA_BOOT_TRACE=1` CLI hook
+/// which prints the struct to stderr after `boot()` returns.
+public struct BootPhases: Sendable, Equatable {
+    public var configMs: Double = 0
+    public var vzStartMs: Double = 0
+    public var totalMs: Double = 0
+
+    public init() {}
 }
 
 // MARK: - Sendable crossing shim
@@ -1254,17 +1473,26 @@ private func attachGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    // Virtio-GPU scanout: single display at the configured resolution.
-    // Works for Linux + Windows-on-ARM guests. macOS guests use a different
-    // VM type (VZMacOSVirtualMachine) and their own graphics class, landing
-    // in M5.
+    // Virtio-GPU scanouts: primary display plus any `additionalDisplays`.
+    // The SwiftUI running-VM window still renders display 0 only; extra
+    // scanouts are live on the VZ side (Linux guests see multiple
+    // framebuffers via `/sys/class/drm/`) for callers driving the VM from
+    // their own view layer. Multi-display UI in the Desktop app is
+    // follow-up work.
     let gfx = VZVirtioGraphicsDeviceConfiguration()
-    gfx.scanouts = [
+    var scanouts: [VZVirtioGraphicsScanoutConfiguration] = [
         VZVirtioGraphicsScanoutConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels
         )
     ]
+    for extra in graphics.additionalDisplays {
+        scanouts.append(VZVirtioGraphicsScanoutConfiguration(
+            widthInPixels: extra.widthInPixels,
+            heightInPixels: extra.heightInPixels
+        ))
+    }
+    gfx.scanouts = scanouts
     config.graphicsDevices = [gfx]
 
     // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic

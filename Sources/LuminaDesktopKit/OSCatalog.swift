@@ -83,7 +83,12 @@ public enum OSCatalog {
         desc: String,
         constraint: String? = nil
     ) -> OSWizardTile {
-        let entry = DesktopOSCatalog.entry(for: catalogID)!
+        guard let entry = DesktopOSCatalog.entry(for: catalogID) else {
+            preconditionFailure(
+                "OSCatalog.tile: no DesktopOSCatalog entry for '\(catalogID)' — "
+                + "IDs here must match Sources/LuminaBootable/DesktopOSCatalog.swift"
+            )
+        }
         return OSWizardTile(
             id: catalogID,
             displayName: entry.displayName,

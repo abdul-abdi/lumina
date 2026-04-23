@@ -21,6 +21,55 @@ public enum OSFamily: String, Codable, Sendable, Equatable {
     case macOS
 }
 
+/// Per-bundle network attachment mode. Persisted on `VMBundleManifest`
+/// so the host and the app agree on behaviour across invocations.
+///
+/// - `.nat`: default. Uses `VZNATNetworkDeviceAttachment` — vmnet's
+///   embedded DHCP server, no external network dependency. The path
+///   that fails with "Network autoconfiguration failed" on a fresh
+///   Debian/Kali install and that Apple's vmnet degrades after ~5 VM
+///   lifecycles per session.
+/// - `.bridged`: `VZBridgedNetworkDeviceAttachment`. Guest joins the
+///   host's LAN directly; DHCP served by the user's real router. Fixes
+///   every known vmnet issue (degradation, first-boot DHCP race,
+///   unreliable UDP/ICMP-to-external), at the cost of requiring an
+///   active bridgeable interface and the `com.apple.vm.networking`
+///   entitlement. `interface` is the `VZBridgedNetworkInterface.identifier`
+///   to bridge against (e.g. `"en0"`); nil means "first available,"
+///   usually `en0`.
+public enum NetworkMode: Sendable, Equatable {
+    case nat
+    case bridged(interface: String?)
+}
+
+extension NetworkMode: Codable {
+    private enum CodingKeys: String, CodingKey { case mode, interface }
+    private enum Tag: String, Codable { case nat, bridged }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let tag = try c.decode(Tag.self, forKey: .mode)
+        switch tag {
+        case .nat:
+            self = .nat
+        case .bridged:
+            let iface = try c.decodeIfPresent(String.self, forKey: .interface)
+            self = .bridged(interface: iface)
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .nat:
+            try c.encode(Tag.nat, forKey: .mode)
+        case .bridged(let iface):
+            try c.encode(Tag.bridged, forKey: .mode)
+            try c.encodeIfPresent(iface, forKey: .interface)
+        }
+    }
+}
+
 public struct VMBundleManifest: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var id: UUID
@@ -32,6 +81,17 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
     public var diskBytes: UInt64
     public var createdAt: Date
     public var lastBootedAt: Date?
+    /// Stable MAC address in `xx:xx:xx:xx:xx:xx` hex form. Persisted so
+    /// every boot of the same bundle presents the same L2 identity to
+    /// vmnet's DHCP server, eliminating lease-table churn and making the
+    /// guest's IP stable across boots. Optional for backward compatibility
+    /// with pre-v0.7.1 bundles; a nil value is lazily filled on first boot
+    /// via `ensureMACAddress()`.
+    public var macAddress: String?
+    /// Network attachment mode. See `NetworkMode` for the tradeoffs.
+    /// Nil means "use the library default" (`.nat`); the boot layer
+    /// maps nil → `.nat` so older bundles continue to work unchanged.
+    public var networkMode: NetworkMode?
 
     public init(
         schemaVersion: Int = 1,
@@ -43,7 +103,9 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
         cpuCount: Int,
         diskBytes: UInt64,
         createdAt: Date,
-        lastBootedAt: Date?
+        lastBootedAt: Date?,
+        macAddress: String? = nil,
+        networkMode: NetworkMode? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -55,6 +117,19 @@ public struct VMBundleManifest: Codable, Sendable, Equatable {
         self.diskBytes = diskBytes
         self.createdAt = createdAt
         self.lastBootedAt = lastBootedAt
+        self.macAddress = macAddress
+        self.networkMode = networkMode
+    }
+
+    /// Generate a MAC address in the locally-administered unicast range —
+    /// byte 0 bit 1 set (locally administered), bit 0 cleared (unicast).
+    /// No dependency on `Virtualization.framework`; the returned string is
+    /// directly parseable by `VZMACAddress(string:)`.
+    public static func generateLocallyAdministeredMAC() -> String {
+        var bytes = [UInt8](repeating: 0, count: 6)
+        for i in 0..<6 { bytes[i] = UInt8.random(in: 0...255) }
+        bytes[0] = (bytes[0] & 0xFE) | 0x02
+        return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
     }
 }
 
@@ -120,10 +195,35 @@ public struct VMBundle: Sendable, Equatable {
             cpuCount: cpuCount,
             diskBytes: diskBytes,
             createdAt: now,
-            lastBootedAt: nil
+            lastBootedAt: nil,
+            macAddress: VMBundleManifest.generateLocallyAdministeredMAC()
         )
         try writeManifest(manifest, into: rootURL)
         return VMBundle(rootURL: rootURL, manifest: manifest)
+    }
+
+    /// Populate `manifest.macAddress` if missing (pre-v0.7.1 bundle),
+    /// persist the change, and return the effective MAC. Safe to call on
+    /// every boot — idempotent when the manifest already has a MAC. Write
+    /// failure doesn't fail the boot (caller still gets a usable MAC this
+    /// run) but is surfaced on stderr so the user can see that the next
+    /// cold boot will regenerate — the exact failure mode this method
+    /// exists to prevent.
+    @discardableResult
+    public mutating func ensureMACAddress() -> String {
+        if let existing = manifest.macAddress, !existing.isEmpty {
+            return existing
+        }
+        let generated = VMBundleManifest.generateLocallyAdministeredMAC()
+        manifest.macAddress = generated
+        do {
+            try save()
+        } catch {
+            let msg = "lumina: warning: failed to persist MAC for \(rootURL.lastPathComponent): \(error). "
+                + "This boot uses \(generated); the next cold boot will regenerate.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
+        return generated
     }
 
     public static func load(from rootURL: URL) throws -> VMBundle {

@@ -16,8 +16,35 @@ cd "$REPO_ROOT"
 CONFIG="${LUMINA_BUILD_CONFIG:-release}"
 SIGN_IDENTITY="${LUMINA_SIGN_IDENTITY:--}"
 APP_DIR=".build/Lumina.app"
-ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop.entitlements"
-VERSION="0.7.0"
+
+# Entitlements file selection is driven by the cert class because Apple
+# enforces different entitlement allowlists per cert type:
+#
+#   Ad-hoc (`-`)                      → LuminaDesktop.entitlements
+#     (safe minimum: virtualization, hypervisor, network.client)
+#   Apple Development (Personal Team) → LuminaDesktop.entitlements
+#     (Personal Team CANNOT provision com.apple.vm.networking — Xcode
+#     throws "Entitlement not found and could not be included in
+#     profile." Personal Team is free + auto-created when you add an
+#     Apple ID in Xcode > Settings > Accounts.)
+#   Developer ID Application          → LuminaDesktop-bridged.entitlements
+#     (paid Apple Developer Program, $99/yr; unlocks
+#     com.apple.vm.networking → NetworkMode.bridged via
+#     VZBridgedNetworkDeviceAttachment, which sidesteps vmnet NAT.)
+#
+# LUMINA_ENTITLEMENTS lets advanced callers override (e.g. provisioning
+# a Developer ID build with a specific cert not named exactly).
+if [ -n "${LUMINA_ENTITLEMENTS:-}" ]; then
+    ENTITLEMENTS="$LUMINA_ENTITLEMENTS"
+elif [[ "$SIGN_IDENTITY" == *"Developer ID Application"* ]] \
+  || [[ "$SIGN_IDENTITY" == *"Apple Distribution"* ]]; then
+    ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop-bridged.entitlements"
+else
+    ENTITLEMENTS="Apps/LuminaDesktop/LuminaDesktop/LuminaDesktop.entitlements"
+fi
+echo "→ Entitlements: $(basename "$ENTITLEMENTS")"
+
+VERSION="0.7.1"
 BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
 echo "→ Building LuminaDesktopApp (config=$CONFIG)"

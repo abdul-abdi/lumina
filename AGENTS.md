@@ -6,7 +6,21 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.7.0.
+here reflects what ships in v0.7.1.
+
+## v0.7.1 deltas (read these if you're on a pre-v0.7.1 mental model)
+
+- **Stable MAC per `.luminaVM` bundle.** Desktop bundles persist a locally-administered MAC in `manifest.json`. Legacy manifests get lazily backfilled on first boot via `VMBundle.ensureMACAddress()`. Fixes the vmnet DHCP-churn class of "Network autoconfiguration failed" errors.
+- **Cancel-during-boot is safe.** `VM.boot()` and `MacOSVM.install()` wrap `vm.start`/installer calls in `withTaskCancellationHandler`; a mid-boot cancel releases `flock()` on the disk and the next boot starts cold. Prior design produced `VZErrorDomain Code 2` on retry.
+- **Pre-start delegate install.** Guest crashes in the 300–500ms kernel window now surface as `.crashed(reason:)` via `VZVirtualMachineDelegate`. Call `VM.setDelegate(_:)` before `boot()`; post-boot `setDelegate` also works (actor-serialized).
+- **`VM.serialTail(lines:)`** returns the last N newline-separated lines from `SerialConsole`, ANSI CSI-stripped. Used by the Desktop running-VM window to show a live serial tail during `.booting` and `.crashed`. Agents that want a readable excerpt of guest output can call it directly.
+- **Windows 11 ARM** uses USB mass-storage for the installer ISO (`EFIBootConfig.preferUSBCDROM = true` for `osFamily == .windows`) instead of virtio-block; fixes "Windows cannot find media." `EFIBootConfig.installPhase` flips the primary disk sync mode to `.fsync` during first install for ~2× faster partman; reverts to `.full` on subsequent boots.
+- **Guest agent split** — `main.go` is now 48 lines (accept loop only); state lives in `*Manager` structs under `Guest/lumina-agent/internal/`. Heartbeat failure now also kills active PTY process groups (previously leaked).
+- **Idle-TTL sessions** — `lumina session start --ttl 30m` auto-shuts-down when idle (no client activity + zero active execs) for the TTL window. Default `0` disables.
+- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove".
+- **NetworkMode** — `manifest.json` can carry `"networkMode": {"mode": "nat"}` (default) or `"networkMode": {"mode": "bridged", "interfaceIdentifier": "en0"}`. Bridged requires `com.apple.vm.networking` entitlement (paid Apple Developer Program); ad-hoc builds reject the config at `validate()`.
+
+Notarization moved from v0.7.1 to v0.7.2; ad-hoc signing remains the default distribution.
 
 ## What Lumina Is
 
@@ -39,6 +53,7 @@ lumina session start
 lumina session start --memory 4GB --cpus 4 --disk-size 8GB
 lumina session start --image claude-box
 lumina session start --forward 3000:3000 --forward 8080:80
+lumina session start --ttl 30m            # auto-shut-down after 30 minutes idle (v0.7.1)
 ```
 
 Provisioning (memory, cpus, disk-size, image, forward) belongs on `session
@@ -107,6 +122,21 @@ Unreachable sessions (stale socket, crashed process) appear as
 
 Clean teardown. Idempotent — stopping an already-stopped SID is not an error.
 
+### `lumina images` (v0.7.1: surfaced in Desktop)
+
+```bash
+lumina images list                                            # list ~/.lumina/images/*
+lumina images create mypy --from default --run "apk add python3"
+lumina images inspect mypy                                    # print meta.json
+lumina images remove mypy
+```
+
+Agent images built here are visible in the **Lumina Desktop → Agent Images**
+sidebar as of v0.7.1. Rows offer "Copy `run`" (copies `lumina run --image
+<name>` to clipboard) and "Open in Terminal" (spawns Terminal.app with
+`lumina session start --image <name>`). The image metadata at
+`~/.lumina/images/<name>/meta.json` carries `{base, command, created, rosetta}`.
+
 ### `lumina desktop` (v0.7.0)
 
 Desktop VMs are a different primitive from agent sessions: they boot a
@@ -149,8 +179,34 @@ lumina desktop ls --json    # machine-readable
 ```
 
 Bundles live at `~/.lumina/desktop-vms/<uuid>/` and are visible to both
-CLI and the Lumina Desktop app (v0.7.0 M6). Agents that don't need
-graphical interaction should continue to use `session start` + `exec`.
+CLI and the Lumina Desktop app. Agents that don't need graphical
+interaction should continue to use `session start` + `exec`.
+
+**v0.7.1 manifest fields** (`manifest.json`):
+
+```json
+{
+  "id": "<uuid>",
+  "name": "Ubuntu 24.04",
+  "osFamily": "linux",
+  "osVariant": "ubuntu-24.04",
+  "memoryBytes": 4294967296,
+  "cpuCount": 2,
+  "diskBytes": 34359738368,
+  "createdAt": "2026-04-22T13:08:21Z",
+  "lastBootedAt": "2026-04-23T08:06:38Z",
+  "macAddress": "76:86:91:9c:a3:5d",        // locally-administered, stable across reboots
+  "networkMode": {"mode": "nat"},           // or {"mode":"bridged","interfaceIdentifier":"en0"}
+  "schemaVersion": 1
+}
+```
+
+Legacy manifests without `macAddress` / `networkMode` are handled via
+backwards-compatible defaults. `ensureMACAddress()` backfills the MAC
+lazily on the next boot and persists; the log line
+`lumina: warning: failed to persist MAC for <bundle>` surfaces when
+the save path fails (the in-memory MAC is still used for that boot but
+the next cold boot will regenerate).
 
 #### ARM64-only
 
@@ -180,9 +236,16 @@ against — Apple IPSWs are signed and verified by `VZMacOSRestoreImage`.
 - A few keys hit a translation gap between macOS HID and Windows 11 ARM's
   inbox keyboard driver — most visibly the backslash and the F-key row.
   v0.7.0 ships the remap table at `Sources/LuminaBootable/WindowsSupport.swift`
-  (`WindowsInputQuirks`); the Desktop app (M6) applies it at the input
+  (`WindowsInputQuirks`); the Desktop app applies it at the input
   layer when the focused VM is `osFamily == .windows`. Headless `lumina
   desktop boot` users won't notice — there's no keyboard input over serial.
+- **v0.7.1**: the installer ISO attaches via `VZUSBMassStorageDeviceConfiguration`
+  (not virtio-block) for `osFamily == .windows`. Windows setup was
+  refusing to detect virtio-block-as-CD-ROM ("Windows cannot find media");
+  USB mass-storage presents as a genuine removable drive and works.
+  During the install phase (`lastBootedAt == nil`) the primary disk runs
+  with `.fsync` sync mode, halving partman time; reverts to `.full`
+  after first successful boot.
 
 ## Output Envelope Contract
 
@@ -249,10 +312,11 @@ of a command that returned non-zero. `make: *** [build] Error 1` is a
 
 ## What NOT to Do
 
-- **Do not assume boot time.** v0.7.0 cold start measures ~540ms P50 on M3 Pro
-  release builds; the CI gate caps median at 2000ms. Image variant, host load,
-  and first-run image fetch move the number. If you need fast iteration, start
-  a session once and `exec` many times.
+- **Do not assume boot time.** v0.7.1 cold start measures ~390ms P50 on M3 Pro
+  release builds (baked image; legacy Alpine runs ~570ms); the CI gate caps
+  median at 2000ms. Image variant, host load, and first-run image fetch move
+  the number. If you need fast iteration, start a session once and `exec`
+  many times. Warm exec is ~31ms P50 with 1ms stdev.
 - **Do not rely on ordering between concurrent `exec`s.** Multiple execs on one
   session run in parallel. If one exec writes a file another exec reads, chain
   them with `&&` inside one `exec` invocation or sequence them serially from the
@@ -309,9 +373,43 @@ lumina cp "$SID:/work/project/dist/" ./dist/
 # session is torn down by the EXIT trap
 ```
 
+## Known failure modes (read if an agent reports a flake)
+
+None of these are regressions — they are the irreducible surface of running
+arbitrary OS installers in a virtualized ARM64 sandbox. Where a v0.7.1 fix
+exists it's noted inline.
+
+- **vmnet NAT `bootpd` first-probe DHCP race.** Embedded `bootpd` in macOS's
+  vmnet can drop the first DHCP DISCOVER. Debian/Kali `netcfg` has a
+  single-probe short timeout and fails. Upstream Apple bug, unfixable
+  host-side. **Workaround**: in the installer's failure screen, pick
+  "Retry network autoconfiguration" — the second DISCOVER usually wins.
+  **Structural fix**: switch `networkMode` to `bridged` (bypasses vmnet).
+  Requires paid Apple Developer Program + `com.apple.vm.networking`
+  entitlement; ad-hoc builds reject the config at `validate()`.
+- **Post-install "no network"** when installer skipped netcfg entirely
+  (clicked past the failure screen). Inside the guest: `sudo dhclient ens3`,
+  then `sudo nmcli connection add type ethernet ifname ens3 con-name eth0
+  autoconnect yes` to persist.
+- **Windows 11 ARM "cannot find media"** — fixed in v0.7.1 by USB mass-storage
+  attachment. If you still hit it, confirm `manifest.json.osFamily == "windows"`
+  so `preferUSBCDROM` defaults to true.
+- **VZErrorDomain Code 2 on retry after cancel** — fixed in v0.7.1 via
+  `withTaskCancellationHandler`. If you see this on an older build, wait
+  ~30s for VZ to drop the disk lock or reboot the host.
+- **Concurrent VM ceiling** ≈ 10 on 18GB M3 Pro at 512MB each. Memory-bound
+  (macOS caps total VM-eligible RAM at ~2/3 of physical). vsock port
+  descriptors do NOT push the ceiling.
+- **UnidentifiedDeveloper warning on first `Lumina.app` launch.** Expected —
+  ad-hoc signed. Right-click → Open. Notarization is on the v0.7.2 runway.
+- **virtio-fs heavy-write corruption** — don't use `--volume ./host:/guest`
+  for `make`, package installs, or anything that writes >100MB. Use
+  `lumina cp` or the `--copy` / `--download` patterns.
+
 ## See Also
 
 - `CLAUDE.md` at the repo root — architecture, protocol messages, repository
   layout. Written for contributors to Lumina itself.
+- `ROADMAP.md` — v0.7.2 candidates, v0.8 post-release plans.
 - `lumina <cmd> --help` — flag-level reference. The CLI is the source of truth
   for flag names.

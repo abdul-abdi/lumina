@@ -38,6 +38,7 @@ public actor MacOSVM {
     private let cpuCount: Int
     private let graphics: GraphicsConfig?
     private let sound: SoundConfig?
+    private let macAddressString: String?
 
     public var state: State { _state }
     public var bootConfig: MacOSBootConfig { _bootConfig }
@@ -52,13 +53,15 @@ public actor MacOSVM {
             keyboardKind: .mac,
             pointingDeviceKind: .trackpad
         ),
-        sound: SoundConfig? = SoundConfig(enabled: true)
+        sound: SoundConfig? = SoundConfig(enabled: true),
+        macAddress: String? = nil
     ) {
         self._bootConfig = bootConfig
         self.memoryBytes = memoryBytes
         self.cpuCount = cpuCount
         self.graphics = graphics
         self.sound = sound
+        self.macAddressString = macAddress
         self.executor = VMExecutor(
             queue: DispatchQueue(label: "com.lumina.macosvm", qos: .userInitiated)
         )
@@ -98,9 +101,16 @@ public actor MacOSVM {
             throw Error.installFailed("MacOSBootable.apply: \(error)")
         }
 
-        // Network for install (downloads inside recovery).
+        // Network for install (downloads inside recovery). Pinning the
+        // MAC when the bundle has one keeps vmnet's DHCP lease stable
+        // between the install run and subsequent regular boots, so the
+        // guest sees the same IP across reboots.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
+        if let macString = macAddressString,
+           let mac = VZMACAddress(string: macString) {
+            network.macAddress = mac
+        }
         vzConfig.networkDevices = [network]
         vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         if let graphics {
@@ -147,18 +157,38 @@ public actor MacOSVM {
         defer { progressToken?.invalidate() }
 
         do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
-                queue.async {
-                    installerBox.value.install { result in
-                        cont.resume(with: result)
+            // Cooperative cancellation during a 30+ minute IPSW restore.
+            // If the user cancels mid-restore (closes the install window,
+            // hits Stop), `onCancel` calls `vm.stop(…)` on the executor
+            // queue which unwinds the installer's completion with an
+            // error. The outer `catch` then releases the `flock()` on
+            // `disk.img` / `aux.img` via `stopVZMachineIfRunning`, so a
+            // subsequent `install()` or `boot()` succeeds cold. Without
+            // this, cancelled installs orphaned the VZ machine and the
+            // next attempt failed with `VZErrorDomain Code 2`.
+            let startQueue = queue
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+                        startQueue.async {
+                            installerBox.value.install { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
                     }
                 }
-            }
+            )
         } catch {
-            // Installer failed mid-flight: a VZ machine is already running
-            // on the executor queue from the VZVirtualMachine(configuration:)
-            // call above. Tear it down before resetting state so a retry
-            // doesn't orphan the old VZ instance inside this actor.
+            // Installer failed mid-flight (or was cancelled): a VZ machine
+            // is already running on the executor queue from the
+            // VZVirtualMachine(configuration:) call above. Tear it down
+            // before resetting state so a retry doesn't orphan the old VZ
+            // instance inside this actor.
             await stopVZMachineIfRunning()
             _state = .idle
             throw Error.installFailed("\(error)")
@@ -174,61 +204,73 @@ public actor MacOSVM {
     }
 
     /// Boot a macOS guest that's already installed.
+    ///
+    /// A mid-boot Task cancel (user clicks Stop in the desktop app before
+    /// the guest reaches userspace) triggers `onCancel` on the start
+    /// continuation, which invokes `vm.stop(…)` on the executor queue.
+    /// That resumes `start`'s completion with an error; the `catch` funnels
+    /// through `stopVZMachineIfRunning` to release `flock()` on the
+    /// primary disk, so a subsequent `boot()` succeeds cold.
     public func boot() async throws {
         guard _state == .idle else {
             throw Error.invalidState("boot requires .idle state, was \(_state)")
         }
         _state = .booting
 
-        let vzConfig = VZVirtualMachineConfiguration()
-        vzConfig.cpuCount = cpuCount
-        vzConfig.memorySize = memoryBytes
-
         do {
+            let vzConfig = VZVirtualMachineConfiguration()
+            vzConfig.cpuCount = cpuCount
+            vzConfig.memorySize = memoryBytes
+
             try MacOSBootable(config: _bootConfig).apply(to: vzConfig)
-        } catch {
-            _state = .idle
-            throw Error.bootFailed("MacOSBootable.apply: \(error)")
-        }
 
-        let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = VZNATNetworkDeviceAttachment()
-        vzConfig.networkDevices = [network]
-        vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-        if let graphics {
-            attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
-        }
-        if let sound, sound.enabled {
-            attachSoundDevice(to: vzConfig, sound: sound)
-        }
+            let network = VZVirtioNetworkDeviceConfiguration()
+            network.attachment = VZNATNetworkDeviceAttachment()
+            if let macString = macAddressString,
+               let mac = VZMACAddress(string: macString) {
+                network.macAddress = mac
+            }
+            vzConfig.networkDevices = [network]
+            vzConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+            if let graphics {
+                attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
+            }
+            if let sound, sound.enabled {
+                attachSoundDevice(to: vzConfig, sound: sound)
+            }
 
-        do {
             try vzConfig.validate()
-        } catch {
-            _state = .idle
-            throw Error.bootFailed("config validation: \(error)")
-        }
+            try Task.checkCancellation()
 
-        let queue = executor.queue
-        let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
-        self.virtualMachine = vm
+            let queue = executor.queue
+            let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
+            self.virtualMachine = vm
 
-        do {
             let vmBox = UncheckedSendable(vm)
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
-                queue.async {
-                    vmBox.value.start { result in
-                        cont.resume(with: result)
+            let startQueue = queue
+            try await withTaskCancellationHandler(
+                operation: {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+                        startQueue.async {
+                            vmBox.value.start { result in
+                                cont.resume(with: result)
+                            }
+                        }
+                    }
+                },
+                onCancel: {
+                    startQueue.async {
+                        vmBox.value.stop(completionHandler: { _ in })
                     }
                 }
-            }
+            )
+
+            _state = .ready
         } catch {
             await stopVZMachineIfRunning()
             _state = .idle
             throw Error.bootFailed("\(error)")
         }
-
-        _state = .ready
     }
 
     public func shutdown() async {
@@ -266,13 +308,22 @@ private func attachMacGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    let display = VZMacGraphicsDisplayConfiguration(
-        widthInPixels: graphics.widthInPixels,
-        heightInPixels: graphics.heightInPixels,
-        pixelsPerInch: 220
-    )
+    var displays: [VZMacGraphicsDisplayConfiguration] = [
+        VZMacGraphicsDisplayConfiguration(
+            widthInPixels: graphics.widthInPixels,
+            heightInPixels: graphics.heightInPixels,
+            pixelsPerInch: 220
+        )
+    ]
+    for extra in graphics.additionalDisplays {
+        displays.append(VZMacGraphicsDisplayConfiguration(
+            widthInPixels: extra.widthInPixels,
+            heightInPixels: extra.heightInPixels,
+            pixelsPerInch: 220
+        ))
+    }
     let gpu = VZMacGraphicsDeviceConfiguration()
-    gpu.displays = [display]
+    gpu.displays = displays
     config.graphicsDevices = [gpu]
 
     config.keyboards = [VZMacKeyboardConfiguration()]

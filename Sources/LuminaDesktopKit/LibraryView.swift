@@ -21,6 +21,7 @@ public enum SidebarSection: String, Hashable, CaseIterable {
     case linux = "Linux"
     case windows = "Windows"
     case macOS = "macOS"
+    case agentImages = "Agent Images"
     case downloads = "Downloads"
     case snapshots = "Snapshots"
 
@@ -31,6 +32,7 @@ public enum SidebarSection: String, Hashable, CaseIterable {
         case .linux: "circle.hexagongrid.fill"
         case .windows: "macwindow"
         case .macOS: "apple.logo"
+        case .agentImages: "shippingbox"
         case .downloads: "arrow.down.circle"
         case .snapshots: "clock.arrow.circlepath"
         }
@@ -62,10 +64,12 @@ public enum LibraryLayout: String, CaseIterable, Sendable {
 @MainActor
 public struct LibraryView: View {
     @Bindable public var model: AppModel
+    @Bindable public var coordinator: LauncherCoordinator
     @State private var section: SidebarSection = .all
     @State private var showingWizard = false
     @State private var wizardInitialTile: String? = nil
     @State private var showingLauncher = false
+    @State private var lastSeenLauncherStamp: UUID? = nil
     @State private var appearanceState: AppearancePreference
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
     @AppStorage("lumina.layout") private var layoutRaw: String = LibraryLayout.list.rawValue
@@ -74,8 +78,9 @@ public struct LibraryView: View {
         LibraryLayout(rawValue: layoutRaw) ?? .list
     }
 
-    public init(model: AppModel) {
+    public init(model: AppModel, coordinator: LauncherCoordinator) {
         self.model = model
+        self.coordinator = coordinator
         // Seed local @State from whatever AppStorage held last session so
         // the initial render matches the persisted choice without an
         // extra propagation cycle.
@@ -126,7 +131,7 @@ public struct LibraryView: View {
                 .onDisappear { wizardInitialTile = nil }
         }
         .sheet(isPresented: $showingLauncher) {
-            CommandLauncher(model: model, isPresented: $showingLauncher)
+            CommandLauncher(model: model, coordinator: coordinator, isPresented: $showingLauncher)
         }
         .background(
             // Global ⌘K / ⌘P shortcut even when focus is on sidebar
@@ -135,12 +140,16 @@ public struct LibraryView: View {
                 .opacity(0)
                 .frame(width: 0, height: 0)
         )
-        .onReceive(NotificationCenter.default.publisher(for: .luminaLauncherOpenWizard)) { note in
-            if let tileID = note.object as? String {
-                showWizard(preselect: tileID)
-            }
+        .onChange(of: coordinator.pendingWizardTile) { _, tile in
+            guard let tile else { return }
+            showWizard(preselect: tile)
+            coordinator.pendingWizardTile = nil
         }
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("LuminaShowLauncher"))) { _ in
+        .onChange(of: coordinator.launcherRequestStamp) { _, stamp in
+            // Open only when the stamp actually changes so reopening while the
+            // sheet is already visible still works.
+            guard stamp != nil, stamp != lastSeenLauncherStamp else { return }
+            lastSeenLauncherStamp = stamp
             showingLauncher = true
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -196,6 +205,9 @@ public struct LibraryView: View {
             sidebarRow(.linux, count: byFamily[.linux]?.count ?? 0)
             sidebarRow(.windows, count: byFamily[.windows]?.count ?? 0)
             sidebarRow(.macOS, count: byFamily[.macOS]?.count ?? 0)
+
+            sectionHeader("AGENT")
+            sidebarRow(.agentImages, count: 0)
 
             sectionHeader("ACTIVITY")
             sidebarRow(.downloads, count: 0)
@@ -260,7 +272,9 @@ public struct LibraryView: View {
     private var detail: some View {
         ZStack {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
-            if filteredForSection.isEmpty && model.bundles.isEmpty {
+            if section == .agentImages {
+                CustomImagesView()
+            } else if filteredForSection.isEmpty && model.bundles.isEmpty {
                 EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {
                 EmptyFilterView(section: section)
@@ -286,10 +300,13 @@ public struct LibraryView: View {
         case .running:
             let live = Set(model.sessions.compactMap { $0.value.status.isLive ? $0.key : nil })
             base = model.filteredBundles.filter { live.contains($0.manifest.id) }
-        case .linux, .windows, .macOS:
-            let fam = section.matchingFamily!
-            base = model.filteredBundles.filter { $0.manifest.osFamily == fam }
-        case .downloads, .snapshots:
+        case .linux:
+            base = model.filteredBundles.filter { $0.manifest.osFamily == .linux }
+        case .windows:
+            base = model.filteredBundles.filter { $0.manifest.osFamily == .windows }
+        case .macOS:
+            base = model.filteredBundles.filter { $0.manifest.osFamily == .macOS }
+        case .downloads, .snapshots, .agentImages:
             base = []
         }
         return base

@@ -34,9 +34,18 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 - 🍎 **macOS guests** — IPSW-restored `VZMacOSVirtualMachine` (needs Apple Silicon host)
 - 🖥 **Lumina Desktop.app** — a SwiftUI library + wizard + per-VM windows, with ⌘K fuzzy launcher, live per-card disk sparklines, drag-drop ISOs, native fullscreen, and a brand-aware look per guest OS (Ubuntu orange, Kali cyber blue, Windows MS blue, macOS silver, …)
 - 🔒 **Catalog ISO integrity** — the wizard streams user-picked catalog ISOs through SHA-256 before creating the VM and refuses partial or tampered downloads
-- 🎨 **Ad-hoc signed build** — no Apple Developer Program account required; notarization is a v0.7.1 upgrade
+- 🎨 **Ad-hoc signed build** — no Apple Developer Program account required. Notarization scaffolding is in place (per-cert-class entitlement selection in `scripts/build-app.sh`); the hosted CI switch from ad-hoc to notarized Developer ID waits on Apple Developer Program enrollment and is tracked as a v0.7.2 follow-up.
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
+
+### v0.7.1 — desktop boot reliability (in progress on `refactor/idiomatic-pass`)
+
+Four hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real. Each is unit-tested; end-to-end installer validation is the current open item.
+
+- **Stable MAC per `.luminaVM` bundle.** Every bundle persists a locally-administered MAC in `manifest.json` via `VMBundleManifest.macAddress` and `VMBundle.ensureMACAddress()`. Legacy (pre-v0.7.1) manifests are lazily backfilled on first boot. Pre-fix every VZ machine got a random MAC on each boot, so vmnet's bootpd churned DHCP leases and the Kali/Debian installers' short-timeout `netcfg` DISCOVER raced the new lease. Post-fix the guest sees the same MAC/IP across reboots and vmnet keeps the lease hot.
+- **Cancel-during-boot → clean retry.** `VM.boot()` now wraps `vm.start` in `withTaskCancellationHandler`; an outer Task cancel (user clicks Stop, window closes, session shutdown) calls `vm.stop(…)` on the executor queue which resumes the start continuation with an error, funnels through a single `catch` that calls `shutdownVM()` to release the `flock()` on `disk.img` + `efi.vars`, and throws `LuminaError.bootFailed(underlying: VMError.cancelled)`. The next `boot()` starts cold. Prior design leaked state and produced `VZErrorDomain Code 2` on retry.
+- **Pre-start delegate install.** `VMStopForwarder` is now attached *before* `vm.start(…)` via `VM.setDelegate(_:)`. Guest crashes in the 300–500 ms kernel → init window (kernel panic, dracut timeout, missing hardware model, Windows TPM refusal) fire `didStopWithError` into a live observer and the desktop session transitions to `.crashed(reason:)`. Prior design attached the delegate after boot returned and lost the callback for early crashes — the UI sat at `.running` over a dead VM.
+- **Windows 11 ARM installer reliability + install-phase speed.** `EFIBootConfig.preferUSBCDROM` (default `true` for `osFamily == .windows`) attaches the installer ISO via `VZUSBMassStorageDeviceConfiguration` (macOS 13+) instead of virtio-block — Windows setup refuses "unknown media" from virtio and installs cleanly from USB mass-storage. `EFIBootConfig.installPhase` (`true` while `manifest.lastBootedAt == nil`) flips the primary disk from `.full` to `.fsync` synchronization on macOS 13+; partman / mkfs install time roughly halves on APFS. Post-install returns to `.full` for real crash safety.
 
 ## Install
 
@@ -55,7 +64,7 @@ lumina run "echo hello world"       # image auto-pulls on first run
 bash scripts/build-app.sh --install  # builds .app, signs ad-hoc, installs to /Applications, launches
 ```
 
-On first launch macOS will warn "from an unidentified developer" — right-click `Lumina.app` in `/Applications` → Open, then confirm. Notarization ships in v0.7.1.
+On first launch macOS will warn "from an unidentified developer" — right-click `Lumina.app` in `/Applications` → Open, then confirm. Notarization ships in a later release once the Apple Developer Program account is wired into CI (tracked as a v0.7.2 task; see ROADMAP).
 
 Pre-built binary + image from the latest [release](https://github.com/abdul-abdi/lumina/releases/latest):
 
@@ -112,6 +121,7 @@ Benchmarked on M3 Pro, macOS 26.4, release build.
 | 4 concurrent cold boots | **753ms** aggregate wall-clock | — | Apple Silicon + VZ scales cleanly |
 | Daemon idle memory | **0 MB** | — | no daemon — sessions are spawned processes |
 | Sustained session exec rate | **100/s** | — | 3-minute soak test |
+| Concurrent CLI clients / session | **1000+ / 200-in-2s** | — | async reader lifted pool-starvation ceiling |
 
 ### Desktop path (v0.7.0 new)
 
@@ -125,7 +135,7 @@ Benchmarked on M3 Pro, macOS 26.4, release build.
 | FSEvents pickup (new VM appears) | **80ms** | coalesced from directory write events |
 | Binary size (`Lumina.app`) | **4.6 MB** | no Sparkle, no bundled frameworks |
 
-Validated under stress: 10 concurrent 512MB VMs booted on 18GB M3 Pro, 100K-line stdout round-trip in ~1s, 3-minute sustained session with 171 periodic execs.  [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
+Validated under stress: 20 concurrent 512MB VMs (100% success), 1000 parallel CLI `exec` clients against one session (100% success, 1.99s wall), 100K-line stdout round-trip in ~1s, 100MB stdout byte-exact in 532ms, 3-minute sustained session with 171 periodic execs.  [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
 
 ---
 
@@ -146,12 +156,17 @@ lumina run --volume mydata:/data "cat /data/file.txt"
 ```bash
 SID=$(lumina session start)                      # ~540ms
 SID=$(lumina session start --memory 4GB --cpus 4 --forward 3000:3000)
+SID=$(lumina session start --ttl 30m)            # auto-stop after 30m idle
 lumina exec $SID "uname -a"                      # ~31ms
 echo '{"k":1}' | lumina exec $SID "jq ."         # stdin piping
 lumina cp ./script.py $SID:/tmp/script.py        # file transfer
 lumina exec --pty $SID "claude"                  # interactive TTY
 lumina session list && lumina session stop $SID
 ```
+
+`--ttl <duration>` arms an idle watchdog that auto-stops the session once
+there has been no client activity **and** no active execs for the interval.
+Default is `0` (never auto-stop). Live execs and PTYs prevent shutdown.
 
 ### Desktop VMs — install Ubuntu, Kali, Windows 11 ARM, macOS
 

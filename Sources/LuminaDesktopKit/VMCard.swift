@@ -341,14 +341,17 @@ public struct VMCard: View {
     let bundle: VMBundle
     let openWindow: () -> Void
     @State private var isHovering = false
-    @State private var stats: VMLiveStats
 
     public init(model: AppModel, bundle: VMBundle, openWindow: @escaping () -> Void) {
         self.model = model
         self.bundle = bundle
         self.openWindow = openWindow
-        _stats = State(initialValue: VMLiveStats(bundle: bundle))
     }
+
+    // Stats are model-owned (issue #11). Grid and list rows of the
+    // same bundle now share a single `VMLiveStats` instance and its
+    // timer, instead of each view spinning its own.
+    private var stats: VMLiveStats { model.liveStats(for: bundle) }
 
     private var session: LuminaDesktopSession {
         model.session(for: bundle)

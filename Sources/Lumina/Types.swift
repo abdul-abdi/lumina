@@ -156,17 +156,38 @@ public struct GraphicsConfig: Sendable {
     public var heightInPixels: Int
     public var keyboardKind: KeyboardKind
     public var pointingDeviceKind: PointingDeviceKind
+    /// Additional displays beyond the primary. Empty by default, which
+    /// preserves single-display v0.7.0 behavior. Each entry becomes a
+    /// second `VZVirtioGraphicsScanoutConfiguration` on the same
+    /// virtio-GPU device, or a second `VZMacGraphicsDisplayConfiguration`
+    /// on the macOS graphics device. The running-VM window still shows
+    /// the primary only; a multi-display UI is follow-up work.
+    public var additionalDisplays: [Display]
 
     public init(
         widthInPixels: Int = 1920,
         heightInPixels: Int = 1080,
         keyboardKind: KeyboardKind = .usb,
-        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate
+        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate,
+        additionalDisplays: [Display] = []
     ) {
         self.widthInPixels = widthInPixels
         self.heightInPixels = heightInPixels
         self.keyboardKind = keyboardKind
         self.pointingDeviceKind = pointingDeviceKind
+        self.additionalDisplays = additionalDisplays
+    }
+
+    /// A display spec. Resolution-only; future fields (ppi, position,
+    /// colorspace) go here without breaking callers.
+    public struct Display: Sendable, Equatable {
+        public var widthInPixels: Int
+        public var heightInPixels: Int
+
+        public init(widthInPixels: Int, heightInPixels: Int) {
+            self.widthInPixels = widthInPixels
+            self.heightInPixels = heightInPixels
+        }
     }
 }
 
@@ -196,17 +217,37 @@ public struct EFIBootConfig: Sendable, Equatable {
     public var primaryDisk: URL
     public var cdromISO: URL?
     public var extraDisks: [URL]
+    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration` on
+    /// macOS 13+ instead of the default virtio-block device. Windows 11
+    /// ARM setup is picky about media type and refuses to boot from a
+    /// virtio-block-labeled CD-ROM with "Windows cannot find the media";
+    /// USB mass-storage presents as a real removable drive and works.
+    /// Linux installers accept either. Default: true when the bundle's
+    /// OS family is Windows, false otherwise — wired in the bundle boot
+    /// layer, not in `EFIBootable` (which just honours the flag).
+    public var preferUSBCDROM: Bool
+    /// Indicates a first-boot-style install phase. Unlocks install-time
+    /// disk-cache relaxations — `.fsync` synchronization instead of
+    /// `.full` — which halves partman / mkfs install time on APFS
+    /// without compromising in-guest crash safety (only a *host* crash
+    /// mid-install loses data, and the install is disposable).
+    /// Callers populate this from `VMBundleManifest.lastBootedAt == nil`.
+    public var installPhase: Bool
 
     public init(
         variableStoreURL: URL,
         primaryDisk: URL,
         cdromISO: URL? = nil,
-        extraDisks: [URL] = []
+        extraDisks: [URL] = [],
+        preferUSBCDROM: Bool = false,
+        installPhase: Bool = false
     ) {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
         self.cdromISO = cdromISO
         self.extraDisks = extraDisks
+        self.preferUSBCDROM = preferUSBCDROM
+        self.installPhase = installPhase
     }
 }
 
@@ -281,6 +322,23 @@ public struct VMOptions: Sendable {
     public var networkIP: String?
     public var rosetta: Bool
     public var diskSize: UInt64?
+    /// Stable L2 identity in `xx:xx:xx:xx:xx:xx` hex form. When set, the VM
+    /// boots with this exact MAC instead of VZ's default random-per-boot
+    /// value. Desktop bundles always set this from `VMBundleManifest` so
+    /// re-boots of the same bundle present the same MAC to vmnet — required
+    /// for a stable DHCP lease and reproducible routing. Disposable CLI VMs
+    /// leave it nil (one-shot boots don't benefit from stability). A
+    /// malformed string falls back to VZ's default silently.
+    public var macAddress: String?
+    /// Optional on-disk destination for the guest's serial console output.
+    /// When set, `VM.boot()` spawns a sibling drain task that appends raw
+    /// bytes from the guest's serial port to this path so failures are
+    /// post-mortem diagnosable without replaying the boot. Parent
+    /// directory must already exist. Nil disables persistence (serial
+    /// output still lives in the in-memory `SerialConsole`, so crash-time
+    /// `guestCrashed(serialOutput:)` still fires — this just adds a
+    /// durable log on top).
+    public var serialLogURL: URL?
     /// v0.7.0: optional display + input for the desktop use case.
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
@@ -323,7 +381,9 @@ public struct VMOptions: Sendable {
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
         bootable: BootableProfile? = nil,
-        sound: SoundConfig? = nil
+        sound: SoundConfig? = nil,
+        macAddress: String? = nil,
+        serialLogURL: URL? = nil
     ) {
         self.memory = memory
         self.cpuCount = cpuCount
@@ -338,6 +398,8 @@ public struct VMOptions: Sendable {
         self.graphics = graphics
         self.bootable = bootable
         self.sound = sound
+        self.macAddress = macAddress
+        self.serialLogURL = serialLogURL
     }
 
     public init(from runOptions: RunOptions) {
@@ -359,6 +421,11 @@ public struct VMOptions: Sendable {
         self.bootable = nil
         // Disposable `run` is headless; no audio.
         self.sound = nil
+        // Disposable `run` is one-shot; no benefit from a stable MAC.
+        self.macAddress = nil
+        // Disposable `run` has no bundle; caller can set a specific log
+        // path via the library API if they want the serial dump.
+        self.serialLogURL = nil
     }
 }
 
@@ -544,6 +611,22 @@ public enum LuminaError: Error, Sendable {
     case sessionNotFound(String)
     case sessionDead(String)
     case sessionFailed(String)
+}
+
+extension LuminaError {
+    /// True when the error originated from cooperative cancellation (an
+    /// outer Task was cancelled — typically the user clicked Stop during
+    /// boot). Surfaces as `.bootFailed(underlying: VMError.cancelled)`
+    /// from `VM.boot()`. Consumers distinguish "user cancelled, retry
+    /// should just work" from "VM genuinely crashed, investigate."
+    public var isCancellation: Bool {
+        if case .bootFailed(let underlying) = self,
+           let vme = underlying as? VMError,
+           case .cancelled = vme {
+            return true
+        }
+        return false
+    }
 }
 
 extension LuminaError: LocalizedError {
