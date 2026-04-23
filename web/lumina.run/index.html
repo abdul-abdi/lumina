@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>lumina — subprocess.run() for virtual machines</title>
-<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~31ms, cold starts in ~524ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
+<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~31ms, cold starts in ~390ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
 <meta property="og:title" content="lumina — subprocess.run() for virtual machines" />
 <meta property="og:description" content="A native sandbox primitive for AI agents on Apple Silicon. Now with Lumina Desktop." />
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -848,7 +848,7 @@ footer .legal .sig {
       </ul>
       <div class="nav-status">
         <span class="dot"></span>
-        <span>v0.7.0 · stable</span>
+        <span>v0.7.1 · stable</span>
       </div>
     </div>
   </div>
@@ -857,7 +857,7 @@ footer .legal .sig {
 <div class="wrap">
   <div class="meta-strip">
     <span>LUMINA / <b>A SANDBOX PRIMITIVE FOR AGENTS</b></span>
-    <span>BUILD <b>0.7.0</b></span>
+    <span>BUILD <b>0.7.1</b></span>
     <span>PLATFORM <b>DARWIN-ARM64</b></span>
     <span>EXEC <b id="meta-lat">31MS</b></span>
     <span id="meta-clock">—</span>
@@ -876,10 +876,12 @@ footer .legal .sig {
         </h1>
         <p class="lede">
           Boot a Linux VM, run a command, collect <b>structured JSON</b>.
-          Sessions exec in <b>~31ms</b>, cold boots land in <b>~524ms P50</b>
+          Sessions exec in <b>~31ms</b>, cold boots land in <b>~390ms P50</b>
           on an M3 Pro, and the sandbox is sealed by default — no host fs,
           no SSH, no escape hatch. Built for the agent loop.
-          <b>v0.7.0 adds Lumina Desktop</b> — full-OS guests with a SwiftUI face.
+          <b>v0.7.1 hardens desktop boot</b> — stable MAC across reboots,
+          cancel-safe retry, pre-start crash delegate, live serial tail
+          when the framebuffer's still dark.
         </p>
         <div class="cta-row">
           <a href="#install" class="btn primary">
@@ -922,7 +924,7 @@ footer .legal .sig {
     <div class="counters">
       <div>
         <div class="label">Cold start (P50)</div>
-        <div class="val" id="c-boot">524<span class="u">ms</span></div>
+        <div class="val" id="c-boot">390<span class="u">ms</span></div>
         <span class="tick"></span>
       </div>
       <div>
@@ -1028,8 +1030,10 @@ footer .legal .sig {
           <li>Library · grid · sparklines · host ribbon</li>
           <li>Wizard · OS tiles · BYO ISO/IPSW · drag-drop</li>
           <li>⌘K fuzzy launcher · menu bar states</li>
-          <li>Fail-closed ISO integrity (SHA-256)</li>
+          <li>Fail-closed ISO integrity — app wizard AND <code>lumina desktop create</code> <small style="color:var(--ink-mute)">v0.7.1</small></li>
           <li>Native fullscreen · per-VM window</li>
+          <li>Agent Images sidebar — custom <code>lumina images create</code> builds, one-click Terminal <small style="color:var(--ink-mute)">v0.7.1</small></li>
+          <li>Live serial tail during boot + crash — no more blank framebuffer <small style="color:var(--ink-mute)">v0.7.1</small></li>
           <li>Stable MAC · stable DHCP lease · cancel-safe retry <small style="color:var(--ink-mute)">v0.7.1</small></li>
           <li>USB-mass-storage CD-ROM for Windows · install-phase disk tuning <small style="color:var(--ink-mute)">v0.7.1</small></li>
         </ul>
@@ -1079,7 +1083,7 @@ footer .legal .sig {
     <div class="section-head reveal">
       <div class="no">§ 05</div>
       <h2>Stable primitives<span class="it"> — what you can rely on.</span></h2>
-      <div class="eyebrow">CONTRACT / v0.7.0</div>
+      <div class="eyebrow">CONTRACT / v0.7.1</div>
     </div>
     <div class="prims reveal">
       <div class="prim">
@@ -1240,10 +1244,10 @@ footer .legal .sig {
     <div class="bench reveal">
       <div>
         <h5>Cold boot <code style="font-size:11px; color:var(--ink-mute)">true</code></h5>
-        <div class="big">524<span class="u">ms</span></div>
+        <div class="big">390<span class="u">ms</span></div>
         <div class="sub">P50 — fresh VM to vsock-ready. P95: 558ms.</div>
         <div class="bars">
-          <div class="bar"><span>P50</span><span class="t"><i style="width:28%"></i></span><span class="v">524ms</span></div>
+          <div class="bar"><span>P50</span><span class="t"><i style="width:20%"></i></span><span class="v">390ms</span></div>
           <div class="bar"><span>P95</span><span class="t"><i style="width:30%"></i></span><span class="v">558ms</span></div>
           <div class="bar"><span>4× concurrent</span><span class="t"><i style="width:40%"></i></span><span class="v">753ms agg</span></div>
           <div class="bar"><span>cold + first exec</span><span class="t"><i style="width:29%"></i></span><span class="v">542ms</span></div>
@@ -1369,7 +1373,7 @@ footer .legal .sig {
           </span>
         </p>
         <div style="display: flex; gap: 10px; font-size: 11px; color: var(--ink-mute); letter-spacing: .1em; text-transform: uppercase;">
-          <span>v0.7.0</span> ·
+          <span>v0.7.1</span> ·
           <span>MIT</span> ·
           <span id="foot-clock">—</span>
         </div>
@@ -1429,7 +1433,7 @@ function copyInstall(btn) {
 
 /* ───── live counters (jitter + drift) ───── */
 const counters = {
-  boot: { el: document.getElementById('c-boot'), base: 524, jit: 14 },
+  boot: { el: document.getElementById('c-boot'), base: 390, jit: 14 },
   exec: { el: document.getElementById('c-exec'), base: 31, jit: 3 },
   sess: { el: document.getElementById('c-sess'), base: 1284 },
   execs: { el: document.getElementById('c-execs'), base: 847312 },
