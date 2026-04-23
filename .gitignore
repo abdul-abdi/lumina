@@ -24,7 +24,17 @@ DerivedData/
 *~
 
 # AI agent / local tooling config
-.claude/
+# User-specific Claude Code state stays local (agents/, commands/, scheduled
+# tasks, worktree metadata, local settings). Shared skills that any agent
+# checking out the repo should load are explicitly allow-listed below.
+# NOTE: gitignore can't re-include files whose parent directory is ignored,
+# so we ignore specific children of .claude/ instead of the whole directory.
+.claude/agents/
+.claude/commands/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/settings.json
 CLAUDE.md
 AGENTS.md
 
@@ -46,4 +56,4 @@ Apps/LuminaDesktop/build/
 
 # Local design-source bundles (Claude Design handoffs, etc.)
 lumina-handoff.zip
-lumina/
+/lumina/
