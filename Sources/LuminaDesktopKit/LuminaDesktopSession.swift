@@ -337,15 +337,30 @@ public final class LuminaDesktopSession: Identifiable {
     /// the graphics driver claims the display). After the framebuffer
     /// lights up the tail collapses in the UI but stays live so a
     /// later crash preserves the last-known-good diagnostic lines.
+    ///
+    /// **Back-pressure:** the loop captures `VM.serialVersion` each tick
+    /// and short-circuits the tail+strip+publish pipeline when it hasn't
+    /// changed since the previous iteration. An idle VM (no new serial
+    /// output — common on a quiescent `.booting` waiting on DHCP or a
+    /// `.crashed` post-mortem) ends up doing one actor hop + one
+    /// `UInt64` read + one equality check per 250ms tick instead of
+    /// copying the megabyte ring buffer and running it through the ANSI
+    /// stripper. This keeps SwiftUI's differ from spinning on identical
+    /// strings for seconds at a time. Issue #27.
     private func startSerialMirror(for vm: VM) {
         serialMirrorTask?.cancel()
         serialMirrorTask = Task { [weak self] in
+            var lastVersion: UInt64 = 0
             while !Task.isCancelled {
-                let tail = await vm.serialTail(lines: 12)
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    if self.serialDigest != tail {
-                        self.serialDigest = tail
+                let version = await vm.serialVersion
+                if version != lastVersion {
+                    lastVersion = version
+                    let tail = await vm.serialTail(lines: 12)
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        if self.serialDigest != tail {
+                            self.serialDigest = tail
+                        }
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(250))

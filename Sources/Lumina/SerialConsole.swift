@@ -6,6 +6,14 @@ public final class SerialConsole: @unchecked Sendable {
     private var buffer: Data
     private let maxSize: Int
     private var _agentStarted = false
+    /// Monotonic counter bumped on every `append` that actually writes
+    /// bytes. Readers that poll the console (e.g. the Desktop app's
+    /// serial-mirror task at ~4 Hz) capture this value and skip their
+    /// full tail/strip/publish pipeline when it hasn't changed — an idle
+    /// VM's mirror task ends up doing one atomic load + one equality
+    /// check per tick instead of copying a megabyte of buffer. See
+    /// `LuminaDesktopSession.startSerialMirror`.
+    private var _version: UInt64 = 0
 
     private static let agentMarker = Data("lumina-agent starting".utf8)
 
@@ -18,7 +26,10 @@ public final class SerialConsole: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        guard !data.isEmpty else { return }
+
         buffer.append(data)
+        _version &+= 1
 
         // Check for agent marker
         if !_agentStarted && buffer.range(of: Self.agentMarker) != nil {
@@ -41,5 +52,15 @@ public final class SerialConsole: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _agentStarted
+    }
+
+    /// Monotonic version counter — increments once per successful
+    /// `append`. Starts at 0 for a freshly-constructed console.
+    /// Overflow wraps via `&+=` (expected to never happen in practice;
+    /// 2^64 appends at 4 Hz is ~146 billion years).
+    public var version: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _version
     }
 }

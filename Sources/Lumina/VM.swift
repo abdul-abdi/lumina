@@ -1270,6 +1270,15 @@ public actor VM {
         serialConsole.output
     }
 
+    /// Monotonic version counter bumped by `SerialConsole.append`.
+    /// Exposed so Desktop-app polling loops can skip the full
+    /// `serialTail` pipeline when nothing new arrived since the last
+    /// tick. Agent-path callers have no use for this — the agent path
+    /// doesn't poll the serial console.
+    public var serialVersion: UInt64 {
+        serialConsole.version
+    }
+
     /// Last `lines` newline-terminated lines from the serial console
     /// buffer, stripped of ANSI CSI sequences that terminals use for
     /// cursor/color control. Designed for the desktop's boot-window
