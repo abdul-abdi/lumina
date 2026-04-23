@@ -42,6 +42,34 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
+        /// True when `boot()` should actually start a new VZ machine.
+        /// Used as the re-entry guard at the top of `boot()` to make
+        /// concurrent boot calls idempotent from every UI path (card
+        /// ▶ BOOT, ⌘K launcher, VM-window `.task`, menu bar). Two paths
+        /// firing for a single user click would each build a
+        /// `VZVirtualMachine` pointing at the same `disk.img`; VZ rejects
+        /// the second attachment with `VZErrorDomain Code 2`. Returning
+        /// early when not bootable prevents the race at source. Issue #14.
+        public var canBoot: Bool {
+            switch self {
+            case .stopped, .crashed: return true
+            case .booting, .running, .paused, .shuttingDown: return false
+            }
+        }
+
+        /// True when a terminal-state guard should early-return in
+        /// `handleExternalStop`. `.shuttingDown` means the explicit
+        /// `shutdown()` path owns the transition; `.stopped` means we
+        /// already landed there. Without this guard the VZ delegate
+        /// callback during user-initiated stop would double-update
+        /// `status` and produce the "Crashed: (null)" flash. Issue #14.
+        public var isTerminal: Bool {
+            switch self {
+            case .stopped, .shuttingDown: return true
+            default: return false
+            }
+        }
+
         public var label: String {
             switch self {
             case .stopped: "Stopped"
@@ -89,21 +117,8 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     public func boot() async {
-        // Re-entry guard. `boot()` is triggered from several UI paths
-        // (card ▶ BOOT, ⌘K launcher, VM window `.task`, menu bar item).
-        // Two of them firing for a single user click would each build a
-        // `VZVirtualMachine` pointing at the same `disk.img`; VZ rejects
-        // the second attachment lock with `VZErrorDomain Code 2` and the
-        // user sees "first boot failed, Try Again works." The race is
-        // the root cause — retry logic only papers over it. Returning
-        // early when already booting / running / stopping makes `boot()`
-        // idempotent from every caller and eliminates the race.
-        switch status {
-        case .booting, .running, .paused, .shuttingDown:
-            return
-        case .stopped, .crashed:
-            break
-        }
+        // Re-entry guard — see `Status.canBoot` for the full rationale.
+        guard status.canBoot else { return }
 
         status = .booting
         lastError = nil
@@ -283,10 +298,10 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     private func handleExternalStop(reason: String?) {
-        // Guard: if we're already in a controlled shutdown, the explicit
-        // shutdown() path owns the transition — don't double-update.
-        if case .shuttingDown = status { return }
-        if case .stopped = status { return }
+        // Terminal-state guard — see `Status.isTerminal`. Covers both
+        // the "shutdown() already owns the transition" and "already
+        // stopped" cases in one name.
+        if status.isTerminal { return }
 
         // Grab one final serial tail from the VM before we drop the
         // actor reference. On a kernel panic or EFI→kernel handoff
