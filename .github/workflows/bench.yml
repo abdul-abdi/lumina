@@ -108,7 +108,6 @@ jobs:
             # Emits one line per iteration: "<ms>" to stdout.
             local label="$1"; shift
             local extra=("$@")
-            local samples=()
             for i in $(seq 1 "$BENCH_ITERATIONS"); do
               OUT="$("$BIN_PATH" run "${extra[@]}" "true" 2>&1 || true)"
               MS="$(printf '%s' "$OUT" | jq -r '
@@ -228,7 +227,9 @@ jobs:
 
           printf '%s\n' "$ROW" >> metrics.jsonl
           git add metrics.jsonl
-          [ -f README.md ] && git add README.md || true
+          if [ -f README.md ]; then
+            git add README.md || true
+          fi
           if git diff --staged --quiet; then
             echo "No changes to commit (row was empty?)."
             exit 0
