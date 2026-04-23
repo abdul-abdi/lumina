@@ -147,27 +147,32 @@ struct Doctor: AsyncParsableCommand {
             return ProcessOutput(stdout: "", stderr: "\(error)", exitCode: -1)
         }
         // Drain pipes concurrently on background queues so neither
-        // fills before the child exits.
-        var outData = Data()
-        var errData = Data()
+        // fills before the child exits. DispatchGroup synchronizes
+        // the writes against the reads below — the `@unchecked`
+        // holder is safe because no access overlaps group.wait().
+        final class Buffers: @unchecked Sendable {
+            var out = Data()
+            var err = Data()
+        }
+        let buf = Buffers()
         let outQueue = DispatchQueue(label: "doctor.out")
         let errQueue = DispatchQueue(label: "doctor.err")
         let group = DispatchGroup()
         group.enter()
         outQueue.async {
-            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            buf.out = outPipe.fileHandleForReading.readDataToEndOfFile()
             group.leave()
         }
         group.enter()
         errQueue.async {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            buf.err = errPipe.fileHandleForReading.readDataToEndOfFile()
             group.leave()
         }
         proc.waitUntilExit()
         group.wait()
         return ProcessOutput(
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? "",
+            stdout: String(data: buf.out, encoding: .utf8) ?? "",
+            stderr: String(data: buf.err, encoding: .utf8) ?? "",
             exitCode: proc.terminationStatus
         )
     }
