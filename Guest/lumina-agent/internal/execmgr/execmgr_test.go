@@ -15,7 +15,6 @@ package execmgr
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"net"
 	"sync"
 	"syscall"
@@ -402,5 +401,4 @@ func TestWaitAll_BlocksUntilCommandsExit(t *testing.T) {
 		t.Fatalf("WaitAll did not return after command exit")
 	}
 	wg.Wait()
-	fmt.Sprintln("done") // silence unused-import linter in other files
 }
