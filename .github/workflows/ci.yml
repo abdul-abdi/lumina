@@ -72,6 +72,25 @@ jobs:
       - name: Run unit tests (parallel)
         run: swift test --parallel
 
+      - name: Build + sign test bundle (for cancellation integration)
+        # The cancellation tests (v0.7.1 #19) drive real Task.cancel()
+        # through VM.boot() on a live VZVirtualMachine. They need the
+        # Virtualization entitlement on the codesigned test bundle
+        # AND a staged agent image. The image is downloaded by the
+        # agent-boot regression gate below; we reuse it there by
+        # running the gate first, then swinging back for these tests.
+        # This step only builds + signs the test bundle — execution
+        # happens post-gate so image presence is guaranteed.
+        run: |
+          swift build --build-tests
+          TEST_BUNDLE=".build/debug/LuminaPackageTests.xctest"
+          if [ -d "$TEST_BUNDLE" ]; then
+            codesign --entitlements lumina.entitlements --force -s - "$TEST_BUNDLE"
+            echo "Test bundle signed: $TEST_BUNDLE"
+          else
+            echo "::warning::Test bundle missing — cancellation suite will be skipped"
+          fi
+
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
@@ -214,3 +233,33 @@ jobs:
             exit 1
           fi
           echo "::notice::Agent-boot gate passed (${MEDIAN}ms / ${AGENT_BOOT_P50_MAX_MS}ms budget)."
+
+      # v0.7.1 #19: behaviour-level cancellation tests. These drive
+      # real Task.cancel() through VM.boot() on a live VZVirtualMachine
+      # and assert cleanup (flock release) + retry succeeds. They
+      # piggyback on the agent image the boot gate just staged. If
+      # the gate skipped (runner can't nest VZ), these skip too — no
+      # extra runtime dependency.
+      - name: Run cancellation integration tests
+        run: |
+          set -euo pipefail
+          # If the image isn't staged, the tests' enabled-if predicate
+          # evaluates false and they skip cleanly. No guard needed here.
+          if [ ! -d ~/.lumina/images/default ]; then
+            echo "::notice::Agent image not staged (VZ-incapable runner); cancellation suite skips."
+            exit 0
+          fi
+          TEST_BUNDLE=".build/debug/LuminaPackageTests.xctest"
+          if [ ! -d "$TEST_BUNDLE" ]; then
+            echo "::notice::Test bundle missing; cancellation suite skipped."
+            exit 0
+          fi
+          LUMINA_INTEGRATION_TESTS=1 \
+            swift test --skip-build --filter 'boot_cancel' 2>&1 | tee /tmp/cancel-out.log
+          # Grep for the explicit pass marker so a silent no-op
+          # (filter matched nothing) fails loudly rather than passing.
+          if ! grep -q 'boot_cancelImmediate_subsequentBootSucceeds()' /tmp/cancel-out.log; then
+            echo "::error::Cancellation suite did not run boot_cancelImmediate; likely filter drift or missing entitlement on test bundle."
+            exit 1
+          fi
+          echo "::notice::Cancellation suite executed on CI."

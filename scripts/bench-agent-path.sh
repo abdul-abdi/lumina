@@ -27,20 +27,22 @@ extract_ms() {
 }
 
 p50p95p99() {
-    # Read stdin numbers one per line, print "p50 p95 p99 min max n"
-    awk '
-        { a[NR]=$1; sum += $1 }
+    # Read stdin numbers one per line, print "p50 p95 p99 min max n".
+    # Sort externally (portable across BSD + GNU awk — BSD awk lacks
+    # `asort`), then pick percentile slots.
+    sort -n | awk '
+        { a[NR] = $1 }
         END {
             n = NR
             if (n == 0) { print "0 0 0 0 0 0"; exit }
-            asort(a)
-            p50 = a[int(n*0.50 + 0.5)]
-            p95 = a[int(n*0.95 + 0.5)]
-            p99 = a[int(n*0.99 + 0.5)]
-            if (p50 == "") p50 = a[n]
-            if (p95 == "") p95 = a[n]
-            if (p99 == "") p99 = a[n]
-            printf "%d %d %d %d %d %d\n", p50, p95, p99, a[1], a[n], n
+            idx50 = int(n * 0.50 + 0.5); if (idx50 < 1) idx50 = 1
+            idx95 = int(n * 0.95 + 0.5); if (idx95 < 1) idx95 = 1
+            idx99 = int(n * 0.99 + 0.5); if (idx99 < 1) idx99 = 1
+            if (idx50 > n) idx50 = n
+            if (idx95 > n) idx95 = n
+            if (idx99 > n) idx99 = n
+            printf "%d %d %d %d %d %d\n", \
+                a[idx50], a[idx95], a[idx99], a[1], a[n], n
         }
     '
 }
