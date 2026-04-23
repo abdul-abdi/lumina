@@ -28,6 +28,7 @@
 // for snapshot callers that want a single import.
 
 import Foundation
+import Lumina
 
 /// Every observable field of a `LuminaDesktopSession` bundled into
 /// one value type. Populate via `LuminaDesktopSession.snapshot`;
@@ -37,17 +38,24 @@ public struct SessionSnapshot: Sendable, Equatable {
     public var lastError: String?
     public var bootDuration: Duration?
     public var serialDigest: String
+    /// Per-phase boot timing, captured from the VM actor after boot
+    /// completes. `BootPhases()` for sessions that have never booted
+    /// or are mid-boot — use `bootPhases.isValid` to gate UI rendering
+    /// so the waterfall doesn't draw a row of "0 ms" phases.
+    public var bootPhases: BootPhases
 
     public init(
         status: LuminaDesktopSession.Status = .stopped,
         lastError: String? = nil,
         bootDuration: Duration? = nil,
-        serialDigest: String = ""
+        serialDigest: String = "",
+        bootPhases: BootPhases = BootPhases()
     ) {
         self.status = status
         self.lastError = lastError
         self.bootDuration = bootDuration
         self.serialDigest = serialDigest
+        self.bootPhases = bootPhases
     }
 
     /// The canonical "nothing has happened yet" snapshot.
