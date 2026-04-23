@@ -16,6 +16,39 @@ import Testing
     #expect(FileManager.default.fileExists(atPath: socketPath.path))
 }
 
+/// v0.7.1 isolation fix: the control socket must land with mode
+/// 0600 regardless of the caller's umask. Under the default macOS
+/// umask 0022, bind() alone would leave it at 0755 — world-
+/// accessible, which means any local user could connect to another
+/// user's session and drive the protocol. Regression guard: if
+/// someone removes the chmod-after-bind in SessionServer, this
+/// test fails.
+@Test func serverSocketIsOwnerOnly() throws {
+    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    // Force a permissive umask so any missing chmod surfaces
+    // clearly in the test output — real users run 0022 but belt-and-
+    // suspenders against a tighter CI default.
+    let saved = umask(0o000)
+    defer { umask(saved) }
+
+    let socketPath = tmpDir.appendingPathComponent("control.sock")
+    let server = SessionServer(socketPath: socketPath)
+    try server.bind()
+    defer { server.close() }
+
+    var st = stat()
+    guard stat(socketPath.path, &st) == 0 else {
+        Issue.record("stat failed on \(socketPath.path)")
+        return
+    }
+    let perms = Int(st.st_mode) & 0o777
+    #expect(perms == 0o600,
+            "expected control.sock to be 0600, got \(String(perms, radix: 8, uppercase: false))")
+}
+
 @Test func serverAcceptsConnection() async throws {
     let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)

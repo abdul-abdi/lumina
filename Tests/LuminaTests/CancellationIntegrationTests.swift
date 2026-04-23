@@ -196,9 +196,8 @@ func macOSInstall_cancelMidway_releasesResources() async throws {
     // MacOSVM should be back in .idle; `install()` retry must work
     // (or fail on a different reason like missing disk, not a leaked
     // flock). We assert actor state rather than attempting the
-    // full 30-minute retry. `state` is a nonisolated read-through on
-    // MacOSVM (actor property with custom executor); no await needed.
-    let state = vm.state
+    // full 30-minute retry.
+    let state = await vm.state
     if case .idle = state {
         // expected
     } else {
