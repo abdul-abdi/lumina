@@ -126,6 +126,13 @@ public actor MacOSVM {
             throw Error.installFailed("config validation: \(error)")
         }
 
+        // Cooperative cancellation gates matching VM.boot: a cancel
+        // that lands between config-build and VZ machine construction
+        // should exit here rather than allocate the VZ instance and
+        // immediately tear it down. UX symmetry with `⌘.` on boot
+        // (issue #23).
+        try Task.checkCancellation()
+
         let queue = executor.queue
         let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
         self.virtualMachine = vm
@@ -133,6 +140,14 @@ public actor MacOSVM {
 
         let vmBox = UncheckedSendable(vm)
         let preparedBox = UncheckedSendable(prepared)
+
+        // Second gate: the user cancelled between VZ machine
+        // construction and installer creation. Entering
+        // VZMacOSInstaller.init allocates installer state inside VZ —
+        // bail before that so the subsequent stopVZMachineIfRunning
+        // path in the outer catch has less to tear down.
+        try Task.checkCancellation()
+
         let installerBox: UncheckedSendable<VZMacOSInstaller> = await withCheckedContinuation { (cont: CheckedContinuation<UncheckedSendable<VZMacOSInstaller>, Never>) in
             queue.async {
                 let inst = VZMacOSInstaller(
@@ -155,6 +170,13 @@ public actor MacOSVM {
             progressHandler?(progress.fractionCompleted)
         }
         defer { progressToken?.invalidate() }
+
+        // Third gate: final pre-flight before the 30-minute VZ call.
+        // A cancel that lands here exits via the outer catch without
+        // ever entering the operation closure — no VZ install work
+        // starts, stopVZMachineIfRunning releases flock, retry boots
+        // cold. Matches VM.boot's pre-start checkpoint.
+        try Task.checkCancellation()
 
         do {
             // Cooperative cancellation during a 30+ minute IPSW restore.
