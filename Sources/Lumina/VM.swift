@@ -891,7 +891,8 @@ public actor VM {
             exitCode: result.exitCode,
             wallTime: wallTime,
             stdoutBytes: result.stdoutBytes,
-            stderrBytes: result.stderrBytes
+            stderrBytes: result.stderrBytes,
+            networkMetrics: result.networkMetrics
         )
     }
 

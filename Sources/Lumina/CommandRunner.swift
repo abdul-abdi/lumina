@@ -46,6 +46,13 @@ final class CommandRunner: @unchecked Sendable {
     // ── Network readiness: one-shot continuation for configure_network flow ──
     private var networkContinuation: CheckedContinuation<GuestMessage, Error>?
 
+    // ── Network metrics: latest snapshot from guest ticker ──
+    // Updated every time a `network_metrics` frame arrives. Read by
+    // exec() at return time so RunResult carries "what was the state when
+    // the command finished." nil means no metrics ever arrived (short
+    // command beat the ticker's 500ms initial delay, or legacy agent).
+    private var _latestNetworkMetrics: NetworkMetricsSummary?
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -59,6 +66,15 @@ final class CommandRunner: @unchecked Sendable {
     private static let vsockPort: UInt32 = 1024
     private static let maxRetries = 2000     // 2000 * 10ms = 20s max
     private static let retryInterval: UInt64 = 10_000_000  // 10ms — shaves ~10-15ms off cold boot (prev 20ms)
+
+    /// Latest network metrics snapshot seen on this connection. nil when no
+    /// metrics have arrived yet (short command + 500ms ticker delay, or
+    /// pre-v0.7.1 agent with no ticker). Thread-safe read.
+    var latestNetworkMetrics: NetworkMetricsSummary? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _latestNetworkMetrics
+    }
 
     var state: ConnectionState {
         lock.lock()
@@ -219,7 +235,8 @@ final class CommandRunner: @unchecked Sendable {
                     exitCode: code,
                     wallTime: .zero,
                     stdoutBytes: stdoutBytes,
-                    stderrBytes: stderrBytes
+                    stderrBytes: stderrBytes,
+                    networkMetrics: latestNetworkMetrics
                 )
             case .heartbeat:
                 continue
@@ -862,6 +879,10 @@ final class CommandRunner: @unchecked Sendable {
             cont?.resume(throwing: LuminaError.protocolError(
                 "guest network setup failed after \(attempts) attempt(s): \(reason)"
             ))
+        case .networkMetrics(let interfaces):
+            lock.lock()
+            _latestNetworkMetrics = NetworkMetricsSummary(interfaces: interfaces)
+            lock.unlock()
         case .portForwardReady(let guestPort, let vsockPort):
             lock.lock()
             let cont = portForwardContinuations.removeValue(forKey: guestPort)

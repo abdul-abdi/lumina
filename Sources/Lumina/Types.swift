@@ -463,15 +463,42 @@ public struct RunResult: Sendable {
     public let stdoutBytes: Data?
     public let stderrBytes: Data?
 
+    /// Latest per-NIC counter snapshot seen during this run. Nil for short
+    /// commands that exited before the guest's first metrics tick (~500ms)
+    /// or on legacy agents. Counters are cumulative VM-lifetime — for
+    /// `Lumina.run()` with a fresh disposable VM, this is effectively
+    /// "what this command caused"; for persistent sessions it is VM-wide.
+    public let networkMetrics: NetworkMetricsSummary?
+
     public var success: Bool { exitCode == 0 }
 
-    public init(stdout: String, stderr: String, exitCode: Int32, wallTime: Duration, stdoutBytes: Data? = nil, stderrBytes: Data? = nil) {
+    public init(
+        stdout: String,
+        stderr: String,
+        exitCode: Int32,
+        wallTime: Duration,
+        stdoutBytes: Data? = nil,
+        stderrBytes: Data? = nil,
+        networkMetrics: NetworkMetricsSummary? = nil
+    ) {
         self.stdout = stdout
         self.stderr = stderr
         self.exitCode = exitCode
         self.wallTime = wallTime
         self.stdoutBytes = stdoutBytes
         self.stderrBytes = stderrBytes
+        self.networkMetrics = networkMetrics
+    }
+}
+
+/// Summary snapshot of guest-side per-NIC counters. Keyed by interface name
+/// (e.g. `"eth0"`); loopback is excluded guest-side. Counters are cumulative
+/// since interface-up — consumers compute deltas themselves.
+public struct NetworkMetricsSummary: Sendable, Equatable, Codable {
+    public let interfaces: [String: InterfaceCounters]
+
+    public init(interfaces: [String: InterfaceCounters]) {
+        self.interfaces = interfaces
     }
 }
 

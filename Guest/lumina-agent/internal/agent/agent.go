@@ -59,6 +59,10 @@ func (a *Agent) Serve() {
 	ctx, cancelHeartbeat := context.WithCancel(context.Background())
 	defer cancelHeartbeat()
 	go a.heartbeat(ctx)
+	// Per-connection metrics ticker. Tied to the same ctx as heartbeat
+	// so it stops when this connection ends. Counters are readable from
+	// boot — no need to gate on configure_network.
+	go network.StartMetricsTicker(ctx, a.w)
 
 	scanner := bufio.NewScanner(a.conn)
 	scanner.Buffer(make([]byte, protocol.MaxChunkSize*2), protocol.MaxChunkSize*2)

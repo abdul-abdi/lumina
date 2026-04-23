@@ -62,6 +62,11 @@ public enum GuestMessage: Sendable, Equatable {
     /// the pending `configureNetwork` caller as a typed
     /// `LuminaError.networkConfigFailed`.
     case networkError(reason: String, attempts: Int)
+    /// Periodic per-NIC counter snapshot from the guest. Map is
+    /// keyed by interface name (e.g. `"eth0"`); loopback is excluded
+    /// guest-side. Counters are cumulative since interface-up —
+    /// hosts compute deltas themselves if they want throughput.
+    case networkMetrics(interfaces: [String: InterfaceCounters])
     /// PTY-backed output (merged stdout+stderr). `data` is the base64-encoded raw bytes
     /// read from the PTY master. Exit is delivered via the shared `.exit(id:code:)` case.
     case ptyOutput(id: String, data: String)
@@ -79,6 +84,44 @@ public enum GuestMessage: Sendable, Equatable {
 public enum OutputStream: String, Sendable, Equatable, Codable {
     case stdout
     case stderr
+}
+
+/// Per-NIC counter snapshot. Wire format carries `rx_bytes` / `tx_bytes` /
+/// `rx_errors` / `tx_errors` / `rx_packets` / `tx_packets` — all cumulative
+/// since the interface came up on the guest. Missing fields default to 0 for
+/// forward compatibility with older agents that may ship a subset.
+public struct InterfaceCounters: Sendable, Equatable, Codable {
+    public let rxBytes: UInt64
+    public let txBytes: UInt64
+    public let rxErrors: UInt64
+    public let txErrors: UInt64
+    public let rxPackets: UInt64
+    public let txPackets: UInt64
+
+    public init(
+        rxBytes: UInt64 = 0,
+        txBytes: UInt64 = 0,
+        rxErrors: UInt64 = 0,
+        txErrors: UInt64 = 0,
+        rxPackets: UInt64 = 0,
+        txPackets: UInt64 = 0
+    ) {
+        self.rxBytes = rxBytes
+        self.txBytes = txBytes
+        self.rxErrors = rxErrors
+        self.txErrors = txErrors
+        self.rxPackets = rxPackets
+        self.txPackets = txPackets
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rxBytes = "rx_bytes"
+        case txBytes = "tx_bytes"
+        case rxErrors = "rx_errors"
+        case txErrors = "tx_errors"
+        case rxPackets = "rx_packets"
+        case txPackets = "tx_packets"
+    }
 }
 
 // MARK: - Wire Format
@@ -201,6 +244,26 @@ enum LuminaProtocol {
             let reason = json["reason"] as? String ?? "unspecified"
             let attempts = json["attempts"] as? Int ?? 0
             return .networkError(reason: reason, attempts: attempts)
+        case "network_metrics":
+            let raw = json["interfaces"] as? [String: [String: Any]] ?? [:]
+            var ifaces: [String: InterfaceCounters] = [:]
+            for (name, fields) in raw {
+                func u64(_ key: String) -> UInt64 {
+                    if let v = fields[key] as? UInt64 { return v }
+                    if let v = fields[key] as? Int, v >= 0 { return UInt64(v) }
+                    if let v = fields[key] as? NSNumber { return v.uint64Value }
+                    return 0
+                }
+                ifaces[name] = InterfaceCounters(
+                    rxBytes: u64("rx_bytes"),
+                    txBytes: u64("tx_bytes"),
+                    rxErrors: u64("rx_errors"),
+                    txErrors: u64("tx_errors"),
+                    rxPackets: u64("rx_packets"),
+                    txPackets: u64("tx_packets")
+                )
+            }
+            return .networkMetrics(interfaces: ifaces)
         case "pty_output":
             guard let id = json["id"] as? String,
                   let outputData = json["data"] as? String else {

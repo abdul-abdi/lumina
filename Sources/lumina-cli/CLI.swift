@@ -464,6 +464,10 @@ private struct ResultJSON: Encodable {
     // v0.6.0: partial data on error
     var partial_stdout: String?
     var partial_stderr: String?
+    // v0.7.1: per-NIC counter snapshot from the guest. Absent when the
+    // command was shorter than the guest's first metrics tick or on
+    // pre-v0.7.1 agents.
+    var network_metrics: NetworkMetricsSummary?
 }
 
 private func printResultJSON(_ result: RunResult, durationMs: Int) {
@@ -473,7 +477,8 @@ private func printResultJSON(_ result: RunResult, durationMs: Int) {
         stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
         stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
         exit_code: Int(result.exitCode),
-        duration_ms: durationMs
+        duration_ms: durationMs,
+        network_metrics: result.networkMetrics
     )
     encodeAndPrint(r)
 }

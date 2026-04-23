@@ -426,3 +426,62 @@ import Testing
     let msg = try Protocol.decodeGuest(raw)
     #expect(msg == .networkError(reason: "unspecified", attempts: 0))
 }
+
+// MARK: - v0.7.1 network metrics (4.2)
+
+@Test func decodeNetworkMetricsSingleInterface() throws {
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":1234,"tx_bytes":5678,"rx_errors":0,"tx_errors":2,"rx_packets":10,"tx_packets":8}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    let expected = InterfaceCounters(
+        rxBytes: 1234, txBytes: 5678,
+        rxErrors: 0, txErrors: 2,
+        rxPackets: 10, txPackets: 8
+    )
+    #expect(msg == .networkMetrics(interfaces: ["eth0": expected]))
+}
+
+@Test func decodeNetworkMetricsMultiInterface() throws {
+    // Multi-NIC VMs — the map shape is the reason `iface: String` was
+    // not used. If we ever grow past eth0, this is the test that
+    // proves the decode path handles it without a wire change.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":1,"tx_bytes":2},"eth1":{"rx_bytes":3,"tx_bytes":4}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    guard case .networkMetrics(let interfaces) = msg else {
+        Issue.record("expected networkMetrics case"); return
+    }
+    #expect(interfaces.count == 2)
+    #expect(interfaces["eth0"]?.rxBytes == 1)
+    #expect(interfaces["eth0"]?.txBytes == 2)
+    #expect(interfaces["eth1"]?.rxBytes == 3)
+    #expect(interfaces["eth1"]?.txBytes == 4)
+}
+
+@Test func decodeNetworkMetricsMissingFieldsDefaultToZero() throws {
+    // Forward-compat: a pre-packet-counter agent might ship only bytes
+    // and errors. Missing fields must default to 0, not throw.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":42}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    let expected = InterfaceCounters(rxBytes: 42)
+    #expect(msg == .networkMetrics(interfaces: ["eth0": expected]))
+}
+
+@Test func decodeNetworkMetricsEmptyInterfaces() throws {
+    // The guest legitimately emits an empty map when /proc/net/dev is
+    // read before any interface has come up (early boot race) — treat
+    // as a valid zero-sample, not an error.
+    let raw = Data(#"{"type":"network_metrics","interfaces":{}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkMetrics(interfaces: [:]))
+}
+
+@Test func decodeNetworkMetricsAcceptsLargeCounters() throws {
+    // UInt64 range: a busy long-running session can easily push past
+    // Int32. Verify the decoder doesn't truncate.
+    let big: UInt64 = 10_000_000_000
+    let raw = Data(#"{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":10000000000}}}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    guard case .networkMetrics(let interfaces) = msg else {
+        Issue.record("expected networkMetrics case"); return
+    }
+    #expect(interfaces["eth0"]?.rxBytes == big)
+}

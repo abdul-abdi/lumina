@@ -30,6 +30,7 @@ const (
 	TypeConfigureNetwork = "configure_network"
 	TypeNetworkReady     = "network_ready"
 	TypeNetworkError     = "network_error"
+	TypeNetworkMetrics   = "network_metrics"
 
 	TypeUpload        = "upload"
 	TypeUploadAck     = "upload_ack"
@@ -191,6 +192,30 @@ type NetworkReadyMsg struct {
 	// defensive fallback; host should treat this as a warning
 	// signal, not a hard guarantee. Absent on pre-v0.7.1 agents.
 	Stage string `json:"stage,omitempty"`
+}
+
+// InterfaceCounters is the per-NIC counter snapshot shipped inside
+// NetworkMetricsMsg. Values are cumulative since interface-up, read
+// straight from /proc/net/dev — the same numbers `ifconfig`/`ip -s`
+// would show. Hosts compute deltas themselves if they want per-
+// interval throughput.
+type InterfaceCounters struct {
+	RxBytes   uint64 `json:"rx_bytes"`
+	TxBytes   uint64 `json:"tx_bytes"`
+	RxErrors  uint64 `json:"rx_errors"`
+	TxErrors  uint64 `json:"tx_errors"`
+	RxPackets uint64 `json:"rx_packets"`
+	TxPackets uint64 `json:"tx_packets"`
+}
+
+// NetworkMetricsMsg is a periodic snapshot of guest-side network
+// counters. The map-shaped `interfaces` field is intentional: multi-
+// NIC VMs are a foreseeable future, and renaming a singular `iface`
+// field later would break the protocol. `lo` is excluded — consumers
+// care about externally-visible traffic, not loopback.
+type NetworkMetricsMsg struct {
+	Type       string                       `json:"type"`
+	Interfaces map[string]InterfaceCounters `json:"interfaces"`
 }
 
 // NetworkErrorMsg signals the guest failed to bring up the network.
