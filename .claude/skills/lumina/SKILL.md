@@ -25,8 +25,8 @@ The canonical agent guide lives at `AGENTS.md` at the repository root — it fol
 - **vmnet NAT has a known DHCP race** that ad-hoc builds cannot work around (the workaround is `networkMode: bridged` which requires the `com.apple.vm.networking` entitlement, paid Developer Program only).
 - **The unified exec envelope** (v0.6.0+) emits a single JSON object on pipe; legacy NDJSON is opt-in via `LUMINA_OUTPUT=ndjson` and is removed in v0.8.0.
 - **PTY is distinct protocol**, not a flag — `pty_exec` has its own message type and handler map. One active PTY per session.
-- **Cold boot P50 (v0.7.2)** measures ~680ms default-await (reliability guarantee) / ~540ms with `--no-wait-network` / ~390ms for `BootPhases.totalMs` alone on baked images, on M3 Pro release builds. CI gate: `AGENT_BOOT_P50_MAX_MS=2000`. Set `LUMINA_BOOT_TRACE=1` for the phase breakdown.
-- **Network reliability is the default.** `configureNetwork` is awaited before exec — `curl`, `ping`, `apt`, DNS all work on the first packet. v0.7.2 made the wait cheap (~150ms on a healthy host, down from ~2.5s). Use `--no-wait-network` only when you know the command doesn't touch network in the first ~20ms.
+- **Cold boot P50 (v0.7.1)** measures ~680ms default-await (reliability guarantee) / ~540ms with `--no-wait-network` / ~390ms for `BootPhases.totalMs` alone on baked images, on M3 Pro release builds. CI gate: `AGENT_BOOT_P50_MAX_MS=2000`. Set `LUMINA_BOOT_TRACE=1` for the phase breakdown.
+- **Network reliability is the default.** `configureNetwork` is awaited before exec — `curl`, `ping`, `apt`, DNS all work on the first packet. v0.7.1 made the wait cheap (~150ms on a healthy host, down from ~2.5s pre-hardening). Use `--no-wait-network` only when you know the command doesn't touch network in the first ~20ms.
 
 ## Where to look for specific topics
 
@@ -38,7 +38,7 @@ The canonical agent guide lives at `AGENTS.md` at the repository root — it fol
 | VM actor, boot paths | `Sources/Lumina/VM.swift` |
 | Guest agent (Go, linux/arm64) | `Guest/lumina-agent/` |
 | Desktop app | `Apps/LuminaDesktop/` + `Sources/LuminaDesktopKit/` |
-| Release notes / v0.7.2 runway | `ROADMAP.md` |
+| Release notes / v0.7.1 deltas, v0.8 runway | `ROADMAP.md` |
 
 ## Don't duplicate this content
 

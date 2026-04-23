@@ -17,7 +17,7 @@ public struct Lumina {
             // Host-driven network config. Default: await network_ready
             // before exec — the guarantee users depend on for commands
             // that send a packet in the first ~20 ms (curl, ping, apt,
-            // dns lookups). v0.7.2 perf work moved the cost from ~2.5s
+            // dns lookups). v0.7.1 perf work moved the cost from ~2.5s
             // to ~50-150 ms by shrinking the guest's carrier-wait
             // timeout, batching the `ip` setup, and using a netlink
             // subscription for instant notification when eth0 comes up
@@ -94,7 +94,7 @@ public struct Lumina {
                         try await vm.bootResult().get()
                         let bootDone = ContinuousClock.now
 
-                        // v0.7.2 perf: default awaits network_ready so
+                        // v0.7.1 perf: default awaits network_ready so
                         // commands that need DNS/TCP in the first ~20ms
                         // of exec work. Opt-out via
                         // options.awaitNetworkReady = false.

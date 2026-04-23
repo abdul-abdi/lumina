@@ -384,7 +384,7 @@ import Testing
     }
 }
 
-// MARK: - v0.7.2 network reliability wire types
+// MARK: - v0.7.1 network reliability wire types
 
 @Test func decodeNetworkReadyWithConfigMsAndStage() throws {
     let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","config_ms":127,"stage":"carrier"}"#.utf8)

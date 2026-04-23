@@ -189,7 +189,7 @@ type NetworkReadyMsg struct {
 	// "carrier", "route-verified", or "timeout-anyway". "timeout-
 	// anyway" means the guest shipped network_ready on the
 	// defensive fallback; host should treat this as a warning
-	// signal, not a hard guarantee. Absent on pre-v0.7.2 agents.
+	// signal, not a hard guarantee. Absent on pre-v0.7.1 agents.
 	Stage string `json:"stage,omitempty"`
 }
 

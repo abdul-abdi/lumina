@@ -9,7 +9,7 @@
 // This view makes them visible and provides one-click ergonomics for
 // launching an interactive session in Terminal.app. Booting in-window
 // (i.e. a SwiftUI terminal emulator pane) is a larger feature deferred
-// to v0.7.2+.
+// to v0.7.1+.
 
 import SwiftUI
 import Lumina

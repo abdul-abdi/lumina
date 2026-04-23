@@ -95,7 +95,7 @@ public struct RunOptions: Sendable {
     /// guarantee — commands that send a packet in the first ~20 ms of
     /// exec (curl, ping, apt, DNS lookups) always see a usable network.
     ///
-    /// v0.7.2 perf: the cost of this guarantee dropped from ~2.5 s to
+    /// v0.7.1 perf: the cost of this guarantee dropped from ~2.5 s to
     /// ~50–150 ms after shrinking the guest's carrier-wait timeout,
     /// batching the `ip` setup, and switching to netlink-based carrier
     /// notification. The default is now both safe and fast — users no

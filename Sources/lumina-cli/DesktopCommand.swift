@@ -149,7 +149,7 @@ struct DesktopCreate: AsyncParsableCommand {
 
         // v0.7.1 M3: SHA-256 verification on catalog ISOs. The Desktop
         // wizard has always done this; the CLI parity gap was tracked on
-        // the v0.7.2 runway. If the ISO filename matches a
+        // the v0.7.1 runway. If the ISO filename matches a
         // `DesktopOSCatalog` entry's URL filename, hash the file and
         // compare. Mismatch = refuse to create (same contract the
         // wizard ships). Non-matched ISOs (BYO distros, Windows MSA,

@@ -1,6 +1,6 @@
 // Package network applies host-driven network configuration, then
 // verifies the route table and polls for carrier before sending
-// network_ready to the host. v0.7.2 reliability pass: individual
+// network_ready to the host. v0.7.1 reliability pass: individual
 // ip-command retries, post-setup route verification, explicit
 // error reporting on failure.
 package network
@@ -18,7 +18,7 @@ import (
 )
 
 // maxCarrierWait is the upper bound on how long we poll /sys/class/net
-// for link-up. v0.7.2 perf: dropped from 2s → 400ms after profiling
+// for link-up. v0.7.1 perf: dropped from 2s → 400ms after profiling
 // showed VZ NAT brings eth0 up in 40–80ms (P95 ~120ms) on M3 hosts.
 // The 400ms ceiling covers the worst case observed; if it times out,
 // we emit network_ready with Stage="timeout-anyway" so the host can
