@@ -35,6 +35,13 @@ jobs:
       # ROADMAP.md so the baseline's provenance is traceable.
       LUMINA_BASELINE_IMAGE_URL: "https://github.com/abdul-abdi/lumina/releases/download/lumina-v0.6.0/lumina-image-default.tar.gz"
       AGENT_BOOT_P50_MAX_MS: "2000"
+      # When "1", a probe-1-succeeded + probe-2-failed combo fails the
+      # gate instead of skipping. Default "0" preserves the pre-v0.7.1
+      # "skip on probe-2 failure" behavior while we observe self-hosted
+      # stability post-v0.7. Flip to "1" once false-positive rate is
+      # acceptably low — tracked by issue #12. Probe-1 failure (runner
+      # literally can't nest VZ) always stays a skip regardless.
+      BOOT_GATE_STRICT_PROBE2: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -137,9 +144,21 @@ jobs:
           PROBE2_OUT="$(run_once || true)"
           PROBE2_MS="$(extract_success_ms "$PROBE2_OUT")"
           if [ -z "$PROBE2_MS" ]; then
-            echo "::notice::Agent-boot gate skipped: runner failed the second boot (clone cleanup or VZ resource limit)."
-            printf '%s\n' "$PROBE2_OUT" | head -20
-            exit 0
+            # Probe 2 failing on a runner that passed probe 1 means the
+            # runner IS capable but the second boot broke — clone cleanup
+            # race, ENOSPC mid-run, VZ resource limit, or something real.
+            # Loud warning; exit status controlled by BOOT_GATE_STRICT_PROBE2
+            # so self-hosted stability can be observed before the flip.
+            # Tracked by issue #12.
+            if [ "${BOOT_GATE_STRICT_PROBE2:-0}" = "1" ]; then
+              echo "::error::Agent-boot gate: probe 1 passed, probe 2 failed on a capable runner. This is a real regression or transient flake — investigate before merging."
+              printf '%s\n' "$PROBE2_OUT" | head -20
+              exit 1
+            else
+              echo "::warning::Agent-boot gate: probe 1 passed, probe 2 failed on a capable runner. Advisory for now (BOOT_GATE_STRICT_PROBE2=0); flip to 1 to fail hard once stability is confirmed (issue #12)."
+              printf '%s\n' "$PROBE2_OUT" | head -20
+              exit 0
+            fi
           fi
           echo "  probe 2: ${PROBE2_MS}ms — runner can sustain consecutive boots."
 
