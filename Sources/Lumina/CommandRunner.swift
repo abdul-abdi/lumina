@@ -538,7 +538,12 @@ final class CommandRunner: @unchecked Sendable {
     /// Send network configuration to the guest and wait for network_ready.
     /// The guest applies IP/route/DNS synchronously, then polls carrier.
     /// Waiting ensures DNS is in place before any exec command starts.
-    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) {
+    /// Returns the guest's self-reported config duration and which gate
+    /// fired (`"operstate"`, `"carrier"`, or `"timeout-anyway"` — the
+    /// last meaning the route is verified but the carrier poll gave up
+    /// waiting). Old agents omit these fields; the decoder defaults
+    /// `configMs` to 0 and `stage` to "" in that case.
+    func configureNetwork(ip: String, gateway: String, dns: String) async throws(LuminaError) -> (configMs: Int, stage: String) {
         let msg = HostMessage.configureNetwork(ip: ip, gateway: gateway, dns: dns)
         let msgData: Data
         do {
@@ -548,12 +553,12 @@ final class CommandRunner: @unchecked Sendable {
         }
 
         // Register continuation BEFORE sending the message to avoid a race
-        // where the guest replies before we're ready to receive. We don't
-        // use the returned GuestMessage — just the synchronization — but
-        // the throwing continuation lets teardown surface as a real error
+        // where the guest replies before we're ready to receive. The
+        // throwing continuation lets teardown surface as a real error
         // instead of a synthetic `.networkReady(ip:"")` success.
+        let reply: GuestMessage
         do {
-            _ = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
+            reply = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
                 lock.lock()
                 networkContinuation = cont
                 lock.unlock()
@@ -574,6 +579,10 @@ final class CommandRunner: @unchecked Sendable {
             throw .connectionFailed
         }
         // network_ready received; DNS, route, and IP are now live on the guest.
+        if case .networkReady(_, let configMs, let stage) = reply {
+            return (configMs: configMs, stage: stage)
+        }
+        return (configMs: 0, stage: "")
     }
 
     // MARK: - Port Forwarding (host-driven)

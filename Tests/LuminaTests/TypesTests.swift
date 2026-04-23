@@ -299,18 +299,31 @@ import Testing
     #expect(a == b)
 }
 
-@Test func bootPhases_isValid_reflectsTotalMs() {
-    // Agent-path / unobserved: zero-valued, isValid false.
+@Test func bootPhases_isValid_reflectsAnyObservedPhase() {
+    // Attached-only VM / unobserved boot: every field zero, isValid false.
     var p = BootPhases()
     #expect(!p.isValid)
 
-    // Writing a per-phase field without totalMs (partial observation,
-    // e.g. cancelled mid-boot) keeps isValid false — totalMs is the
-    // authoritative "boot ran to completion" signal.
+    // Partial observation (cancelled mid-boot before totalMs is written):
+    // isValid flips true as soon as any phase has been recorded. This
+    // matches the docstring contract — "any phase observed" — and lets
+    // UI show partial timings for a boot that crashed mid-sequence.
     p.configMs = 5
-    #expect(!p.isValid)
+    #expect(p.isValid)
 
-    // Populated (VM.boot ran to `.ready`): isValid true.
+    // Completed boot (VM.boot ran to `.ready`): still valid.
+    p = BootPhases()
     p.totalMs = 390
     #expect(p.isValid)
+
+    // Any one non-zero phase is sufficient — spot-check a few that
+    // cover different boot paths (agent vs EFI vs mid-network config).
+    for kp: WritableKeyPath<BootPhases, Double> in [
+        \.imageResolveMs, \.cloneMs, \.vzStartMs, \.vsockConnectMs,
+        \.runnerReadyMs, \.networkConfigMs,
+    ] {
+        var q = BootPhases()
+        q[keyPath: kp] = 1
+        #expect(q.isValid)
+    }
 }

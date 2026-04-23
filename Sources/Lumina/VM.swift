@@ -89,7 +89,9 @@ public actor VM {
 
     /// Latest boot-phase timings, populated by `recordPhase(…)` during
     /// `boot()`. Surfaced via `bootPhases` for instrumentation and the
-    /// upcoming cold-boot regression bench. Zero-cost when unused.
+    /// cold-boot regression bench. Cost is unconditional and
+    /// sub-microsecond per boot — see the `recordPhase` comment in
+    /// `boot()` for the breakdown.
     private var _bootPhases = BootPhases()
 
     public var bootPhases: BootPhases { _bootPhases }
@@ -151,9 +153,10 @@ public actor VM {
 
         // Phase instrumentation — each recordPhase() resets the phase
         // cursor to now so the next phase's timing starts at this line.
-        // Zero-overhead when `LUMINA_BOOT_TRACE` is unset: the cost is
-        // a few ContinuousClock.now calls (~50ns each on M3) and a
-        // Double add. The CI agent-boot P50 gate guards against this
+        // Cost is unconditional (regardless of `LUMINA_BOOT_TRACE`):
+        // ~50ns per `ContinuousClock.now` call × ~7 phases + a Double
+        // add each, i.e. sub-microsecond on M3 — 0.0001% of a 680ms
+        // boot. The CI agent-boot P50 gate guards against this
         // regressing the 2000ms budget.
         let phaseStart = ContinuousClock.now
         var phaseMark = phaseStart
@@ -1156,7 +1159,22 @@ public actor VM {
         let hostNum = (Int(lastByte) % 253) + 2
         let ip = "\(subnetPrefix).\(hostNum)/24"
 
-        try await runner.configureNetwork(ip: ip, gateway: gateway, dns: gateway)
+        let result = try await runner.configureNetwork(ip: ip, gateway: gateway, dns: gateway)
+
+        // Capture the guest's self-reported config duration + stage so
+        // LUMINA_BOOT_TRACE=1 (and UI consumers of `bootPhases`) see
+        // which gate actually fired. Warn loudly on `timeout-anyway` —
+        // the route is verified but the guest never saw carrier come
+        // up, which means first-packet latency will include the TCP
+        // retry the kernel has to do. Silent today == silently slow
+        // tomorrow when a user files a "lumina run is slow" issue.
+        _bootPhases.networkConfigMs = Double(result.configMs)
+        _bootPhases.networkStage = result.stage
+        if result.stage == "timeout-anyway" {
+            FileHandle.standardError.write(Data(
+                "[lumina] warning: guest network carrier did not come up within 400ms; route is installed and traffic should flow, but first packets may be delayed. See `lumina doctor` if this persists.\n".utf8
+            ))
+        }
     }
 
     /// Find the IPv4 address of the host-side vmnet bridge (bridge100, bridge101, …).
@@ -1489,17 +1507,39 @@ public struct BootPhases: Sendable, Equatable {
     /// Time from vsock open to the guest agent emitting `{"type":"ready"}`.
     /// Agent path only; this is "how long did guest userspace take to boot".
     public var runnerReadyMs: Double = 0
+    /// Guest-reported time to apply `configure_network` (link + addr +
+    /// route + carrier). Populated by `VM.configureNetwork()` from the
+    /// `network_ready.config_ms` field. Zero on EFI path, zero on old
+    /// guest agents that don't emit the field.
+    public var networkConfigMs: Double = 0
+    /// Which gate fired for `network_ready`:
+    ///   - `"operstate"`     — eth0 reports `up`/`unknown` (fast path)
+    ///   - `"carrier"`       — eth0 reports carrier=1 but operstate didn't transition
+    ///   - `"timeout-anyway"`— 400ms carrier ceiling hit; route is verified
+    ///                         but link-carrier was never observed. Usable
+    ///                         but TCP will pay a retry on first packet.
+    ///   - `""`              — field absent (old agent, or `configureNetwork`
+    ///                         wasn't called on this boot).
+    public var networkStage: String = ""
     /// Wall-clock from `boot()` entry to `.ready`.
     public var totalMs: Double = 0
 
     public init() {}
 
-    /// True when any phase was observed (i.e. `VM.boot()` ran to the
-    /// point of writing at least one field). False on the agent path
-    /// where the VM was attached, not booted here. Callers rendering
-    /// boot timings in UI should gate on this to avoid "0 ms" rows.
+    /// True when any boot phase was observed — i.e. `VM.boot()` ran
+    /// far enough to populate at least one timing field. Returns
+    /// false on a VM that was attached rather than booted here
+    /// (all fields remain zero). UI code rendering boot timings
+    /// should gate on this to avoid "0 ms" rows.
     public var isValid: Bool {
-        totalMs > 0
+        imageResolveMs > 0
+            || cloneMs > 0
+            || configMs > 0
+            || vzStartMs > 0
+            || vsockConnectMs > 0
+            || runnerReadyMs > 0
+            || networkConfigMs > 0
+            || totalMs > 0
     }
 
     /// Human-readable one-phase-per-line formatter used by the
@@ -1524,6 +1564,11 @@ public struct BootPhases: Sendable, Equatable {
         emit("vz start:", vzStartMs)
         emit("vsock connect:", vsockConnectMs)
         emit("guest agent ready:", runnerReadyMs)
+        emit("guest network:", networkConfigMs)
+        if !networkStage.isEmpty {
+            let padded = "network stage:".padding(toLength: 18, withPad: " ", startingAt: 0)
+            lines.append("  \(padded) \(networkStage)")
+        }
         let paddedTotal = "total:".padding(toLength: 18, withPad: " ", startingAt: 0)
         let totalMsStr = String(format: "%7.1f", totalMs)
         lines.append("  \(paddedTotal) \(totalMsStr) ms")
