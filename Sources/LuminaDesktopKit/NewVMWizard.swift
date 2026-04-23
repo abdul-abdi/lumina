@@ -11,6 +11,8 @@ public struct NewVMWizard: View {
     @Binding var isPresented: Bool
     let initialTileID: String?
 
+    @Environment(\.openWindow) private var openWindow
+
     @State private var step: Step = .chooseOS
     @State private var selectedTile: OSWizardTile?
     @State private var byoFile: URL?
@@ -524,6 +526,7 @@ public struct NewVMWizard: View {
         let rootURL = model.store.rootURL.appendingPathComponent(id.uuidString)
         try? FileManager.default.createDirectory(at: model.store.rootURL, withIntermediateDirectories: true)
 
+        var createdBundle: VMBundle?
         do {
             let bundle = try VMBundle.create(
                 at: rootURL,
@@ -541,11 +544,24 @@ public struct NewVMWizard: View {
                 let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
                 try? Data(f.path.utf8).write(to: sidecar, options: .atomic)
             }
+            createdBundle = bundle
         } catch {
             model.pendingError = "Couldn't create VM: \(error)"
         }
         model.refresh()
         isPresented = false
+
+        // Auto-boot the fresh VM so the user doesn't land back in the
+        // library and have to click the card to start the install.
+        // Mirrors VMCard.activate() ordering: open the window first so
+        // the booting-screen → framebuffer handoff is visible, then
+        // kick off boot(). `model.session(for:)` is on-demand create-
+        // or-cache, so calling it on a bundle that model.refresh() may
+        // not have surfaced yet is safe.
+        if let bundle = createdBundle {
+            openWindow(id: "vm-window", value: bundle.manifest.id)
+            Task { await model.session(for: bundle).boot() }
+        }
     }
 
 
