@@ -66,9 +66,29 @@ public struct EFIBootable: Sendable {
             }
         }
 
-        let loader = VZEFIBootLoader()
-        loader.variableStore = variableStore
-        vzConfig.bootLoader = loader
+        // Linux-direct override path: if the caller supplied a pre-extracted
+        // kernel + initramfs, bypass the ISO's own GRUB and boot via
+        // VZLinuxBootLoader so we can set `console=hvc0` on the kernel
+        // cmdline. Intended only for serial capture — stock arm64 Linux
+        // ISOs ship GRUB configs with `console=tty0` / `console=efifb`
+        // and would otherwise emit zero bytes on our virtio serial.
+        //
+        // The EFI variable store is still created (harmless, cheap) so the
+        // bundle's future "boot normally" flip doesn't have to create it.
+        if let kernel = config.linuxDirectKernel {
+            let linuxLoader = VZLinuxBootLoader(kernelURL: kernel)
+            if let initrd = config.linuxDirectInitramfs {
+                linuxLoader.initialRamdiskURL = initrd
+            }
+            if let cmdline = config.linuxDirectCmdline {
+                linuxLoader.commandLine = cmdline
+            }
+            vzConfig.bootLoader = linuxLoader
+        } else {
+            let loader = VZEFIBootLoader()
+            loader.variableStore = variableStore
+            vzConfig.bootLoader = loader
+        }
 
         // Storage devices: primary read-write disk, optional CD-ROM
         // (USB mass-storage on macOS 13+ when preferred, else virtio

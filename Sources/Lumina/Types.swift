@@ -252,6 +252,23 @@ public struct EFIBootConfig: Sendable, Equatable {
     /// mid-install loses data, and the install is disposable).
     /// Callers populate this from `VMBundleManifest.lastBootedAt == nil`.
     public var installPhase: Bool
+    /// Opt-in Linux-direct boot override. When any of these are set, the
+    /// EFIBootable path substitutes `VZLinuxBootLoader` for
+    /// `VZEFIBootLoader`, bypassing the ISO's own GRUB. The only reason
+    /// to do this is to inject `console=hvc0 earlycon=hvc0` into the
+    /// kernel cmdline so host-side `--serial` capture sees anything —
+    /// stock arm64 Linux ISOs default to `console=tty0`, so our
+    /// virtio-console receives zero bytes without this override.
+    ///
+    /// Tradeoff: the caller must supply a kernel + initramfs that match
+    /// the ISO's rootfs. `LuminaBootable.LinuxISOExtractor` is the
+    /// helper that pulls them out via hdiutil; it supports Ubuntu
+    /// live/casper, Debian netinst, Alpine standard, and Fedora Live
+    /// layouts. Windows and other OSes fall through to the default
+    /// VZEFIBootLoader path.
+    public var linuxDirectKernel: URL?
+    public var linuxDirectInitramfs: URL?
+    public var linuxDirectCmdline: String?
 
     public init(
         variableStoreURL: URL,
@@ -259,7 +276,10 @@ public struct EFIBootConfig: Sendable, Equatable {
         cdromISO: URL? = nil,
         extraDisks: [URL] = [],
         preferUSBCDROM: Bool = false,
-        installPhase: Bool = false
+        installPhase: Bool = false,
+        linuxDirectKernel: URL? = nil,
+        linuxDirectInitramfs: URL? = nil,
+        linuxDirectCmdline: String? = nil
     ) {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
@@ -267,6 +287,9 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.extraDisks = extraDisks
         self.preferUSBCDROM = preferUSBCDROM
         self.installPhase = installPhase
+        self.linuxDirectKernel = linuxDirectKernel
+        self.linuxDirectInitramfs = linuxDirectInitramfs
+        self.linuxDirectCmdline = linuxDirectCmdline
     }
 }
 
