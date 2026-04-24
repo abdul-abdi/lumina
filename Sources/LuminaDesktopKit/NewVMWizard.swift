@@ -3,6 +3,7 @@
 // v0.7.0 M6 — 4-step wizard: choose OS → variant → resources → review.
 
 import SwiftUI
+import Lumina
 import LuminaBootable
 
 @MainActor
@@ -25,6 +26,13 @@ public struct NewVMWizard: View {
     /// re-hashing when the user goes back to .variant and forward again
     /// without swapping files. Resets when `byoFile` changes.
     @State private var verifiedISO: URL? = nil
+    /// Network attachment mode. .nat is the historical default (vmnet +
+    /// embedded bootpd, works out of the box, documented reliability
+    /// issues). .bridged joins the guest to the host LAN directly via
+    /// the user's real router — fixes the vmnet-induced failure modes
+    /// but requires a signed build with `com.apple.vm.networking`.
+    @State private var networkMode: NetworkModeChoice = .nat
+    @State private var bridgedInterface: String? = nil
 
     public init(model: AppModel, isPresented: Binding<Bool>, initialTileID: String? = nil) {
         self.model = model
@@ -252,36 +260,128 @@ public struct NewVMWizard: View {
         let overMemory = memoryGB > hostRAMGB * 0.66
         let overDisk = diskGB > freeGB * 0.90
 
-        return VStack(alignment: .leading, spacing: 18) {
-            // Host chip bar — numbers that constrain the choices below.
-            HostChipBar(host: host, freeDisk: freeDisk)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // Host chip bar — numbers that constrain the choices below.
+                HostChipBar(host: host, freeDisk: freeDisk)
 
-            sliderRow(label: "Memory", value: $memoryGB,
-                      range: 1...max(4, hostRAMGB),
-                      step: 1, suffix: "GB",
-                      warn: overMemory,
-                      caption: overMemory
-                        ? "⚠ above recommended ceiling (\(Int(maxMemory)) GB)"
-                        : nil)
+                sliderRow(label: "Memory", value: $memoryGB,
+                          range: 1...max(4, hostRAMGB),
+                          step: 1, suffix: "GB",
+                          warn: overMemory,
+                          caption: overMemory
+                            ? "⚠ above recommended ceiling (\(Int(maxMemory)) GB)"
+                            : nil)
 
-            sliderRow(label: "CPU cores", valueInt: $cpus,
-                      range: 1...max(2, host.processorCount))
+                sliderRow(label: "CPU cores", valueInt: $cpus,
+                          range: 1...max(2, host.processorCount))
 
-            sliderRow(label: "Disk size", value: $diskGB,
-                      range: 8...max(32, freeGB),
-                      step: 4, suffix: "GB",
-                      warn: overDisk,
-                      caption: overDisk
-                        ? "⚠ only \(String(format: "%.0f", freeGB)) GB free on library volume"
-                        : "sparse — uses ~0 B until guest writes")
+                sliderRow(label: "Disk size", value: $diskGB,
+                          range: 8...max(32, freeGB),
+                          step: 4, suffix: "GB",
+                          warn: overDisk,
+                          caption: overDisk
+                            ? "⚠ only \(String(format: "%.0f", freeGB)) GB free on library volume"
+                            : "sparse — uses ~0 B until guest writes")
 
-            Text("Defaults match \(selectedTile?.displayName ?? "your OS"). Host limits shown above.")
-                .font(.system(size: 11))
-                .foregroundStyle(LuminaTheme.inkMute)
-            Spacer()
+                networkingSection
+
+                Text("Defaults match \(selectedTile?.displayName ?? "your OS"). Host limits shown above.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(LuminaTheme.inkMute)
+            }
+            .padding(20)
         }
-        .padding(20)
         .onAppear { applyOSDefaults() }
+    }
+
+    /// Networking section on the resources step. vmnet-NAT is the
+    /// default because it needs no entitlement and works on every
+    /// install; bridged is offered because it's the only reliable
+    /// cure for the vmnet failure modes (degradation after ~5 VM
+    /// lifecycles, ICMP/UDP flakiness, Debian netcfg first-probe
+    /// race). The picker pulls from VZBridgedNetworkInterface so a
+    /// host without bridgeable interfaces shows an empty picker with
+    /// a warning rather than silently defaulting to something wrong.
+    @ViewBuilder
+    private var networkingSection: some View {
+        let bridges = BridgedNetworkProvider.availableInterfaceIdentifiers()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Text("Networking")
+                    .font(.system(size: 12))
+                    .foregroundStyle(LuminaTheme.ink)
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                networkModeButton(
+                    choice: .nat,
+                    label: "NAT",
+                    caption: "Default. vmnet DHCP. No entitlement required."
+                )
+                networkModeButton(
+                    choice: .bridged,
+                    label: "Bridged",
+                    caption: bridges.isEmpty
+                        ? "No bridgeable interface available on this host."
+                        : "Guest joins the host LAN. Needs a signed build."
+                )
+            }
+            if networkMode == .bridged {
+                if bridges.isEmpty {
+                    Text("⚠ No host interface can be bridged. Plug in Ethernet or join a Wi-Fi network, then re-create this VM.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(LuminaTheme.warn)
+                } else {
+                    Picker("Host interface", selection: Binding(
+                        get: { bridgedInterface ?? bridges.first ?? "" },
+                        set: { bridgedInterface = $0.isEmpty ? nil : $0 }
+                    )) {
+                        ForEach(bridges, id: \.self) { identifier in
+                            Text(identifier).tag(identifier)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(.system(size: 11, design: .monospaced))
+
+                    Text("Bridged requires `com.apple.vm.networking` at codesign time. Ad-hoc signing accepts it; unsigned distributions will crash at boot. Flip back to NAT if this boot fails.")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(LuminaTheme.inkMute)
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private func networkModeButton(choice: NetworkModeChoice, label: String, caption: String) -> some View {
+        Button(action: { networkMode = choice }) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(label)
+                        .font(LuminaTheme.headline)
+                        .foregroundStyle(networkMode == choice ? LuminaTheme.accent : LuminaTheme.ink)
+                    Spacer()
+                    if networkMode == choice {
+                        Text("●").font(LuminaTheme.label).foregroundStyle(LuminaTheme.accent)
+                    }
+                }
+                Text(caption)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(LuminaTheme.inkMute)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(
+                Rectangle().stroke(
+                    networkMode == choice ? LuminaTheme.accent : LuminaTheme.rule2,
+                    lineWidth: networkMode == choice ? 2 : 1
+                )
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var reviewStep: some View {
@@ -450,13 +550,22 @@ public struct NewVMWizard: View {
         switch step {
         case .chooseOS: step = .variant
         case .variant:
-            // Fail-closed SHA-256 on catalog ISOs before advancing. Verifying
-            // here (not at Create) saves the user two wasted steps on a
-            // corrupted download: they find out the file is bad while still
-            // attached to the variant picker, where they can re-attach a
-            // fresh download without losing configuration.
-            if let tile = selectedTile,
-               case .catalogISO(let entry) = tile.acquisition,
+            // Fail-closed checks before advancing out of the ISO picker:
+            //   1. Architecture gate (all acquisition types with byoFile).
+            //      VZ only boots aarch64; an x86_64 ISO reaches the EFI
+            //      loader and stalls on a black screen indefinitely. 1 MB
+            //      read; runs in ~20ms on a stock APFS volume.
+            //   2. SHA-256 verify (catalog ISOs only — we publish hashes
+            //      for those). Saves the user two wasted steps on a
+            //      corrupted download: they find out the file is bad
+            //      while still attached to the variant picker, where
+            //      they can re-attach a fresh download without losing
+            //      configuration.
+            guard let tile = selectedTile else { step = .resources; return }
+            if let picked = byoFile, !architectureCheck(tile: tile, file: picked) {
+                return // architectureCheck surfaced the error already
+            }
+            if case .catalogISO(let entry) = tile.acquisition,
                let picked = byoFile,
                picked != verifiedISO {
                 isVerifying = true
@@ -485,6 +594,37 @@ public struct NewVMWizard: View {
             step = .resources
         case .resources: step = .review
         case .review: createAndDismiss()
+        }
+    }
+
+    /// Inspect the attached ISO's EFI bootloader filenames and reject
+    /// anything that is provably not arm64. `.unknown` passes — some
+    /// legitimate ISOs put the EFI binary deeper than our 5 MB scan
+    /// window, and blocking them breaks the "bring your own installer"
+    /// path for obscure distros. Returns true when the wizard may advance.
+    private func architectureCheck(tile: OSWizardTile, file: URL) -> Bool {
+        let arch: ISOInspector.Architecture
+        do {
+            arch = try ISOInspector.detectArchitecture(at: file)
+        } catch {
+            model.pendingError = "Couldn't read ISO: \(error). Re-attach the file and try again."
+            return false
+        }
+        switch arch {
+        case .arm64, .unknown:
+            return true
+        case .x86_64:
+            model.pendingError = """
+            \(tile.displayName) needs an arm64 installer, but this file is x86_64.
+            Apple Silicon's Virtualization.framework can't boot x86 guests; Lumina won't emulate a CPU architecture.
+            Download the ARM64 / AArch64 build from the vendor (Microsoft: "Windows 11 ARM64 VHDX/ISO", Ubuntu: "arm64 server install image", Debian: "netinst arm64") and re-attach.
+            """
+            return false
+        case .riscv64:
+            model.pendingError = """
+            This ISO is RISC-V 64-bit. Lumina on Apple Silicon only boots arm64 (aarch64) guests — VZ doesn't emulate other ISAs.
+            """
+            return false
         }
     }
 
@@ -536,6 +676,7 @@ public struct NewVMWizard: View {
                 memoryBytes: memBytes,
                 cpuCount: cpus,
                 diskBytes: diskBytes,
+                networkMode: resolvedNetworkMode(),
                 id: id
             )
             try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: diskBytes)
@@ -568,6 +709,32 @@ public struct NewVMWizard: View {
     private func formatGB(_ bytes: UInt64) -> String {
         String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))
     }
+
+    /// Collapse the UI choice + selected bridge interface into the
+    /// persisted `NetworkMode` shape. Returns nil for NAT so older
+    /// bundle readers (pre-networkMode schema) still load cleanly —
+    /// `LuminaDesktopSession.networkProvider(for:)` maps nil → .nat.
+    private func resolvedNetworkMode() -> NetworkMode? {
+        switch networkMode {
+        case .nat:
+            return nil
+        case .bridged:
+            let bridges = BridgedNetworkProvider.availableInterfaceIdentifiers()
+            if bridges.isEmpty {
+                // Fall back to NAT so the VM can at least boot; the
+                // user saw the warning in the UI and chose to proceed.
+                return nil
+            }
+            return .bridged(interface: bridgedInterface ?? bridges.first)
+        }
+    }
+}
+
+/// UI-local representation of the network attachment choice. Maps to
+/// `LuminaBootable.NetworkMode` at persist time via `resolvedNetworkMode()`.
+enum NetworkModeChoice: Equatable {
+    case nat
+    case bridged
 }
 
 /// Thin bar showing host constraints above the resource sliders.

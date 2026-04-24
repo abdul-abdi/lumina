@@ -118,6 +118,36 @@ echo "  Applying Lumina overrides..."
 "$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS
 "$KERNEL_SRC/scripts/config" --enable CONFIG_DEVTMPFS_MOUNT
 
+# ── Boot-time pruning: things arm64 defconfig enables that we pay for ──
+#
+# RAID6_PQ — the 8-way algorithm benchmark (neonx8/.../int64x1 + xor) that
+# runs at boot to pick the fastest RAID6 codec. ~545ms on M3 Pro, 62% of
+# total guest bootstrap (measured 2026-04-24). A Lumina VM never touches
+# RAID, so this code serves zero purpose.
+#
+# Nuance: RAID6_PQ is a LIBRARY config, selected (not depended-on) by
+# BTRFS_FS, BCACHE, DM_RAID, MD_RAID456. If ANY selector stays =y,
+# olddefconfig silently re-enables RAID6_PQ to satisfy it — our earlier
+# `--disable CONFIG_RAID6_PQ` alone was a no-op. Must also disable the
+# selectors.
+"$KERNEL_SRC/scripts/config" --disable CONFIG_RAID6_PQ
+"$KERNEL_SRC/scripts/config" --disable CONFIG_MD
+"$KERNEL_SRC/scripts/config" --disable CONFIG_BLK_DEV_MD
+"$KERNEL_SRC/scripts/config" --disable CONFIG_MD_RAID456
+"$KERNEL_SRC/scripts/config" --disable CONFIG_MD_RAID6_PQ
+"$KERNEL_SRC/scripts/config" --disable CONFIG_ASYNC_RAID6_RECOV
+"$KERNEL_SRC/scripts/config" --disable CONFIG_ASYNC_PQ
+"$KERNEL_SRC/scripts/config" --disable CONFIG_DM_RAID
+# RAID6_PQ selectors — must go too or olddefconfig re-enables RAID6_PQ.
+"$KERNEL_SRC/scripts/config" --disable CONFIG_BTRFS_FS
+"$KERNEL_SRC/scripts/config" --disable CONFIG_BCACHE
+"$KERNEL_SRC/scripts/config" --disable CONFIG_DM_CACHE
+
+# We also never want the kernel to sit waiting for MD device autodetect —
+# even if some vestigial dependency re-enables MD, `md=noautodetect` via
+# cmdline short-circuits the 500ms+ autodetect wait. Harmless when MD is
+# already compiled out.
+
 echo "  Resolving dependencies (olddefconfig)..."
 if ! make olddefconfig 2>&1; then
     echo "ERROR: make olddefconfig failed. .config snapshot:"
@@ -142,6 +172,13 @@ CRITICAL_CONFIGS=(
     CONFIG_VIRTIO_FS:y        # Directory sharing
     CONFIG_VIRTIO:y           # VirtIO core
     CONFIG_DEVTMPFS:y         # /dev population
+    # RAID6_PQ must be OFF — the library's boot-time algorithm
+    # benchmark takes ~545ms. If this verification fails, some new
+    # `=y` config is selecting RAID6_PQ; find it with
+    # `grep -l "select.*RAID6_PQ" /lib/raid6 /fs /drivers`, disable it
+    # above, retry.
+    CONFIG_RAID6_PQ:n
+    CONFIG_MD:n
 )
 
 FAILED=false

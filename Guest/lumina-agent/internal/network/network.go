@@ -3,6 +3,12 @@
 // network_ready to the host. v0.7.1 reliability pass: individual
 // ip-command retries, post-setup route verification, explicit
 // error reporting on failure.
+//
+// v0.7.2 reliability pass: the target interface is discovered at
+// runtime instead of hard-coded to "eth0". Images that use systemd
+// predictable names (enp0s1, ens3) or that enumerate virtio-net as
+// a non-eth0 name on first boot now configure cleanly. Fallback is
+// "eth0" so existing images keep working.
 package network
 
 import (
@@ -10,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,13 +26,13 @@ import (
 
 // maxCarrierWait is the upper bound on how long we poll /sys/class/net
 // for link-up. v0.7.1 perf: dropped from 2s → 400ms after profiling
-// showed VZ NAT brings eth0 up in 40–80ms (P95 ~120ms) on M3 hosts.
-// The 400ms ceiling covers the worst case observed; if it times out,
-// we emit network_ready with Stage="timeout-anyway" so the host can
-// treat it as a softer signal.
+// showed VZ NAT brings the interface up in 40–80ms (P95 ~120ms) on M3
+// hosts. The 400ms ceiling covers the worst case observed; if it times
+// out, we emit network_ready with Stage="timeout-anyway" so the host
+// can treat it as a softer signal.
 const maxCarrierWait = 400 * time.Millisecond
 
-// carrierPollInterval is the sysfs read cadence. 5ms gives us an
+// carrierPollInterval is the sysfs read cadence. 5ms gives us
 // 8-16 poll ticks on the typical 50-80ms carrier-up latency, without
 // measurably costing anything (open(2)+read(2)+close(2) = ~5µs).
 const carrierPollInterval = 5 * time.Millisecond
@@ -40,26 +47,36 @@ const ipRetryAttempts = 3
 // ipRetryBackoff is the linear backoff between ip retries.
 const ipRetryBackoff = 20 * time.Millisecond
 
+// fallbackInterface is the interface name used if /sys/class/net is
+// unreadable or contains nothing that looks like an ethernet device.
+// Matches the pre-v0.7.2 hard-coded default — images that relied on
+// it still work.
+const fallbackInterface = "eth0"
+
 // Injection points for tests. These are package-level vars rather
 // than struct fields because Configure is a free function; tests
 // substitute them directly. In production they always point at the
 // defaults below.
 var (
-	runIP         func(args ...string) error                = defaultRunIP
-	runIPBatch    func(ip, gateway string) (bool, string)   = defaultRunIPBatch
-	readRouteFile func() ([]byte, error)                    = defaultReadRouteFile
-	clock         func() time.Time                          = time.Now
+	runIP          func(iface string, args ...string) error             = defaultRunIP
+	runIPBatch     func(iface, ip, gateway string) (bool, string)       = defaultRunIPBatch
+	readRouteFile  func() ([]byte, error)                               = defaultReadRouteFile
+	pickInterface  func() string                                        = defaultPickInterface
+	readNetSysfs   func(iface, file string) ([]byte, error)             = defaultReadNetSysfs
+	clock          func() time.Time                                     = time.Now
 )
 
-// Configure applies msg to eth0 (IP/route/DNS) with retries, verifies
-// the routing table reflects the requested default route, then polls
-// for carrier and sends NetworkReadyMsg. On hard failure (setup
-// couldn't complete even with retries), sends NetworkErrorMsg and
-// returns — the host-side caller sees a typed error, not a silent
-// best-effort success.
+// Configure applies msg to the primary ethernet interface (IP/route/DNS)
+// with retries, verifies the routing table reflects the requested
+// default route, then polls for carrier and sends NetworkReadyMsg. On
+// hard failure (setup couldn't complete even with retries), sends
+// NetworkErrorMsg and returns — the host-side caller sees a typed
+// error, not a silent best-effort success.
 func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	started := clock()
-	_, _ = fmt.Fprintf(os.Stderr, "configuring network: ip=%s gw=%s dns=%s\n", msg.IP, msg.Gateway, msg.DNS)
+	iface := pickInterface()
+	_, _ = fmt.Fprintf(os.Stderr, "configuring network on %s: ip=%s gw=%s dns=%s\n",
+		iface, msg.IP, msg.Gateway, msg.DNS)
 
 	// VZ NAT is IPv4-only; disable IPv6 so the guest doesn't waste
 	// time discovering a missing router. Cheap — a single writev.
@@ -72,7 +89,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// or if post-verification shows the route didn't land.
 	attempts := 0
 	var lastErr error
-	batchOK, batchStderr := runIPBatch(msg.IP, msg.Gateway)
+	batchOK, batchStderr := runIPBatch(iface, msg.IP, msg.Gateway)
 	if !batchOK {
 		attempts++
 		// Carry the batch failure into lastErr so a subsequent
@@ -94,11 +111,11 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		// Retry individually — if only the route is missing, just
 		// replace the route; don't redo the link+addr since those
 		// are idempotent but add noise.
-		if err := runIP("link", "set", "eth0", "up"); err != nil {
+		if err := runIP(iface, "link", "set", iface, "up"); err != nil {
 			lastErr = fmt.Errorf("link up: %w", err)
 		}
-		_ = runIP("addr", "add", msg.IP, "dev", "eth0") // benign if already set
-		if err := runIP("route", "replace", "default", "via", msg.Gateway); err != nil {
+		_ = runIP(iface, "addr", "add", msg.IP, "dev", iface) // benign if already set
+		if err := runIP(iface, "route", "replace", "default", "via", msg.Gateway); err != nil {
 			lastErr = fmt.Errorf("route replace: %w", err)
 		}
 	}
@@ -112,7 +129,8 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		if lastErr != nil {
 			reason = lastErr.Error()
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "network setup failed after %d attempts: %s\n", attempts, reason)
+		_, _ = fmt.Fprintf(os.Stderr, "network setup failed on %s after %d attempts: %s\n",
+			iface, attempts, reason)
 		_ = w.Send(protocol.NetworkErrorMsg{
 			Type:     protocol.TypeNetworkError,
 			Reason:   reason,
@@ -134,9 +152,9 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// packets can flow.
 	deadline := started.Add(maxCarrierWait)
 	for clock().Before(deadline) {
-		if operstateReady() {
+		if operstateReady(iface) {
 			elapsed := clock().Sub(started)
-			_, _ = fmt.Fprintf(os.Stderr, "network operstate up after %s\n", elapsed)
+			_, _ = fmt.Fprintf(os.Stderr, "network operstate up on %s after %s\n", iface, elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
 				IP:       bareIP,
@@ -145,9 +163,9 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 			})
 			return
 		}
-		if carrierUp() {
+		if carrierUp(iface) {
 			elapsed := clock().Sub(started)
-			_, _ = fmt.Fprintf(os.Stderr, "network carrier up after %s\n", elapsed)
+			_, _ = fmt.Fprintf(os.Stderr, "network carrier up on %s after %s\n", iface, elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
 				IP:       bareIP,
@@ -165,7 +183,8 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// any remaining lag. Emit network_ready with Stage="timeout-
 	// anyway" so the host can surface a soft warning if desired.
 	elapsed := clock().Sub(started)
-	_, _ = fmt.Fprintf(os.Stderr, "network readiness timeout after %s; route verified, shipping network_ready (stage=timeout-anyway)\n", elapsed)
+	_, _ = fmt.Fprintf(os.Stderr, "network readiness timeout on %s after %s; route verified, shipping network_ready (stage=timeout-anyway)\n",
+		iface, elapsed)
 	_ = w.Send(protocol.NetworkReadyMsg{
 		Type:     protocol.TypeNetworkReady,
 		IP:       bareIP,
@@ -174,13 +193,138 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	})
 }
 
+// defaultPickInterface enumerates /sys/class/net and returns the
+// primary ethernet-style interface. Order of preference:
+//   1. Any interface whose /sys/class/net/<name>/device/modalias
+//      starts with "virtio:" — this is the VZ virtio-net device,
+//      unambiguous when present.
+//   2. Any interface named like en* or eth* that is not a bridge,
+//      vlan, tap, tun, docker, or loopback. Handles kernel-named
+//      enp0s1, ens3, enX0 alongside the classic eth0.
+//   3. Any remaining non-loopback, non-virtual interface.
+//   4. Fallback: the literal string "eth0" — keeps old images that
+//      genuinely expose eth0 working if sysfs enumeration fails for
+//      any reason (unreadable, container environment, etc.).
+//
+// Called once per Configure invocation. No caching — cheap enough
+// (a handful of sysfs reads) and avoids a whole class of "stale
+// after interface rename" bugs.
+func defaultPickInterface() string {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return fallbackInterface
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		n := e.Name()
+		if n == "" || n == "lo" {
+			continue
+		}
+		names = append(names, n)
+	}
+	// Deterministic order so the choice is stable across boots even
+	// when readdir order is not.
+	sort.Strings(names)
+
+	// Pass 1: virtio-net modalias is the ground truth on a VZ guest.
+	for _, n := range names {
+		data, err := readNetSysfs(n, "device/modalias")
+		if err != nil {
+			continue
+		}
+		if bytes.HasPrefix(bytes.TrimSpace(data), []byte("virtio:")) {
+			// Double-check it's an ethernet device (virtio has many
+			// personalities: net, block, console, rng…). The kernel
+			// exposes net devices under /sys/class/net, so presence
+			// here is already a strong signal, but require the type
+			// file to read as ARPHRD_ETHER (1) to be safe.
+			if isEthernet(n) {
+				return n
+			}
+		}
+	}
+
+	// Pass 2: predictable naming + classic eth* names.
+	for _, n := range names {
+		if !looksLikeEthernet(n) {
+			continue
+		}
+		if isVirtualInterface(n) {
+			continue
+		}
+		if isEthernet(n) {
+			return n
+		}
+	}
+
+	// Pass 3: anything else that is an ethernet device and not
+	// obviously virtual.
+	for _, n := range names {
+		if isVirtualInterface(n) {
+			continue
+		}
+		if isEthernet(n) {
+			return n
+		}
+	}
+
+	return fallbackInterface
+}
+
+// looksLikeEthernet filters by name pattern only — cheap, no I/O.
+// Matches en*, eth*, enX* (predictable naming), enp*, ens*, eno*.
+func looksLikeEthernet(name string) bool {
+	if strings.HasPrefix(name, "eth") {
+		return true
+	}
+	if strings.HasPrefix(name, "en") {
+		return true
+	}
+	return false
+}
+
+// isVirtualInterface rejects bridges, tap devices, docker links,
+// wireguard tunnels, and the like. These are userspace-created
+// and should never be the VZ guest's primary NIC.
+func isVirtualInterface(name string) bool {
+	switch {
+	case strings.HasPrefix(name, "br"):
+		return true
+	case strings.HasPrefix(name, "docker"):
+		return true
+	case strings.HasPrefix(name, "veth"):
+		return true
+	case strings.HasPrefix(name, "tap"):
+		return true
+	case strings.HasPrefix(name, "tun"):
+		return true
+	case strings.HasPrefix(name, "wg"):
+		return true
+	case strings.HasPrefix(name, "vnet"):
+		return true
+	}
+	return false
+}
+
+// isEthernet reads /sys/class/net/<name>/type and confirms it
+// reports ARPHRD_ETHER (1). Filters out anything Linux exposes as
+// a netdev that is not actually ethernet (ppp, ipip, sit).
+func isEthernet(name string) bool {
+	data, err := readNetSysfs(name, "type")
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(bytes.TrimSpace(data), []byte("1"))
+}
+
 // defaultRunIPBatch runs link-set / addr-add / route-replace as a single
 // `ip -batch -` process. Returns (exitedZero, stderr); stderr is
 // captured so the caller can surface the root cause in network_error.
-func defaultRunIPBatch(ip, gateway string) (bool, string) {
+func defaultRunIPBatch(iface, ip, gateway string) (bool, string) {
 	batch := strings.NewReader(
-		"link set eth0 up\n" +
-			"addr add " + ip + " dev eth0\n" +
+		"link set " + iface + " up\n" +
+			"addr add " + ip + " dev " + iface + "\n" +
 			"route replace default via " + gateway + "\n",
 	)
 	cmd := exec.Command("ip", "-batch", "-")
@@ -195,8 +339,11 @@ func defaultRunIPBatch(ip, gateway string) (bool, string) {
 }
 
 // defaultRunIP runs a single `ip` command and returns any error along with
-// stderr context for diagnostics.
-func defaultRunIP(args ...string) error {
+// stderr context for diagnostics. The `iface` parameter is present for
+// symmetry with runIPBatch and to make test injection uniform; the real
+// implementation doesn't need it because the caller already wove the
+// interface name into args.
+func defaultRunIP(_ string, args ...string) error {
 	cmd := exec.Command("ip", args...)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
@@ -213,6 +360,13 @@ func defaultReadRouteFile() ([]byte, error) {
 	return os.ReadFile("/proc/net/route")
 }
 
+// defaultReadNetSysfs reads a file under /sys/class/net/<iface>/.
+// Split out so tests can supply synthetic sysfs state without
+// mounting a fake tree.
+func defaultReadNetSysfs(iface, file string) ([]byte, error) {
+	return os.ReadFile("/sys/class/net/" + iface + "/" + file)
+}
+
 // routeVerified checks that the default route in the kernel's
 // routing table points to `gateway`. Reads /proc/net/route rather
 // than spawning `ip route` for a ~3× speedup (no fork/exec).
@@ -223,7 +377,9 @@ func defaultReadRouteFile() ([]byte, error) {
 //	eth0   00000000     0140A8C0  0003   0       0    0       00000000  0    0       0
 //
 // Destination=00000000 is the default (0.0.0.0) route; Gateway is
-// little-endian hex (0140A8C0 → 192.168.64.1).
+// little-endian hex (0140A8C0 → 192.168.64.1). The interface name
+// is not checked — we only care that the default route points at
+// the gateway we requested.
 func routeVerified(gateway string) bool {
 	data, err := readRouteFile()
 	if err != nil {
@@ -281,11 +437,11 @@ func ipv4ToLittleEndianHex(ip string) string {
 	return fmt.Sprintf("%02X%02X%02X%02X", b[0], b[1], b[2], b[3])
 }
 
-// operstateReady returns true when /sys/class/net/eth0/operstate
+// operstateReady returns true when /sys/class/net/<iface>/operstate
 // reports "up" or "unknown" (some drivers don't transition cleanly
 // but the link is usable).
-func operstateReady() bool {
-	data, err := os.ReadFile("/sys/class/net/eth0/operstate")
+func operstateReady(iface string) bool {
+	data, err := readNetSysfs(iface, "operstate")
 	if err != nil {
 		return false
 	}
@@ -293,9 +449,9 @@ func operstateReady() bool {
 	return state == "up" || state == "unknown"
 }
 
-// carrierUp returns true when /sys/class/net/eth0/carrier is "1".
-func carrierUp() bool {
-	data, err := os.ReadFile("/sys/class/net/eth0/carrier")
+// carrierUp returns true when /sys/class/net/<iface>/carrier is "1".
+func carrierUp(iface string) bool {
+	data, err := readNetSysfs(iface, "carrier")
 	if err != nil {
 		return false
 	}
