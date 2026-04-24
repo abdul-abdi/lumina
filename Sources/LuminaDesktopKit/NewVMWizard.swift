@@ -228,6 +228,7 @@ public struct NewVMWizard: View {
                             }
                             .padding(.top, 4)
                             isoPicker
+                            windowsTPMAdvisory
                         }
                         .padding(8)
                     }
@@ -468,6 +469,31 @@ public struct NewVMWizard: View {
                    step: 1)
                 .tint(LuminaTheme.accent)
         }
+    }
+
+    /// Inline compat advisory surfaced when the user picks Windows 11 ARM.
+    /// Apple's Virtualization.framework has no TPM API — stock Win11 Home/Pro
+    /// retail ISOs refuse OOBE without TPM 2.0, which means users download
+    /// a 5 GB file that won't boot through Setup. Cheap to warn up-front.
+    @ViewBuilder
+    private var windowsTPMAdvisory: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("⚠ KNOWN CONSTRAINT: WINDOWS 11 TPM")
+                .font(LuminaTheme.label).tracking(1.3)
+                .foregroundStyle(LuminaTheme.warn)
+            Text("Apple's Virtualization.framework exposes no TPM. Stock Windows 11 Home/Pro retail ISOs refuse Setup without TPM 2.0. Known workable paths on Apple Silicon:")
+                .font(.system(size: 11))
+                .foregroundStyle(LuminaTheme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("  • Tiny11 ARM ISO (pre-bypassed). Not Microsoft-signed.\n  • Windows Insider Preview ISO (TPM bypass during Insider flighting).\n  • Inject LabConfig\\BypassTPMCheck=1 via unattend.xml on a FAT32 sidecar.")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(LuminaTheme.inkMute)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(Rectangle().stroke(LuminaTheme.warn.opacity(0.5), lineWidth: 1))
+        .padding(.top, 6)
     }
 
     private var isoPicker: some View {

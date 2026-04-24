@@ -34,8 +34,16 @@ struct Doctor: AsyncParsableCommand {
     @Flag(name: .long, help: "Fix what's safe to fix automatically (orphan run-dirs). Reports everything else.")
     var fix: Bool = false
 
+    @Option(name: .long, help: "Inspect an ISO file instead of running host checks. Reports arch (arm64 / x86_64 / riscv64 / unknown), size, and boot-loader viability for VZ EFI.")
+    var iso: String? = nil
+
     func run() async throws {
-        let report = await generateReport(fix: fix)
+        let report: DoctorReport
+        if let iso {
+            report = inspectISO(path: iso)
+        } else {
+            report = await generateReport(fix: fix)
+        }
 
         let wantJSON = json || isatty(fileno(stdout)) == 0
         if wantJSON {
@@ -55,6 +63,135 @@ struct Doctor: AsyncParsableCommand {
         } else if report.checks.contains(where: { $0.severity == .warning }) {
             throw ExitCode(1)
         }
+    }
+
+    // MARK: - ISO inspect
+
+    /// `lumina doctor --iso <path>` — focused preflight for an installer
+    /// ISO. Users hit this path after downloading an OS and before
+    /// committing to `lumina desktop create`; a 30-second check beats a
+    /// 30-second black-screen at the EFI firmware.
+    ///
+    /// Checks:
+    ///   - File exists + non-empty + plausible size
+    ///   - EFI boot architecture via ISOInspector.detectArchitecture() —
+    ///     scans first 5MB of the ISO for BOOTAA64/BOOTX64/BOOTRISCV64 EFI
+    ///     binary names. Rejects non-arm64 with a pointer at the fix.
+    ///
+    /// Intentionally omits signature/SHA-256 checks (that's `DesktopOSCatalog`
+    /// + `ISOVerifier`, driven by the wizard). Doctor is the hardware-
+    /// compat gate; the catalog is the integrity gate.
+    private func inspectISO(path: String) -> DoctorReport {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        var checks: [DoctorCheck] = []
+
+        // File existence + size.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            checks.append(DoctorCheck(
+                id: "iso-file",
+                severity: .error,
+                title: "ISO not found",
+                detail: "No file at \(url.path). Double-check the path."
+            ))
+            return DoctorReport(
+                generatedAt: Date(),
+                luminaVersion: "0.7.1",
+                host: hostInfo(),
+                checks: checks
+            )
+        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        if size < 32 * 1024 * 1024 {
+            checks.append(DoctorCheck(
+                id: "iso-size",
+                severity: .warning,
+                title: "ISO suspiciously small",
+                detail: "File is \(formatBytesLocal(size)). A legitimate installer ISO is typically 150 MB+. Partial download?"
+            ))
+        } else {
+            checks.append(DoctorCheck(
+                id: "iso-size",
+                severity: .info,
+                title: "ISO size \(formatBytesLocal(size))",
+                detail: "Within the normal range for an installer ISO."
+            ))
+        }
+
+        // Architecture gate — the big one. ISOInspector scans the first
+        // ~5MB of the image for EFI bootloader filenames; cheap, bounded,
+        // and authoritative for the common case (all mainstream arm64
+        // distros put BOOTAA64.EFI in the first MB).
+        let arch: ISOInspector.Architecture
+        do {
+            arch = try ISOInspector.detectArchitecture(at: url)
+        } catch {
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "Couldn't read ISO",
+                detail: "\(error). File may be unreadable, corrupted, or a non-ISO container."
+            ))
+            return DoctorReport(
+                generatedAt: Date(),
+                luminaVersion: "0.7.1",
+                host: hostInfo(),
+                checks: checks
+            )
+        }
+
+        switch arch {
+        case .arm64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .info,
+                title: "ARM64 (aarch64) EFI bootloader detected",
+                detail: "BOOTAA64.EFI present. This ISO should boot in Lumina Desktop."
+            ))
+        case .x86_64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "x86_64 ISO — will not boot",
+                detail:
+                    "BOOTX64.EFI present. Apple Silicon's Virtualization.framework does not emulate x86. "
+                    + "Download the ARM64 / AArch64 build from the vendor and retry "
+                    + "(Microsoft: 'Windows 11 ARM64 VHDX/ISO', Ubuntu: 'arm64 server install image', "
+                    + "Debian: 'netinst arm64')."
+            ))
+        case .riscv64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "RISC-V 64 ISO — will not boot",
+                detail: "BOOTRISCV64.EFI present. VZ on Apple Silicon only boots arm64 guests."
+            ))
+        case .unknown:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .warning,
+                title: "Architecture could not be determined",
+                detail:
+                    "No known EFI bootloader name (BOOTAA64/BOOTX64/BOOTRISCV64) found in the first 5MB. "
+                    + "Some legitimate ISOs put the EFI binary deeper and still boot fine. "
+                    + "Safe to try — if EFI sits at a black screen for 30s+ the ISO is probably unsuitable."
+            ))
+        }
+
+        return DoctorReport(
+            generatedAt: Date(),
+            luminaVersion: "0.7.1",
+            host: hostInfo(),
+            checks: checks
+        )
+    }
+
+    private func formatBytesLocal(_ bytes: UInt64) -> String {
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+        } else if bytes >= 1_048_576 {
+            return String(format: "%.0f MB", Double(bytes) / 1_048_576)
+        }
+        return "\(bytes) B"
     }
 
     // MARK: - Report generation
