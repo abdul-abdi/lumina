@@ -158,6 +158,7 @@ public struct VMBundle: Sendable, Equatable {
         memoryBytes: UInt64,
         cpuCount: Int,
         diskBytes: UInt64,
+        networkMode: NetworkMode? = nil,
         id: UUID = UUID(),
         now: Date = Date()
     ) throws -> VMBundle {
@@ -196,7 +197,8 @@ public struct VMBundle: Sendable, Equatable {
             diskBytes: diskBytes,
             createdAt: now,
             lastBootedAt: nil,
-            macAddress: VMBundleManifest.generateLocallyAdministeredMAC()
+            macAddress: VMBundleManifest.generateLocallyAdministeredMAC(),
+            networkMode: networkMode
         )
         try writeManifest(manifest, into: rootURL)
         return VMBundle(rootURL: rootURL, manifest: manifest)

@@ -4,6 +4,84 @@ import os
 @preconcurrency import Virtualization
 import Darwin
 
+/// Process-wide claim table for vmnet bridge interfaces.
+///
+/// Why this exists: `VZNATNetworkDeviceAttachment` creates a `bridge1XX`
+/// interface per VM. When multiple VMs boot concurrently in the same
+/// process (e.g. `Pool.swift` parallel dispatch, or the Desktop app
+/// running several VMs at once), each VM's host-side `configureNetwork`
+/// call independently scans `getifaddrs()` and may pick the SAME bridge
+/// as a sibling VM — every bridge looks like a candidate. The old
+/// `mac % bridge_count` heuristic deconflicted by luck, not invariant.
+///
+/// This registry fixes it deterministically within one process: the
+/// first VM to observe a bridge claims it under its MAC last byte;
+/// subsequent VMs see the bridge as claimed and pick another candidate.
+/// Idempotent for the same MAC (a VM re-resolving its bridge sees its
+/// own claim). Released on `VM.shutdown()`.
+///
+/// **Cross-process concurrency is not solved here.** Two independent
+/// `lumina run` invocations racing to boot still rely on the legacy
+/// heuristic — the correct fix there needs a host-level lock (or
+/// vmnet's private MAC→bridge mapping API) and is intentionally out
+/// of scope. Single-bridge hosts (most users, most of the time) are
+/// unaffected either way.
+actor VmnetBridgeRegistry {
+    static let shared = VmnetBridgeRegistry()
+
+    /// Map of bridge interface name → MAC last byte that has claimed it.
+    private var claimed: [String: UInt8] = [:]
+
+    /// Returns the bridge this MAC should use given the current candidate
+    /// set. The algorithm is exact when every VM in the process uses a
+    /// unique MAC last byte; falls back to the first candidate when two
+    /// VMs share a last byte (which itself is a MAC-generation bug — the
+    /// locally-administered random MAC space is 2^40, so collisions are
+    /// astronomically unlikely for real workloads).
+    ///
+    /// Precondition: `candidates` is non-empty.
+    func claim(
+        mac: UInt8?,
+        candidates: [(gateway: String, subnetPrefix: String, name: String)]
+    ) -> (gateway: String, subnetPrefix: String, name: String) {
+        guard let mac else {
+            // No MAC hint — caller is pre-v0.7.1 agent path. Legacy
+            // behaviour: first candidate. Don't record a claim; we
+            // have no stable identity to key on.
+            return candidates[0]
+        }
+
+        // If this MAC already claimed a bridge, return it (idempotent
+        // for the polling loop, re-connects, etc.). Drop the claim
+        // transparently if the bridge has gone away between calls.
+        if let existing = claimed.first(where: { $0.value == mac })?.key,
+           let still = candidates.first(where: { $0.name == existing }) {
+            return still
+        }
+
+        // Pick the first candidate not claimed by a different MAC.
+        for candidate in candidates {
+            if let owner = claimed[candidate.name], owner != mac { continue }
+            claimed[candidate.name] = mac
+            return candidate
+        }
+
+        // Every candidate is held by another MAC. This shouldn't
+        // happen in practice — there's at most one bridge per VM and
+        // candidate count ≥ VM count — but if it does, take the first
+        // one rather than fail the boot. Log so the edge case is
+        // visible in `lumina doctor` output.
+        NSLog("[Lumina.VmnetBridgeRegistry] All candidates claimed; falling back to first (mac=0x%02X)", mac)
+        return candidates[0]
+    }
+
+    /// Release the bridge claimed by this MAC. Called from `VM.shutdown()`.
+    /// Safe to call on a MAC that never claimed anything.
+    func release(mac: UInt8) {
+        claimed = claimed.filter { $0.value != mac }
+    }
+}
+
 /// Custom executor that pins all actor work to a specific DispatchQueue.
 /// This satisfies VZVirtualMachine's thread-affinity requirement by making
 /// the actor's isolation domain the same queue VZ was created with.
@@ -217,7 +295,21 @@ public actor VM {
         // ── Kernel command line ──
         // All cmdline params built in one block. Both paths share mounts and IP;
         // baked images additionally pass hosts via cmdline (legacy uses initrd overlay).
-        var cmdLine = "console=hvc0 root=/dev/vda rw"
+        //
+        // md=noautodetect — skip the kernel's autodetect-RAID-arrays pass
+        //   at init time. Negligible on its own (<50ms), but semantically
+        //   correct: Lumina VMs never host MD devices.
+        //
+        // Note: the single largest boot cost on current images is the
+        //   kernel's 8-way RAID6 algorithm benchmark (~545ms on M3 Pro,
+        //   measured 2026-04-24). That benchmark runs only when the
+        //   kernel is compiled with RAID6 code (CONFIG_RAID6_PQ=y),
+        //   and there is no runtime cmdline to skip it on upstream
+        //   kernels. The eliminating fix is in `Guest/build-kernel.sh`
+        //   which now disables CONFIG_MD — next image build drops ~550ms
+        //   cold-boot. Existing images continue to pay the cost until
+        //   a new image tarball ships.
+        var cmdLine = "console=hvc0 root=/dev/vda rw md=noautodetect"
 
         if !options.mounts.isEmpty {
             let specs = options.mounts.enumerated().map { "lumina\($0.offset):\($0.element.guestPath)" }
@@ -1205,28 +1297,33 @@ public actor VM {
             if attempt > 0 {
                 try? await Task.sleep(for: .milliseconds(25))
             }
-            if let result = discoverVmnetGatewayOnce(preferringMAC: macLastByte) {
+            if let result = await discoverVmnetGatewayOnce(preferringMAC: macLastByte) {
                 return result
             }
         }
         return nil
     }
 
-    /// Match a vmnet bridge by the last octet of the VM's MAC address.
-    /// Returns the gateway IP and subnet prefix if a matching bridge is found.
-    /// The vmnet bridge assigns IPs in the same /24 as its gateway, and the
-    /// bridge's ARP table contains the VM's MAC. We match by iterating bridges
-    /// and checking if the VM's MAC last-octet appears in the bridge's subnet.
+    /// Match a vmnet bridge to this VM's MAC address.
     ///
-    /// For now: match by bridge name + AF_INET. The MAC-based matching requires
-    /// reading the ARP table (or using vmnet's interface mapping), which we defer
-    /// to when we can reproduce multi-bridge scenarios.
+    /// Single-bridge case: return the one bridge, no ambiguity.
+    /// Multi-bridge case: consult `VmnetBridgeRegistry`, which records
+    /// first-come claims by MAC last byte so concurrent VM boots in the
+    /// same process don't double-assign. If the registry is short-
+    /// circuited (nil MAC), falls back to the first candidate — the
+    /// legacy behaviour that pre-v0.7.1 callers relied on.
     ///
-    /// Simplified v1: accept a `macLastByte` and prefer bridges whose subnet
-    /// matches the DHCP-assigned range for that byte.
+    /// Sorted by bridge name so the candidate order is stable across
+    /// discovery polls; the registry's first-come claim then becomes
+    /// deterministic for a given sequence of boots.
+    ///
+    /// This fixes within-process concurrency. Across-process concurrent
+    /// boots (two `lumina run` processes racing) still fall back to the
+    /// legacy heuristic — that needs a host-level lock (or vmnet's
+    /// private MAC→bridge mapping API) and is out of scope.
     static func discoverVmnetGatewayOnce(
         preferringMAC macLastByte: UInt8? = nil
-    ) -> (gateway: String, subnetPrefix: String)? {
+    ) async -> (gateway: String, subnetPrefix: String)? {
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0, let head = ifap else { return nil }
         defer { freeifaddrs(head) }
@@ -1264,29 +1361,34 @@ public actor VM {
 
         guard !candidates.isEmpty else { return nil }
 
-        // If only one bridge, return it (most common case)
+        // Sort by bridge name so registry claim order is deterministic
+        // across discovery polls and across processes; "sorted" is the
+        // invariant the registry assumes.
+        candidates.sort { $0.name < $1.name }
+
         if candidates.count == 1 {
             let c = candidates[0]
             NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@", c.gateway, c.name)
             return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
         }
 
-        // Multiple bridges: if we have a MAC byte, match by bridge index ordering.
-        // vmnet assigns bridges in creation order; we rely on the MAC hint to
-        // disambiguate. This is a best-effort heuristic — true MAC-to-bridge
-        // mapping requires vmnet API access.
+        // Multiple bridges: go through the process-wide registry so
+        // concurrent VMs in this Lumina process deterministically claim
+        // distinct bridges. Cross-process concurrency is not fully
+        // solved — two lumina-cli invocations still race on claim
+        // order — but the common concurrency pattern (Pool, Desktop
+        // multi-VM) lives inside a single process.
+        let claimed = await VmnetBridgeRegistry.shared.claim(
+            mac: macLastByte, candidates: candidates
+        )
         if let mac = macLastByte {
-            let sorted = candidates.sorted { $0.name < $1.name }
-            let idx = Int(mac) % sorted.count
-            let c = sorted[idx]
-            NSLog("[Lumina.VM] Matched vmnet gateway %@ on %@ (MAC hint: 0x%02X)", c.gateway, c.name, mac)
-            return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+            NSLog("[Lumina.VM] Claimed vmnet gateway %@ on %@ (MAC last byte 0x%02X)",
+                  claimed.gateway, claimed.name, mac)
+        } else {
+            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@ (no MAC hint — first-found)",
+                  claimed.gateway, claimed.name)
         }
-
-        // No MAC hint: fall back to first bridge (legacy behavior)
-        let c = candidates[0]
-        NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@ (first-found, no MAC hint)", c.gateway, c.name)
-        return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+        return (gateway: claimed.gateway, subnetPrefix: claimed.subnetPrefix)
     }
 
     /// Number of exec commands currently in flight on this VM.
@@ -1310,6 +1412,14 @@ public actor VM {
         guard _state != .shutdown else { return }
         _state = .shutdown
         await shutdownVM()
+        // Release any vmnet bridge claim so a future VM with the same
+        // MAC (unlikely — MAC is 48 random bits — but not impossible
+        // with a bundle MAC that was persisted and re-used) doesn't
+        // silently inherit a claim tied to a bridge that no longer
+        // belongs to it. No-op if this VM never claimed a bridge.
+        if let mac = macLastByte {
+            await VmnetBridgeRegistry.shared.release(mac: mac)
+        }
     }
 
     /// Detach the disk clone from this VM (caller takes ownership).

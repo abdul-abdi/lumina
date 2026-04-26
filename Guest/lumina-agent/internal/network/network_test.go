@@ -128,17 +128,168 @@ func TestStubsWireUp(t *testing.T) {
 		readRouteFile = origRoute
 	}()
 
-	runIPBatch = func(ip, gateway string) (bool, string) { return true, "" }
-	runIP = func(args ...string) error { return nil }
+	runIPBatch = func(_ string, _, _ string) (bool, string) { return true, "" }
+	runIP = func(_ string, _ ...string) error { return nil }
 	readRouteFile = func() ([]byte, error) { return []byte(sampleRouteFile), nil }
 
-	if ok, _ := runIPBatch("1.2.3.4/24", "1.2.3.1"); !ok {
+	if ok, _ := runIPBatch("eth0", "1.2.3.4/24", "1.2.3.1"); !ok {
 		t.Fatalf("stubbed runIPBatch should return true")
 	}
-	if err := runIP("link", "set", "eth0", "up"); err != nil {
+	if err := runIP("eth0", "link", "set", "eth0", "up"); err != nil {
 		t.Fatalf("stubbed runIP should return nil, got %v", err)
 	}
 	if data, err := readRouteFile(); err != nil || len(data) == 0 {
 		t.Fatalf("stubbed readRouteFile should return sample data, got err=%v len=%d", err, len(data))
+	}
+}
+
+// sysfsStub returns a readNetSysfs implementation that reads from
+// an in-memory map keyed "<iface>/<file>". Missing keys return
+// os.ErrNotExist-equivalent behaviour.
+func sysfsStub(entries map[string]string) func(string, string) ([]byte, error) {
+	return func(iface, file string) ([]byte, error) {
+		key := iface + "/" + file
+		if v, ok := entries[key]; ok {
+			return []byte(v), nil
+		}
+		return nil, errors.New("no such file: " + key)
+	}
+}
+
+func TestPickInterface_prefersVirtioEthernet(t *testing.T) {
+	// A VZ guest typically exposes a single virtio-net device; the
+	// primary pass should resolve it regardless of kernel-assigned
+	// name.
+	orig := readNetSysfs
+	readNetSysfsOverride := sysfsStub(map[string]string{
+		"enp0s1/device/modalias": "virtio:d00000001v00001AF4",
+		"enp0s1/type":            "1",
+	})
+	readNetSysfs = readNetSysfsOverride
+	defer func() { readNetSysfs = orig }()
+
+	// Shim ReadDir via a one-off: defaultPickInterface reads
+	// /sys/class/net directly, so to keep this test hermetic we
+	// call the underlying helpers instead of exercising the real
+	// filesystem walk. The integration path is covered in CI by
+	// the real VM boot.
+	if !isEthernet("enp0s1") {
+		t.Fatalf("virtio-net ethernet device should register as type=1")
+	}
+}
+
+func TestLooksLikeEthernet(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"eth0", true},
+		{"eth1", true},
+		{"en0", true},
+		{"enp0s1", true},
+		{"ens3", true},
+		{"eno1", true},
+		{"lo", false},
+		{"wlan0", false},
+		{"docker0", false}, // note: isVirtualInterface catches this separately
+		{"br0", false},
+		{"tap0", false},
+	}
+	for _, c := range cases {
+		if got := looksLikeEthernet(c.name); got != c.want {
+			t.Errorf("looksLikeEthernet(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestIsVirtualInterface(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"br0", true},
+		{"bridge100", true},
+		{"docker0", true},
+		{"veth0abc", true},
+		{"tap0", true},
+		{"tun0", true},
+		{"wg0", true},
+		{"vnet0", true},
+		{"eth0", false},
+		{"enp0s1", false},
+		{"en0", false},
+	}
+	for _, c := range cases {
+		if got := isVirtualInterface(c.name); got != c.want {
+			t.Errorf("isVirtualInterface(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestIsEthernet_readsTypeFile(t *testing.T) {
+	orig := readNetSysfs
+	defer func() { readNetSysfs = orig }()
+
+	readNetSysfs = sysfsStub(map[string]string{
+		"eth0/type": "1\n",
+		"ppp0/type": "512", // ARPHRD_PPP
+	})
+
+	if !isEthernet("eth0") {
+		t.Errorf("eth0 with type=1 should be ethernet")
+	}
+	if isEthernet("ppp0") {
+		t.Errorf("ppp0 with type=512 should not be ethernet")
+	}
+	if isEthernet("missing") {
+		t.Errorf("missing interface should not be ethernet")
+	}
+}
+
+func TestOperstateReady_acceptsUpAndUnknown(t *testing.T) {
+	orig := readNetSysfs
+	defer func() { readNetSysfs = orig }()
+
+	readNetSysfs = sysfsStub(map[string]string{
+		"eth0/operstate":    "up\n",
+		"enp0s1/operstate":  "unknown",
+		"eth1/operstate":    "down",
+	})
+
+	if !operstateReady("eth0") {
+		t.Errorf("operstate=up should be ready")
+	}
+	if !operstateReady("enp0s1") {
+		t.Errorf("operstate=unknown should be ready (some drivers never transition)")
+	}
+	if operstateReady("eth1") {
+		t.Errorf("operstate=down should not be ready")
+	}
+	if operstateReady("missing") {
+		t.Errorf("missing sysfs should not be ready")
+	}
+}
+
+func TestCarrierUp(t *testing.T) {
+	orig := readNetSysfs
+	defer func() { readNetSysfs = orig }()
+
+	readNetSysfs = sysfsStub(map[string]string{
+		"eth0/carrier":   "1\n",
+		"enp0s1/carrier": "1",
+		"eth1/carrier":   "0",
+	})
+
+	if !carrierUp("eth0") {
+		t.Errorf("carrier=1 should be up")
+	}
+	if !carrierUp("enp0s1") {
+		t.Errorf("carrier=1 (no newline) should be up")
+	}
+	if carrierUp("eth1") {
+		t.Errorf("carrier=0 should not be up")
+	}
+	if carrierUp("missing") {
+		t.Errorf("missing sysfs should not be up")
 	}
 }

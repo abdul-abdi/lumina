@@ -9,15 +9,35 @@ Forward-looking plan. Shipped milestones move to [the release history](https://g
 - v0.5.0 — Agent-grade VM execution: concurrent exec, stdin piping, pre-warmed pools, unified NDJSON (pre-unified-envelope).
 - v0.4.x and earlier — initial runtime, sessions, images, volumes.
 
-## v0.7.1 — desktop boot reliability (shipped on `refactor/idiomatic-pass`)
+## v0.7.1 — desktop boot reliability + agent-path speed + visibility (shipping on `perf/boot-trace`, PR #28)
 
-Reliability-first release. Three headline fixes:
+Reliability-first release that grew to include agent-path network speed, observability wiring, and Desktop UX polish.
+
+**Reliability headline fixes:**
 
 - **Stable MAC per `.luminaVM` bundle.** Backfilled lazily on first boot; kills the vmnet DHCP-churn class of failures.
 - **Cancel-during-boot → clean retry.** `withTaskCancellationHandler` wrapping `vm.start(…)` releases the `flock()` on `disk.img` + `efi.vars` so the next boot starts cold.
 - **Pre-start delegate install.** Guest crashes in the 300–500 ms kernel-boot window now surface as `.crashed(reason:)` instead of hanging the UI at `.running`.
 
-Plus: USB mass-storage CD-ROM for Windows 11 ARM + install-phase disk-cache tuning (~2× faster partman), guest-agent Manager split + PTY leak fix on connection drop, cooperative-pool starvation regression gate, idle-TTL for orphaned sessions, serial tail in the Desktop boot window (no more framebuffer blind spot), custom agent images visible in the Desktop library, `AppModel.runningCount` as a named computed property.
+**Agent-path network rewrite:**
+
+- **`ip -batch -` + route verification + `network_error` wire msg.** Guest no longer silently emits `network_ready` when the route didn't actually land.
+- **Carrier-wait 2s → 400ms + `--no-wait-network`.** `lumina run "echo hello"` drops from ~3050ms to ~680ms (default-await) / ~540ms (opt-out).
+- **`LUMINA_BOOT_TRACE=1`** prints per-phase waterfall to stderr after every run.
+- **`network_metrics` wire msg + `RunResult.networkMetrics` + JSON envelope field.** Periodic per-NIC counter snapshots (rx/tx bytes/packets/errors) so agents can diagnose network failures without guessing.
+
+**Desktop UX (PR #28 addendum):**
+
+- **Tap-to-boot.** Clicking a stopped/crashed VM card or row opens the window AND kicks off `boot()`. Same behavior on the wizard's "Create VM" completion.
+- **Live boot-phase waterfall.** SwiftUI view mirrors `vm.bootPhases` at 150ms during `.booting`, plus post-mortem on `.crashed` so users can see which phase hit the wall.
+- **Agent Images grid/list parity.** `CustomImagesView` now respects the global `LayoutPicker`; new `ImageCard` / `CatalogCard` match `VMCard`'s visual weight. Tap a row/card → primary action (open in Terminal / pull).
+
+**Ops:**
+
+- **CI P99 bench workflow → `gh-pages:metrics.jsonl`.** Informational trend tracker (20 iterations, 2 modes, weekly + on-push). Does not gate PRs — `ci.yml` median ≤ 2000ms stays the hard tripwire.
+- **Session socket hardening.** `~/.lumina/sessions/<sid>/control.sock` is chmod'd to 0600, enclosing dir 0700. Other users on the host can no longer connect. `SessionServerTests.serverSocketIsOwnerOnly` regression guard.
+
+**Also:** USB mass-storage CD-ROM for Windows 11 ARM + install-phase disk-cache tuning (~2× faster partman), guest-agent Manager split + PTY leak fix on connection drop, cooperative-pool starvation regression gate, idle-TTL for orphaned sessions, serial tail in the Desktop boot window (no more framebuffer blind spot), `AppModel.runningCount` named computed property.
 
 ## v0.7.2 candidates (post-v0.7.1 follow-ups)
 
@@ -27,8 +47,11 @@ Plus: USB mass-storage CD-ROM for Windows 11 ARM + install-phase disk-cache tuni
 - **CLI-side ISO SHA-256 verification** — `lumina desktop create --iso` currently does arch pre-flight but not digest verification; the app wizard does. Mirror the verification into the CLI.
 - **Windows scancode remap at runtime** — apply `WindowsInputQuirks` table inside the running-VM input layer.
 - **Multi-display per VM** — `VZGraphicsDeviceConfiguration.displays` accepts arrays.
-- **Agent-path `BootPhases` instrumentation** — v0.7.1 wired `BootPhases` for the EFI path; the agent path still reports zeros. Either fill in the phase recording or delete the unused `agentReadyMs` field.
-- **Go integration tests for the guest agent** — v0.7.1 refactored the agent into per-responsibility packages but shipped without a test harness. A faked vsock peer + per-Manager tests would catch regressions manual smoke can't.
+- **Go integration tests for the guest agent** — v0.7.1 refactored the agent into per-responsibility packages; unit tests exist for the platform-neutral packages (`portfwd`, `execmgr`, `wire`, `protocol`, `network`) but `ptymgr` / `agent` have Linux-only syscalls that only cross-compile in CI. A faked-vsock-peer harness that runs the full agent locally would tighten the loop.
+- **Multi-NIC network metrics** — the v0.7.1 `network_metrics` wire msg uses a map-shape `interfaces: {<iface>: {...}}` so adding multi-NIC support is additive. Host-side UI + `RunResult` don't yet surface per-interface breakdowns beyond the raw map.
+- **Per-command delta metrics** — v0.7.1 `RunResult.networkMetrics` carries cumulative counters since interface-up. A delta mode (sample at exec-start and exec-end, report diff) would give agents the "how much network did this specific command do" number directly.
+- **`lumina-bench` CLI** — a first-class subcommand for on-demand perf runs with the same percentile math as `bench.yml`, so users can compare their host against the trend without pushing to CI.
+- **gh-pages dashboard HTML** — v0.7.1 ships the `metrics.jsonl` data stream but no visualization. A single-file HTML that fetches the JSONL via raw.githubusercontent and renders the P50/P95/P99 trend would make the dashboard real.
 
 ## In progress (none — v0.7.0 was the last in-progress release)
 

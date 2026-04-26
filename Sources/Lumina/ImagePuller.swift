@@ -3,13 +3,35 @@ import Foundation
 import CryptoKit
 
 /// Downloads pre-built VM images from GitHub Releases.
+///
+/// Tag selection order at pull time (first non-nil wins):
+///   1. explicit `tag:` passed to init()
+///   2. `LUMINA_IMAGE_TAG` environment variable
+///   3. latest GitHub release whose assets include `assetName`
+///   4. `fallbackTag` (hard-coded, bumped per host release)
+///
+/// This auto-resolution means a host built from recent `main` pulls
+/// the most recent image automatically — no more host-v0.7.x running
+/// against a v0.5.0 guest agent. Resolution is bounded to a 3-second
+/// API call; if GitHub is unreachable we fall back to the pinned tag
+/// so offline / air-gapped builds still work.
 public struct ImagePuller: Sendable {
     public static let defaultRepo = "abdul-abdi/lumina"
-    public static let defaultTag = "lumina-v0.5.0"
+    /// Last-resort tag when env override is absent and the GitHub
+    /// API can't be reached (offline, rate-limited, 5xx). Bump in
+    /// lockstep with the host release so the fallback never points
+    /// at a more-than-one-minor-version-older image.
+    public static let fallbackTag = "lumina-v0.7.0"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
 
+    /// Back-compat alias — older code reads `ImagePuller.defaultTag`.
+    /// Reports the fallback, not the resolved tag.
+    public static var defaultTag: String { fallbackTag }
+
     private let repo: String
-    private let tag: String
+    /// nil means "resolve at pull time" (env → API latest → fallback).
+    /// Non-nil means the caller pinned a specific tag explicitly.
+    private let tag: String?
     private let assetName: String
     private let imageStore: ImageStore
     /// When set, download this URL directly instead of constructing
@@ -26,7 +48,7 @@ public struct ImagePuller: Sendable {
 
     public init(
         repo: String = ImagePuller.defaultRepo,
-        tag: String = ImagePuller.defaultTag,
+        tag: String? = nil,
         assetName: String = ImagePuller.defaultAssetName,
         imageStore: ImageStore = ImageStore(),
         directURL: URL? = nil,
@@ -57,12 +79,15 @@ public struct ImagePuller: Sendable {
         // override both via init; defaults preserve v0.5.0 behaviour.
         let name = imageName ?? requestedName
         let releaseURL: String
+        let resolvedTag: String
         if let directURL {
             releaseURL = directURL.absoluteString
+            resolvedTag = tag ?? Self.fallbackTag  // display-only for errors
             progress("Downloading \(directURL.lastPathComponent) → image '\(name)'...")
         } else {
-            releaseURL = "https://github.com/\(repo)/releases/download/\(tag)/\(assetName)"
-            progress("Downloading \(assetName) from \(repo) (\(tag))...")
+            resolvedTag = await resolveTag(progress: progress)
+            releaseURL = "https://github.com/\(repo)/releases/download/\(resolvedTag)/\(assetName)"
+            progress("Downloading \(assetName) from \(repo) (\(resolvedTag))...")
         }
 
         // 1. Download the tarball
@@ -249,7 +274,7 @@ public struct ImagePuller: Sendable {
             return localURL
         case 404:
             throw PullError(
-                message: "Release '\(tag)' not found at \(repo). "
+                message: "Release not found at \(repo). "
                 + "Check https://github.com/\(repo)/releases for available versions."
             )
         case 403:
@@ -264,6 +289,88 @@ public struct ImagePuller: Sendable {
         default:
             throw PullError(message: "Unexpected HTTP status \(http.statusCode).")
         }
+    }
+
+    /// Resolve which GitHub release tag to pull from. Order:
+    ///   1. explicit `self.tag` set at init (pin mode — no network)
+    ///   2. `LUMINA_IMAGE_TAG` env var (easy override for testing)
+    ///   3. GitHub API latest release containing `assetName` (normal path)
+    ///   4. `Self.fallbackTag` (offline / rate-limited / unexpected error)
+    ///
+    /// The API call is bounded to 3 seconds. If it fails for any
+    /// reason, we log once and fall through to the hardcoded fallback
+    /// — never block the boot on a transient GitHub issue.
+    private func resolveTag(
+        progress: @Sendable (_ message: String) -> Void
+    ) async -> String {
+        if let explicit = tag { return explicit }
+        if let env = ProcessInfo.processInfo.environment["LUMINA_IMAGE_TAG"],
+           !env.isEmpty {
+            progress("Using image tag from LUMINA_IMAGE_TAG: \(env)")
+            return env
+        }
+        if let latest = await Self.resolveLatestTag(
+            repo: repo, assetName: assetName, timeout: 3.0
+        ) {
+            return latest
+        }
+        progress("GitHub API unreachable; using pinned fallback \(Self.fallbackTag)")
+        return Self.fallbackTag
+    }
+
+    /// Query GitHub's releases endpoint and return the most recent
+    /// release tag whose asset list includes `assetName`. Nil on any
+    /// failure — caller falls back to the pinned tag.
+    ///
+    /// We list `per_page=10` rather than hit `/latest` because a
+    /// release that doesn't ship the image asset (e.g. a CLI-only
+    /// patch release) would mislead `/latest` into 404-ing the image
+    /// download. Walking the first page handles that cleanly.
+    static func resolveLatestTag(
+        repo: String,
+        assetName: String,
+        timeout: TimeInterval = 3.0
+    ) async -> String? {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=10") else {
+            return nil
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            return nil
+        }
+
+        guard let http = response as? HTTPURLResponse,
+              http.statusCode == 200 else {
+            return nil
+        }
+
+        // Minimal decode: only the two fields we need off each release.
+        struct Asset: Decodable { let name: String }
+        struct Release: Decodable {
+            let tag_name: String
+            let draft: Bool?
+            let prerelease: Bool?
+            let assets: [Asset]
+        }
+
+        guard let releases = try? JSONDecoder().decode([Release].self, from: data) else {
+            return nil
+        }
+
+        // Skip drafts and pre-releases; pick first stable release
+        // carrying the image asset.
+        return releases.first(where: { release in
+            (release.draft ?? false) == false &&
+            (release.prerelease ?? false) == false &&
+            release.assets.contains(where: { $0.name == assetName })
+        })?.tag_name
     }
 
     private func hashFile(at url: URL) -> String {

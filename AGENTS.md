@@ -14,9 +14,11 @@ here reflects what ships in v0.7.1.
 
 - **Hardened network configure, default-await stays safe and is now fast.** Guest `internal/network/network.go` batches `ip link/addr/route` into one `ip -batch -` call, reads `/proc/net/route` to verify the default route actually landed, retries up to 3× on failure, and emits `network_error` with reason when setup truly breaks. `network_ready` carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings. Carrier wait ceiling shrunk 2s → 400ms. Net result: `lumina run "echo hello"` went from ~3050ms (pre-hardening) to ~680ms (P50, default-await, healthy host).
 - **`--no-wait-network` CLI flag / `RunOptions.awaitNetworkReady = false`.** Opt-out for workloads that know they don't touch DNS/TCP in the first ~20ms. Default stays `true` (reliable). Saves ~150ms on top of the already-fast default.
+- **Network metrics wire msg + `RunResult.networkMetrics` (new).** Guest agent emits `{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":N,"tx_bytes":N,"rx_errors":N,"tx_errors":N,"rx_packets":N,"tx_packets":N}}}` periodically (first sample at 500ms, then every 2s). Host caches the latest snapshot and surfaces it on `RunResult.networkMetrics` + the piped CLI envelope's `network_metrics` field. Map-shape (plural `interfaces`) — multi-NIC is additive without a wire migration. Counters are cumulative from interface-up; loopback excluded. Short commands that exit before the 500ms first-sample tick get `null` in the envelope — use this field as an opt-in diagnostic, not a contract.
 - **`LUMINA_BOOT_TRACE=1` stderr trace.** Agent-path boot reports phase breakdown: `image resolve / disk clone / config build / vz start / vsock connect / guest agent ready / total`. Use this when diagnosing slow boots — the hotspot is rarely where you'd guess.
 - **`BootPhases.isValid`** accessor distinguishes populated vs. agent-path-attached (zero-valued) BootPhases for UI gating.
 - **Session socket hardening.** `~/.lumina/sessions/<sid>/control.sock` is now mode `0600` and the session directory is `0700` — other users on the host can no longer connect to your session.
+- **CI P99 trend dashboard (informational).** `.github/workflows/bench.yml` appends 20-sample P50/P95/P99 rows to the `gh-pages:metrics.jsonl` branch on push to main + weekly schedule. Two modes tracked (default-await, `--no-wait-network`). Does NOT gate PRs — the hard 2000ms median regression gate stays in `ci.yml`. Shared macos-15 runners have ~20-30% run-to-run variance; read the trend, not single-commit deltas.
 
 ### Desktop boot reliability (also in v0.7.1)
 
@@ -27,7 +29,9 @@ here reflects what ships in v0.7.1.
 - **Windows 11 ARM** uses USB mass-storage for the installer ISO (`EFIBootConfig.preferUSBCDROM = true` for `osFamily == .windows`) instead of virtio-block; fixes "Windows cannot find media." `EFIBootConfig.installPhase` flips the primary disk sync mode to `.fsync` during first install for ~2× faster partman; reverts to `.full` on subsequent boots.
 - **Guest agent split** — `main.go` is now 48 lines (accept loop only); state lives in `*Manager` structs under `Guest/lumina-agent/internal/`. Heartbeat failure now also kills active PTY process groups (previously leaked).
 - **Idle-TTL sessions** — `lumina session start --ttl 30m` auto-shuts-down when idle (no client activity + zero active execs) for the TTL window. Default `0` disables.
-- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove".
+- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each card/row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove". v0.7.1 also: tap anywhere on the row/card to launch in Terminal (no button-hunt); the section now respects the global LayoutPicker and offers full grid/list parity with the VM library (`ImageCard` + `CatalogCard` match `VMCard`'s dimensions). Catalog entries support tap-to-pull, with dimmed state while another pull is in flight.
+- **Desktop tap-to-boot + auto-boot on create.** Clicking a stopped/crashed VM's card or row now opens the VM window AND kicks off `session.boot()` in one gesture — no intermediate "click BOOT" screen. The New-VM wizard does the same on completion: finish the wizard, the VM window is already open and booting. Re-entry guard (`Status.canBoot`) keeps concurrent taps idempotent.
+- **Boot-phase UI waterfall (new).** During the Desktop booting screen, a live SwiftUI waterfall renders each phase (`image resolve → disk clone → config build → vz start → vsock connect → guest agent ready`) as a proportional bar, filling in as phases complete (polled at 150ms from `await vm.bootPhases`). Same waterfall appears post-mortem on the crashed screen so you can see which phase was running when the VM fell over. EFI-path guests render a 3-bar subset (only `configMs`, `vzStartMs`, `totalMs` populate); the view self-gates on `BootPhases.isValid`.
 - **NetworkMode** — `manifest.json` can carry `"networkMode": {"mode": "nat"}` (default) or `"networkMode": {"mode": "bridged", "interfaceIdentifier": "en0"}`. Bridged requires `com.apple.vm.networking` entitlement (paid Apple Developer Program); ad-hoc builds reject the config at `validate()`.
 
 Notarization remains on the v0.7.2 runway; v0.7.1 ships ad-hoc signed.
@@ -273,6 +277,32 @@ object. This is the v0.6.0 unified envelope — do not assume NDJSON.
   "duration_ms": 31
 }
 ```
+
+v0.7.1+ piped envelopes may additionally carry a `network_metrics` field
+with the latest per-NIC counter snapshot observed during the run:
+
+```json
+{
+  "stdout": "...",
+  "stderr": "",
+  "exit_code": 0,
+  "duration_ms": 1842,
+  "network_metrics": {
+    "interfaces": {
+      "eth0": {
+        "rx_bytes": 124567, "tx_bytes": 8932,
+        "rx_packets": 87,   "tx_packets": 42,
+        "rx_errors": 0,     "tx_errors": 0
+      }
+    }
+  }
+}
+```
+
+Counters are cumulative since interface-up, not per-command deltas.
+The field is absent / `null` on short commands that exit before the
+guest's first metrics tick (~500ms) and on pre-v0.7.1 agents. Treat
+it as opt-in diagnostic, not a contract — missing field ≠ error.
 
 ### Error
 

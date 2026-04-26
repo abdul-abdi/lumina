@@ -310,6 +310,9 @@ struct DesktopBoot: AsyncParsableCommand {
     @Flag(name: .customLong("rosetta"), help: "Mount Rosetta as /run/lumina-rosetta inside Linux guests for x86_64 binary translation.")
     var rosetta = false
 
+    @Flag(name: .customLong("capture-serial"), help: "Bypass ISO GRUB, boot kernel+initramfs directly via VZLinuxBootLoader with console=hvc0 earlycon=hvc0. Use when --serial captures 0 bytes. Linux only; supported: Ubuntu/Debian/Alpine/Fedora/Arch arm64.")
+    var captureSerial = false
+
     mutating func run() async throws {
         var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
 
@@ -319,6 +322,62 @@ struct DesktopBoot: AsyncParsableCommand {
         if let data = try? Data(contentsOf: sidecar),
            let path = String(data: data, encoding: .utf8) {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        // --capture-serial: extract kernel + initramfs out of the ISO so
+        // we can boot via VZLinuxBootLoader with an hvc0 console. Only
+        // tractable when we actually have an ISO and a known layout.
+        var linuxDirectKernel: URL?
+        var linuxDirectInitramfs: URL?
+        var linuxDirectCmdline: String?
+        if captureSerial {
+            guard let iso = cdromURL else {
+                let msg = "error: --capture-serial needs an attached ISO (via `desktop create --iso`). "
+                    + "Nothing to extract from.\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                throw ExitCode(1)
+            }
+            let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
+            // Reset between ISO swaps so a previous distro's kernel /
+            // initramfs / vmlinuz-raw can't accidentally co-exist with
+            // the new layout's outputs.
+            try? FileManager.default.removeItem(at: artifacts)
+            try? FileManager.default.createDirectory(
+                at: artifacts, withIntermediateDirectories: true
+            )
+            do {
+                let extracted = try LinuxISOExtractor.extract(
+                    iso: iso, destination: artifacts
+                )
+                linuxDirectKernel = extracted.kernel
+                linuxDirectInitramfs = extracted.initramfs
+                // Base cmdline: hvc0 for serial output, earlycon for
+                // pre-init panic capture. Deliberately NOT `quiet` —
+                // the whole point of --capture-serial is to see what
+                // happens, and Alpine/Debian-style init scripts gate
+                // their progress prints on KOPT_quiet=no. Verbose
+                // serial is the feature, not a bug.
+                let base = "console=hvc0 earlycon=hvc0"
+                linuxDirectCmdline = extracted.cmdlineExtra.isEmpty
+                    ? base
+                    : base + " " + extracted.cmdlineExtra
+                let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
+                FileHandle.standardError.write(Data(info.utf8))
+            } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
+                let supported = LinuxISOExtractor.knownLayouts
+                    .map { $0.name }
+                    .joined(separator: ", ")
+                let msg = "error: --capture-serial: couldn't find a known kernel layout in \(iso.lastPathComponent). "
+                    + "Supported: \(supported). "
+                    + "Tried: \(tried.joined(separator: ", "))\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                throw ExitCode(1)
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "error: --capture-serial: ISO extraction failed: \(error)\n".utf8
+                ))
+                throw ExitCode(1)
+            }
         }
 
         // Ensure + persist a stable MAC on first boot. See
@@ -350,7 +409,10 @@ struct DesktopBoot: AsyncParsableCommand {
             primaryDisk: bundle.primaryDiskURL,
             cdromISO: cdromURL,
             preferUSBCDROM: isWindows,
-            installPhase: isInstallPhase
+            installPhase: isInstallPhase,
+            linuxDirectKernel: linuxDirectKernel,
+            linuxDirectInitramfs: linuxDirectInitramfs,
+            linuxDirectCmdline: linuxDirectCmdline
         ))
         if !headless {
             opts.graphics = GraphicsConfig(

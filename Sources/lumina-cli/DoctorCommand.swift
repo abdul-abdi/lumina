@@ -34,8 +34,16 @@ struct Doctor: AsyncParsableCommand {
     @Flag(name: .long, help: "Fix what's safe to fix automatically (orphan run-dirs). Reports everything else.")
     var fix: Bool = false
 
+    @Option(name: .long, help: "Inspect an ISO file instead of running host checks. Reports arch (arm64 / x86_64 / riscv64 / unknown), size, and boot-loader viability for VZ EFI.")
+    var iso: String? = nil
+
     func run() async throws {
-        let report = await generateReport(fix: fix)
+        let report: DoctorReport
+        if let iso {
+            report = inspectISO(path: iso)
+        } else {
+            report = await generateReport(fix: fix)
+        }
 
         let wantJSON = json || isatty(fileno(stdout)) == 0
         if wantJSON {
@@ -57,6 +65,135 @@ struct Doctor: AsyncParsableCommand {
         }
     }
 
+    // MARK: - ISO inspect
+
+    /// `lumina doctor --iso <path>` — focused preflight for an installer
+    /// ISO. Users hit this path after downloading an OS and before
+    /// committing to `lumina desktop create`; a 30-second check beats a
+    /// 30-second black-screen at the EFI firmware.
+    ///
+    /// Checks:
+    ///   - File exists + non-empty + plausible size
+    ///   - EFI boot architecture via ISOInspector.detectArchitecture() —
+    ///     scans first 5MB of the ISO for BOOTAA64/BOOTX64/BOOTRISCV64 EFI
+    ///     binary names. Rejects non-arm64 with a pointer at the fix.
+    ///
+    /// Intentionally omits signature/SHA-256 checks (that's `DesktopOSCatalog`
+    /// + `ISOVerifier`, driven by the wizard). Doctor is the hardware-
+    /// compat gate; the catalog is the integrity gate.
+    private func inspectISO(path: String) -> DoctorReport {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        var checks: [DoctorCheck] = []
+
+        // File existence + size.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            checks.append(DoctorCheck(
+                id: "iso-file",
+                severity: .error,
+                title: "ISO not found",
+                detail: "No file at \(url.path). Double-check the path."
+            ))
+            return DoctorReport(
+                generatedAt: Date(),
+                luminaVersion: "0.7.1",
+                host: hostInfo(),
+                checks: checks
+            )
+        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        if size < 32 * 1024 * 1024 {
+            checks.append(DoctorCheck(
+                id: "iso-size",
+                severity: .warning,
+                title: "ISO suspiciously small",
+                detail: "File is \(formatBytesLocal(size)). A legitimate installer ISO is typically 150 MB+. Partial download?"
+            ))
+        } else {
+            checks.append(DoctorCheck(
+                id: "iso-size",
+                severity: .info,
+                title: "ISO size \(formatBytesLocal(size))",
+                detail: "Within the normal range for an installer ISO."
+            ))
+        }
+
+        // Architecture gate — the big one. ISOInspector scans the first
+        // ~5MB of the image for EFI bootloader filenames; cheap, bounded,
+        // and authoritative for the common case (all mainstream arm64
+        // distros put BOOTAA64.EFI in the first MB).
+        let arch: ISOInspector.Architecture
+        do {
+            arch = try ISOInspector.detectArchitecture(at: url)
+        } catch {
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "Couldn't read ISO",
+                detail: "\(error). File may be unreadable, corrupted, or a non-ISO container."
+            ))
+            return DoctorReport(
+                generatedAt: Date(),
+                luminaVersion: "0.7.1",
+                host: hostInfo(),
+                checks: checks
+            )
+        }
+
+        switch arch {
+        case .arm64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .info,
+                title: "ARM64 (aarch64) EFI bootloader detected",
+                detail: "BOOTAA64.EFI present. This ISO should boot in Lumina Desktop."
+            ))
+        case .x86_64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "x86_64 ISO — will not boot",
+                detail:
+                    "BOOTX64.EFI present. Apple Silicon's Virtualization.framework does not emulate x86. "
+                    + "Download the ARM64 / AArch64 build from the vendor and retry "
+                    + "(Microsoft: 'Windows 11 ARM64 ISO', Ubuntu: 'arm64 server install image', "
+                    + "Debian: 'netinst arm64')."
+            ))
+        case .riscv64:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .error,
+                title: "RISC-V 64 ISO — will not boot",
+                detail: "BOOTRISCV64.EFI present. VZ on Apple Silicon only boots arm64 guests."
+            ))
+        case .unknown:
+            checks.append(DoctorCheck(
+                id: "iso-arch",
+                severity: .warning,
+                title: "Architecture could not be determined",
+                detail:
+                    "No known EFI bootloader name (BOOTAA64/BOOTX64/BOOTRISCV64) found in the first 5MB. "
+                    + "Some legitimate ISOs put the EFI binary deeper and still boot fine. "
+                    + "Safe to try — if EFI sits at a black screen for 30s+ the ISO is probably unsuitable."
+            ))
+        }
+
+        return DoctorReport(
+            generatedAt: Date(),
+            luminaVersion: "0.7.1",
+            host: hostInfo(),
+            checks: checks
+        )
+    }
+
+    private func formatBytesLocal(_ bytes: UInt64) -> String {
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+        } else if bytes >= 1_048_576 {
+            return String(format: "%.0f MB", Double(bytes) / 1_048_576)
+        }
+        return "\(bytes) B"
+    }
+
     // MARK: - Report generation
 
     private func generateReport(fix: Bool) async -> DoctorReport {
@@ -70,7 +207,9 @@ struct Doctor: AsyncParsableCommand {
         step("entitlements") { checkEntitlements() }
         step("memory") { checkMemoryPressure() }
         step("vz-processes") { checkCompetingVZProcesses() }
+        step("vmnet-holders") { checkCompetingVmnetHolders() }
         step("vmnet") { checkVmnetBridges() }
+        step("vmnet-leak") { checkVmnetInterfaceLeak() }
         step("images") { checkImages() }
         if ProcessInfo.processInfo.environment["LUMINA_DOCTOR_TRACE"] == "1" {
             FileHandle.standardError.write(Data("doctor: sessions…\n".utf8))
@@ -262,6 +401,130 @@ struct Doctor: AsyncParsableCommand {
                 detail: "Heavy VZ contention. vmnet-NAT may degrade (bridge allocations become flaky). Consider stopping unused VMs."
             )
         }
+    }
+
+    /// Other tools that hold vmnet NAT state collide with VZ's attempt
+    /// to allocate its own bridge on the same subnet. Apple's `container`
+    /// CLI with `--variant reserved` is the one observed in the wild.
+    /// When it's running, `lumina run` silently gets a bridge with no
+    /// IPv4; guest boots, gets an IP, but every outbound packet fails
+    /// with "Network unreachable." The symptom is invisible until you
+    /// `nslookup` from inside the guest — exactly the class of failure
+    /// this doctor entry exists to make loud.
+    private func checkCompetingVmnetHolders() -> DoctorCheck {
+        let result = runAndCapture(path: "/bin/ps", args: ["ax", "-o", "pid,command"])
+        if result.exitCode != 0 {
+            return DoctorCheck(id: "vmnet-holders", severity: .info,
+                               title: "vmnet holders", detail: "ps unavailable; skipped")
+        }
+
+        // Each entry: (matching-process-substring, friendly-name, fix hint).
+        let knownHolders: [(needle: String, name: String, hint: String)] = [
+            (
+                needle: "container-network-vmnet",
+                name: "Apple `container` CLI",
+                hint: "Run `container system stop` to release vmnet. Restart later with `container system start` when you need container again."
+            ),
+        ]
+
+        var found: [(String, String, String)] = []
+        for line in result.stdout.split(separator: "\n") {
+            let s = String(line)
+            for h in knownHolders where s.contains(h.needle) {
+                found.append((h.name, h.hint, s.trimmingCharacters(in: .whitespaces)))
+                break
+            }
+        }
+
+        if found.isEmpty {
+            return DoctorCheck(
+                id: "vmnet-holders",
+                severity: .info,
+                title: "No competing vmnet holders",
+                detail: "No known NAT-reserving processes running."
+            )
+        }
+
+        let names = found.map { $0.0 }.joined(separator: ", ")
+        let hints = found.map { "- \($0.0): \($0.1)" }.joined(separator: "\n")
+        return DoctorCheck(
+            id: "vmnet-holders",
+            severity: .error,
+            title: "Competing vmnet holder(s): \(names)",
+            detail:
+                "Another tool has reserved vmnet's NAT subnet. VZ will silently fail to allocate a bridge IP; "
+                + "every `lumina run` will appear to boot but outbound packets will hit 'Network unreachable'. "
+                + "Fix:\n\(hints)"
+        )
+    }
+
+    /// Count leaked `vmenetNN` interfaces. Each VZ VM boot pairs a
+    /// host-side `bridgeNN` (ephemeral) with a guest-side `vmenetNN`.
+    /// On clean shutdown both are destroyed. On crash or hard-kill the
+    /// `vmenet*` leaks and accumulates across runs. Past ~20 leaked
+    /// interfaces, vmnet's allocator starts refusing new bridges and
+    /// VZ NAT attachments come up with no IPv4 — same silent-fail
+    /// signature as the competing-holder case above.
+    ///
+    /// The only clean recovery is a host reboot (`ifconfig vmenet*
+    /// destroy` needs sudo and doesn't always work on newer kernels).
+    /// Flagging loudly here is the difference between a user spending
+    /// an afternoon chasing a Lumina bug and spending 30 seconds
+    /// rebooting.
+    private func checkVmnetInterfaceLeak() -> DoctorCheck {
+        let result = runAndCapture(path: "/sbin/ifconfig", args: ["-a"])
+        if result.exitCode != 0 {
+            return DoctorCheck(id: "vmnet-leak", severity: .info,
+                               title: "vmnet leak check skipped",
+                               detail: "ifconfig unavailable")
+        }
+
+        var vmenetCount = 0
+        for line in result.stdout.split(separator: "\n") {
+            // Interface lines start at column 0 with the name + ":".
+            let s = String(line)
+            if s.hasPrefix("vmenet") {
+                vmenetCount += 1
+            }
+        }
+
+        if vmenetCount == 0 {
+            return DoctorCheck(
+                id: "vmnet-leak",
+                severity: .info,
+                title: "No leaked vmenet interfaces",
+                detail: "Clean vmnet state."
+            )
+        }
+        if vmenetCount < 8 {
+            return DoctorCheck(
+                id: "vmnet-leak",
+                severity: .info,
+                title: "\(vmenetCount) vmenet interface(s) present",
+                detail: "Normal — in-flight VMs each register one."
+            )
+        }
+        if vmenetCount < 20 {
+            return DoctorCheck(
+                id: "vmnet-leak",
+                severity: .warning,
+                title: "\(vmenetCount) vmenet interfaces — accumulating",
+                detail:
+                    "Some prior VM shutdowns leaked their guest-side vmnet interface. Not yet fatal but close. "
+                    + "If networking starts silently failing, reboot to flush vmnet state."
+            )
+        }
+        return DoctorCheck(
+            id: "vmnet-leak",
+            severity: .error,
+            title: "\(vmenetCount) leaked vmenet interfaces — vmnet is saturated",
+            detail:
+                "vmnet's bridge allocator won't give VZ a working IPv4 bridge in this state. "
+                + "Every `lumina run` will silently boot but outbound packets will hit 'Network unreachable'. "
+                + "The only reliable fix is to reboot the host — `ifconfig vmenetN destroy` requires root "
+                + "and doesn't always stick on newer macOS kernels. After reboot, re-run `lumina doctor` "
+                + "to confirm the count drops to 0."
+        )
     }
 
     private func checkVmnetBridges() -> DoctorCheck {
