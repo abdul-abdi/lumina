@@ -51,6 +51,38 @@ import Testing
         #expect(names.contains("Fedora Live / netinst"))
     }
 
+    @Test func alpineLayoutsForceISO9660AndVirtioBlkModules() {
+        // Regression guard. Alpine's init script reads /proc/cmdline
+        // through an explicit allowlist (`myopts` — verified on 3.23
+        // initramfs); `alpine_dev` and `modloop` are NOT in it and
+        // silently drop. What IS honoured is `modules=`, which the
+        // init does an early modprobe -a on. nlplug-findfs (Alpine's
+        // block-device scanner) needs iso9660 + virtio_blk to see and
+        // mount the attached ISO. Drop these from the cmdline and
+        // the init reaches switch_root with an empty $sysroot →
+        // `switch_root: can't execute '/sbin/init'` panic.
+        let alpine = LinuxISOExtractor.knownLayouts.filter {
+            $0.name.hasPrefix("Alpine")
+        }
+        for layout in alpine {
+            #expect(layout.cmdlineExtra.contains("modules="),
+                    "\(layout.name) missing modules= prefix")
+            #expect(layout.cmdlineExtra.contains("iso9660"),
+                    "\(layout.name) missing iso9660 module — nlplug-findfs can't mount the ISO without it")
+            #expect(layout.cmdlineExtra.contains("virtio_blk"),
+                    "\(layout.name) missing virtio_blk module — nlplug-findfs can't see the ISO device without it")
+            #expect(layout.cmdlineExtra.contains("squashfs"),
+                    "\(layout.name) missing squashfs module — modloop is a squashfs")
+        }
+    }
+
+    @Test func ubuntuLayoutHasCasperBoot() {
+        // boot=casper invokes the live-boot init scripts; without it
+        // Ubuntu live ISOs panic on init.
+        let ubuntu = LinuxISOExtractor.knownLayouts.first { $0.name == "Ubuntu live/server" }
+        #expect(ubuntu?.cmdlineExtra.contains("boot=casper") == true)
+    }
+
     @Test func unwrapEFIZBoot_passesThroughNonZbootKernels() throws {
         // Any file whose bytes at offset 4 aren't "zimg" is returned
         // unchanged. We fake a raw arm64 Image by writing the right

@@ -39,26 +39,101 @@ public struct LinuxISOExtractor: Sendable {
     }
 
     /// Pair of URLs to the extracted kernel + initramfs inside the
-    /// destination directory. Caller is responsible for deleting the
-    /// directory when the VM shuts down.
+    /// destination directory plus the per-distro kernel cmdline
+    /// snippet that has to run alongside `console=hvc0` for the boot
+    /// to actually reach userspace. Caller is responsible for deleting
+    /// the directory when the VM shuts down.
     public struct Extracted: Sendable, Equatable {
         public let kernel: URL
         public let initramfs: URL
         /// Name of the matched layout (e.g. "Alpine standard (LTS)").
-        /// Useful for log messages and test assertions.
         public let layoutName: String
+        /// Distro-specific cmdline append. Empty for layouts where the
+        /// kernel default is sufficient. Caller appends this to the
+        /// base `console=hvc0 earlycon=hvc0 quiet`.
+        public let cmdlineExtra: String
     }
 
     /// Candidate kernel-path / initramfs-path pairs, tried in order.
     /// Paths are relative to the ISO root, no leading slash. Matched
     /// by exact substring in `bsdtar -tf` output.
-    public static let knownLayouts: [(kernel: String, initramfs: String, name: String)] = [
-        ("casper/vmlinuz",                     "casper/initrd",                         "Ubuntu live/server"),
-        ("install.a64/vmlinuz",                "install.a64/initrd.gz",                 "Debian arm64 netinst"),
-        ("boot/vmlinuz-lts",                   "boot/initramfs-lts",                    "Alpine standard (LTS)"),
-        ("boot/vmlinuz-virt",                  "boot/initramfs-virt",                   "Alpine virt"),
-        ("images/pxeboot/vmlinuz",             "images/pxeboot/initrd.img",             "Fedora Live / netinst"),
-        ("arch/boot/aarch64/vmlinuz-linux",    "arch/boot/aarch64/initramfs-linux.img", "Arch arm64"),
+    ///
+    /// `cmdlineExtra` is the distro-specific kernel cmdline glue
+    /// needed alongside `console=hvc0` to actually reach userspace.
+    /// Without these snippets the kernel boots, the initramfs runs,
+    /// and then `switch_root` fails because the live-init scripts
+    /// can't locate their squashfs/casper/install media. We learned
+    /// this empirically by capturing the panic line on Alpine 3.23.
+    ///
+    /// Per-distro hints (verified against shipping ISOs as of 2026-04):
+    ///   - Alpine: Lumina attaches the installer ISO as a virtio-block
+    ///     device (`/dev/vdb` — `vda` is the primary disk), NOT as a
+    ///     `/dev/cdrom`/`/dev/sr0` SCSI cd-rom. Alpine's mkinitfs init
+    ///     script's media-discovery defaults assume the latter, so we
+    ///     have to point it at vdb directly: `alpine_dev=vdb:iso9660`.
+    ///     `modloop=/boot/modloop-lts` then tells the init script where
+    ///     the squashfs lives on that mount, and `modules=...` ensures
+    ///     the loop+squashfs modules are available in the initramfs
+    ///     stage so the modloop can be mounted at all.
+    ///   - Ubuntu (casper): `boot=casper` activates the live-boot
+    ///     init script set; `live-media-path=/casper` points it at
+    ///     the right directory inside the ISO.
+    ///   - Debian (install.a64): the d-i kernel auto-detects most
+    ///     things; no extra cmdline is needed for serial-mode
+    ///     installs (we still pass `quiet` and the operator can
+    ///     remove it).
+    ///   - Fedora (pxeboot): `root=live:CDLABEL=Fedora-...` is
+    ///     ISO-label-specific and we don't know it ahead of time.
+    ///     Pass `inst.stage2=hd:LABEL=Fedora` and let dracut search
+    ///     by label prefix; works on most spins.
+    ///   - Arch arm64: `archisobasedir=arch` plus the search-by-label
+    ///     mechanism in archiso's mkinitcpio hook (`archisosearch`),
+    ///     same fallback story as Fedora.
+    public static let knownLayouts: [(kernel: String, initramfs: String, name: String, cmdlineExtra: String)] = [
+        (
+            "casper/vmlinuz",
+            "casper/initrd",
+            "Ubuntu live/server",
+            "boot=casper live-media-path=/casper"
+        ),
+        (
+            "install.a64/vmlinuz",
+            "install.a64/initrd.gz",
+            "Debian arm64 netinst",
+            ""  // d-i kernel doesn't need extra hints for the serial path
+        ),
+        (
+            "boot/vmlinuz-lts",
+            "boot/initramfs-lts",
+            "Alpine standard (LTS)",
+            // Alpine's init script's `myopts` allowlist (parsed from
+            // /proc/cmdline) does NOT include `alpine_dev` or
+            // `modloop` keys — verified empirically on 3.23 — so
+            // those silently drop. What it DOES honour is `modules=`,
+            // which forces an early `modprobe -a` of the listed
+            // modules. We list iso9660 + virtio-blk so nlplug-findfs
+            // (Alpine's actual block-device-and-boot-media scanner)
+            // can see and mount the attached ISO.
+            "modules=iso9660,virtio_blk,loop,squashfs,sd-mod,usb-storage,ext4"
+        ),
+        (
+            "boot/vmlinuz-virt",
+            "boot/initramfs-virt",
+            "Alpine virt",
+            "modules=iso9660,virtio_blk,loop,squashfs,sd-mod,usb-storage,ext4"
+        ),
+        (
+            "images/pxeboot/vmlinuz",
+            "images/pxeboot/initrd.img",
+            "Fedora Live / netinst",
+            "inst.stage2=hd:LABEL=Fedora rd.live.image"
+        ),
+        (
+            "arch/boot/aarch64/vmlinuz-linux",
+            "arch/boot/aarch64/initramfs-linux.img",
+            "Arch arm64",
+            "archisobasedir=arch archisosearch"
+        ),
     ]
 
     /// Find a matching layout via `bsdtar -tf`, then extract it via
@@ -78,7 +153,7 @@ public struct LinuxISOExtractor: Sendable {
 
         // 2. Find a matching layout.
         var tried: [String] = []
-        var matched: (layout: (kernel: String, initramfs: String, name: String), kernel: String, initramfs: String)? = nil
+        var matched: (layout: (kernel: String, initramfs: String, name: String, cmdlineExtra: String), kernel: String, initramfs: String)? = nil
         for layout in knownLayouts {
             tried.append(layout.kernel)
             // bsdtar may list paths with or without a leading "./" or
@@ -136,7 +211,8 @@ public struct LinuxISOExtractor: Sendable {
         return Extracted(
             kernel: kernelURL,
             initramfs: initrdURL,
-            layoutName: matched.layout.name
+            layoutName: matched.layout.name,
+            cmdlineExtra: matched.layout.cmdlineExtra
         )
     }
 

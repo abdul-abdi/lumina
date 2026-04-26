@@ -347,15 +347,18 @@ struct DesktopBoot: AsyncParsableCommand {
                 )
                 linuxDirectKernel = extracted.kernel
                 linuxDirectInitramfs = extracted.initramfs
-                // Generic cmdline that works for every supported distro:
-                // root= comes from the initramfs; console=hvc0 is what we
-                // wanted; earlycon=hvc0 picks up panic messages pre-init;
-                // quiet suppresses driver spam so the useful stuff isn't
-                // buried.
-                linuxDirectCmdline = "console=hvc0 earlycon=hvc0 quiet"
-                FileHandle.standardError.write(Data(
-                    "--capture-serial: extracted kernel+initramfs from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n".utf8
-                ))
+                // Base cmdline: hvc0 for serial output, earlycon for
+                // pre-init panic capture. Deliberately NOT `quiet` —
+                // the whole point of --capture-serial is to see what
+                // happens, and Alpine/Debian-style init scripts gate
+                // their progress prints on KOPT_quiet=no. Verbose
+                // serial is the feature, not a bug.
+                let base = "console=hvc0 earlycon=hvc0"
+                linuxDirectCmdline = extracted.cmdlineExtra.isEmpty
+                    ? base
+                    : base + " " + extracted.cmdlineExtra
+                let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
+                FileHandle.standardError.write(Data(info.utf8))
             } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
                 let msg = "error: --capture-serial: couldn't find a known kernel layout in \(iso.lastPathComponent). "
                     + "Supported: Ubuntu live/server, Debian netinst, Alpine standard, Fedora Live, Arch arm64. "
