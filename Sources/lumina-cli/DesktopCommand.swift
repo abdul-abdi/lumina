@@ -338,6 +338,10 @@ struct DesktopBoot: AsyncParsableCommand {
                 throw ExitCode(1)
             }
             let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
+            // Reset between ISO swaps so a previous distro's kernel /
+            // initramfs / vmlinuz-raw can't accidentally co-exist with
+            // the new layout's outputs.
+            try? FileManager.default.removeItem(at: artifacts)
             try? FileManager.default.createDirectory(
                 at: artifacts, withIntermediateDirectories: true
             )
@@ -360,8 +364,11 @@ struct DesktopBoot: AsyncParsableCommand {
                 let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
                 FileHandle.standardError.write(Data(info.utf8))
             } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
+                let supported = LinuxISOExtractor.knownLayouts
+                    .map { $0.name }
+                    .joined(separator: ", ")
                 let msg = "error: --capture-serial: couldn't find a known kernel layout in \(iso.lastPathComponent). "
-                    + "Supported: Ubuntu live/server, Debian netinst, Alpine standard, Fedora Live, Arch arm64. "
+                    + "Supported: \(supported). "
                     + "Tried: \(tried.joined(separator: ", "))\n"
                 FileHandle.standardError.write(Data(msg.utf8))
                 throw ExitCode(1)

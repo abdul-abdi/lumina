@@ -66,22 +66,20 @@ public struct LinuxISOExtractor: Sendable {
     /// this empirically by capturing the panic line on Alpine 3.23.
     ///
     /// Per-distro hints (verified against shipping ISOs as of 2026-04):
-    ///   - Alpine: Lumina attaches the installer ISO as a virtio-block
-    ///     device (`/dev/vdb` — `vda` is the primary disk), NOT as a
-    ///     `/dev/cdrom`/`/dev/sr0` SCSI cd-rom. Alpine's mkinitfs init
-    ///     script's media-discovery defaults assume the latter, so we
-    ///     have to point it at vdb directly: `alpine_dev=vdb:iso9660`.
-    ///     `modloop=/boot/modloop-lts` then tells the init script where
-    ///     the squashfs lives on that mount, and `modules=...` ensures
-    ///     the loop+squashfs modules are available in the initramfs
-    ///     stage so the modloop can be mounted at all.
+    ///   - Alpine: the init script's `myopts` allowlist (parsed from
+    ///     /proc/cmdline) does NOT include `alpine_dev` or `modloop`
+    ///     keys — verified empirically on 3.23 — so those silently
+    ///     drop. What it DOES honour is `modules=`, which forces an
+    ///     early `modprobe -a` of the listed modules. We list iso9660
+    ///     + virtio-blk so nlplug-findfs (Alpine's actual
+    ///     block-device-and-boot-media scanner) can see and mount the
+    ///     attached ISO.
     ///   - Ubuntu (casper): `boot=casper` activates the live-boot
     ///     init script set; `live-media-path=/casper` points it at
     ///     the right directory inside the ISO.
     ///   - Debian (install.a64): the d-i kernel auto-detects most
     ///     things; no extra cmdline is needed for serial-mode
-    ///     installs (we still pass `quiet` and the operator can
-    ///     remove it).
+    ///     installs.
     ///   - Fedora (pxeboot): `root=live:CDLABEL=Fedora-...` is
     ///     ISO-label-specific and we don't know it ahead of time.
     ///     Pass `inst.stage2=hd:LABEL=Fedora` and let dracut search

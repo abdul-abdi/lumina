@@ -262,9 +262,9 @@ public struct EFIBootConfig: Sendable, Equatable {
     ///
     /// Tradeoff: the caller must supply a kernel + initramfs that match
     /// the ISO's rootfs. `LuminaBootable.LinuxISOExtractor` is the
-    /// helper that pulls them out via hdiutil; it supports Ubuntu
-    /// live/casper, Debian netinst, Alpine standard, and Fedora Live
-    /// layouts. Windows and other OSes fall through to the default
+    /// helper that pulls them out via `bsdtar` (see
+    /// `LinuxISOExtractor.knownLayouts` for the supported distro
+    /// matrix). Windows and other OSes fall through to the default
     /// VZEFIBootLoader path.
     public var linuxDirectKernel: URL?
     public var linuxDirectInitramfs: URL?

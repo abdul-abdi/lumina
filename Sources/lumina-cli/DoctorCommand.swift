@@ -155,7 +155,7 @@ struct Doctor: AsyncParsableCommand {
                 detail:
                     "BOOTX64.EFI present. Apple Silicon's Virtualization.framework does not emulate x86. "
                     + "Download the ARM64 / AArch64 build from the vendor and retry "
-                    + "(Microsoft: 'Windows 11 ARM64 VHDX/ISO', Ubuntu: 'arm64 server install image', "
+                    + "(Microsoft: 'Windows 11 ARM64 ISO', Ubuntu: 'arm64 server install image', "
                     + "Debian: 'netinst arm64')."
             ))
         case .riscv64:

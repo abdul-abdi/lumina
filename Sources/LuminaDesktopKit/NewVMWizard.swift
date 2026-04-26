@@ -643,7 +643,7 @@ public struct NewVMWizard: View {
             model.pendingError = """
             \(tile.displayName) needs an arm64 installer, but this file is x86_64.
             Apple Silicon's Virtualization.framework can't boot x86 guests; Lumina won't emulate a CPU architecture.
-            Download the ARM64 / AArch64 build from the vendor (Microsoft: "Windows 11 ARM64 VHDX/ISO", Ubuntu: "arm64 server install image", Debian: "netinst arm64") and re-attach.
+            Download the ARM64 / AArch64 build from the vendor (Microsoft: "Windows 11 ARM64 ISO", Ubuntu: "arm64 server install image", Debian: "netinst arm64") and re-attach.
             """
             return false
         case .riscv64:
