@@ -272,6 +272,75 @@ import Testing
         var value: T?
     }
 
+    @Test func debian_firstBoot_routesPrimaryConsoleToFramebuffer() throws {
+        // Linux uses the LAST `console=` flag as /dev/console — that's
+        // where the userland text UI (d-i) goes. We need tty0 (the
+        // virtio framebuffer) to be primary so the user can see the
+        // installer; hvc0 stays in the list so the kernel ring buffer
+        // also reaches serial.log for diagnostics.
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let iso = URL(fileURLWithPath: "/fake/debian.iso")
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/k"),
+                    initramfs: URL(fileURLWithPath: "/fake/i"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, _ in URL(fileURLWithPath: "/fake/initrd.preseeded") },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend
+        )
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+        let cmdline = try #require(plan.linuxDirectCmdline)
+        // Order matters. Last console= wins as /dev/console.
+        let hvc0Range = cmdline.range(of: "console=hvc0")
+        let tty0Range = cmdline.range(of: "console=tty0")
+        let hvc0 = try #require(hvc0Range)
+        let tty0 = try #require(tty0Range)
+        #expect(hvc0.lowerBound < tty0.lowerBound, "console=tty0 must come AFTER console=hvc0 so the framebuffer is the userland console")
+    }
+
+    @Test func captureSerial_routesPrimaryConsoleToSerial() throws {
+        // --capture-serial is the explicit "I want serial-direct boot"
+        // flag — the framebuffer staying dark is the documented
+        // tradeoff. /dev/console must be hvc0 here.
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "fedora-39")
+        let iso = URL(fileURLWithPath: "/fake/fedora.iso")
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/k"),
+                    initramfs: URL(fileURLWithPath: "/fake/i"),
+                    layoutName: "Fedora Live",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: Self.unreachableDeps.injectPreseed,
+            generateAutounattend: Self.unreachableDeps.generateAutounattend
+        )
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: true,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+        let cmdline = try #require(plan.linuxDirectCmdline)
+        let hvc0Range = cmdline.range(of: "console=hvc0")
+        let tty0Range = cmdline.range(of: "console=tty0")
+        let hvc0 = try #require(hvc0Range)
+        let tty0 = try #require(tty0Range)
+        #expect(tty0.lowerBound < hvc0.lowerBound, "for --capture-serial, console=hvc0 must come last so /dev/console=hvc0")
+    }
+
     @Test func kali_firstBoot_usesKaliMirrorInPreseed() throws {
         // The default Debian preseed points at deb.debian.org which
         // doesn't host Kali suites — install fails mid-APT. The

@@ -194,10 +194,29 @@ public func prepareFirstBoot(
         // overwrites this with the patched copy.
         var initrdURL = extracted.initramfs
 
-        // earlycon=hvc0 lets the kernel start writing to virtio-serial
-        // before init runs — without it the first ~10s of boot are
-        // invisible. Cheap and load-bearing for capture-serial diagnosis.
-        var cmdlineParts = ["console=hvc0", "earlycon=hvc0"]
+        // Linux uses the LAST `console=` flag as /dev/console — that's
+        // where userland (d-i, login, etc.) writes. Both consoles also
+        // receive the kernel ring buffer, so serial.log gets populated
+        // either way.
+        //
+        //   captureSerial=false (auto-preseed):
+        //     console=hvc0 console=tty0 → /dev/console=tty0 → d-i UI
+        //     renders on the framebuffer; serial.log still captures the
+        //     kernel ring buffer.
+        //
+        //   captureSerial=true (--capture-serial):
+        //     console=tty0 console=hvc0 → /dev/console=hvc0 → d-i UI
+        //     goes to serial. Framebuffer is dark — explicit tradeoff
+        //     of the flag.
+        //
+        // earlycon=hvc0 stays in both: it provides the kernel a console
+        // before init runs, so the first ~10s of boot still hit serial.log.
+        var cmdlineParts: [String]
+        if captureSerial {
+            cmdlineParts = ["earlycon=hvc0", "console=tty0", "console=hvc0"]
+        } else {
+            cmdlineParts = ["earlycon=hvc0", "console=hvc0", "console=tty0"]
+        }
         if !extracted.cmdlineExtra.isEmpty {
             cmdlineParts.append(extracted.cmdlineExtra)
         }
