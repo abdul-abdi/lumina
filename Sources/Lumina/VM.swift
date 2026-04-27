@@ -813,6 +813,21 @@ public actor VM {
         return now
     }
 
+    // MARK: - Deprecated Result Wrapper
+
+    /// Deprecated `Result`-returning wrapper around `boot()`. Kept for one
+    /// release to avoid silently breaking library callers that linked
+    /// against v0.7.1 or earlier. Migrate to `try await vm.boot()`.
+    @available(*, deprecated, renamed: "boot()", message: "Use try await vm.boot() — the throwing API matches every other VM method.")
+    public func bootResult() async -> Result<Void, LuminaError> {
+        do {
+            try await boot()
+            return .success(())
+        } catch {
+            return .failure(error)
+        }
+    }
+
     // MARK: - File Transfer
 
     /// Upload files to the guest. Must be called after boot().
