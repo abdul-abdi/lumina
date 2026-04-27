@@ -219,6 +219,18 @@ public actor VM {
         )
     }
 
+    /// Boot the VM and complete the vsock handshake. After this returns
+    /// successfully, `exec()` works against the guest agent.
+    ///
+    /// **Network contract (v0.7.2+):** `boot()` does NOT configure the
+    /// NAT eth0 interface. The default eth0 link comes up with carrier
+    /// but no IP/route. Call `configureNetwork()` explicitly if you
+    /// need NAT outbound (DNS, internet). Every convenience entry point
+    /// (`Lumina.run`, `Lumina.stream`, `Lumina.createImage`,
+    /// `SessionProcess`, `Pool`, `Network.session`) does this for you.
+    /// Callers driving `VM` directly must do it themselves — the
+    /// previous udhcpc fallback in the guest init was removed in v0.7.2
+    /// because it raced the host-driven config.
     public func boot() async throws(LuminaError) {
         guard _state == .idle else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot boot from state: \(_state)"))

@@ -39,6 +39,13 @@ public actor Network {
         let vm = VM(options: vmOpts)
         try await vm.boot()
 
+        // Configure the NAT eth0 interface (host-driven; replaces the
+        // udhcpc fallback that was removed from the guest init in
+        // v0.7.2). Network.swift VMs still want NAT outbound for
+        // package installs / DNS even though VM-to-VM traffic flows
+        // over the private eth1 set up via kernel cmdline.
+        try await vm.configureNetwork()
+
         sessions.append((name: sessionName, ip: ip, vm: vm))
 
         if sessions.count == 2 {

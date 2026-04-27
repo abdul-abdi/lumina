@@ -240,12 +240,20 @@ fi
   echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null
 
   # NOTE: udhcpc was previously invoked here as a fallback DHCP
-  # client. Removed in v0.7.2 — the host driver always sends
-  # `configure_network` over vsock (Lumina.run, Lumina.stream,
-  # Lumina.createImage, SessionProcess, Pool, Network all call it),
-  # which is faster and authoritative. udhcpc raced the host
-  # driver, occasionally installed a different IP/route than the
-  # host requested, and added 30–80 ms of churn on every boot.
+  # client. Removed in v0.7.2 — every internal caller of `VM`
+  # (Lumina.run, Lumina.stream, Lumina.createImage,
+  # SessionProcess, Pool, Network) drives `configure_network`
+  # over vsock, which is faster and authoritative. udhcpc raced
+  # the host driver, occasionally installed a different IP/route
+  # than the host requested, and added 30–80 ms of churn on
+  # every boot.
+  #
+  # Library callers using the public `VM` actor directly
+  # (Layer 3 — Lifecycle in the three-layer API) MUST call
+  # `vm.configureNetwork()` themselves before the first exec
+  # if they need NAT eth0 outbound (DNS, internet). Skipping
+  # it leaves eth0 with carrier UP and no IP — traffic out the
+  # default route will fail. See the docstring on `VM.boot()`.
 
   # Private networking config — LUMINA_NET_IP / LUMINA_HOSTS were parsed
   # from /proc/cmdline at init start (outer scope).
