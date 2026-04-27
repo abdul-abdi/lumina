@@ -813,31 +813,6 @@ public actor VM {
         return now
     }
 
-    // MARK: - Internal Result API
-
-    public func bootResult() async -> Result<Void, LuminaError> {
-        do {
-            try await boot()
-            return .success(())
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    func execResult(
-        _ command: String,
-        timeout: Int = 60,
-        env: [String: String] = [:],
-        cwd: String? = nil,
-        stdin: Stdin = .closed
-    ) async -> Result<RunResult, LuminaError> {
-        do {
-            return .success(try await exec(command, timeout: timeout, env: env, cwd: cwd, stdin: stdin))
-        } catch {
-            return .failure(error)
-        }
-    }
-
     // MARK: - File Transfer
 
     /// Upload files to the guest. Must be called after boot().
@@ -941,24 +916,6 @@ public actor VM {
         }
         guard extractProcess.terminationStatus == 0 else {
             throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(extractProcess.terminationStatus)")
-        }
-    }
-
-    func uploadFilesResult(_ uploads: [FileUpload]) async -> Result<Void, LuminaError> {
-        do {
-            try await uploadFiles(uploads)
-            return .success(())
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    func downloadFilesResult(_ downloads: [FileDownload]) async -> Result<Void, LuminaError> {
-        do {
-            try await downloadFiles(downloads)
-            return .success(())
-        } catch {
-            return .failure(error)
         }
     }
 

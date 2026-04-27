@@ -37,7 +37,7 @@ public actor Network {
         vmOpts.networkIP = ip
 
         let vm = VM(options: vmOpts)
-        try await vm.bootResult().get()
+        try await vm.boot()
 
         sessions.append((name: sessionName, ip: ip, vm: vm))
 

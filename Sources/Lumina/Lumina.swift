@@ -12,7 +12,7 @@ public struct Lumina {
         try await withVM(options: options) { vm in
             let start = ContinuousClock.now
 
-            try await vm.bootResult().get()
+            try await vm.boot()
 
             // Host-driven network config. Default in v0.7.2+:
             // fire-and-forget, do NOT block exec on `network_ready`.
@@ -40,7 +40,7 @@ public struct Lumina {
 
             // Upload files before exec
             if !options.uploads.isEmpty {
-                try await vm.uploadFilesResult(options.uploads).get()
+                try await vm.uploadFiles(options.uploads)
             }
             // Upload directories before exec
             for dir in options.directoryUploads {
@@ -49,7 +49,7 @@ public struct Lumina {
 
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin).get()
+            let result = try await vm.exec(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
 
             // Download after exec — auto-detect file vs directory on guest
             for dl in options.downloads {
@@ -90,7 +90,7 @@ public struct Lumina {
                 do {
                     try await withVM(options: options) { vm in
                         let start = ContinuousClock.now
-                        try await vm.bootResult().get()
+                        try await vm.boot()
                         let bootDone = ContinuousClock.now
 
                         // v0.7.1 perf: default awaits network_ready so
@@ -119,7 +119,7 @@ public struct Lumina {
 
                         // Upload files before exec
                         if !options.uploads.isEmpty {
-                            try await vm.uploadFilesResult(options.uploads).get()
+                            try await vm.uploadFiles(options.uploads)
                         }
                         for dir in options.directoryUploads {
                             try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
@@ -193,7 +193,7 @@ public struct Lumina {
         let vm = VM(options: vmOptions)
 
         do {
-            try await vm.bootResult().get()
+            try await vm.boot()
             try await vm.configureNetwork()
         } catch {
             await vm.shutdown()
@@ -202,7 +202,7 @@ public struct Lumina {
 
         let timeoutSecs = max(Int(opts.timeout.components.seconds), 1)
         for (index, cmd) in commands.enumerated() {
-            let result = try await vm.execResult(cmd, timeout: timeoutSecs, env: opts.env).get()
+            let result = try await vm.exec(cmd, timeout: timeoutSecs, env: opts.env)
             guard result.success else {
                 await vm.shutdown()
                 throw LuminaError.sessionFailed(
@@ -212,7 +212,7 @@ public struct Lumina {
         }
 
         // Flush dirty pages before clone capture (same rationale as single-command path).
-        _ = await vm.execResult("sync", timeout: 10)
+        _ = try? await vm.exec("sync", timeout: 10)
 
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()
