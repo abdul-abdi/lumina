@@ -61,35 +61,26 @@ final class CommandRunner: @unchecked Sendable {
     private var _guestProtocolVersion: Int = 0
     private var _guestCapabilities: [String] = []
 
-    // ── Late-exit stash (v0.7.2) ──
-    // Audit-flagged correctness fix: `dispatchMessage` previously
-    // dropped any `.exit(id:code:)` whose id was not in
-    // `execHandlers` or `ptyHandlers`. Combined with the timeout
-    // watchdog, a slow command finishing a hair after timeout could
-    // lose its exit code — host returned `timeout`, guest had
-    // returned 0. Agents retrying non-idempotent ops did the work
-    // twice without any signal that they had.
+    // ── Late-exit grace window (v0.7.2) ──
+    // Audit-flagged correctness fix: a slow command finishing a
+    // hair after the timeout watchdog fired could lose its exit
+    // code — host returned `timeout`, guest had already returned 0.
+    // Agents retrying non-idempotent ops did the work twice with
+    // no signal that they had.
     //
-    // Two-part fix in this file:
-    //   1. dispatchMessage now stashes orphan exits here keyed by
-    //      id instead of dropping them.
-    //   2. exec() / execStream() use a soft/hard deadline pattern:
-    //      the watchdog fires SIGTERM at the soft deadline, but the
-    //      loop keeps reading the stream until the hard deadline
-    //      (soft + lateExitGraceWindow). A natural exit during the
-    //      grace window beats the synthetic timeout.
+    // Fix: `exec()` / `execStream()` use a soft/hard deadline
+    // pattern. The watchdog fires SIGTERM at the soft deadline
+    // (T+timeout) and wakes the loop, but the loop keeps reading
+    // the stream until the hard deadline (soft + grace window).
+    // A natural `.exit` during the grace window beats the
+    // synthetic timeout — the handler is still registered, so
+    // the dispatcher routes the message into the same stream
+    // we're still reading.
     //
-    // Bounded: pruned to entries inserted within `recentExitTTL`.
-    // Memory ceiling ~32 entries × ~24 B → trivial.
-    private struct StashedExit { let code: Int32; let when: ContinuousClock.Instant }
-    private var _recentExits: [String: StashedExit] = [:]
-    private static let recentExitTTL: Duration = .seconds(30)
-    /// Window after a soft timeout during which a natural `.exit`
-    /// from the guest beats the synthetic timeout error. Picked at
-    /// 250 ms because the typical guest-side cancel→exit RTT is
-    /// well under 50 ms; 250 ms covers the 95th-percentile
-    /// "command was about to exit anyway" race without making
-    /// genuine timeouts feel sluggish.
+    // 250 ms picked because the typical guest-side cancel→exit
+    // RTT is well under 50 ms; 250 ms covers the 95th-percentile
+    // "command was about to exit anyway" race without making
+    // genuine timeouts feel sluggish.
     private static let lateExitGraceWindow: Duration = .milliseconds(250)
 
     // ── Port forward continuations: one per in-flight port_forward_start ──
@@ -931,7 +922,7 @@ final class CommandRunner: @unchecked Sendable {
             let handler = ptyHandlers[id]
             ptyLock.unlock()
             handler?.yield(msg)
-        case .exit(let id, let code):
+        case .exit(let id, _):
             // Check exec handlers first (common case)
             lock.lock()
             let execHandler = execHandlers[id]
@@ -948,11 +939,13 @@ final class CommandRunner: @unchecked Sendable {
                 h.yield(msg)
                 break
             }
-            // Orphan exit: handler already unregistered (most likely a
-            // command exiting just after the timeout watchdog fired).
-            // Stash so the timeout path in `exec()` can claim it during
-            // its grace window instead of dropping the code.
-            stashLateExit(id: id, code: code)
+            // Orphan exit: handler already unregistered. Drop.
+            // Pre-fix this was the silent-loss path; the soft/hard
+            // deadline grace window in `exec()` keeps the handler
+            // registered through the natural-exit window, so by the
+            // time we land here the command genuinely overshot the
+            // window and the synthetic .timeout error is correct.
+            break
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
             lock.lock()
@@ -1187,30 +1180,6 @@ final class CommandRunner: @unchecked Sendable {
         _guestProtocolVersion = protocolVersion
         _guestCapabilities = capabilities
         lock.unlock()
-    }
-
-    /// Record an orphan exit for later claim. Prunes expired entries
-    /// on every insert so the stash size stays bounded by
-    /// `recentExitTTL`.
-    private func stashLateExit(id: String, code: Int32) {
-        let now = ContinuousClock.now
-        lock.lock()
-        for (k, v) in _recentExits where v.when < now - Self.recentExitTTL {
-            _recentExits.removeValue(forKey: k)
-        }
-        _recentExits[id] = StashedExit(code: code, when: now)
-        lock.unlock()
-    }
-
-    /// Atomically remove and return a stashed exit code if one
-    /// arrived for `id` after the handler was unregistered. Called
-    /// from post-mortem reclaim paths. Returns nil when no late
-    /// exit has been recorded — that's the genuine-timeout path.
-    func consumeRecentExit(id: String) -> Int32? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let entry = _recentExits.removeValue(forKey: id) else { return nil }
-        return entry.code
     }
 
     /// Store a new vsock connection and create file handles for I/O.

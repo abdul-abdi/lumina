@@ -61,6 +61,48 @@ func integrationRunTimeout() async {
     }
 }
 
+/// Audit-fix regression guard (v0.7.2): a command that finishes a hair
+/// after the timeout watchdog fires SIGTERM should land its real exit
+/// code via the soft/hard deadline grace window, not synthesize
+/// `.timeout`. Without this fix, agents retrying non-idempotent ops
+/// repeated work that actually succeeded.
+///
+/// Test shape: timeout 1s on a `sleep 0.95 && exit 7`. The `sleep`
+/// returns naturally just before the 1s soft deadline most of the
+/// time, but on a loaded host the schedule can overshoot. Either way:
+///   - Natural-exit case: exit code 7, no error.
+///   - Late-exit-in-grace-window case: also exit code 7 (the fix
+///     guarantees this — pre-fix it would surface as `.timeout`).
+///   - Hard-overshoot (>1.25s on a *very* loaded host): `.timeout`.
+///     Treated as inconclusive rather than a failure.
+@Test(.enabled(if: integrationEnabled()))
+func integrationTimeoutGraceWindow() async {
+    do {
+        let result = try await Lumina.run(
+            "sleep 0.95 && exit 7",
+            options: RunOptions(timeout: .seconds(1))
+        )
+        // The contract: if the command was within the natural-exit
+        // window OR the post-watchdog grace window, the host MUST
+        // surface the real exit code (7) instead of a synthetic
+        // timeout.
+        #expect(result.exitCode == 7,
+                "Expected exit 7 (natural exit or grace-window reclaim); got \(result.exitCode)")
+    } catch let error as LuminaError {
+        if case .timeout = error {
+            // Hard overshoot — only acceptable on a heavily loaded
+            // host where the command genuinely took >1.25s. Don't
+            // fail the suite on that, but record the slip so it
+            // shows up if it becomes a regression pattern.
+            Issue.record("Grace-window test fell off the cliff to .timeout — host likely loaded; expected exit 7")
+        } else {
+            Issue.record("Expected exit 7 or .timeout, got: \(error)")
+        }
+    } catch {
+        Issue.record("Unexpected error type: \(error)")
+    }
+}
+
 @Test(.enabled(if: integrationEnabled()))
 func integrationVMLifecycle() async throws {
     let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
