@@ -53,6 +53,14 @@ final class CommandRunner: @unchecked Sendable {
     // command beat the ticker's 500ms initial delay, or legacy agent).
     private var _latestNetworkMetrics: NetworkMetricsSummary?
 
+    // ── Guest handshake metadata (v0.7.2) ──
+    // Captured from the agent's `ready` frame. 0 / [] when the guest
+    // pre-dates capability negotiation (older release tarballs).
+    // Diagnostic only today; future protocol bumps can branch on
+    // these to refuse incompatible guests instead of misdecoding.
+    private var _guestProtocolVersion: Int = 0
+    private var _guestCapabilities: [String] = []
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -74,6 +82,23 @@ final class CommandRunner: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _latestNetworkMetrics
+    }
+
+    /// Wire-format version reported by the guest on its `ready` frame.
+    /// 0 means the guest pre-dates v0.7.2 (no protocol_version field
+    /// in its `ready`). Thread-safe read.
+    var guestProtocolVersion: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _guestProtocolVersion
+    }
+
+    /// Capability strings reported by the guest on its `ready` frame.
+    /// Empty when the guest pre-dates v0.7.2. Thread-safe read.
+    var guestCapabilities: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _guestCapabilities
     }
 
     var state: ConnectionState {
@@ -143,10 +168,15 @@ final class CommandRunner: @unchecked Sendable {
             setState(.disconnected)
             throw .protocolError("Failed to decode guest message: \(error)")
         }
-        guard msg == .ready else {
+        guard case .ready(let protocolVersion, let capabilities) = msg else {
             setState(.disconnected)
             throw .protocolError("Expected ready message, got: \(msg)")
         }
+
+        // Stash handshake metadata for diagnostics + future capability
+        // gating. v0.7.2+ agents populate these; older guests omit the
+        // fields and decode as (0, []) which is fine.
+        setHandshakeMetadata(protocolVersion: protocolVersion, capabilities: capabilities)
 
         setState(.ready)
         startDispatcher(initialBuffer: readBuffer)
@@ -1070,6 +1100,17 @@ final class CommandRunner: @unchecked Sendable {
     private func setState(_ newState: ConnectionState) {
         lock.lock()
         _state = newState
+        lock.unlock()
+    }
+
+    /// Sync wrapper so async callers (connect) can stash the guest's
+    /// handshake metadata without touching the NSLock directly —
+    /// `lock.lock()` is unavailable from async contexts under Swift 6
+    /// strict concurrency.
+    private func setHandshakeMetadata(protocolVersion: Int, capabilities: [String]) {
+        lock.lock()
+        _guestProtocolVersion = protocolVersion
+        _guestCapabilities = capabilities
         lock.unlock()
     }
 

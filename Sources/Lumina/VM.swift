@@ -194,6 +194,23 @@ public actor VM {
     /// Expose the current disk clone for image creation workflows.
     public var diskClone: DiskClone? { clone }
 
+    /// Wire-format protocol version the guest agent reported on its
+    /// `ready` frame. 0 when no handshake has happened yet, or when
+    /// the guest pre-dates v0.7.2 (no `protocol_version` field on
+    /// `ready`). Diagnostic only today; future host code can branch
+    /// on this to refuse incompatible guests rather than misdecoding.
+    public var guestProtocolVersion: Int {
+        commandRunner?.guestProtocolVersion ?? 0
+    }
+
+    /// Capability strings the guest agent reported on its `ready`
+    /// frame. Empty when no handshake has happened yet, or when the
+    /// guest pre-dates v0.7.2. Hosts can consult this before issuing
+    /// capability-gated requests like `pty_exec` or `port_forward_start`.
+    public var guestCapabilities: [String] {
+        commandRunner?.guestCapabilities ?? []
+    }
+
     public init(options: VMOptions = .default) {
         self.options = options
         self.imageStore = ImageStore()
@@ -613,9 +630,14 @@ public actor VM {
             config.cpuCount = options.cpuCount
             config.memorySize = options.memory
 
-            // Boot loader + storage.
+            // Boot loader + storage. configMs is recorded once at the
+            // end of the config block (after VZ instantiation + delegate
+            // install), matching the agent path's single-accumulation
+            // pattern. The earlier double-call here was numerically
+            // correct (both calls used `+=`) but split a single
+            // semantic phase into two redundant writes, making the
+            // boot trace harder to reason about.
             try EFIBootable(config: cfg).apply(to: config)
-            phaseMark = recordPhase(\.configMs, since: phaseMark)
 
             // Serial console — capture guest output for diagnostics.
             let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()

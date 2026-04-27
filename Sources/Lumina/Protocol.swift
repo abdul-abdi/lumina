@@ -35,7 +35,17 @@ public enum HostMessage: Sendable {
 // MARK: - Guest Messages (received from guest)
 
 public enum GuestMessage: Sendable, Equatable {
-    case ready
+    /// Initial handshake from the guest agent. Optional fields:
+    ///   - `protocolVersion`: wire-format version the agent speaks. 0
+    ///     means absent (pre-v0.7.2 agent). Hosts can branch on this
+    ///     for forward/backward-compat decisions when a future bump
+    ///     ships breaking changes — without resorting to message-
+    ///     shape probing.
+    ///   - `capabilities`: list of feature strings the agent
+    ///     implements (e.g. `"pty"`, `"port_forward"`,
+    ///     `"network_metrics"`). Empty when absent. Hosts may consult
+    ///     it before issuing capability-gated requests.
+    case ready(protocolVersion: Int, capabilities: [String])
     /// Text output (UTF-8). `data` carries the text verbatim.
     case output(id: String, stream: OutputStream, data: String)
     /// Binary output. `bytes` carries the raw bytes that were base64-encoded
@@ -177,7 +187,12 @@ enum LuminaProtocol {
 
         switch type {
         case "ready":
-            return .ready
+            // protocol_version / capabilities are optional. Pre-v0.7.2
+            // agents omit both and decode as (0, []) — host treats
+            // version=0 as "old agent, no capability negotiation".
+            let protocolVersion = json["protocol_version"] as? Int ?? 0
+            let capabilities = (json["capabilities"] as? [String]) ?? []
+            return .ready(protocolVersion: protocolVersion, capabilities: capabilities)
         case "output":
             guard let id = json["id"] as? String,
                   let streamStr = json["stream"] as? String,

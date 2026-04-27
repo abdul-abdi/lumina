@@ -148,11 +148,42 @@ type PortForwardStopMsg struct {
 
 // ── Guest → host messages ──────────────────────────────────────────
 
-type ReadyMsg struct {
-	Type string `json:"type"`
+// ProtocolVersion is the wire-format version this agent speaks.
+// Bump on any breaking wire change so the host can branch cleanly
+// (or refuse to talk to a too-old/too-new agent) instead of
+// guessing from message-shape probing. Old agents predate this
+// field and the host treats absence as version=0.
+const ProtocolVersion = 1
+
+// AgentCapabilities is the conservative list of message families
+// this build of the agent implements. The host may consult it
+// before issuing a `pty_exec` or `port_forward_start` against an
+// older guest. Adding a capability is non-breaking (older hosts
+// ignore unknown strings); removing one IS breaking and must be
+// paired with a ProtocolVersion bump.
+var AgentCapabilities = []string{
+	"pty",              // pty_exec / pty_input / pty_output / window_resize
+	"port_forward",     // port_forward_start / stop / ready / error
+	"network_metrics",  // periodic network_metrics frames
+	"network_error",    // typed network_error on configure_network failure
+	"binary_output",    // base64-encoded output for non-UTF-8 chunks
+	"configure_network",
+	"stdin",
 }
 
-func NewReady() ReadyMsg { return ReadyMsg{Type: TypeReady} }
+type ReadyMsg struct {
+	Type            string   `json:"type"`
+	ProtocolVersion int      `json:"protocol_version,omitempty"`
+	Capabilities    []string `json:"capabilities,omitempty"`
+}
+
+func NewReady() ReadyMsg {
+	return ReadyMsg{
+		Type:            TypeReady,
+		ProtocolVersion: ProtocolVersion,
+		Capabilities:    AgentCapabilities,
+	}
+}
 
 type HeartbeatMsg struct {
 	Type string `json:"type"`
