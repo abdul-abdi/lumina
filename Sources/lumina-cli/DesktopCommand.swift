@@ -324,137 +324,42 @@ struct DesktopBoot: AsyncParsableCommand {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        // Pre-boot transformations driven by guest OS family. Two cases
-        // auto-fire on first boot to fix problems we can't fix host-side:
+        // First-boot orchestration: linux-direct extraction + preseed
+        // injection (Debian/Kali/Ubuntu) and Windows 11 autounattend
+        // sidecar. Centralized in `LuminaBootable.prepareFirstBoot` so
+        // the GUI desktop session calls the same function — see
+        // `LuminaDesktopSession.boot()`.
         //
-        //   (a) Debian-family installer (Debian/Kali) — vmnet bootpd misses
-        //       the first DHCP DISCOVER and netcfg sends only one. We
-        //       extract the installer's kernel+initrd, append a preseed.cfg
-        //       cpio.gz with `netcfg/dhcp_retries=4`, and boot via
-        //       VZLinuxBootLoader with `auto=true preseed/file=/preseed.cfg`.
-        //       The original ISO stays mounted as the CD-ROM so d-i finds
-        //       its packages.
-        //
-        //   (b) Windows 11 — Apple's VZ has no TPM device, stock retail Win11
-        //       ISO refuses Setup. We generate an autounattend.xml ISO with
-        //       LabConfig\Bypass{TPM,SecureBoot,RAM,CPU,Storage}Check=1 and
-        //       attach it as an extra disk. Win11 Setup auto-loads it from
-        //       the drive root before the compat check fires.
-        //
-        // `--capture-serial` keeps its previous semantics (force linux-direct
-        // boot for serial diagnostics). It composes with (a): if both fire,
-        // we use the linux-direct boot AND the preseed.
+        // `--capture-serial` keeps its previous semantics (force linux-
+        // direct boot for serial diagnostics). It composes with the
+        // Debian preseed: if both fire, we get linux-direct AND the
+        // preseed.
         let isFirstBoot = bundle.manifest.lastBootedAt == nil
-        let osVariantLower = bundle.manifest.osVariant.lowercased()
-        let isDebianFamily = osVariantLower.contains("debian")
-            || osVariantLower.contains("kali")
-            || osVariantLower.contains("ubuntu")  // Ubuntu Server installer is debian-installer-derived
-        let needsLinuxDirect = captureSerial || (isDebianFamily && isFirstBoot)
 
-        var linuxDirectKernel: URL?
-        var linuxDirectInitramfs: URL?
-        var linuxDirectCmdline: String?
-        var extraDisks: [URL] = []
-
-        if needsLinuxDirect {
-            guard let iso = cdromURL else {
-                let msg = captureSerial
-                    ? "error: --capture-serial needs an attached ISO. Nothing to extract from.\n"
-                    : "error: \(bundle.manifest.osVariant) first-boot needs an attached ISO for the network preseed fix. Attach via `desktop create --iso`.\n"
-                FileHandle.standardError.write(Data(msg.utf8))
-                throw ExitCode(1)
-            }
-            let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
-            try? FileManager.default.removeItem(at: artifacts)
-            try? FileManager.default.createDirectory(
-                at: artifacts, withIntermediateDirectories: true
+        let plan: FirstBootPlan
+        do {
+            plan = try prepareFirstBoot(
+                bundle: bundle,
+                attachedISO: cdromURL,
+                captureSerial: captureSerial,
+                isFirstBoot: isFirstBoot
             )
-            do {
-                let extracted = try LinuxISOExtractor.extract(
-                    iso: iso, destination: artifacts
-                )
-                linuxDirectKernel = extracted.kernel
-
-                // Default to the extracted initrd. Inject preseed if this
-                // is a Debian-family first boot.
-                var initrdURL = extracted.initramfs
-                // earlycon=hvc0 lets the kernel start writing to our virtio
-                // serial before init runs — without it, the first ~10s of
-                // boot are invisible. Cheap and load-bearing for the
-                // auto-preseed path's serial-log diagnosability.
-                var cmdlineParts = ["console=hvc0", "earlycon=hvc0"]
-                if !extracted.cmdlineExtra.isEmpty {
-                    cmdlineParts.append(extracted.cmdlineExtra)
-                }
-
-                if isDebianFamily && isFirstBoot {
-                    let seed = PreseedSeed(
-                        bundleRootURL: bundle.rootURL,
-                        originalInitrd: extracted.initramfs
-                    )
-                    do {
-                        initrdURL = try seed.patch()
-                        cmdlineParts.append(PreseedSeed.cmdlinePreseedFlags)
-                        let info = "preseed: injected /preseed.cfg into initrd; netcfg/dhcp_retries=4 will defeat the vmnet bootpd race\n"
-                        FileHandle.standardError.write(Data(info.utf8))
-                    } catch {
-                        // Preseed failure shouldn't block boot — fall
-                        // back to the unpatched initrd. User sees the
-                        // standard "click Retry" workaround.
-                        let warn = "warning: preseed injection failed (\(error)); booting unpatched. If DHCP fails in netcfg, click Retry.\n"
-                        FileHandle.standardError.write(Data(warn.utf8))
-                    }
-                }
-
-                linuxDirectInitramfs = initrdURL
-                linuxDirectCmdline = cmdlineParts.joined(separator: " ")
-
-                let info = "linux-direct: matched \(extracted.layoutName); booting via VZLinuxBootLoader\n"
-                FileHandle.standardError.write(Data(info.utf8))
-            } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
-                let supported = LinuxISOExtractor.knownLayouts
-                    .map { $0.name }
-                    .joined(separator: ", ")
-                let msg = "error: linux-direct: couldn't find a known kernel layout in \(iso.lastPathComponent). "
-                    + "Supported: \(supported). "
-                    + "Tried: \(tried.joined(separator: ", "))\n"
-                FileHandle.standardError.write(Data(msg.utf8))
-                if captureSerial {
-                    throw ExitCode(1)
-                }
-                // Auto-preseed mode: fall back to standard EFI boot if we
-                // can't extract. The user gets the legacy "click Retry"
-                // experience but at least the VM still boots.
-                FileHandle.standardError.write(Data("falling back to standard EFI boot\n".utf8))
-                linuxDirectKernel = nil
-                linuxDirectInitramfs = nil
-                linuxDirectCmdline = nil
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "error: linux-direct: ISO extraction failed: \(error)\n".utf8
-                ))
-                if captureSerial { throw ExitCode(1) }
-                FileHandle.standardError.write(Data("falling back to standard EFI boot\n".utf8))
-            }
+        } catch let error as FirstBootError {
+            // Fatal classes: missing ISO and (in capture-serial mode)
+            // unknown layout. Translate to ExitCode.
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            throw ExitCode(1)
         }
 
-        // Windows 11: autounattend sidecar to bypass TPM/SecureBoot/RAM/CPU
-        // checks and skip the Microsoft-Account OOBE. First boot only —
-        // post-install reboots don't read autounattend.
-        if bundle.manifest.osFamily == .windows && isFirstBoot {
-            let seed = AutounattendSeed(bundleRootURL: bundle.rootURL)
-            do {
-                let unattendISO = try seed.generate()
-                extraDisks.append(unattendISO)
-                let msg = "windows: autounattend sidecar generated at \(unattendISO.lastPathComponent); "
-                    + "bypasses TPM/SecureBoot/RAM/CPU/Storage checks; skips MSA OOBE\n"
-                FileHandle.standardError.write(Data(msg.utf8))
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "warning: autounattend generation failed (\(error)); Win11 Setup may refuse compat check\n".utf8
-                ))
-            }
+        // Translate the plan's structured events into the human-readable
+        // stderr lines the CLI used to emit inline. Order preserved.
+        for event in plan.events {
+            FileHandle.standardError.write(Data(formatFirstBootEvent(event).utf8))
         }
+        let extraDisks = plan.extraDisks
+        let linuxDirectKernel = plan.linuxDirectKernel
+        let linuxDirectInitramfs = plan.linuxDirectInitramfs
+        let linuxDirectCmdline = plan.linuxDirectCmdline
 
         // Ensure + persist a stable MAC on first boot. See
         // `LuminaDesktopSession.boot()` for the full rationale.
@@ -576,6 +481,32 @@ struct DesktopBoot: AsyncParsableCommand {
 
         await vm.shutdown()
         serialTask?.cancel()
+    }
+}
+
+/// Translate a `FirstBootPlan.Event` into the stderr line the CLI has
+/// historically emitted for that case. Centralized here so the wire
+/// the user sees is identical to v0.7.1, while the orchestrator stays
+/// pure.
+private func formatFirstBootEvent(_ event: FirstBootPlan.Event) -> String {
+    switch event {
+    case .linuxDirectMatched(let layoutName):
+        return "linux-direct: matched \(layoutName); booting via VZLinuxBootLoader\n"
+    case .linuxDirectUnknownLayoutFallback(let tried, let supported):
+        return "error: linux-direct: couldn't find a known kernel layout. "
+            + "Supported: \(supported.joined(separator: ", ")). "
+            + "Tried: \(tried.joined(separator: ", "))\nfalling back to standard EFI boot\n"
+    case .linuxDirectExtractFailed(let reason):
+        return "error: linux-direct: ISO extraction failed: \(reason)\nfalling back to standard EFI boot\n"
+    case .preseedInjected:
+        return "preseed: injected /preseed.cfg into initrd; netcfg/dhcp_retries=4 will defeat the vmnet bootpd race\n"
+    case .preseedFailed(let reason):
+        return "warning: preseed injection failed (\(reason)); booting unpatched. If DHCP fails in netcfg, click Retry.\n"
+    case .autounattendGenerated(let iso):
+        return "windows: autounattend sidecar generated at \(iso.lastPathComponent); "
+            + "bypasses TPM/SecureBoot/RAM/CPU/Storage checks; skips MSA OOBE\n"
+    case .autounattendFailed(let reason):
+        return "warning: autounattend generation failed (\(reason)); Win11 Setup may refuse compat check\n"
     }
 }
 
