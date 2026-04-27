@@ -47,7 +47,7 @@ import Testing
             Issue.record("extract was called but the test did not expect it")
             throw NSError(domain: "test", code: 1)
         },
-        injectPreseed: { _, _ in
+        injectPreseed: { _, _, _ in
             Issue.record("injectPreseed was called but the test did not expect it")
             throw NSError(domain: "test", code: 1)
         },
@@ -91,7 +91,7 @@ import Testing
                     cmdlineExtra: ""
                 )
             },
-            injectPreseed: { _, original in
+            injectPreseed: { _, original, _ in
                 #expect(original == extractedInitrd, "preseed must run on the extracted initrd, not a different file")
                 return patchedInitrd
             },
@@ -158,7 +158,7 @@ import Testing
             extract: { _, _ in
                 throw LinuxISOExtractor.Error.unknownLayout(triedPaths: ["foo/vmlinuz", "bar/vmlinuz"])
             },
-            injectPreseed: { _, _ in
+            injectPreseed: { _, _, _ in
                 Issue.record("preseed must not be called when extract failed")
                 throw NSError(domain: "test", code: 1)
             },
@@ -262,6 +262,90 @@ import Testing
         } else {
             Issue.record("expected .autounattendFailed event, got \(plan.events)")
         }
+    }
+
+    /// Single-shot capture box for closure observation in tests.
+    /// `@unchecked Sendable` is fine here because each `prepareFirstBoot`
+    /// call we make in tests is fully synchronous — the closure runs
+    /// inline before `prepareFirstBoot` returns.
+    private final class Capture<T>: @unchecked Sendable {
+        var value: T?
+    }
+
+    @Test func kali_firstBoot_usesKaliMirrorInPreseed() throws {
+        // The default Debian preseed points at deb.debian.org which
+        // doesn't host Kali suites — install fails mid-APT. The
+        // orchestrator must select the Kali-flavoured preseed when the
+        // osVariant matches Kali.
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "kali-rolling")
+        let iso = URL(fileURLWithPath: "/fake/kali.iso")
+
+        let seen = Capture<String>()
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/k"),
+                    initramfs: URL(fileURLWithPath: "/fake/i"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, cfg in
+                seen.value = cfg
+                return URL(fileURLWithPath: "/fake/initrd.preseeded")
+            },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend
+        )
+
+        _ = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        let cfg = try #require(seen.value)
+        #expect(cfg.contains("http.kali.org"), "Kali preseed must use the Kali mirror, not deb.debian.org")
+        #expect(cfg.contains("netcfg/dhcp_retries string 4"), "Kali still needs the DHCP-retries fix")
+        #expect(!cfg.contains("deb.debian.org"), "Kali preseed must not reference the Debian mirror")
+    }
+
+    @Test func debian_firstBoot_usesDebianMirrorInPreseed() throws {
+        // Companion to kali_firstBoot_usesKaliMirrorInPreseed: ensure
+        // Debian still gets deb.debian.org (regression guard if someone
+        // flips the dispatch the wrong way later).
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let iso = URL(fileURLWithPath: "/fake/debian.iso")
+
+        let seen = Capture<String>()
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/k"),
+                    initramfs: URL(fileURLWithPath: "/fake/i"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, cfg in
+                seen.value = cfg
+                return URL(fileURLWithPath: "/fake/initrd.preseeded")
+            },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend
+        )
+
+        _ = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        let cfg = try #require(seen.value)
+        #expect(cfg.contains("deb.debian.org"))
+        #expect(!cfg.contains("http.kali.org"))
     }
 
     @Test func notFirstBoot_skipsAllSeeds() throws {

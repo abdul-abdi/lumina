@@ -84,7 +84,9 @@ public enum FirstBootError: Swift.Error, Equatable, CustomStringConvertible {
 
 public struct FirstBootDependencies: Sendable {
     public typealias Extractor = @Sendable (_ iso: URL, _ destination: URL) throws -> LinuxISOExtractor.Extracted
-    public typealias Preseeder = @Sendable (_ bundleRoot: URL, _ originalInitrd: URL) throws -> URL
+    /// Caller picks the preseed body via the `cfg` parameter (Debian
+    /// vs Kali mirror lines, etc.) — the closure just runs cpio + cat.
+    public typealias Preseeder = @Sendable (_ bundleRoot: URL, _ originalInitrd: URL, _ cfg: String) throws -> URL
     public typealias Autounattender = @Sendable (_ bundleRoot: URL) throws -> URL
 
     public var extract: Extractor
@@ -107,10 +109,11 @@ public struct FirstBootDependencies: Sendable {
         extract: { iso, destination in
             try LinuxISOExtractor.extract(iso: iso, destination: destination)
         },
-        injectPreseed: { bundleRoot, originalInitrd in
+        injectPreseed: { bundleRoot, originalInitrd, cfg in
             try PreseedSeed(
                 bundleRootURL: bundleRoot,
-                originalInitrd: originalInitrd
+                originalInitrd: originalInitrd,
+                preseedCfg: cfg
             ).patch()
         },
         generateAutounattend: { bundleRoot in
@@ -200,8 +203,11 @@ public func prepareFirstBoot(
         }
 
         if isDebianFamily && isFirstBoot {
+            let preseedCfg = PreseedSeed.cfg(forOSVariant: bundle.manifest.osVariant)
             do {
-                let patched = try dependencies.injectPreseed(bundle.rootURL, extracted.initramfs)
+                let patched = try dependencies.injectPreseed(
+                    bundle.rootURL, extracted.initramfs, preseedCfg
+                )
                 initrdURL = patched
                 cmdlineParts.append(PreseedSeed.cmdlinePreseedFlags)
                 plan.events.append(.preseedInjected(initrd: patched))

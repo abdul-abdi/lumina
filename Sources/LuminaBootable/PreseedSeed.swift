@@ -56,7 +56,24 @@ public struct PreseedSeed: Sendable {
         }
     }
 
-    /// Default preseed for Debian arm64 / Kali installer ARM64. Tuned for the
+    /// Pick the right preseed body for a given osVariant. Debian, Kali,
+    /// and Ubuntu (legacy d-i, not Subiquity) need different mirror
+    /// lines — the rest of the preseed is identical so we templatize
+    /// the variable parts and reuse the body.
+    ///
+    /// Falls back to the Debian body for unknown osVariants — the only
+    /// difference that matters for boot-time is the mirror, and a
+    /// non-Debian-family osVariant won't reach this codepath in
+    /// `prepareFirstBoot` anyway.
+    public static func cfg(forOSVariant osVariant: String) -> String {
+        let lower = osVariant.lowercased()
+        if lower.contains("kali") {
+            return defaultKaliPreseed
+        }
+        return defaultDebianPreseed
+    }
+
+    /// Default preseed for Debian arm64 installer ARM64. Tuned for the
     /// minimal-friction install path: English, US keyboard, single full-disk
     /// install with `lumina:lumina` user, no proxy. The load-bearing line is
     /// `netcfg/dhcp_retries=4` — that's what fixes the vmnet race.
@@ -203,6 +220,87 @@ public struct PreseedSeed: Sendable {
         }
         return outURL
     }
+
+    /// Kali preseed — same shape as the Debian body but the mirror
+    /// section points at `http.kali.org/kali` (Kali's apt mirror does
+    /// not host Debian suites; Debian's mirror does not host Kali's
+    /// `kali-rolling` suite either, so the wrong choice fails mid-APT).
+    /// Component list follows the Kali installer default: `main contrib
+    /// non-free non-free-firmware`.
+    public static let defaultKaliPreseed: String = """
+    # Lumina-injected preseed (cures vmnet DHCP first-probe race).
+    # Kali variant — uses Kali's apt mirror.
+    # Generated; do not hand-edit.
+
+    # ---- Locale + keyboard
+    d-i debian-installer/locale string en_US.UTF-8
+    d-i keyboard-configuration/xkb-keymap select us
+    d-i debian-installer/language string en
+    d-i debian-installer/country string US
+
+    # ---- Network — the load-bearing fix.
+    # vmnet's bootpd misses the first DHCP DISCOVER. dhcp_retries=4 makes
+    # d-i issue 4 probes ~5s apart; by probe 2 bootpd is warm.
+    d-i netcfg/choose_interface select auto
+    d-i netcfg/dhcp_timeout string 60
+    d-i netcfg/dhcp_retries string 4
+    d-i netcfg/get_hostname string lumina-vm
+    d-i netcfg/get_domain string local
+    d-i netcfg/hostname string lumina-vm
+
+    # ---- Mirror — Kali apt repo (not Debian's). kali-rolling is a
+    # rolling-release suite; APT will pull current packages.
+    d-i mirror/country string manual
+    d-i mirror/protocol string http
+    d-i mirror/http/hostname string http.kali.org
+    d-i mirror/http/directory string /kali
+    d-i mirror/http/proxy string
+    d-i mirror/suite string kali-rolling
+    d-i mirror/codename string kali-rolling
+
+    # ---- Clock + timezone
+    d-i clock-setup/utc boolean true
+    d-i time/zone string Etc/UTC
+    d-i clock-setup/ntp boolean true
+
+    # ---- Partitioning — single full-disk install.
+    d-i partman-auto/method string regular
+    d-i partman-auto/choose_recipe select atomic
+    d-i partman-lvm/device_remove_lvm boolean true
+    d-i partman-md/device_remove_md boolean true
+    d-i partman/confirm_write_new_label boolean true
+    d-i partman/choose_partition select finish
+    d-i partman/confirm boolean true
+    d-i partman/confirm_nooverwrite boolean true
+
+    # ---- Account setup — `lumina:lumina`. Non-prod default.
+    d-i passwd/root-login boolean false
+    d-i passwd/make-user boolean true
+    d-i passwd/user-fullname string Lumina User
+    d-i passwd/username string lumina
+    d-i passwd/user-password password lumina
+    d-i passwd/user-password-again password lumina
+
+    # ---- APT setup — components match Kali's installer default.
+    d-i apt-setup/use_mirror boolean true
+    d-i apt-setup/services-select multiselect
+    d-i apt-setup/components string main contrib non-free non-free-firmware
+
+    # ---- Package selection — keep tiny so install is fast. Users can
+    # `apt install kali-linux-default` post-install for the full toolset.
+    tasksel tasksel/first multiselect standard
+    d-i pkgsel/include string openssh-server
+    d-i pkgsel/upgrade select none
+    popularity-contest popularity-contest/participate boolean false
+
+    # ---- GRUB
+    d-i grub-installer/only_debian boolean true
+    d-i grub-installer/with_other_os boolean false
+    d-i grub-installer/bootdev string /dev/vda
+
+    # ---- Finish without final prompt.
+    d-i finish-install/reboot_in_progress note
+    """
 
     /// Kernel cmdline that engages preseed + sets the right console for our
     /// virtio serial. Append after any caller-supplied prefix (e.g. distro
