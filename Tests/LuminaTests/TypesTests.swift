@@ -11,6 +11,9 @@ import Testing
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
     #expect(opts.directoryDownloads.isEmpty)
+    // v0.7.2 default flip: do NOT block exec on network_ready by default.
+    // Regression guard against an accidental flip-back to true.
+    #expect(opts.awaitNetworkReady == false)
 }
 
 @Test func directoryUploadInit() {

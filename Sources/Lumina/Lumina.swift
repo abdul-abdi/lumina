@@ -93,13 +93,13 @@ public struct Lumina {
                         try await vm.boot()
                         let bootDone = ContinuousClock.now
 
-                        // v0.7.1 perf: default awaits network_ready so
-                        // commands that need DNS/TCP in the first ~20ms
-                        // of exec work. Opt-out via
-                        // options.awaitNetworkReady = false.
+                        // Host-driven network config. See `Lumina.run`
+                        // for the v0.7.2 default-flip rationale and the
+                        // DNS NXDOMAIN race that motivates the opt-in.
                         if options.awaitNetworkReady {
                             try await vm.configureNetwork()
                         } else {
+                            // Fire-and-forget: start the config, don't await.
                             Task.detached { try? await vm.configureNetwork() }
                         }
                         let netDone = ContinuousClock.now
