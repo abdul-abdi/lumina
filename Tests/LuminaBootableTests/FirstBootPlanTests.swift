@@ -417,6 +417,58 @@ import Testing
         #expect(!cfg.contains("http.kali.org"))
     }
 
+    @Test func firstBoot_resetsEFIVarStore() throws {
+        // VZEFI persists boot-order + boot-device entries to the
+        // efi.vars store across boots. If a prior boot wrote stale
+        // entries (Win11 Setup partial-install attempt, dead boot
+        // device, etc.), the EFI may sit at a non-existent boot
+        // entry on the next attempt and never reach the kernel —
+        // user sees a black framebuffer indistinguishable from a
+        // hung VM. First boot owns this state — wipe it so EFI
+        // re-discovers boot devices from scratch.
+        let bundle = try makeBundle(osFamily: .windows, osVariant: "windows-11-arm")
+        // Pre-write a 64-byte stub at efi.vars to simulate stale state.
+        let efiVars = bundle.rootURL.appendingPathComponent("efi.vars")
+        try Data(repeating: 0xAB, count: 64).write(to: efiVars)
+        #expect(FileManager.default.fileExists(atPath: efiVars.path))
+
+        _ = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: FirstBootDependencies(
+                extract: Self.unreachableDeps.extract,
+                injectPreseed: Self.unreachableDeps.injectPreseed,
+                generateAutounattend: { _ in URL(fileURLWithPath: "/fake/autounattend.iso") }
+            )
+        )
+        #expect(!FileManager.default.fileExists(atPath: efiVars.path), "first boot must wipe efi.vars so VZ re-initializes a fresh store")
+    }
+
+    @Test func notFirstBoot_preservesEFIVarStore() throws {
+        // The flip side — a re-boot of an installed VM must NOT
+        // wipe efi.vars; that's where the post-install boot order
+        // lives and we'd brick the boot loop.
+        let bundle = try makeBundle(
+            osFamily: .windows, osVariant: "windows-11-arm", isFirstBoot: false
+        )
+        let efiVars = bundle.rootURL.appendingPathComponent("efi.vars")
+        let sentinel = Data([0x42, 0x61, 0x64, 0x00])
+        try sentinel.write(to: efiVars)
+
+        _ = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: false,
+            dependencies: Self.unreachableDeps
+        )
+
+        let after = try Data(contentsOf: efiVars)
+        #expect(after == sentinel, "non-first-boot must not touch efi.vars")
+    }
+
     @Test func notFirstBoot_skipsAllSeeds() throws {
         // Bundle has lastBootedAt set — neither preseed nor autounattend
         // should fire. Use the Windows variant since it's the most likely

@@ -148,6 +148,17 @@ public func prepareFirstBoot(
         return .empty
     }
 
+    // First boot owns the EFI variable store. VZEFI persists boot-order
+    // entries across boots; if a prior boot wrote stale entries (failed
+    // Win11 Setup attempt, dead boot device, etc.) the EFI may sit at a
+    // non-existent boot entry forever — user sees a black framebuffer
+    // indistinguishable from a hung VM. Wipe efi.vars so VZ re-initializes
+    // a fresh store on this attempt. Best-effort.
+    if isFirstBoot {
+        let efiVars = bundle.rootURL.appendingPathComponent("efi.vars")
+        try? FileManager.default.removeItem(at: efiVars)
+    }
+
     var plan = FirstBootPlan.empty
 
     if needsLinuxDirect {

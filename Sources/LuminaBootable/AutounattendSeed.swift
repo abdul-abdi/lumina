@@ -248,6 +248,12 @@ public struct AutounattendSeed: Sendable {
         }
 
         let outURL = bundleRootURL.appendingPathComponent("autounattend.iso")
+        // hdiutil makehybrid refuses to overwrite — pre-delete so a
+        // bundle with a stale ISO from a prior boot regenerates cleanly.
+        // Without this, the orchestrator's autounattendFailed path
+        // fires on every subsequent boot and Win11 Setup hits the
+        // compat check on a black framebuffer.
+        try? FileManager.default.removeItem(at: outURL)
         let staging = bundleRootURL.appendingPathComponent("autounattend-staging-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: staging) }
 
