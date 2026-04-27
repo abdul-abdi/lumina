@@ -136,7 +136,10 @@ struct Run: AsyncParsableCommand {
             awaitNetworkReady: waitNetwork
         )
 
-        if noWaitNetwork {
+        // Mid-migration scripts may pass both flags. If --wait-network is
+        // also set, the user has clearly opted in — don't shout about the
+        // deprecated alias on top of that.
+        if noWaitNetwork && !waitNetwork {
             FileHandle.standardError.write(Data(
                 "lumina: --no-wait-network is a no-op in v0.7.2+ (default behaviour). Pass --wait-network to opt back into the v0.7.1 default.\n".utf8
             ))
