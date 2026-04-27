@@ -940,11 +940,20 @@ final class CommandRunner: @unchecked Sendable {
                 break
             }
             // Orphan exit: handler already unregistered. Drop.
-            // Pre-fix this was the silent-loss path; the soft/hard
-            // deadline grace window in `exec()` keeps the handler
-            // registered through the natural-exit window, so by the
-            // time we land here the command genuinely overshot the
-            // window and the synthetic .timeout error is correct.
+            // For `exec()` / `execStream()`: the soft/hard deadline
+            // grace window keeps the handler registered through the
+            // natural-exit window, so by the time we land here the
+            // command genuinely overshot the window and the synthetic
+            // .timeout error is correct.
+            // For `ptyExec()`: there is no host-side soft/hard
+            // deadline pattern — PTY timeout is enforced solely by
+            // the guest's gracefulKill (SIGTERM, then SIGKILL after
+            // 5s). A late PTY exit can therefore land here if the
+            // consumer cancelled or dropped the stream. This drop is
+            // bounded by the guest's SIGKILL fallback so the process
+            // can't outlive the host's cleanup; the PTY stream
+            // closes either way. Pre-existing — not introduced by
+            // the soft/hard deadline change.
             break
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
