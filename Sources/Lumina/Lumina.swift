@@ -14,20 +14,18 @@ public struct Lumina {
 
             try await vm.bootResult().get()
 
-            // Host-driven network config. Default: await network_ready
-            // before exec — the guarantee users depend on for commands
-            // that send a packet in the first ~20 ms (curl, ping, apt,
-            // dns lookups). v0.7.1 perf work moved the cost from ~2.5s
-            // to ~50-150 ms by shrinking the guest's carrier-wait
-            // timeout, batching the `ip` setup, and using a netlink
-            // subscription for instant notification when eth0 comes up
-            // (see Guest/lumina-agent/internal/network/network.go).
+            // Host-driven network config. Default in v0.7.2+:
+            // fire-and-forget, do NOT block exec on `network_ready`.
+            // Most short agentic commands (echoes, builds, file ops)
+            // don't need a usable network in their first ms; making
+            // every disposable run pay 50–150ms for the rare DNS
+            // command was the wrong default.
             //
-            // Opt-out for speed-first workloads that know they don't
-            // need network: set `options.awaitNetworkReady = false` or
-            // pass `--no-wait-network` on the CLI. The guest agent
-            // still configures the network in a goroutine concurrently
-            // — the opt-out just drops the host-side barrier.
+            // Opt back in via `options.awaitNetworkReady = true` or
+            // `--wait-network` on the CLI when the command hits DNS
+            // immediately (apt update, pip install, curl). See the
+            // RunOptions.awaitNetworkReady docstring for the DNS
+            // NXDOMAIN race that motivates the opt-in path.
             if options.awaitNetworkReady {
                 try await vm.configureNetwork()
             } else {
