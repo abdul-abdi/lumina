@@ -148,12 +148,18 @@ type PortForwardStopMsg struct {
 
 // ── Guest → host messages ──────────────────────────────────────────
 
+// Version is the wire-format version this agent speaks. Typed (not
+// a bare int) so future v2 branching is greppable and `go vet`
+// flags missed comparison sites. JSON-encodes as a plain integer —
+// no migration on the wire.
+type Version int
+
 // ProtocolVersion is the wire-format version this agent speaks.
 // Bump on any breaking wire change so the host can branch cleanly
 // (or refuse to talk to a too-old/too-new agent) instead of
 // guessing from message-shape probing. Old agents predate this
 // field and the host treats absence as version=0.
-const ProtocolVersion = 1
+const ProtocolVersion Version = 1
 
 // AgentCapabilities is the conservative list of message families
 // this build of the agent implements. The host may consult it
@@ -173,7 +179,7 @@ var AgentCapabilities = []string{
 
 type ReadyMsg struct {
 	Type            string   `json:"type"`
-	ProtocolVersion int      `json:"protocol_version,omitempty"`
+	ProtocolVersion Version  `json:"protocol_version,omitempty"`
 	Capabilities    []string `json:"capabilities,omitempty"`
 }
 
