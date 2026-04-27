@@ -324,23 +324,47 @@ struct DesktopBoot: AsyncParsableCommand {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        // --capture-serial: extract kernel + initramfs out of the ISO so
-        // we can boot via VZLinuxBootLoader with an hvc0 console. Only
-        // tractable when we actually have an ISO and a known layout.
+        // Pre-boot transformations driven by guest OS family. Two cases
+        // auto-fire on first boot to fix problems we can't fix host-side:
+        //
+        //   (a) Debian-family installer (Debian/Kali) — vmnet bootpd misses
+        //       the first DHCP DISCOVER and netcfg sends only one. We
+        //       extract the installer's kernel+initrd, append a preseed.cfg
+        //       cpio.gz with `netcfg/dhcp_retries=4`, and boot via
+        //       VZLinuxBootLoader with `auto=true preseed/file=/preseed.cfg`.
+        //       The original ISO stays mounted as the CD-ROM so d-i finds
+        //       its packages.
+        //
+        //   (b) Windows 11 — Apple's VZ has no TPM device, stock retail Win11
+        //       ISO refuses Setup. We generate an autounattend.xml ISO with
+        //       LabConfig\Bypass{TPM,SecureBoot,RAM,CPU,Storage}Check=1 and
+        //       attach it as an extra disk. Win11 Setup auto-loads it from
+        //       the drive root before the compat check fires.
+        //
+        // `--capture-serial` keeps its previous semantics (force linux-direct
+        // boot for serial diagnostics). It composes with (a): if both fire,
+        // we use the linux-direct boot AND the preseed.
+        let isFirstBoot = bundle.manifest.lastBootedAt == nil
+        let osVariantLower = bundle.manifest.osVariant.lowercased()
+        let isDebianFamily = osVariantLower.contains("debian")
+            || osVariantLower.contains("kali")
+            || osVariantLower.contains("ubuntu")  // Ubuntu Server installer is debian-installer-derived
+        let needsLinuxDirect = captureSerial || (isDebianFamily && isFirstBoot)
+
         var linuxDirectKernel: URL?
         var linuxDirectInitramfs: URL?
         var linuxDirectCmdline: String?
-        if captureSerial {
+        var extraDisks: [URL] = []
+
+        if needsLinuxDirect {
             guard let iso = cdromURL else {
-                let msg = "error: --capture-serial needs an attached ISO (via `desktop create --iso`). "
-                    + "Nothing to extract from.\n"
+                let msg = captureSerial
+                    ? "error: --capture-serial needs an attached ISO. Nothing to extract from.\n"
+                    : "error: \(bundle.manifest.osVariant) first-boot needs an attached ISO for the network preseed fix. Attach via `desktop create --iso`.\n"
                 FileHandle.standardError.write(Data(msg.utf8))
                 throw ExitCode(1)
             }
             let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
-            // Reset between ISO swaps so a previous distro's kernel /
-            // initramfs / vmlinuz-raw can't accidentally co-exist with
-            // the new layout's outputs.
             try? FileManager.default.removeItem(at: artifacts)
             try? FileManager.default.createDirectory(
                 at: artifacts, withIntermediateDirectories: true
@@ -350,33 +374,82 @@ struct DesktopBoot: AsyncParsableCommand {
                     iso: iso, destination: artifacts
                 )
                 linuxDirectKernel = extracted.kernel
-                linuxDirectInitramfs = extracted.initramfs
-                // Base cmdline: hvc0 for serial output, earlycon for
-                // pre-init panic capture. Deliberately NOT `quiet` —
-                // the whole point of --capture-serial is to see what
-                // happens, and Alpine/Debian-style init scripts gate
-                // their progress prints on KOPT_quiet=no. Verbose
-                // serial is the feature, not a bug.
-                let base = "console=hvc0 earlycon=hvc0"
-                linuxDirectCmdline = extracted.cmdlineExtra.isEmpty
-                    ? base
-                    : base + " " + extracted.cmdlineExtra
-                let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
+
+                // Default to the extracted initrd. Inject preseed if this
+                // is a Debian-family first boot.
+                var initrdURL = extracted.initramfs
+                var cmdlineParts = ["console=hvc0"]
+                if captureSerial { cmdlineParts.append("earlycon=hvc0") }
+                if !extracted.cmdlineExtra.isEmpty {
+                    cmdlineParts.append(extracted.cmdlineExtra)
+                }
+
+                if isDebianFamily && isFirstBoot {
+                    let seed = PreseedSeed(
+                        bundleRootURL: bundle.rootURL,
+                        originalInitrd: extracted.initramfs
+                    )
+                    do {
+                        initrdURL = try seed.patch()
+                        cmdlineParts.append(PreseedSeed.cmdlinePreseedFlags)
+                        let info = "preseed: injected /preseed.cfg into initrd; netcfg/dhcp_retries=4 will defeat the vmnet bootpd race\n"
+                        FileHandle.standardError.write(Data(info.utf8))
+                    } catch {
+                        // Preseed failure shouldn't block boot — fall
+                        // back to the unpatched initrd. User sees the
+                        // standard "click Retry" workaround.
+                        let warn = "warning: preseed injection failed (\(error)); booting unpatched. If DHCP fails in netcfg, click Retry.\n"
+                        FileHandle.standardError.write(Data(warn.utf8))
+                    }
+                }
+
+                linuxDirectInitramfs = initrdURL
+                linuxDirectCmdline = cmdlineParts.joined(separator: " ")
+
+                let info = "linux-direct: matched \(extracted.layoutName); booting via VZLinuxBootLoader\n"
                 FileHandle.standardError.write(Data(info.utf8))
             } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
                 let supported = LinuxISOExtractor.knownLayouts
                     .map { $0.name }
                     .joined(separator: ", ")
-                let msg = "error: --capture-serial: couldn't find a known kernel layout in \(iso.lastPathComponent). "
+                let msg = "error: linux-direct: couldn't find a known kernel layout in \(iso.lastPathComponent). "
                     + "Supported: \(supported). "
                     + "Tried: \(tried.joined(separator: ", "))\n"
                 FileHandle.standardError.write(Data(msg.utf8))
-                throw ExitCode(1)
+                if captureSerial {
+                    throw ExitCode(1)
+                }
+                // Auto-preseed mode: fall back to standard EFI boot if we
+                // can't extract. The user gets the legacy "click Retry"
+                // experience but at least the VM still boots.
+                FileHandle.standardError.write(Data("falling back to standard EFI boot\n".utf8))
+                linuxDirectKernel = nil
+                linuxDirectInitramfs = nil
+                linuxDirectCmdline = nil
             } catch {
                 FileHandle.standardError.write(Data(
-                    "error: --capture-serial: ISO extraction failed: \(error)\n".utf8
+                    "error: linux-direct: ISO extraction failed: \(error)\n".utf8
                 ))
-                throw ExitCode(1)
+                if captureSerial { throw ExitCode(1) }
+                FileHandle.standardError.write(Data("falling back to standard EFI boot\n".utf8))
+            }
+        }
+
+        // Windows 11: autounattend sidecar to bypass TPM/SecureBoot/RAM/CPU
+        // checks and skip the Microsoft-Account OOBE. First boot only —
+        // post-install reboots don't read autounattend.
+        if bundle.manifest.osFamily == .windows && isFirstBoot {
+            let seed = AutounattendSeed(bundleRootURL: bundle.rootURL)
+            do {
+                let unattendISO = try seed.generate()
+                extraDisks.append(unattendISO)
+                let msg = "windows: autounattend sidecar generated at \(unattendISO.lastPathComponent); "
+                    + "bypasses TPM/SecureBoot/RAM/CPU/Storage checks; skips MSA OOBE\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "warning: autounattend generation failed (\(error)); Win11 Setup may refuse compat check\n".utf8
+                ))
             }
         }
 
@@ -408,6 +481,7 @@ struct DesktopBoot: AsyncParsableCommand {
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
             cdromISO: cdromURL,
+            extraDisks: extraDisks,
             preferUSBCDROM: isWindows,
             installPhase: isInstallPhase,
             linuxDirectKernel: linuxDirectKernel,
