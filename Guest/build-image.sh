@@ -252,8 +252,10 @@ fi
   # (Layer 3 — Lifecycle in the three-layer API) MUST call
   # `vm.configureNetwork()` themselves before the first exec
   # if they need NAT eth0 outbound (DNS, internet). Skipping
-  # it leaves eth0 with carrier UP and no IP — traffic out the
-  # default route will fail. See the docstring on `VM.boot()`.
+  # it leaves eth0 admin-down with no IP/route — traffic out
+  # the default route will fail. See the docstring on
+  # `VM.boot()`. configureNetwork() brings eth0 up via
+  # `ip link set eth0 up` and assigns the IP/route over vsock.
 
   # Private networking config — LUMINA_NET_IP / LUMINA_HOSTS were parsed
   # from /proc/cmdline at init start (outer scope).

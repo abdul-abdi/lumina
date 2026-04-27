@@ -223,10 +223,11 @@ public actor VM {
     /// successfully, `exec()` works against the guest agent.
     ///
     /// **Network contract (v0.7.2+):** `boot()` does NOT configure the
-    /// NAT eth0 interface. The default eth0 link comes up with carrier
-    /// but no IP/route. Call `configureNetwork()` explicitly if you
-    /// need NAT outbound (DNS, internet). Every convenience entry point
-    /// (`Lumina.run`, `Lumina.stream`, `Lumina.createImage`,
+    /// NAT eth0 interface. eth0 stays admin-down with no IP/route until
+    /// something brings it up. Call `configureNetwork()` explicitly if
+    /// you need NAT outbound (DNS, internet) — it runs `ip link set
+    /// eth0 up` plus addr/route assignment. Every convenience entry
+    /// point (`Lumina.run`, `Lumina.stream`, `Lumina.createImage`,
     /// `SessionProcess`, `Pool`, `Network.session`) does this for you.
     /// Callers driving `VM` directly must do it themselves — the
     /// previous udhcpc fallback in the guest init was removed in v0.7.2
