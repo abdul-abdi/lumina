@@ -61,6 +61,37 @@ final class CommandRunner: @unchecked Sendable {
     private var _guestProtocolVersion: Int = 0
     private var _guestCapabilities: [String] = []
 
+    // ── Late-exit stash (v0.7.2) ──
+    // Audit-flagged correctness fix: `dispatchMessage` previously
+    // dropped any `.exit(id:code:)` whose id was not in
+    // `execHandlers` or `ptyHandlers`. Combined with the timeout
+    // watchdog, a slow command finishing a hair after timeout could
+    // lose its exit code — host returned `timeout`, guest had
+    // returned 0. Agents retrying non-idempotent ops did the work
+    // twice without any signal that they had.
+    //
+    // Two-part fix in this file:
+    //   1. dispatchMessage now stashes orphan exits here keyed by
+    //      id instead of dropping them.
+    //   2. exec() / execStream() use a soft/hard deadline pattern:
+    //      the watchdog fires SIGTERM at the soft deadline, but the
+    //      loop keeps reading the stream until the hard deadline
+    //      (soft + lateExitGraceWindow). A natural exit during the
+    //      grace window beats the synthetic timeout.
+    //
+    // Bounded: pruned to entries inserted within `recentExitTTL`.
+    // Memory ceiling ~32 entries × ~24 B → trivial.
+    private struct StashedExit { let code: Int32; let when: ContinuousClock.Instant }
+    private var _recentExits: [String: StashedExit] = [:]
+    private static let recentExitTTL: Duration = .seconds(30)
+    /// Window after a soft timeout during which a natural `.exit`
+    /// from the guest beats the synthetic timeout error. Picked at
+    /// 250 ms because the typical guest-side cancel→exit RTT is
+    /// well under 50 ms; 250 ms covers the 95th-percentile
+    /// "command was about to exit anyway" race without making
+    /// genuine timeouts feel sluggish.
+    private static let lateExitGraceWindow: Duration = .milliseconds(250)
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -210,25 +241,44 @@ final class CommandRunner: @unchecked Sendable {
         // nil and RunResult.stdoutBytes/stderrBytes are nil.
         var stdoutBytes: Data? = nil
         var stderrBytes: Data? = nil
-        let deadline = ContinuousClock.now + .seconds(timeout)
 
-        // Precision watchdog: guest heartbeats arrive every 2s, so a deadline
-        // shorter than two heartbeats would never be checked promptly. This task
-        // fires at exactly `timeout` seconds, cancels the guest command, and
-        // injects a synthetic heartbeat to unblock the for-await loop below.
+        // Two deadlines (v0.7.2 audit follow-up):
+        //
+        //   softDeadline = T+timeout   — watchdog fires SIGTERM here and
+        //                                 wakes the loop, but we keep
+        //                                 reading the stream looking
+        //                                 for a natural exit.
+        //   hardDeadline = soft+grace  — only here do we throw `.timeout`.
+        //
+        // The grace window between them lets a command that finished
+        // a hair after the timeout fired report its real exit code
+        // instead of getting a synthetic timeout error. Without this,
+        // agents retrying non-idempotent operations could repeat work
+        // that actually succeeded.
+        let softDeadline = ContinuousClock.now + .seconds(timeout)
+        let hardDeadline = softDeadline + Self.lateExitGraceWindow
+
+        // Watchdog: two wakeups. First at soft deadline (send cancel +
+        // wake the loop so it stops blocking on for-await). Second at
+        // hard deadline (wake the loop again so it sees `now > hard`
+        // and throws — without this, the loop would block forever if
+        // no late exit arrives during grace).
         let watchdogId = id
         let watchdog = Task.detached { [weak self] in
             do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
             guard let self else { return }
             try? self.cancel(id: watchdogId, signal: 15, gracePeriod: 5)
             self.yieldSyntheticHeartbeat(to: watchdogId)
+            do { try await Task.sleep(for: Self.lateExitGraceWindow) } catch { return }
+            self.yieldSyntheticHeartbeat(to: watchdogId)
         }
         defer { watchdog.cancel() }
 
         for await msg in stream {
-            if ContinuousClock.now > deadline {
-                // Send cancel to clean up the guest side (watchdog may have
-                // already sent it — cancel is idempotent on the guest).
+            if ContinuousClock.now > hardDeadline {
+                // Grace window expired without a natural exit. Genuine
+                // timeout — cancel is idempotent so an extra send here
+                // is fine if the watchdog already fired one.
                 try? cancel(id: id, signal: 15, gracePeriod: 5)
                 throw .timeout
             }
@@ -304,14 +354,30 @@ final class CommandRunner: @unchecked Sendable {
         let execId = id
 
         return AsyncThrowingStream { continuation in
+            // Soft/hard deadline pattern — same rationale as `exec()`.
+            // Soft deadline fires the cancel; hard deadline + grace
+            // window is when we actually throw timeout. Lets a natural
+            // exit racing the watchdog still report its real code.
+            let softDeadline = ContinuousClock.now + .seconds(timeout)
+            let hardDeadline = softDeadline + Self.lateExitGraceWindow
+
+            let watchdog = Task.detached { [weak runner] in
+                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+                guard let runner else { return }
+                try? runner.cancel(id: execId, signal: 15, gracePeriod: 5)
+                runner.yieldSyntheticHeartbeat(to: execId)
+                do { try await Task.sleep(for: Self.lateExitGraceWindow) } catch { return }
+                runner.yieldSyntheticHeartbeat(to: execId)
+            }
+
             let task = Task.detached {
-                let deadline = ContinuousClock.now + .seconds(timeout)
                 for await msg in msgStream {
                     if Task.isCancelled {
                         continuation.finish()
                         return
                     }
-                    if ContinuousClock.now > deadline {
+                    if ContinuousClock.now > hardDeadline {
+                        // Cancel is idempotent on the guest side.
                         try? runner.cancel(id: execId, signal: 15, gracePeriod: 5)
                         continuation.finish(throwing: LuminaError.timeout)
                         return
@@ -334,6 +400,7 @@ final class CommandRunner: @unchecked Sendable {
 
             continuation.onTermination = { @Sendable _ in
                 task.cancel()
+                watchdog.cancel()
                 runner.unregisterExecHandler(execId)
             }
         }
@@ -864,7 +931,7 @@ final class CommandRunner: @unchecked Sendable {
             let handler = ptyHandlers[id]
             ptyLock.unlock()
             handler?.yield(msg)
-        case .exit(let id, _):
+        case .exit(let id, let code):
             // Check exec handlers first (common case)
             lock.lock()
             let execHandler = execHandlers[id]
@@ -877,7 +944,15 @@ final class CommandRunner: @unchecked Sendable {
             ptyLock.lock()
             let ptyHandler = ptyHandlers[id]
             ptyLock.unlock()
-            ptyHandler?.yield(msg)
+            if let h = ptyHandler {
+                h.yield(msg)
+                break
+            }
+            // Orphan exit: handler already unregistered (most likely a
+            // command exiting just after the timeout watchdog fired).
+            // Stash so the timeout path in `exec()` can claim it during
+            // its grace window instead of dropping the code.
+            stashLateExit(id: id, code: code)
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
             lock.lock()
@@ -1112,6 +1187,30 @@ final class CommandRunner: @unchecked Sendable {
         _guestProtocolVersion = protocolVersion
         _guestCapabilities = capabilities
         lock.unlock()
+    }
+
+    /// Record an orphan exit for later claim. Prunes expired entries
+    /// on every insert so the stash size stays bounded by
+    /// `recentExitTTL`.
+    private func stashLateExit(id: String, code: Int32) {
+        let now = ContinuousClock.now
+        lock.lock()
+        for (k, v) in _recentExits where v.when < now - Self.recentExitTTL {
+            _recentExits.removeValue(forKey: k)
+        }
+        _recentExits[id] = StashedExit(code: code, when: now)
+        lock.unlock()
+    }
+
+    /// Atomically remove and return a stashed exit code if one
+    /// arrived for `id` after the handler was unregistered. Called
+    /// from post-mortem reclaim paths. Returns nil when no late
+    /// exit has been recorded — that's the genuine-timeout path.
+    func consumeRecentExit(id: String) -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = _recentExits.removeValue(forKey: id) else { return nil }
+        return entry.code
     }
 
     /// Store a new vsock connection and create file handles for I/O.
