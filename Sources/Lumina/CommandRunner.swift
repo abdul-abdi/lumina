@@ -53,6 +53,36 @@ final class CommandRunner: @unchecked Sendable {
     // command beat the ticker's 500ms initial delay, or legacy agent).
     private var _latestNetworkMetrics: NetworkMetricsSummary?
 
+    // ── Guest handshake metadata (v0.7.2) ──
+    // Captured from the agent's `ready` frame. 0 / [] when the guest
+    // pre-dates capability negotiation (older release tarballs).
+    // Diagnostic only today; future protocol bumps can branch on
+    // these to refuse incompatible guests instead of misdecoding.
+    private var _guestProtocolVersion: Int = 0
+    private var _guestCapabilities: [String] = []
+
+    // ── Late-exit grace window (v0.7.2) ──
+    // Audit-flagged correctness fix: a slow command finishing a
+    // hair after the timeout watchdog fired could lose its exit
+    // code — host returned `timeout`, guest had already returned 0.
+    // Agents retrying non-idempotent ops did the work twice with
+    // no signal that they had.
+    //
+    // Fix: `exec()` / `execStream()` use a soft/hard deadline
+    // pattern. The watchdog fires SIGTERM at the soft deadline
+    // (T+timeout) and wakes the loop, but the loop keeps reading
+    // the stream until the hard deadline (soft + grace window).
+    // A natural `.exit` during the grace window beats the
+    // synthetic timeout — the handler is still registered, so
+    // the dispatcher routes the message into the same stream
+    // we're still reading.
+    //
+    // 250 ms picked because the typical guest-side cancel→exit
+    // RTT is well under 50 ms; 250 ms covers the 95th-percentile
+    // "command was about to exit anyway" race without making
+    // genuine timeouts feel sluggish.
+    private static let lateExitGraceWindow: Duration = .milliseconds(250)
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -74,6 +104,23 @@ final class CommandRunner: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _latestNetworkMetrics
+    }
+
+    /// Wire-format version reported by the guest on its `ready` frame.
+    /// 0 means the guest pre-dates v0.7.2 (no protocol_version field
+    /// in its `ready`). Thread-safe read.
+    var guestProtocolVersion: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _guestProtocolVersion
+    }
+
+    /// Capability strings reported by the guest on its `ready` frame.
+    /// Empty when the guest pre-dates v0.7.2. Thread-safe read.
+    var guestCapabilities: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _guestCapabilities
     }
 
     var state: ConnectionState {
@@ -143,10 +190,15 @@ final class CommandRunner: @unchecked Sendable {
             setState(.disconnected)
             throw .protocolError("Failed to decode guest message: \(error)")
         }
-        guard msg == .ready else {
+        guard case .ready(let protocolVersion, let capabilities) = msg else {
             setState(.disconnected)
             throw .protocolError("Expected ready message, got: \(msg)")
         }
+
+        // Stash handshake metadata for diagnostics + future capability
+        // gating. v0.7.2+ agents populate these; older guests omit the
+        // fields and decode as (0, []) which is fine.
+        setHandshakeMetadata(protocolVersion: protocolVersion, capabilities: capabilities)
 
         setState(.ready)
         startDispatcher(initialBuffer: readBuffer)
@@ -180,25 +232,44 @@ final class CommandRunner: @unchecked Sendable {
         // nil and RunResult.stdoutBytes/stderrBytes are nil.
         var stdoutBytes: Data? = nil
         var stderrBytes: Data? = nil
-        let deadline = ContinuousClock.now + .seconds(timeout)
 
-        // Precision watchdog: guest heartbeats arrive every 2s, so a deadline
-        // shorter than two heartbeats would never be checked promptly. This task
-        // fires at exactly `timeout` seconds, cancels the guest command, and
-        // injects a synthetic heartbeat to unblock the for-await loop below.
+        // Two deadlines (v0.7.2 audit follow-up):
+        //
+        //   softDeadline = T+timeout   — watchdog fires SIGTERM here and
+        //                                 wakes the loop, but we keep
+        //                                 reading the stream looking
+        //                                 for a natural exit.
+        //   hardDeadline = soft+grace  — only here do we throw `.timeout`.
+        //
+        // The grace window between them lets a command that finished
+        // a hair after the timeout fired report its real exit code
+        // instead of getting a synthetic timeout error. Without this,
+        // agents retrying non-idempotent operations could repeat work
+        // that actually succeeded.
+        let softDeadline = ContinuousClock.now + .seconds(timeout)
+        let hardDeadline = softDeadline + Self.lateExitGraceWindow
+
+        // Watchdog: two wakeups. First at soft deadline (send cancel +
+        // wake the loop so it stops blocking on for-await). Second at
+        // hard deadline (wake the loop again so it sees `now > hard`
+        // and throws — without this, the loop would block forever if
+        // no late exit arrives during grace).
         let watchdogId = id
         let watchdog = Task.detached { [weak self] in
             do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
             guard let self else { return }
             try? self.cancel(id: watchdogId, signal: 15, gracePeriod: 5)
             self.yieldSyntheticHeartbeat(to: watchdogId)
+            do { try await Task.sleep(for: Self.lateExitGraceWindow) } catch { return }
+            self.yieldSyntheticHeartbeat(to: watchdogId)
         }
         defer { watchdog.cancel() }
 
         for await msg in stream {
-            if ContinuousClock.now > deadline {
-                // Send cancel to clean up the guest side (watchdog may have
-                // already sent it — cancel is idempotent on the guest).
+            if ContinuousClock.now > hardDeadline {
+                // Grace window expired without a natural exit. Genuine
+                // timeout — cancel is idempotent so an extra send here
+                // is fine if the watchdog already fired one.
                 try? cancel(id: id, signal: 15, gracePeriod: 5)
                 throw .timeout
             }
@@ -274,14 +345,30 @@ final class CommandRunner: @unchecked Sendable {
         let execId = id
 
         return AsyncThrowingStream { continuation in
+            // Soft/hard deadline pattern — same rationale as `exec()`.
+            // Soft deadline fires the cancel; hard deadline + grace
+            // window is when we actually throw timeout. Lets a natural
+            // exit racing the watchdog still report its real code.
+            let softDeadline = ContinuousClock.now + .seconds(timeout)
+            let hardDeadline = softDeadline + Self.lateExitGraceWindow
+
+            let watchdog = Task.detached { [weak runner] in
+                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+                guard let runner else { return }
+                try? runner.cancel(id: execId, signal: 15, gracePeriod: 5)
+                runner.yieldSyntheticHeartbeat(to: execId)
+                do { try await Task.sleep(for: Self.lateExitGraceWindow) } catch { return }
+                runner.yieldSyntheticHeartbeat(to: execId)
+            }
+
             let task = Task.detached {
-                let deadline = ContinuousClock.now + .seconds(timeout)
                 for await msg in msgStream {
                     if Task.isCancelled {
                         continuation.finish()
                         return
                     }
-                    if ContinuousClock.now > deadline {
+                    if ContinuousClock.now > hardDeadline {
+                        // Cancel is idempotent on the guest side.
                         try? runner.cancel(id: execId, signal: 15, gracePeriod: 5)
                         continuation.finish(throwing: LuminaError.timeout)
                         return
@@ -304,6 +391,7 @@ final class CommandRunner: @unchecked Sendable {
 
             continuation.onTermination = { @Sendable _ in
                 task.cancel()
+                watchdog.cancel()
                 runner.unregisterExecHandler(execId)
             }
         }
@@ -847,7 +935,26 @@ final class CommandRunner: @unchecked Sendable {
             ptyLock.lock()
             let ptyHandler = ptyHandlers[id]
             ptyLock.unlock()
-            ptyHandler?.yield(msg)
+            if let h = ptyHandler {
+                h.yield(msg)
+                break
+            }
+            // Orphan exit: handler already unregistered. Drop.
+            // For `exec()` / `execStream()`: the soft/hard deadline
+            // grace window keeps the handler registered through the
+            // natural-exit window, so by the time we land here the
+            // command genuinely overshot the window and the synthetic
+            // .timeout error is correct.
+            // For `ptyExec()`: there is no host-side soft/hard
+            // deadline pattern — PTY timeout is enforced solely by
+            // the guest's gracefulKill (SIGTERM, then SIGKILL after
+            // 5s). A late PTY exit can therefore land here if the
+            // consumer cancelled or dropped the stream. This drop is
+            // bounded by the guest's SIGKILL fallback so the process
+            // can't outlive the host's cleanup; the PTY stream
+            // closes either way. Pre-existing — not introduced by
+            // the soft/hard deadline change.
+            break
         case .heartbeat:
             // Broadcast to all exec handlers so timeout checks can run
             lock.lock()
@@ -1070,6 +1177,17 @@ final class CommandRunner: @unchecked Sendable {
     private func setState(_ newState: ConnectionState) {
         lock.lock()
         _state = newState
+        lock.unlock()
+    }
+
+    /// Sync wrapper so async callers (connect) can stash the guest's
+    /// handshake metadata without touching the NSLock directly —
+    /// `lock.lock()` is unavailable from async contexts under Swift 6
+    /// strict concurrency.
+    private func setHandshakeMetadata(protocolVersion: Int, capabilities: [String]) {
+        lock.lock()
+        _guestProtocolVersion = protocolVersion
+        _guestCapabilities = capabilities
         lock.unlock()
     }
 

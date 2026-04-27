@@ -49,7 +49,10 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
 
-    @Flag(name: .customLong("no-wait-network"), help: "Skip the host-side wait for network_ready. Guest still configures the network concurrently; this just drops the barrier. Only use when you KNOW the command won't touch DNS/TCP in the first ~20ms. Default (await) is now ~50-150ms on v0.7.1+ so the speedup is small and the reliability cost is real.")
+    @Flag(name: .customLong("wait-network"), help: "Block exec until the guest's network is up (~50-150ms cost). Recommended for commands that hit DNS in their first millisecond (apt update, curl, pip install). Off by default in v0.7.2+.")
+    var waitNetwork: Bool = false
+
+    @Flag(name: .customLong("no-wait-network"), help: "[deprecated] Was the v0.7.1 opt-out flag; v0.7.2+ does not wait by default, so this is now a no-op. Use --wait-network to opt back in to the legacy default.")
     var noWaitNetwork: Bool = false
 
     func run() async throws {
@@ -102,84 +105,11 @@ struct Run: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        var parsedEnv: [String: String] = [:]
-        for pair in env {
-            guard let eqIndex = pair.firstIndex(of: "=") else {
-                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL format\n".utf8))
-                throw ExitCode.failure
-            }
-            let key = String(pair[pair.startIndex..<eqIndex])
-            let value = String(pair[pair.index(after: eqIndex)...])
-            parsedEnv[key] = value
-        }
-
-        // Parse --copy: auto-detect file vs directory from local path
-        var parsedUploads: [FileUpload] = []
-        var parsedDirUploads: [DirectoryUpload] = []
-        for spec in copy {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'. Use local:remote format\n".utf8))
-                throw ExitCode.failure
-            }
-            let localStr = String(spec[spec.startIndex..<colonIndex])
-            let remote = String(spec[spec.index(after: colonIndex)...])
-            let localURL = URL(fileURLWithPath: localStr)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir) else {
-                FileHandle.standardError.write(Data("lumina: not found: \(localStr)\n".utf8))
-                throw ExitCode.failure
-            }
-            if isDir.boolValue {
-                parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
-            } else {
-                let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
-                parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
-            }
-        }
-
-        // Parse --download: auto-detected as file vs directory at runtime on guest
-        var parsedDownloads: [FileDownload] = []
-        for spec in download {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --download '\(spec)'. Use remote:local format\n".utf8))
-                throw ExitCode.failure
-            }
-            let remote = String(spec[spec.startIndex..<colonIndex])
-            let localStr = String(spec[spec.index(after: colonIndex)...])
-            let localURL = URL(fileURLWithPath: localStr)
-            parsedDownloads.append(FileDownload(remotePath: remote, localPath: localURL))
-        }
-
-        // Parse --volume: host path (starts with / or .) = mount, otherwise = named volume
-        var parsedMounts: [MountPoint] = []
+        let parsedEnv = try parseEnvSpecs(env)
+        let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
+        let parsedDownloads = try parseDownloadSpecs(download)
         let volumeStore = VolumeStore()
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
-                throw ExitCode.failure
-            }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                // Host directory mount
-                let hostURL = URL(fileURLWithPath: left)
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
-                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
-                    throw ExitCode.failure
-                }
-                parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
-            } else {
-                // Named volume
-                guard let hostDir = volumeStore.resolve(name: left) else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                volumeStore.touch(name: left)
-                parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
-            }
-        }
+        let parsedMounts = try parseVolumeSpecs(volume, volumeStore: volumeStore)
 
         var parsedDiskSize: UInt64? = nil
         if let ds = resolvedDiskSize {
@@ -203,8 +133,17 @@ struct Run: AsyncParsableCommand {
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
             stdin: resolveStdin(),
-            awaitNetworkReady: !noWaitNetwork
+            awaitNetworkReady: waitNetwork
         )
+
+        // Mid-migration scripts may pass both flags. If --wait-network is
+        // also set, the user has clearly opted in — don't shout about the
+        // deprecated alias on top of that.
+        if noWaitNetwork && !waitNetwork {
+            FileHandle.standardError.write(Data(
+                "lumina: --no-wait-network is a no-op in v0.7.2+ (default behaviour). Pass --wait-network to opt back into the v0.7.1 default.\n".utf8
+            ))
+        }
 
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()
@@ -1269,14 +1208,7 @@ struct Exec: AsyncParsableCommand {
         }
         let timeoutSecs = Int(parsedTimeout.components.seconds)
 
-        var parsedEnv: [String: String] = [:]
-        for pair in env {
-            guard let eqIndex = pair.firstIndex(of: "=") else {
-                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedEnv[String(pair[..<eqIndex])] = String(pair[pair.index(after: eqIndex)...])
-        }
+        let parsedEnv = try parseEnvSpecs(env)
 
         let client = SessionClient()
         do {
@@ -1941,78 +1873,11 @@ struct PoolRun: AsyncParsableCommand {
             FileHandle.standardError.write(Data("lumina: invalid memory: \(memory)\n".utf8))
             throw ExitCode.failure
         }
-        var parsedEnv: [String: String] = [:]
-        for pair in env {
-            guard let eqIndex = pair.firstIndex(of: "=") else {
-                FileHandle.standardError.write(Data("lumina: invalid env '\(pair)'. Use KEY=VAL format\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedEnv[String(pair[pair.startIndex..<eqIndex])] = String(pair[pair.index(after: eqIndex)...])
-        }
-
-        // Parse --copy: auto-detect file vs directory from local path
-        var parsedUploads: [FileUpload] = []
-        var parsedDirUploads: [DirectoryUpload] = []
-        for spec in copy {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --copy '\(spec)'. Use local:remote format\n".utf8))
-                throw ExitCode.failure
-            }
-            let localStr = String(spec[spec.startIndex..<colonIndex])
-            let remote = String(spec[spec.index(after: colonIndex)...])
-            let localURL = URL(fileURLWithPath: localStr)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDir) else {
-                FileHandle.standardError.write(Data("lumina: not found: \(localStr)\n".utf8))
-                throw ExitCode.failure
-            }
-            if isDir.boolValue {
-                parsedDirUploads.append(DirectoryUpload(localPath: localURL, remotePath: remote))
-            } else {
-                let mode = FileManager.default.isExecutableFile(atPath: localURL.path) ? "0755" : "0644"
-                parsedUploads.append(FileUpload(localPath: localURL, remotePath: remote, mode: mode))
-            }
-        }
-
-        // Parse --download: auto-detected as file vs directory at runtime on guest
-        var parsedDownloads: [FileDownload] = []
-        for spec in download {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --download '\(spec)'. Use remote:local format\n".utf8))
-                throw ExitCode.failure
-            }
-            let remote = String(spec[spec.startIndex..<colonIndex])
-            let localStr = String(spec[spec.index(after: colonIndex)...])
-            parsedDownloads.append(FileDownload(remotePath: remote, localPath: URL(fileURLWithPath: localStr)))
-        }
-
-        // Parse --volume: applied at pool boot time (VM-level config)
-        var parsedMounts: [MountPoint] = []
+        let parsedEnv = try parseEnvSpecs(env)
+        let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
+        let parsedDownloads = try parseDownloadSpecs(download)
         let volumeStore = VolumeStore()
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
-                throw ExitCode.failure
-            }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                let hostURL = URL(fileURLWithPath: left)
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
-                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
-                    throw ExitCode.failure
-                }
-                parsedMounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
-            } else {
-                guard let hostDir = volumeStore.resolve(name: left) else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                volumeStore.touch(name: left)
-                parsedMounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
-            }
-        }
+        let parsedMounts = try parseVolumeSpecs(volume, volumeStore: volumeStore)
 
         let opts = VMOptions(memory: parsedMemory, cpuCount: cpus, image: image, mounts: parsedMounts)
 

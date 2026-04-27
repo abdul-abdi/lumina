@@ -11,6 +11,9 @@ import Testing
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
     #expect(opts.directoryDownloads.isEmpty)
+    // v0.7.2 default flip: do NOT block exec on network_ready by default.
+    // Regression guard against an accidental flip-back to true.
+    #expect(opts.awaitNetworkReady == false)
 }
 
 @Test func directoryUploadInit() {
@@ -59,7 +62,8 @@ import Testing
 
 @Test func guestMessageHeartbeatEquality() {
     #expect(GuestMessage.heartbeat == GuestMessage.heartbeat)
-    #expect(GuestMessage.heartbeat != GuestMessage.ready)
+    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 0, capabilities: []))
+    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 1, capabilities: ["pty"]))
 }
 
 @Test func runOptionsWorkingDirectoryDefaultNil() {

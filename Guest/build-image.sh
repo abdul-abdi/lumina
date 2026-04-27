@@ -232,15 +232,30 @@ fi
     n=$((n+1))
   done
 
-  # Disable IPv6 — VZ NAT only provides IPv4 routing
+  # Disable IPv6 — VZ NAT only provides IPv4 routing.
+  # The host-side `configure_network` (network.go) does this too;
+  # keeping it here so eth0 stays sane even if the host driver
+  # doesn't run (e.g. custom library callers that skip
+  # `vm.configureNetwork()`).
   echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null
 
-  # DHCP — let vmnet assign the correct IP and gateway.
-  # Static MAC-derived IPs hardcoded the subnet to 192.168.64.0/24, but
-  # vmnet will pick a different range (e.g. 192.168.65.0/24) when that
-  # range is already in use by another interface or VPN. DHCP always gets
-  # the right subnet regardless of which one vmnet chose.
-  udhcpc -i eth0 -t 5 -T 1 -n -q -s /usr/share/udhcpc/default.script 2>/dev/null
+  # NOTE: udhcpc was previously invoked here as a fallback DHCP
+  # client. Removed in v0.7.2 — every internal caller of `VM`
+  # (Lumina.run, Lumina.stream, Lumina.createImage,
+  # SessionProcess, Pool, Network) drives `configure_network`
+  # over vsock, which is faster and authoritative. udhcpc raced
+  # the host driver, occasionally installed a different IP/route
+  # than the host requested, and added 30–80 ms of churn on
+  # every boot.
+  #
+  # Library callers using the public `VM` actor directly
+  # (Layer 3 — Lifecycle in the three-layer API) MUST call
+  # `vm.configureNetwork()` themselves before the first exec
+  # if they need NAT eth0 outbound (DNS, internet). Skipping
+  # it leaves eth0 admin-down with no IP/route — traffic out
+  # the default route will fail. See the docstring on
+  # `VM.boot()`. configureNetwork() brings eth0 up via
+  # `ip link set eth0 up` and assigns the IP/route over vsock.
 
   # Private networking config — LUMINA_NET_IP / LUMINA_HOSTS were parsed
   # from /proc/cmdline at init start (outer scope).
