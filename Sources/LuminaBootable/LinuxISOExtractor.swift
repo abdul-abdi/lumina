@@ -324,11 +324,13 @@ public struct LinuxISOExtractor: Sendable {
         return false
     }
 
-    // Small, focused process runner. Intentionally duplicated from
-    // ImagePuller / DoctorCommand — the latter two live in Lumina /
-    // lumina-cli and this file is in LuminaBootable, so sharing would
-    // require a new shared utility target. ~15 lines of duplication is
-    // cheaper than the target reshuffle.
+    // Process runner that drains stdout/stderr concurrently. Critical when
+    // the child writes more than ~64 KB (one pipe buffer) — `bsdtar -tf` on
+    // Debian's 550 MB netinst ISO outputs ~69 KB, which deadlocks the
+    // naive "waitUntilExit then read" pattern: bsdtar blocks on write,
+    // we block on wait, no progress. Alpine's smaller ISO didn't trigger
+    // it because its tf output fits in the buffer. Discovered while
+    // debugging the auto-preseed boot path 2026-04-27.
     private static func runProcess(
         _ path: String, arguments: [String]
     ) -> (exitCode: Int32, stdout: String, stderr: String) {
@@ -339,20 +341,36 @@ public struct LinuxISOExtractor: Sendable {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        // Drain both pipes on background queues. Each thread reads to EOF;
+        // EOF arrives when the child closes its end (i.e. after exit). The
+        // semaphore wait below blocks until both drains have finished.
+        var stdoutData = Data()
+        var stderrData = Data()
+        let stdoutSem = DispatchSemaphore(value: 0)
+        let stderrSem = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            stdoutSem.signal()
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrSem.signal()
+        }
+
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return (-1, "", error.localizedDescription)
         }
-        let stdout = String(
-            data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        let stderr = String(
-            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
+        process.waitUntilExit()
+        // Wait for the drain threads to finish reading any tail bytes
+        // emitted between the last write and the file-handle close.
+        stdoutSem.wait()
+        stderrSem.wait()
+
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
     }
 }

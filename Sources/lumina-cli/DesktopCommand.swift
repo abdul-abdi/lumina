@@ -378,8 +378,11 @@ struct DesktopBoot: AsyncParsableCommand {
                 // Default to the extracted initrd. Inject preseed if this
                 // is a Debian-family first boot.
                 var initrdURL = extracted.initramfs
-                var cmdlineParts = ["console=hvc0"]
-                if captureSerial { cmdlineParts.append("earlycon=hvc0") }
+                // earlycon=hvc0 lets the kernel start writing to our virtio
+                // serial before init runs — without it, the first ~10s of
+                // boot are invisible. Cheap and load-bearing for the
+                // auto-preseed path's serial-log diagnosability.
+                var cmdlineParts = ["console=hvc0", "earlycon=hvc0"]
                 if !extracted.cmdlineExtra.isEmpty {
                     cmdlineParts.append(extracted.cmdlineExtra)
                 }
