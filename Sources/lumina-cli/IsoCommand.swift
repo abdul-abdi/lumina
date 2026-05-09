@@ -224,6 +224,27 @@ struct IsoInspect: AsyncParsableCommand {
 
 // MARK: - iso boot
 
+/// Target guest OS family. Drives CD-ROM device choice (Windows
+/// requires VZUSBMassStorage; Linux accepts virtio-block) and surfaces
+/// distro-specific advisories before boot.
+enum IsoTargetOS: String, CaseIterable {
+    case auto, linux, windows, macos
+
+    /// Heuristic detection from the ISO filename. Returns `.windows` on
+    /// any of `win11/win10/windows/tiny11`, `.macos` on `.ipsw` or
+    /// `macos.iso`, and `.linux` otherwise.
+    static func detect(forFilename filename: String) -> IsoTargetOS {
+        let lower = filename.lowercased()
+        if lower.hasSuffix(".ipsw") { return .macos }
+        if lower.contains("macos") || lower.contains("osx") { return .macos }
+        if lower.contains("windows") || lower.contains("win11") ||
+           lower.contains("win10") || lower.contains("tiny11") {
+            return .windows
+        }
+        return .linux
+    }
+}
+
 struct IsoBoot: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "boot",
@@ -272,6 +293,10 @@ struct IsoBoot: AsyncParsableCommand {
             help: "Host interface to bridge against when --network=bridged.")
     var bridgeInterface: String?
 
+    @Option(name: .customLong("os"),
+            help: "Target guest OS: auto (default — filename heuristic), linux, windows, or macos. Drives CD-ROM device type and TPM advisory. macOS is rejected — use `lumina desktop install-macos` with an IPSW.")
+    var osHint: String = "auto"
+
     func run() async throws {
         installSignalHandlers()
 
@@ -279,6 +304,68 @@ struct IsoBoot: AsyncParsableCommand {
         guard FileManager.default.fileExists(atPath: isoURL.path) else {
             FileHandle.standardError.write(Data("error: ISO not found: \(iso)\n".utf8))
             throw ExitCode(2)
+        }
+
+        // Resolve target guest OS.
+        let resolvedOS: IsoTargetOS
+        switch osHint.lowercased() {
+        case "auto":
+            resolvedOS = IsoTargetOS.detect(forFilename: isoURL.lastPathComponent)
+        case "linux":
+            resolvedOS = .linux
+        case "windows":
+            resolvedOS = .windows
+        case "macos":
+            resolvedOS = .macos
+        default:
+            FileHandle.standardError.write(Data(
+                "error: --os must be one of: auto, linux, windows, macos (got '\(osHint)')\n".utf8
+            ))
+            throw ExitCode(2)
+        }
+
+        // macOS guests don't ship as ISOs — Apple uses IPSW restore
+        // images consumed by VZMacOSInstaller. The CLI surface for
+        // macOS lives elsewhere; refuse here with a clear pointer.
+        if resolvedOS == .macos {
+            let detail: String
+            if isoURL.pathExtension.lowercased() == "ipsw" {
+                detail = "This looks like an IPSW. macOS guests use VZMacOSInstaller, not VZEFIBootLoader."
+            } else {
+                detail = "macOS does not distribute installer ISOs. Apple Silicon macOS guests need an IPSW (restore image)."
+            }
+            let macosMsg = """
+                error: \(detail)
+
+                       Use the macOS installation path instead:
+                         lumina desktop install-macos --ipsw <path/or/url>
+
+                       Auto-detected from filename. Pass --os linux or
+                       --os windows to override if this is wrong.
+
+                """
+            FileHandle.standardError.write(Data(macosMsg.utf8))
+            throw ExitCode(2)
+        }
+
+        // Windows TPM advisory — Apple's Virtualization.framework has no
+        // TPM API, and stock Win11 Home/Pro retail ISOs refuse OOBE
+        // without TPM 2.0. Surface this BEFORE booting so the user
+        // doesn't waste an install attempt.
+        if resolvedOS == .windows {
+            FileHandle.standardError.write(Data("""
+
+                ⚠ KNOWN CONSTRAINT: WINDOWS 11 TPM
+                  Apple's Virtualization.framework exposes no TPM. Stock Windows 11
+                  Home/Pro retail ISOs refuse Setup without TPM 2.0. Workable paths:
+                    • Tiny11 ARM ISO (pre-bypassed). Not Microsoft-signed.
+                    • Windows Insider Preview ISO (TPM bypass during flighting).
+                    • Inject LabConfig\\BypassTPMCheck=1 via unattend.xml on a
+                      FAT32 sidecar (advanced).
+                  Stock retail ISOs WILL boot to the Setup screen but cannot
+                  proceed past the TPM check.
+
+                """.utf8))
         }
 
         // Pre-flight: architecture check. x86_64 / RISC-V get a friendly
@@ -313,10 +400,10 @@ struct IsoBoot: AsyncParsableCommand {
             }
         }
 
-        try await proceedWithBoot(isoURL: isoURL)
+        try await proceedWithBoot(isoURL: isoURL, targetOS: resolvedOS)
     }
 
-    private func proceedWithBoot(isoURL: URL) async throws {
+    private func proceedWithBoot(isoURL: URL, targetOS: IsoTargetOS) async throws {
         // Parse memory + disk size.
         let resolvedMemory = resolveMemory(flag: memory)
         let resolvedCPUs = resolveCpus(flag: cpus)
@@ -350,6 +437,13 @@ struct IsoBoot: AsyncParsableCommand {
         // Resolve / create the bundle directory.
         let (bundleRoot, isEphemeral) = try resolveBundleRoot()
 
+        let bundleOSFamily: OSFamily
+        switch targetOS {
+        case .linux, .auto: bundleOSFamily = .linux
+        case .windows:      bundleOSFamily = .windows
+        case .macos:        bundleOSFamily = .macOS  // unreachable — refused earlier
+        }
+
         var bundle: VMBundle
         let manifestPath = bundleRoot.appendingPathComponent("manifest.json")
         if FileManager.default.fileExists(atPath: manifestPath.path) {
@@ -361,8 +455,8 @@ struct IsoBoot: AsyncParsableCommand {
                 bundle = try VMBundle.create(
                     at: bundleRoot,
                     name: "iso-boot-\(isoURL.deletingPathExtension().lastPathComponent)",
-                    osFamily: .linux,
-                    osVariant: "iso",
+                    osFamily: bundleOSFamily,
+                    osVariant: "iso-\(targetOS.rawValue)",
                     memoryBytes: memBytes,
                     cpuCount: resolvedCPUs,
                     diskBytes: diskBytes
@@ -392,11 +486,12 @@ struct IsoBoot: AsyncParsableCommand {
             }
         }
 
-        // --capture-serial extraction (auto-attempted unless opted out).
+        // --capture-serial extraction (auto-attempted unless opted out
+        // OR target is Windows — there's no Linux kernel to extract).
         var captureKernel: URL?
         var captureInitrd: URL?
         var captureCmdline: String?
-        if !noCaptureSerial {
+        if !noCaptureSerial && targetOS == .linux {
             let extractDir = bundle.rootURL.appendingPathComponent("linux-direct")
             do {
                 if let arts = try IsoBootHelpers.runCaptureSerialExtraction(
@@ -413,7 +508,7 @@ struct IsoBoot: AsyncParsableCommand {
                     .map { $0.name }
                     .joined(separator: ", ")
                 FileHandle.standardError.write(Data(
-                    "→ unknown layout — booting via EFI (GRUB). --capture-serial inactive.\n   Supported for capture: \(supported).\n".utf8
+                    "→ unknown Linux layout — booting via EFI (GRUB). --capture-serial inactive.\n   Supported for capture: \(supported).\n".utf8
                 ))
             } catch IsoBootHelpers.CaptureError.extractionFailed(let detail) {
                 FileHandle.standardError.write(Data(
@@ -437,11 +532,14 @@ struct IsoBoot: AsyncParsableCommand {
             opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
         }
         opts.serialLogURL = bundle.logsDirectory.appendingPathComponent("serial.log")
+        // Windows guests need VZUSBMassStorage CD-ROM (Windows refuses
+        // virtio-block-as-CD-ROM with "cannot find media"). Linux
+        // accepts either; default to virtio for parity with desktop.
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
             cdromISO: isoURL,
-            preferUSBCDROM: false,  // Linux installers handle either; default to virtio.
+            preferUSBCDROM: targetOS == .windows,
             installPhase: isInstallPhase,
             linuxDirectKernel: captureKernel,
             linuxDirectInitramfs: captureInitrd,
