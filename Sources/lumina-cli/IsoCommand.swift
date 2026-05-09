@@ -6,23 +6,68 @@
 // installer / live ISOs without going through the bundle-creation
 // dance that `lumina desktop create + boot` requires.
 //
+// === Design overview ===
+//
 // Three subcommands:
 //
-//   lumina iso inspect <path>     — arch + distro fingerprint + recommended
-//                                   flags, exits 0; rejects only on file-not-
-//                                   found (read-only verb).
-//   lumina iso boot --iso <path>  — one-step boot. Ephemeral disk by default
-//                                   (cleaned on shutdown), or persistent at
-//                                   --persist <dir>. x86_64 / RISC-V ISOs are
-//                                   refused with an actionable message.
-//   lumina iso ls                 — DesktopOSCatalog entries (downloadable
-//                                   known-good distros), JSON when piped.
+//   lumina iso inspect <path>     arch + distro fingerprint + recommended
+//                                 flags, exits 0; rejects only on file-not-
+//                                 found (read-only verb).
+//   lumina iso boot --iso <path>  one-step boot. Ephemeral disk by default
+//                                 (cleaned on shutdown), or persistent at
+//                                 --persist <dir>. x86_64 / RISC-V ISOs are
+//                                 refused with an actionable message.
+//   lumina iso ls                 DesktopOSCatalog entries (downloadable
+//                                 known-good distros), JSON when piped.
 //
-// Non-goals (v1):
+// === Boot path layering (Linux) ===
+//
+//   1. LinuxISOExtractor.knownLayouts — hand-tuned per-distro
+//      (Ubuntu / Debian / Alpine LTS+virt / Fedora / Arch). Each
+//      entry carries kernel/initramfs paths AND a cmdlineExtra
+//      string that's been verified to reach userspace on hvc0.
+//   2. Failure of (1) → plain EFI boot. The user gets a working
+//      VM via the ISO's own GRUB; serial capture is unavailable
+//      but the bundle's framebuffer (--graphics) works.
+//   3. Silent-kernel detection: even when (1) succeeds the kernel
+//      may not emit on hvc0 (Debian d-i is the canonical case).
+//      A polling task watches `vm.serialOutput` for 8s post-boot;
+//      if 0 bytes captured AND --graphics not passed, prints a
+//      hint pointing at --graphics or --no-capture-serial.
+//
+// === OS detection ===
+//
+//   `IsoTargetOS.detect(forFilename:)` filename heuristic drives
+//   CD-ROM device choice (Windows → VZUSBMassStorage so Setup
+//   accepts it; Linux → virtio-block) and TPM advisory display.
+//   `--os {auto, linux, windows, macos}` forces a specific path.
+//
+// === Windows TPM bypass ===
+//
+//   Apple's Virtualization.framework exposes no TPM 2.0. Stock
+//   Win11 retail ISOs abort Setup at the readiness check. Pass
+//   `--bypass-tpm-check` (Windows-only): generates an
+//   autounattend.xml sidecar ISO via `WindowsUnattend.generateISO`
+//   that disables BypassTPMCheck/BypassSecureBootCheck/
+//   BypassRAMCheck/BypassCPUCheck/BypassStorageCheck under
+//   `HKLM\System\Setup\LabConfig` during the windowsPE pass,
+//   then attaches it as a second USB mass-storage CD-ROM via
+//   `EFIBootConfig.extraCDROMs`. Windows Setup scans drives for
+//   autounattend.xml, finds the sidecar, applies the keys before
+//   the readiness check fires.
+//
+// === Non-goals (v1) ===
+//
 //   - Agent injection / vsock exec against ISO-booted VMs.
 //   - `lumina iso run --iso X "cmd"` returning a JSON envelope.
 //   - Boot-once-snapshot to convert installer ISOs into Lumina images.
-//   - Windows / macOS guest CLI surface (covered by `lumina desktop`).
+//   - macOS guest CLI surface (use `lumina desktop install-macos`).
+//   - Generic grub.cfg variable-expansion parser. Considered for
+//     unknown-distro support; rejected because Archboot-style
+//     fully scripted grub.cfgs require an actual GRUB interpreter
+//     (the kernel/initrd paths live in shell variables expanded
+//     at GRUB runtime). The plain-EFI fallback is the right
+//     primitive for that case.
 
 import ArgumentParser
 import Foundation
@@ -297,6 +342,10 @@ struct IsoBoot: AsyncParsableCommand {
             help: "Target guest OS: auto (default — filename heuristic), linux, windows, or macos. Drives CD-ROM device type and TPM advisory. macOS is rejected — use `lumina desktop install-macos` with an IPSW.")
     var osHint: String = "auto"
 
+    @Flag(name: .customLong("bypass-tpm-check"),
+          help: "Windows-only: auto-generate an autounattend.xml sidecar ISO that disables Windows 11 Setup's TPM/SecureBoot/RAM/CPU/storage readiness checks. Apple Virtualization.framework has no TPM; without this flag stock Win11 retail ISOs abort Setup before the install-target screen. No-op when target OS is not windows.")
+    var bypassTpmCheck = false
+
     func run() async throws {
         installSignalHandlers()
 
@@ -532,6 +581,32 @@ struct IsoBoot: AsyncParsableCommand {
             opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
         }
         opts.serialLogURL = bundle.logsDirectory.appendingPathComponent("serial.log")
+        // Windows-only: generate an autounattend.xml sidecar ISO that
+        // disables Win11 Setup's TPM/SecureBoot/RAM/CPU/storage
+        // readiness checks. The sidecar lives inside the bundle so
+        // ephemeral cleanup sweeps it; persistent bundles regenerate
+        // it on each boot (cost is ~5 ms).
+        var extraCDROMs: [URL] = []
+        if targetOS == .windows && bypassTpmCheck {
+            let unattendDir = bundle.rootURL.appendingPathComponent("win-unattend")
+            do {
+                let unattendISO = try WindowsUnattend.allBypasses
+                    .generateISO(in: unattendDir)
+                extraCDROMs.append(unattendISO)
+                FileHandle.standardError.write(Data(
+                    "→ TPM bypass: attached autounattend.xml sidecar at \(unattendISO.path)\n".utf8
+                ))
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "warning: failed to generate autounattend.xml sidecar (\(error)); proceeding without TPM bypass.\n".utf8
+                ))
+            }
+        } else if targetOS == .windows && !bypassTpmCheck {
+            FileHandle.standardError.write(Data(
+                "→ tip: pass --bypass-tpm-check to auto-generate an autounattend.xml sidecar that lets stock Win11 retail ISOs proceed past the readiness check.\n".utf8
+            ))
+        }
+
         // Windows guests need VZUSBMassStorage CD-ROM (Windows refuses
         // virtio-block-as-CD-ROM with "cannot find media"). Linux
         // accepts either; default to virtio for parity with desktop.
@@ -543,7 +618,8 @@ struct IsoBoot: AsyncParsableCommand {
             installPhase: isInstallPhase,
             linuxDirectKernel: captureKernel,
             linuxDirectInitramfs: captureInitrd,
-            linuxDirectCmdline: captureCmdline
+            linuxDirectCmdline: captureCmdline,
+            extraCDROMs: extraCDROMs
         ))
         if graphics {
             opts.graphics = GraphicsConfig(

@@ -116,6 +116,25 @@ public struct EFIBootable: Sendable {
             }
         }
 
+        // Additional CD-ROMs (Windows autounattend.xml sidecar, etc.).
+        // Always attached as USB mass-storage on macOS 13+ so Windows
+        // Setup sees them as removable drives and scans for
+        // autounattend.xml. On macOS 12 the only multi-CD-ROM path is
+        // virtio-block, which Windows Setup refuses — those callers
+        // should detect the macOS version and surface that constraint
+        // (the wizard / CLI does this at flag-time, not here).
+        for extraISO in config.extraCDROMs {
+            do {
+                let att = try Self.makeISOAttachment(url: extraISO)
+                storage.append(Self.makeCDROMDevice(
+                    attachment: att,
+                    preferUSB: true
+                ))
+            } catch {
+                throw Error.diskAttachmentFailed(extraISO, "\(error)")
+            }
+        }
+
         for extra in config.extraDisks {
             do {
                 let att = try VZDiskImageStorageDeviceAttachment(url: extra, readOnly: false)
