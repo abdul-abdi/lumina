@@ -325,8 +325,16 @@ struct DesktopBoot: AsyncParsableCommand {
         }
 
         // --capture-serial: extract kernel + initramfs out of the ISO so
-        // we can boot via VZLinuxBootLoader with an hvc0 console. Only
-        // tractable when we actually have an ISO and a known layout.
+        // we can boot via VZLinuxBootLoader with an hvc0 console. Shares
+        // the IsoBootHelpers.runCaptureSerialExtraction codepath with
+        // `lumina iso boot` so both subcommands tune the cmdline the
+        // same way (single source of truth for v0.7.x).
+        //
+        // Semantic difference vs `lumina iso boot`: desktop bundles
+        // treat unknown layouts as fatal — the user explicitly opted
+        // into linux-direct via `--capture-serial`. `lumina iso boot`
+        // makes the same flag implicit and falls back to plain EFI
+        // when the layout doesn't match.
         var linuxDirectKernel: URL?
         var linuxDirectInitramfs: URL?
         var linuxDirectCmdline: String?
@@ -338,32 +346,17 @@ struct DesktopBoot: AsyncParsableCommand {
                 throw ExitCode(1)
             }
             let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
-            // Reset between ISO swaps so a previous distro's kernel /
-            // initramfs / vmlinuz-raw can't accidentally co-exist with
-            // the new layout's outputs.
-            try? FileManager.default.removeItem(at: artifacts)
-            try? FileManager.default.createDirectory(
-                at: artifacts, withIntermediateDirectories: true
-            )
             do {
-                let extracted = try LinuxISOExtractor.extract(
-                    iso: iso, destination: artifacts
-                )
-                linuxDirectKernel = extracted.kernel
-                linuxDirectInitramfs = extracted.initramfs
-                // Base cmdline: hvc0 for serial output, earlycon for
-                // pre-init panic capture. Deliberately NOT `quiet` —
-                // the whole point of --capture-serial is to see what
-                // happens, and Alpine/Debian-style init scripts gate
-                // their progress prints on KOPT_quiet=no. Verbose
-                // serial is the feature, not a bug.
-                let base = "console=hvc0 earlycon=hvc0"
-                linuxDirectCmdline = extracted.cmdlineExtra.isEmpty
-                    ? base
-                    : base + " " + extracted.cmdlineExtra
-                let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
-                FileHandle.standardError.write(Data(info.utf8))
-            } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
+                if let arts = try IsoBootHelpers.runCaptureSerialExtraction(
+                    iso: iso, destination: artifacts, quiet: true
+                ) {
+                    linuxDirectKernel = arts.kernel
+                    linuxDirectInitramfs = arts.initramfs
+                    linuxDirectCmdline = arts.cmdline
+                    let info = "--capture-serial: matched \(arts.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
+                    FileHandle.standardError.write(Data(info.utf8))
+                }
+            } catch IsoBootHelpers.CaptureError.unknownLayout(let tried) {
                 let supported = LinuxISOExtractor.knownLayouts
                     .map { $0.name }
                     .joined(separator: ", ")
@@ -372,9 +365,9 @@ struct DesktopBoot: AsyncParsableCommand {
                     + "Tried: \(tried.joined(separator: ", "))\n"
                 FileHandle.standardError.write(Data(msg.utf8))
                 throw ExitCode(1)
-            } catch {
+            } catch IsoBootHelpers.CaptureError.extractionFailed(let detail) {
                 FileHandle.standardError.write(Data(
-                    "error: --capture-serial: ISO extraction failed: \(error)\n".utf8
+                    "error: --capture-serial: ISO extraction failed: \(detail)\n".utf8
                 ))
                 throw ExitCode(1)
             }

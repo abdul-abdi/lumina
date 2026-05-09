@@ -579,6 +579,32 @@ struct IsoBoot: AsyncParsableCommand {
             }
         }
 
+        // Silent-kernel detection: if --capture-serial is on but the
+        // kernel emits nothing in the first 8 seconds, surface a hint
+        // pointing at --graphics. Catches Debian d-i and similar
+        // installer kernels that boot fine via EFI/framebuffer but
+        // don't initialise virtio-console output. The 8s window covers
+        // the slowest legitimate cold boot in the test matrix
+        // (Archboot ~2.5s, Alpine ~0.6s) with margin.
+        let captureSerialActive = (captureKernel != nil)
+        let silentKernelHint: Task<Void, Never>? = captureSerialActive ? Task.detached {
+            try? await Task.sleep(for: .seconds(8))
+            if Task.isCancelled { return }
+            let serialBytes = await vm.serialOutput.utf8.count
+            if serialBytes == 0 && !graphics {
+                FileHandle.standardError.write(Data("""
+                    ⚠ silent kernel: 0 bytes on virtio-console (hvc0) after 8s.
+                      The kernel booted but isn't emitting to our serial port.
+                      Known on Debian d-i and some installer kernels. Workarounds:
+                        --graphics            open a framebuffer window
+                        --no-capture-serial   plain EFI/GRUB boot (uses ISO's
+                                              own console config; serial may
+                                              still be silent)
+                    \n
+                    """.utf8))
+            }
+        } : nil
+
         // Boot.
         do {
             try await vm.boot()
@@ -654,6 +680,7 @@ struct IsoBoot: AsyncParsableCommand {
 
         await vm.shutdown()
         serialTask?.cancel()
+        silentKernelHint?.cancel()
 
         // Cleanup ephemeral bundle (only on clean shutdown — failures
         // preserved earlier for post-mortem).

@@ -2,6 +2,7 @@
 import Foundation
 import Testing
 @testable import Lumina
+@testable import LuminaBootable
 
 // Integration tests — require:
 // 1. Alpine image at ~/.lumina/images/default/
@@ -1097,4 +1098,61 @@ func bootWithEFIProfile_createsVariableStore() async throws {
         "EFIBootable should have created the variable store; branch was not taken"
     )
     await vm.shutdown()
+}
+
+// MARK: - ISO boot library smoke (no VM start)
+//
+// Real ISO boot end-to-end requires VZ entitlements that SPM test
+// bundles can't carry — `codesign --entitlements` on a `.xctest`
+// produced by `swift build --build-tests` does not embed the
+// entitlements blob into the bundle's main Mach-O (verified
+// 2026-05-09 against debug build on macOS 26). The full-boot smoke
+// lives at `tests/iso-boot-smoke.sh`, which exercises the
+// codesigned `lumina` binary directly.
+//
+// What this test DOES verify:
+//   - LinuxISOExtractor.extract resolves a real ARM64 Linux ISO's
+//     kernel+initramfs paths and lands the files on disk
+//   - The zboot unwrap path runs cleanly when the kernel is a
+//     CONFIG_EFI_ZBOOT image (Alpine virt qualifies)
+//   - The extracted artifacts are non-zero-byte regular files
+//
+// Gates: LUMINA_INTEGRATION_TESTS=1 + ISO present in the cache.
+
+private func alpineISOIntegrationEnabled() -> Bool {
+    guard ProcessInfo.processInfo.environment["LUMINA_INTEGRATION_TESTS"] == "1"
+    else { return false }
+    return FileManager.default.fileExists(atPath: alpineISOURL().path)
+}
+
+private func alpineISOURL() -> URL {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home
+        .appendingPathComponent(".lumina/cache/test-isos")
+        .appendingPathComponent("alpine-virt-3.21.4-aarch64.iso")
+}
+
+@Test(.enabled(if: alpineISOIntegrationEnabled()))
+func integrationISOBoot_alpineExtractionLands() throws {
+    let isoURL = alpineISOURL()
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("iso-extract-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let extracted = try LinuxISOExtractor.extract(iso: isoURL, destination: tmp)
+    #expect(extracted.layoutName == "Alpine virt")
+    #expect(FileManager.default.fileExists(atPath: extracted.kernel.path))
+    #expect(FileManager.default.fileExists(atPath: extracted.initramfs.path))
+
+    // Alpine ships zboot kernels (CONFIG_EFI_ZBOOT). The extractor
+    // unwraps to a raw arm64 Image at <dest>/vmlinuz-raw. Verify the
+    // unwrap landed by checking for the file AND that it's non-empty
+    // (zboot decompression failures historically left 0-byte files).
+    let raw = tmp.appendingPathComponent("vmlinuz-raw")
+    if FileManager.default.fileExists(atPath: raw.path) {
+        let attrs = try FileManager.default.attributesOfItem(atPath: raw.path)
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        #expect(size > 1_000_000, "zboot unwrap produced suspiciously small kernel")
+    }
 }

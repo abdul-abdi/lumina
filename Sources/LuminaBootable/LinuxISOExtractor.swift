@@ -98,7 +98,18 @@ public struct LinuxISOExtractor: Sendable {
             "install.a64/vmlinuz",
             "install.a64/initrd.gz",
             "Debian arm64 netinst",
-            ""  // d-i kernel doesn't need extra hints for the serial path
+            // Empirical (2026-05-09): the d-i kernel binary boots fine
+            // via VZLinuxBootLoader but emits 0 bytes on hvc0 regardless
+            // of cmdline (`console=hvc0`, `console=ttyAMA0`,
+            // `DEBIAN_FRONTEND=text`, `--- text` after init separator
+            // — all produce silent serial). Tested against
+            // debian-12.12.0-arm64-netinst.iso. The issue is the d-i
+            // kernel's virtio-console driver, not our cmdline. Use
+            // `--graphics` (framebuffer) or plain EFI boot
+            // (`--no-capture-serial`) to interact with d-i. The 0-byte
+            // detection in IsoBoot.proceedWithBoot now surfaces this
+            // explicitly with a usability hint pointing at --graphics.
+            ""
         ),
         (
             "boot/vmlinuz-lts",
