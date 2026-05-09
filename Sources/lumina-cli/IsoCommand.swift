@@ -161,22 +161,29 @@ struct IsoInspect: AsyncParsableCommand {
 
     /// Best-effort detection of a known LinuxISOExtractor layout via
     /// `bsdtar -tf`. Returns nil when nothing matches or bsdtar fails.
+    ///
+    /// Pipe-deadlock note: a Debian-class ISO produces ~70 KB of file
+    /// listing output, which exceeds the macOS pipe buffer. We MUST drain
+    /// stdout (and stderr — see /dev/null pattern below) before calling
+    /// `waitUntilExit()`; otherwise bsdtar blocks on write and we hang.
     private func detectKnownLayout(iso: URL) -> KnownLayout? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/bsdtar")
         proc.arguments = ["-tf", iso.path]
         let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
-        proc.standardError = stderrPipe
+        proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             return nil
         }
-        guard proc.terminationStatus == 0 else { return nil }
+        // Read FIRST — readDataToEndOfFile returns when bsdtar closes
+        // stdout (i.e. on exit), at which point waitUntilExit is a
+        // no-op. Reversed order deadlocks on >pipe-buffer outputs.
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
         guard let stdout = String(data: stdoutData, encoding: .utf8) else { return nil }
         let members = Set(stdout.split(separator: "\n").map(String.init))
 
