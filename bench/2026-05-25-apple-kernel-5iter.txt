@@ -1,6 +1,0 @@
-=== APPLE KERNEL bench (5 cold lumina run 'true') ===
-iter 1: 215ms
-iter 2: 184ms
-iter 3: 200ms
-iter 4: 201ms
-iter 5: 196ms

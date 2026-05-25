@@ -1,6 +1,0 @@
-=== ALPINE KERNEL baseline (5 cold lumina run 'true') ===
-iter 1: 331ms
-iter 2: 287ms
-iter 3: 272ms
-iter 4: 275ms
-iter 5: 276ms
