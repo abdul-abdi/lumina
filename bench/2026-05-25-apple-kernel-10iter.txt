@@ -1,0 +1,11 @@
+=== APPLE KERNEL bench (10 cold) ===
+iter 1: 209ms
+iter 2: 188ms
+iter 3: 184ms
+iter 4: 199ms
+iter 5: 202ms
+iter 6: 184ms
+iter 7: 196ms
+iter 8: 208ms
+iter 9: 191ms
+iter 10: 199ms
