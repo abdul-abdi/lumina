@@ -279,6 +279,17 @@ public struct EFIBootConfig: Sendable, Equatable {
     public var linuxDirectKernel: URL?
     public var linuxDirectInitramfs: URL?
     public var linuxDirectCmdline: String?
+    /// Additional CD-ROM ISOs attached alongside the primary `cdromISO`.
+    /// Used to deliver a Windows autounattend.xml sidecar (TPM-bypass
+    /// pass) without having to repack the user's installer ISO. Each
+    /// entry is attached as a separate `VZUSBMassStorageDeviceConfiguration`
+    /// (macOS 13+); on macOS 12 the primary ISO falls back to virtio-block
+    /// and `extraCDROMs` are silently skipped (older OS users get a clear
+    /// stderr warning from the caller). Order is preserved — Windows
+    /// Setup scans drives in attachment order and applies the first
+    /// `autounattend.xml` it finds, which is normally the sidecar
+    /// because the installer ISO doesn't ship one.
+    public var extraCDROMs: [URL]
 
     public init(
         variableStoreURL: URL,
@@ -289,7 +300,8 @@ public struct EFIBootConfig: Sendable, Equatable {
         installPhase: Bool = false,
         linuxDirectKernel: URL? = nil,
         linuxDirectInitramfs: URL? = nil,
-        linuxDirectCmdline: String? = nil
+        linuxDirectCmdline: String? = nil,
+        extraCDROMs: [URL] = []
     ) {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
@@ -300,6 +312,7 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.linuxDirectKernel = linuxDirectKernel
         self.linuxDirectInitramfs = linuxDirectInitramfs
         self.linuxDirectCmdline = linuxDirectCmdline
+        self.extraCDROMs = extraCDROMs
     }
 }
 

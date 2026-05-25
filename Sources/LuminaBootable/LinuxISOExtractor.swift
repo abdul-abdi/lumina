@@ -98,7 +98,18 @@ public struct LinuxISOExtractor: Sendable {
             "install.a64/vmlinuz",
             "install.a64/initrd.gz",
             "Debian arm64 netinst",
-            ""  // d-i kernel doesn't need extra hints for the serial path
+            // Empirical (2026-05-09): the d-i kernel binary boots fine
+            // via VZLinuxBootLoader but emits 0 bytes on hvc0 regardless
+            // of cmdline (`console=hvc0`, `console=ttyAMA0`,
+            // `DEBIAN_FRONTEND=text`, `--- text` after init separator
+            // — all produce silent serial). Tested against
+            // debian-12.12.0-arm64-netinst.iso. The issue is the d-i
+            // kernel's virtio-console driver, not our cmdline. Use
+            // `--graphics` (framebuffer) or plain EFI boot
+            // (`--no-capture-serial`) to interact with d-i. The 0-byte
+            // detection in IsoBoot.proceedWithBoot now surfaces this
+            // explicitly with a usability hint pointing at --graphics.
+            ""
         ),
         (
             "boot/vmlinuz-lts",
@@ -329,6 +340,17 @@ public struct LinuxISOExtractor: Sendable {
     // lumina-cli and this file is in LuminaBootable, so sharing would
     // require a new shared utility target. ~15 lines of duplication is
     // cheaper than the target reshuffle.
+    //
+    // Pipe-deadlock contract (2026-05-09): `bsdtar -tf` on a
+    // Debian-class ISO emits ~70 KB of output, which exceeds the macOS
+    // pipe buffer (16 KB). We MUST drain stdout/stderr concurrently
+    // and BEFORE calling `waitUntilExit()`; otherwise bsdtar blocks on
+    // write to a full pipe and `waitUntilExit` hangs forever. The fix
+    // here drains stderr in a background Thread while the main thread
+    // drains stdout to EOF, then waits for the process. Either pipe
+    // hitting EOF means the child closed its end, which happens on
+    // exit. Without this fix, `lumina iso boot --capture-serial`
+    // against any non-trivial ISO hangs at the bsdtar -tf step.
     private static func runProcess(
         _ path: String, arguments: [String]
     ) -> (exitCode: Int32, stdout: String, stderr: String) {
@@ -341,18 +363,33 @@ public struct LinuxISOExtractor: Sendable {
         process.standardError = stderrPipe
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return (-1, "", error.localizedDescription)
         }
-        let stdout = String(
-            data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        let stderr = String(
-            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
+
+        // Drain stderr off-thread so a chatty child doesn't deadlock
+        // on its stderr pipe while we drain stdout.
+        let stderrBox = StderrBox()
+        let stderrThread = Thread {
+            stderrBox.set(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+        stderrThread.start()
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        // Cheap join — typically already finished by now.
+        while stderrThread.isExecuting { Thread.sleep(forTimeInterval: 0.001) }
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrBox.get(), encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
+    }
+
+    /// Tiny synchronised box for handing the stderr Data from the
+    /// drain thread back to the main thread. Plain captured-var would
+    /// trip Swift 6's concurrent-capture diagnostic.
+    private final class StderrBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func set(_ d: Data) { lock.lock(); data = d; lock.unlock() }
+        func get() -> Data { lock.lock(); defer { lock.unlock() }; return data }
     }
 }

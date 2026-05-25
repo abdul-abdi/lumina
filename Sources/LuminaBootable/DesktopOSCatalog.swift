@@ -125,4 +125,37 @@ public enum DesktopOSCatalog {
     public static func entry(for id: String) -> DesktopOSEntry? {
         all.first(where: { $0.id == id })
     }
+
+    /// Best-effort match from an ISO filename to a catalog entry. Used to
+    /// surface "you fed an x86_64 ISO; here's the ARM64 equivalent URL"
+    /// errors.
+    ///
+    /// Match policy: the catalog id is split on `-` (e.g. `fedora-42` →
+    /// `["fedora", "42"]`); a filename matches when EVERY token is a
+    /// substring of the lowercased filename. This handles vendor naming
+    /// like `Fedora-Workstation-Live-42-1.1.x86_64.iso` where id tokens
+    /// don't appear adjacent. Catalog entries with the most tokens go
+    /// first so e.g. a future `ubuntu-24.04` beats a hypothetical bare
+    /// `ubuntu`. Wrong suggestions are worse than none — this stays
+    /// strict on purpose.
+    ///
+    /// Returns nil when no entry's full token set appears.
+    public static func suggestArm64Equivalent(forFilename filename: String) -> DesktopOSEntry? {
+        let lower = filename.lowercased()
+        struct Candidate { let entry: DesktopOSEntry; let tokens: [String] }
+        let candidates: [Candidate] = all.map { entry in
+            Candidate(
+                entry: entry,
+                tokens: entry.id.lowercased()
+                    .split(separator: "-")
+                    .map(String.init)
+                    .filter { !$0.isEmpty }
+            )
+        }
+        let ranked = candidates.sorted { $0.tokens.count > $1.tokens.count }
+        for cand in ranked where cand.tokens.allSatisfy({ lower.contains($0) }) {
+            return cand.entry
+        }
+        return nil
+    }
 }

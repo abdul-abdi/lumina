@@ -13,7 +13,7 @@ struct LuminaCLI: AsyncParsableCommand {
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
-                      Desktop.self, Doctor.self]
+                      Desktop.self, Doctor.self, Iso.self]
     )
 }
 
