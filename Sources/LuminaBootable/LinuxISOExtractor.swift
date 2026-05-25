@@ -341,16 +341,16 @@ public struct LinuxISOExtractor: Sendable {
     // require a new shared utility target. ~15 lines of duplication is
     // cheaper than the target reshuffle.
     //
-    // Pipe-deadlock contract (2026-05-09): `bsdtar -tf` on a
-    // Debian-class ISO emits ~70 KB of output, which exceeds the macOS
-    // pipe buffer (16 KB). We MUST drain stdout/stderr concurrently
+    // Pipe-deadlock contract (2026-04-27 / 2026-05-09): `bsdtar -tf` on
+    // Debian's 550 MB netinst ISO emits ~70 KB of output, exceeding the
+    // ~16-64 KB macOS pipe buffer. We MUST drain stdout/stderr concurrently
     // and BEFORE calling `waitUntilExit()`; otherwise bsdtar blocks on
-    // write to a full pipe and `waitUntilExit` hangs forever. The fix
-    // here drains stderr in a background Thread while the main thread
-    // drains stdout to EOF, then waits for the process. Either pipe
-    // hitting EOF means the child closed its end, which happens on
-    // exit. Without this fix, `lumina iso boot --capture-serial`
-    // against any non-trivial ISO hangs at the bsdtar -tf step.
+    // write to a full pipe and `waitUntilExit` hangs forever. Alpine's
+    // smaller ISO did not trigger it (tf output fits in the buffer).
+    // The fix here drains stderr in a background Thread while the main
+    // thread drains stdout to EOF, then waits for the process. The
+    // captured-var + DispatchQueue.async alternative trips Swift 6's
+    // concurrent-capture diagnostic, hence the StderrBox lock pattern.
     private static func runProcess(
         _ path: String, arguments: [String]
     ) -> (exitCode: Int32, stdout: String, stderr: String) {
@@ -361,6 +361,7 @@ public struct LinuxISOExtractor: Sendable {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
         do {
             try process.run()
         } catch {
