@@ -324,61 +324,46 @@ struct DesktopBoot: AsyncParsableCommand {
             cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        // --capture-serial: extract kernel + initramfs out of the ISO so
-        // we can boot via VZLinuxBootLoader with an hvc0 console. Only
-        // tractable when we actually have an ISO and a known layout.
-        var linuxDirectKernel: URL?
-        var linuxDirectInitramfs: URL?
-        var linuxDirectCmdline: String?
-        if captureSerial {
-            guard let iso = cdromURL else {
-                let msg = "error: --capture-serial needs an attached ISO (via `desktop create --iso`). "
-                    + "Nothing to extract from.\n"
-                FileHandle.standardError.write(Data(msg.utf8))
-                throw ExitCode(1)
-            }
-            let artifacts = bundle.rootURL.appendingPathComponent("linux-direct")
-            // Reset between ISO swaps so a previous distro's kernel /
-            // initramfs / vmlinuz-raw can't accidentally co-exist with
-            // the new layout's outputs.
-            try? FileManager.default.removeItem(at: artifacts)
-            try? FileManager.default.createDirectory(
-                at: artifacts, withIntermediateDirectories: true
+        // First-boot orchestration: linux-direct extraction + preseed
+        // injection (Debian/Kali/Ubuntu) and Windows 11 autounattend
+        // sidecar. Centralized in `LuminaBootable.prepareFirstBoot` so
+        // the GUI desktop session calls the same function — see
+        // `LuminaDesktopSession.boot()`.
+        //
+        // `--capture-serial` keeps its previous semantics (force linux-
+        // direct boot for serial diagnostics). It composes with the
+        // Debian preseed: if both fire, we get linux-direct AND the
+        // preseed.
+        //
+        // Replaces feat/iso-cli-2026-05-09's inline
+        // `IsoBootHelpers.runCaptureSerialExtraction` call — same behavior,
+        // broader scope (Windows autounattend + Debian preseed too).
+        let isFirstBoot = bundle.manifest.lastBootedAt == nil
+
+        let plan: FirstBootPlan
+        do {
+            plan = try prepareFirstBoot(
+                bundle: bundle,
+                attachedISO: cdromURL,
+                captureSerial: captureSerial,
+                isFirstBoot: isFirstBoot
             )
-            do {
-                let extracted = try LinuxISOExtractor.extract(
-                    iso: iso, destination: artifacts
-                )
-                linuxDirectKernel = extracted.kernel
-                linuxDirectInitramfs = extracted.initramfs
-                // Base cmdline: hvc0 for serial output, earlycon for
-                // pre-init panic capture. Deliberately NOT `quiet` —
-                // the whole point of --capture-serial is to see what
-                // happens, and Alpine/Debian-style init scripts gate
-                // their progress prints on KOPT_quiet=no. Verbose
-                // serial is the feature, not a bug.
-                let base = "console=hvc0 earlycon=hvc0"
-                linuxDirectCmdline = extracted.cmdlineExtra.isEmpty
-                    ? base
-                    : base + " " + extracted.cmdlineExtra
-                let info = "--capture-serial: matched \(extracted.layoutName); kernel+initramfs extracted from \(iso.lastPathComponent); booting via VZLinuxBootLoader\n"
-                FileHandle.standardError.write(Data(info.utf8))
-            } catch LinuxISOExtractor.Error.unknownLayout(let tried) {
-                let supported = LinuxISOExtractor.knownLayouts
-                    .map { $0.name }
-                    .joined(separator: ", ")
-                let msg = "error: --capture-serial: couldn't find a known kernel layout in \(iso.lastPathComponent). "
-                    + "Supported: \(supported). "
-                    + "Tried: \(tried.joined(separator: ", "))\n"
-                FileHandle.standardError.write(Data(msg.utf8))
-                throw ExitCode(1)
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "error: --capture-serial: ISO extraction failed: \(error)\n".utf8
-                ))
-                throw ExitCode(1)
-            }
+        } catch let error as FirstBootError {
+            // Fatal classes: missing ISO and (in capture-serial mode)
+            // unknown layout. Translate to ExitCode.
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            throw ExitCode(1)
         }
+
+        // Translate the plan's structured events into the human-readable
+        // stderr lines the CLI used to emit inline. Order preserved.
+        for event in plan.events {
+            FileHandle.standardError.write(Data(formatFirstBootEvent(event).utf8))
+        }
+        let extraDisks = plan.extraDisks
+        let linuxDirectKernel = plan.linuxDirectKernel
+        let linuxDirectInitramfs = plan.linuxDirectInitramfs
+        let linuxDirectCmdline = plan.linuxDirectCmdline
 
         // Ensure + persist a stable MAC on first boot. See
         // `LuminaDesktopSession.boot()` for the full rationale.
@@ -408,6 +393,7 @@ struct DesktopBoot: AsyncParsableCommand {
             variableStoreURL: bundle.efiVarsURL,
             primaryDisk: bundle.primaryDiskURL,
             cdromISO: cdromURL,
+            extraDisks: extraDisks,
             preferUSBCDROM: isWindows,
             installPhase: isInstallPhase,
             linuxDirectKernel: linuxDirectKernel,
@@ -499,6 +485,32 @@ struct DesktopBoot: AsyncParsableCommand {
 
         await vm.shutdown()
         serialTask?.cancel()
+    }
+}
+
+/// Translate a `FirstBootPlan.Event` into the stderr line the CLI has
+/// historically emitted for that case. Centralized here so the wire
+/// the user sees is identical to v0.7.1, while the orchestrator stays
+/// pure.
+private func formatFirstBootEvent(_ event: FirstBootPlan.Event) -> String {
+    switch event {
+    case .linuxDirectMatched(let layoutName):
+        return "linux-direct: matched \(layoutName); booting via VZLinuxBootLoader\n"
+    case .linuxDirectUnknownLayoutFallback(let tried, let supported):
+        return "error: linux-direct: couldn't find a known kernel layout. "
+            + "Supported: \(supported.joined(separator: ", ")). "
+            + "Tried: \(tried.joined(separator: ", "))\nfalling back to standard EFI boot\n"
+    case .linuxDirectExtractFailed(let reason):
+        return "error: linux-direct: ISO extraction failed: \(reason)\nfalling back to standard EFI boot\n"
+    case .preseedInjected:
+        return "preseed: injected /preseed.cfg into initrd; netcfg/dhcp_retries=4 will defeat the vmnet bootpd race\n"
+    case .preseedFailed(let reason):
+        return "warning: preseed injection failed (\(reason)); booting unpatched. If DHCP fails in netcfg, click Retry.\n"
+    case .autounattendGenerated(let iso):
+        return "windows: autounattend sidecar generated at \(iso.lastPathComponent); "
+            + "bypasses TPM/SecureBoot/RAM/CPU/Storage checks; skips MSA OOBE\n"
+    case .autounattendFailed(let reason):
+        return "warning: autounattend generation failed (\(reason)); Win11 Setup may refuse compat check\n"
     }
 }
 

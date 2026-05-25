@@ -45,6 +45,13 @@ test-cancellation: build
 test-desktop: build
 	@bash tests/desktop.sh
 
+# v0.7.x — `lumina iso boot` smoke test against the same Alpine ARM64
+# ISO. Boots via the new one-step CLI surface, asserts Alpine init
+# banner appears in serial.log within 25 s. Trust-on-first-use SHA
+# pin lives at tests/fixtures/alpine-iso-boot.sha256.
+test-iso-boot: build
+	@bash tests/iso-boot-smoke.sh
+
 # Run quick smoke tests only (subset of e2e, faster)
 test-smoke: build
 	@echo "=== smoke: echo hello ==="

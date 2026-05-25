@@ -206,6 +206,40 @@ public final class LuminaDesktopSession: Identifiable {
 
         let isWindows = mutableBundle.manifest.osFamily == .windows
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
+        let cdromURL = pendingCDROM()
+
+        // First-boot orchestration — preseed injection (Debian/Kali) and
+        // Windows 11 autounattend sidecar. Same call the CLI makes from
+        // `lumina desktop boot`. Without this, the GUI Boot button
+        // bypassed both fixes and Debian d-i hit the vmnet DHCP race
+        // every install. See `LuminaBootable.prepareFirstBoot`.
+        //
+        // Failures: `FirstBootError.missingISO` (Debian first boot with
+        // no attached ISO) lands as a `.crashed` so the user sees a
+        // failure card rather than the VM booting into the standard EFI
+        // path with no preseed and the Retry-network-autoconfig dance.
+        let firstBootPlan: FirstBootPlan
+        do {
+            firstBootPlan = try prepareFirstBoot(
+                bundle: mutableBundle,
+                attachedISO: cdromURL,
+                captureSerial: false,
+                isFirstBoot: isInstallPhase
+            )
+        } catch {
+            applyAtomic(SessionSnapshot(
+                status: .crashed(reason: "first-boot prep: \(error)"),
+                lastError: "first-boot prep: \(error)",
+                bootDuration: bootDuration,
+                serialDigest: serialDigest,
+                bootPhases: BootPhases()
+            ))
+            return
+        }
+        // Persist event log alongside the bundle so the user can post-
+        // mortem what happened on first boot from the framebuffer alone.
+        // Best-effort; failures are non-fatal.
+        appendFirstBootLog(events: firstBootPlan.events, to: mutableBundle.logsDirectory)
 
         var opts = VMOptions.default
         opts.memory = mutableBundle.manifest.memoryBytes
@@ -229,9 +263,13 @@ public final class LuminaDesktopSession: Identifiable {
         opts.bootable = .efi(EFIBootConfig(
             variableStoreURL: mutableBundle.efiVarsURL,
             primaryDisk: mutableBundle.primaryDiskURL,
-            cdromISO: pendingCDROM(),
+            cdromISO: cdromURL,
+            extraDisks: firstBootPlan.extraDisks,
             preferUSBCDROM: isWindows,
-            installPhase: isInstallPhase
+            installPhase: isInstallPhase,
+            linuxDirectKernel: firstBootPlan.linuxDirectKernel,
+            linuxDirectInitramfs: firstBootPlan.linuxDirectInitramfs,
+            linuxDirectCmdline: firstBootPlan.linuxDirectCmdline
         ))
         opts.graphics = GraphicsConfig(
             widthInPixels: 1920,
@@ -347,6 +385,54 @@ public final class LuminaDesktopSession: Identifiable {
         let flag = bundle.rootURL.appendingPathComponent(".metadata_never_index")
         if !FileManager.default.fileExists(atPath: flag.path) {
             try? Data().write(to: flag, options: .atomic)
+        }
+    }
+
+    /// Append the orchestrator's structured event list to
+    /// `<bundle>/logs/first-boot.log` as one human-readable line per
+    /// event. The CLI emits these to stderr; the GUI has no equivalent,
+    /// so we land them on disk where the user can `tail -f` if they
+    /// hit a problem and need to see what the host did or didn't try.
+    /// Best-effort — failures here never block boot.
+    nonisolated private func appendFirstBootLog(
+        events: [FirstBootPlan.Event],
+        to logsDirectory: URL
+    ) {
+        guard !events.isEmpty else { return }
+        let url = logsDirectory.appendingPathComponent("first-boot.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        var text = "--- first-boot \(timestamp) ---\n"
+        for event in events {
+            text += "  " + Self.describe(event: event) + "\n"
+        }
+        try? FileManager.default.createDirectory(
+            at: logsDirectory, withIntermediateDirectories: true
+        )
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(text.utf8))
+        } else {
+            try? Data(text.utf8).write(to: url, options: .atomic)
+        }
+    }
+
+    nonisolated private static func describe(event: FirstBootPlan.Event) -> String {
+        switch event {
+        case .linuxDirectMatched(let layoutName):
+            return "linux-direct: matched \(layoutName)"
+        case .linuxDirectUnknownLayoutFallback(let tried, _):
+            return "linux-direct: unknown layout (tried \(tried.joined(separator: ", "))); fell back to EFI"
+        case .linuxDirectExtractFailed(let reason):
+            return "linux-direct: extract failed (\(reason)); fell back to EFI"
+        case .preseedInjected(let initrd):
+            return "preseed: injected /preseed.cfg into \(initrd.lastPathComponent)"
+        case .preseedFailed(let reason):
+            return "preseed: failed (\(reason)); booting unpatched initrd"
+        case .autounattendGenerated(let iso):
+            return "windows: autounattend sidecar at \(iso.lastPathComponent)"
+        case .autounattendFailed(let reason):
+            return "windows: autounattend failed (\(reason)); compat check will fire"
         }
     }
 
