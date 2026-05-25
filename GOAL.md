@@ -24,6 +24,15 @@ Make lumina concretely, measurably better — in performance, code surface, agen
 - **ISO booting as a first-class verb.** `lumina iso <path>` already exists on `feat/iso-cli-2026-05-09` (one-step boot/inspect/ls, `--os` auto-detect for windows/macos/linux, `--bypass-tpm-check` autounattend sidecar for Win11). Plus `fix/iso-boot-windows-kali` has auto-preseed for Debian/Kali + first-boot fixes. Goal: **merge both branches in**, ensure they survive the actor→DispatchQueue migration, expose the verb through both CLI and Desktop. (lumi explicitly punts ISO — lumina must keep it.)
 - **Backwards-compat shim, briefly.** Old `lumina session start/exec/stop` keeps working via thin wrapper over the daemon for one minor version (deprecation warning), then removed. Hard cut at v0.9.0.
 
+## Live results (2026-05-25 — running tally)
+
+| Phase | Status | Bar                           | Measured                                                                                                                                |
+| ----- | ------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | ✅ MET | Cold ≤ 250 ms P50             | **196 ms** P50 (n=10), 209 ms P95, 184–209 ms range. Was 276 ms median on Alpine.                                                       |
+| 2     | ✅ MET | `lumina iso` verb works       | merged feat/iso-cli-2026-05-09 + fix/iso-boot-windows-kali clean. `lumina iso --help` shows boot/inspect/ls. 419/419 swift tests green. |
+| 3     | ⏳     | Daemon ≤ 10 ms warm exec      | TBD                                                                                                                                     |
+| 4     | ⏳     | Real workflow, Brain docs, PR | TBD                                                                                                                                     |
+
 ## Concrete proof bar (all must be true before declaring "super better")
 
 | Metric / artifact                                 | Baseline (2026-04-26 measured) | Target                                                                       |
