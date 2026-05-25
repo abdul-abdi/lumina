@@ -45,9 +45,27 @@ import Testing
 // MARK: - Guest Message Tests
 
 @Test func decodeReadyMessage() throws {
+    // Pre-v0.7.2 agents omit protocol_version + capabilities. Decoder
+    // defaults them to (0, []) so old guests stay compatible.
     let data = Data("{\"type\":\"ready\"}\n".utf8)
     let msg = try Protocol.decodeGuest(data)
-    #expect(msg == .ready)
+    #expect(msg == .ready(protocolVersion: 0, capabilities: []))
+}
+
+@Test func decodeReadyMessageWithProtocolVersion() throws {
+    // v0.7.2+ agents emit protocol_version + capabilities so the host
+    // can branch on guest features without message-shape probing.
+    let json = #"{"type":"ready","protocol_version":1,"capabilities":["pty","port_forward","network_metrics"]}"# + "\n"
+    let msg = try Protocol.decodeGuest(Data(json.utf8))
+    #expect(msg == .ready(protocolVersion: 1, capabilities: ["pty", "port_forward", "network_metrics"]))
+}
+
+@Test func decodeReadyMessagePartialCapabilities() throws {
+    // Capabilities is just a list of strings — order matters for
+    // equality but the host should treat it as a set in practice.
+    let json = #"{"type":"ready","protocol_version":2,"capabilities":[]}"# + "\n"
+    let msg = try Protocol.decodeGuest(Data(json.utf8))
+    #expect(msg == .ready(protocolVersion: 2, capabilities: []))
 }
 
 @Test func decodeOutputMessage() throws {

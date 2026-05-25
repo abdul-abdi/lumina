@@ -61,6 +61,67 @@ func integrationRunTimeout() async {
     }
 }
 
+/// Audit-fix regression guard (v0.7.2): a command that finishes a hair
+/// after the timeout watchdog fires SIGTERM should land its real exit
+/// code via the soft/hard deadline grace window, not synthesize
+/// `.timeout`. Without this fix, agents retrying non-idempotent ops
+/// repeated work that actually succeeded.
+///
+/// Test shape: timeout 1s on a SIGTERM-trapping shell that would
+/// otherwise sleep far past the hard deadline:
+///
+///     trap 'exit 7' TERM; sleep 5
+///
+/// At T=1.0s the watchdog fires SIGTERM. The shell's trap runs,
+/// the `sleep` is interrupted, and the shell exits 7 within a few
+/// milliseconds — well inside the 250ms grace window. The natural
+/// exit and the synthetic timeout race, and the fix's contract is
+/// that the natural exit wins.
+///
+/// Why this shape (not `sleep 0.95 && exit 7`):
+///   - With a pre-watchdog natural exit, the test would pass even
+///     pre-fix (handler is still registered when the early `.exit`
+///     arrives) — it doesn't discriminate.
+///   - With this shape, the natural exit STRICTLY arrives after the
+///     watchdog has fired. Pre-fix the handler is unregistered the
+///     instant the watchdog throws, so `.exit(7)` is dropped and
+///     `.timeout` surfaces. Post-fix the handler stays registered
+///     through soft+250ms, so `.exit(7)` lands.
+///
+/// Failure modes:
+///   - exit 7: post-fix correct.
+///   - exit 143 (SIGTERM kill code): the shell's trap didn't run —
+///     possible on shells that don't honor `trap` while a child
+///     foreground process is alive. Recorded but not failed because
+///     it indicates a guest-image quirk, not a host regression.
+///   - .timeout: the fix is missing OR the host is so loaded that
+///     even the trap shell overshot the 1.25s hard deadline. The
+///     latter is wildly unlikely on CI; treat as a failure since
+///     this is the regression guard.
+@Test(.enabled(if: integrationEnabled()))
+func integrationTimeoutGraceWindow() async {
+    do {
+        let result = try await Lumina.run(
+            "trap 'exit 7' TERM; sleep 5",
+            options: RunOptions(timeout: .seconds(1))
+        )
+        if result.exitCode == 143 {
+            Issue.record("Guest shell didn't honor TERM trap (got 143). Test inconclusive on this image — fix coverage not exercised.")
+            return
+        }
+        #expect(result.exitCode == 7,
+                "Expected exit 7 from grace-window reclaim; got \(result.exitCode). Pre-fix would surface .timeout; the soft/hard deadline keeps the handler registered so the trap's exit lands.")
+    } catch let error as LuminaError {
+        if case .timeout = error {
+            Issue.record("Grace-window reclaim missing — handler was unregistered before trap's `.exit(7)` arrived. This is the bug the soft/hard deadline pattern is supposed to prevent.")
+        } else {
+            Issue.record("Expected exit 7 or .timeout, got: \(error)")
+        }
+    } catch {
+        Issue.record("Unexpected error type: \(error)")
+    }
+}
+
 @Test(.enabled(if: integrationEnabled()))
 func integrationVMLifecycle() async throws {
     let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))

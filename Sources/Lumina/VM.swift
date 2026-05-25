@@ -194,6 +194,23 @@ public actor VM {
     /// Expose the current disk clone for image creation workflows.
     public var diskClone: DiskClone? { clone }
 
+    /// Wire-format protocol version the guest agent reported on its
+    /// `ready` frame. 0 when no handshake has happened yet, or when
+    /// the guest pre-dates v0.7.2 (no `protocol_version` field on
+    /// `ready`). Diagnostic only today; future host code can branch
+    /// on this to refuse incompatible guests rather than misdecoding.
+    public var guestProtocolVersion: Int {
+        commandRunner?.guestProtocolVersion ?? 0
+    }
+
+    /// Capability strings the guest agent reported on its `ready`
+    /// frame. Empty when no handshake has happened yet, or when the
+    /// guest pre-dates v0.7.2. Hosts can consult this before issuing
+    /// capability-gated requests like `pty_exec` or `port_forward_start`.
+    public var guestCapabilities: [String] {
+        commandRunner?.guestCapabilities ?? []
+    }
+
     public init(options: VMOptions = .default) {
         self.options = options
         self.imageStore = ImageStore()
@@ -202,6 +219,19 @@ public actor VM {
         )
     }
 
+    /// Boot the VM and complete the vsock handshake. After this returns
+    /// successfully, `exec()` works against the guest agent.
+    ///
+    /// **Network contract (v0.7.2+):** `boot()` does NOT configure the
+    /// NAT eth0 interface. eth0 stays admin-down with no IP/route until
+    /// something brings it up. Call `configureNetwork()` explicitly if
+    /// you need NAT outbound (DNS, internet) — it runs `ip link set
+    /// eth0 up` plus addr/route assignment. Every convenience entry
+    /// point (`Lumina.run`, `Lumina.stream`, `Lumina.createImage`,
+    /// `SessionProcess`, `Pool`, `Network.session`) does this for you.
+    /// Callers driving `VM` directly must do it themselves — the
+    /// previous udhcpc fallback in the guest init was removed in v0.7.2
+    /// because it raced the host-driven config.
     public func boot() async throws(LuminaError) {
         guard _state == .idle else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot boot from state: \(_state)"))
@@ -613,9 +643,14 @@ public actor VM {
             config.cpuCount = options.cpuCount
             config.memorySize = options.memory
 
-            // Boot loader + storage.
+            // Boot loader + storage. configMs is recorded once at the
+            // end of the config block (after VZ instantiation + delegate
+            // install), matching the agent path's single-accumulation
+            // pattern. The earlier double-call here was numerically
+            // correct (both calls used `+=`) but split a single
+            // semantic phase into two redundant writes, making the
+            // boot trace harder to reason about.
             try EFIBootable(config: cfg).apply(to: config)
-            phaseMark = recordPhase(\.configMs, since: phaseMark)
 
             // Serial console — capture guest output for diagnostics.
             let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -791,26 +826,16 @@ public actor VM {
         return now
     }
 
-    // MARK: - Internal Result API
+    // MARK: - Deprecated Result Wrapper
 
+    /// Deprecated `Result`-returning wrapper around `boot()`. Kept for one
+    /// release to avoid silently breaking library callers that linked
+    /// against v0.7.1 or earlier. Migrate to `try await vm.boot()`.
+    @available(*, deprecated, renamed: "boot()", message: "Use try await vm.boot() — the throwing API matches every other VM method.")
     public func bootResult() async -> Result<Void, LuminaError> {
         do {
             try await boot()
             return .success(())
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    func execResult(
-        _ command: String,
-        timeout: Int = 60,
-        env: [String: String] = [:],
-        cwd: String? = nil,
-        stdin: Stdin = .closed
-    ) async -> Result<RunResult, LuminaError> {
-        do {
-            return .success(try await exec(command, timeout: timeout, env: env, cwd: cwd, stdin: stdin))
         } catch {
             return .failure(error)
         }
@@ -919,24 +944,6 @@ public actor VM {
         }
         guard extractProcess.terminationStatus == 0 else {
             throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(extractProcess.terminationStatus)")
-        }
-    }
-
-    func uploadFilesResult(_ uploads: [FileUpload]) async -> Result<Void, LuminaError> {
-        do {
-            try await uploadFiles(uploads)
-            return .success(())
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    func downloadFilesResult(_ downloads: [FileDownload]) async -> Result<Void, LuminaError> {
-        do {
-            try await downloadFiles(downloads)
-            return .success(())
-        } catch {
-            return .failure(error)
         }
     }
 

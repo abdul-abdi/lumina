@@ -12,22 +12,20 @@ public struct Lumina {
         try await withVM(options: options) { vm in
             let start = ContinuousClock.now
 
-            try await vm.bootResult().get()
+            try await vm.boot()
 
-            // Host-driven network config. Default: await network_ready
-            // before exec — the guarantee users depend on for commands
-            // that send a packet in the first ~20 ms (curl, ping, apt,
-            // dns lookups). v0.7.1 perf work moved the cost from ~2.5s
-            // to ~50-150 ms by shrinking the guest's carrier-wait
-            // timeout, batching the `ip` setup, and using a netlink
-            // subscription for instant notification when eth0 comes up
-            // (see Guest/lumina-agent/internal/network/network.go).
+            // Host-driven network config. Default in v0.7.2+:
+            // fire-and-forget, do NOT block exec on `network_ready`.
+            // Most short agentic commands (echoes, builds, file ops)
+            // don't need a usable network in their first ms; making
+            // every disposable run pay 50–150ms for the rare DNS
+            // command was the wrong default.
             //
-            // Opt-out for speed-first workloads that know they don't
-            // need network: set `options.awaitNetworkReady = false` or
-            // pass `--no-wait-network` on the CLI. The guest agent
-            // still configures the network in a goroutine concurrently
-            // — the opt-out just drops the host-side barrier.
+            // Opt back in via `options.awaitNetworkReady = true` or
+            // `--wait-network` on the CLI when the command hits DNS
+            // immediately (apt update, pip install, curl). See the
+            // RunOptions.awaitNetworkReady docstring for the DNS
+            // NXDOMAIN race that motivates the opt-in path.
             if options.awaitNetworkReady {
                 try await vm.configureNetwork()
             } else {
@@ -42,7 +40,7 @@ public struct Lumina {
 
             // Upload files before exec
             if !options.uploads.isEmpty {
-                try await vm.uploadFilesResult(options.uploads).get()
+                try await vm.uploadFiles(options.uploads)
             }
             // Upload directories before exec
             for dir in options.directoryUploads {
@@ -51,7 +49,7 @@ public struct Lumina {
 
             let remaining = options.timeout - elapsed
             let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.execResult(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin).get()
+            let result = try await vm.exec(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
 
             // Download after exec — auto-detect file vs directory on guest
             for dl in options.downloads {
@@ -92,16 +90,16 @@ public struct Lumina {
                 do {
                     try await withVM(options: options) { vm in
                         let start = ContinuousClock.now
-                        try await vm.bootResult().get()
+                        try await vm.boot()
                         let bootDone = ContinuousClock.now
 
-                        // v0.7.1 perf: default awaits network_ready so
-                        // commands that need DNS/TCP in the first ~20ms
-                        // of exec work. Opt-out via
-                        // options.awaitNetworkReady = false.
+                        // Host-driven network config. See `Lumina.run`
+                        // for the v0.7.2 default-flip rationale and the
+                        // DNS NXDOMAIN race that motivates the opt-in.
                         if options.awaitNetworkReady {
                             try await vm.configureNetwork()
                         } else {
+                            // Fire-and-forget: start the config, don't await.
                             Task.detached { try? await vm.configureNetwork() }
                         }
                         let netDone = ContinuousClock.now
@@ -121,7 +119,7 @@ public struct Lumina {
 
                         // Upload files before exec
                         if !options.uploads.isEmpty {
-                            try await vm.uploadFilesResult(options.uploads).get()
+                            try await vm.uploadFiles(options.uploads)
                         }
                         for dir in options.directoryUploads {
                             try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
@@ -195,7 +193,7 @@ public struct Lumina {
         let vm = VM(options: vmOptions)
 
         do {
-            try await vm.bootResult().get()
+            try await vm.boot()
             try await vm.configureNetwork()
         } catch {
             await vm.shutdown()
@@ -204,7 +202,7 @@ public struct Lumina {
 
         let timeoutSecs = max(Int(opts.timeout.components.seconds), 1)
         for (index, cmd) in commands.enumerated() {
-            let result = try await vm.execResult(cmd, timeout: timeoutSecs, env: opts.env).get()
+            let result = try await vm.exec(cmd, timeout: timeoutSecs, env: opts.env)
             guard result.success else {
                 await vm.shutdown()
                 throw LuminaError.sessionFailed(
@@ -214,7 +212,7 @@ public struct Lumina {
         }
 
         // Flush dirty pages before clone capture (same rationale as single-command path).
-        _ = await vm.execResult("sync", timeout: 10)
+        _ = try? await vm.exec("sync", timeout: 10)
 
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()

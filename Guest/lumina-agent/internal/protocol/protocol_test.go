@@ -145,6 +145,51 @@ func TestPortForwardReadyMsg_HasExpectedShape(t *testing.T) {
 	}
 }
 
+func TestNewReady_PopulatesProtocolVersionAndCapabilities(t *testing.T) {
+	msg := NewReady()
+	if msg.Type != TypeReady {
+		t.Errorf("expected type=ready, got %q", msg.Type)
+	}
+	if msg.ProtocolVersion != ProtocolVersion {
+		t.Errorf("expected protocol_version=%d, got %d", ProtocolVersion, msg.ProtocolVersion)
+	}
+	if len(msg.Capabilities) == 0 {
+		t.Errorf("expected non-empty capabilities, got %v", msg.Capabilities)
+	}
+	// Wire-shape lock: ensure a few load-bearing capabilities make it
+	// onto the frame so a future refactor can't silently drop one.
+	required := []string{"pty", "port_forward", "network_metrics", "binary_output"}
+	for _, want := range required {
+		found := false
+		for _, c := range msg.Capabilities {
+			if c == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected capability %q in NewReady(), got %v", want, msg.Capabilities)
+		}
+	}
+}
+
+func TestReadyMsg_OmitsEmptyOptionalFields(t *testing.T) {
+	// A literal ReadyMsg with zero values must marshal without
+	// protocol_version/capabilities so old hosts that don't
+	// recognise the fields stay quiet — `omitempty` is the
+	// backward-compat guarantee.
+	bare := ReadyMsg{Type: TypeReady}
+	data, _ := json.Marshal(bare)
+	asMap := map[string]any{}
+	_ = json.Unmarshal(data, &asMap)
+	if _, present := asMap["protocol_version"]; present {
+		t.Errorf("expected protocol_version omitted on zero, got present in %v", asMap)
+	}
+	if _, present := asMap["capabilities"]; present {
+		t.Errorf("expected capabilities omitted on nil, got present in %v", asMap)
+	}
+}
+
 func TestNewExit_BuildsCorrectDiscriminator(t *testing.T) {
 	msg := NewExit("xyz", 42)
 	if msg.Type != TypeExit {

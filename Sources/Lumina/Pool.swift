@@ -108,20 +108,20 @@ public actor Pool {
 
         // Upload files before exec
         if !uploads.isEmpty {
-            try await vm.uploadFilesResult(uploads).get()
+            try await vm.uploadFiles(uploads)
         }
         for dir in directoryUploads {
             try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
         }
 
         let timeoutSecs = max(Int(timeout.components.seconds), 1)
-        let result = try await vm.execResult(
+        let result = try await vm.exec(
             command,
             timeout: timeoutSecs,
             env: env,
             cwd: workingDirectory,
             stdin: stdin
-        ).get()
+        )
 
         // Download after exec — auto-detect file vs directory on guest (mirrors Lumina.run)
         for dl in downloads {
@@ -227,7 +227,7 @@ public actor Pool {
         booting += 1
         let vm = VM(options: options)
         do {
-            try await vm.bootResult().get()
+            try await vm.boot()
             try await vm.configureNetwork()
             return vm
         } catch {

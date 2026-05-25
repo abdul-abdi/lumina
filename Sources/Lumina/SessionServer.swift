@@ -655,22 +655,20 @@ public final class SessionServer: @unchecked Sendable {
 
     private func handleUpload(localPath: String, remotePath: String, vm: VM, handle: FileHandle) async {
         let upload = FileUpload(localPath: URL(fileURLWithPath: localPath), remotePath: remotePath)
-        let result = await vm.uploadFilesResult([upload])
-        switch result {
-        case .success:
+        do {
+            try await vm.uploadFiles([upload])
             try? writeResponse(.uploadDone(path: remotePath), to: handle)
-        case .failure(let error):
+        } catch {
             try? writeResponse(.error(message: "Upload failed: \(error)"), to: handle)
         }
     }
 
     private func handleDownload(remotePath: String, localPath: String, vm: VM, handle: FileHandle) async {
         let download = FileDownload(remotePath: remotePath, localPath: URL(fileURLWithPath: localPath))
-        let result = await vm.downloadFilesResult([download])
-        switch result {
-        case .success:
+        do {
+            try await vm.downloadFiles([download])
             try? writeResponse(.downloadDone(path: localPath), to: handle)
-        case .failure(let error):
+        } catch {
             try? writeResponse(.error(message: "Download failed: \(error)"), to: handle)
         }
     }

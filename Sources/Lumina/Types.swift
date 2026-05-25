@@ -90,22 +90,32 @@ public struct RunOptions: Sendable {
     public var diskSize: UInt64?
     /// Stdin source. Default `.closed` sends EOF immediately.
     public var stdin: Stdin
-    /// When true (default), `Lumina.run`/`Lumina.stream` block on
-    /// `network_ready` before invoking exec. This is the reliability
-    /// guarantee — commands that send a packet in the first ~20 ms of
-    /// exec (curl, ping, apt, DNS lookups) always see a usable network.
+    /// When true, `Lumina.run`/`Lumina.stream` block on
+    /// `network_ready` before invoking exec — guarantees commands
+    /// that send a packet in the first ~20 ms of exec (curl, ping,
+    /// apt, DNS lookups) always see a usable network.
     ///
-    /// v0.7.1 perf: the cost of this guarantee dropped from ~2.5 s to
-    /// ~50–150 ms after shrinking the guest's carrier-wait timeout,
-    /// batching the `ip` setup, and switching to netlink-based carrier
-    /// notification. The default is now both safe and fast — users no
-    /// longer have to choose.
+    /// **Default flipped to `false` in v0.7.2** (audit follow-up).
+    /// Rationale: the audit observed that the ~50–150 ms cost is
+    /// paid on every disposable run regardless of whether the
+    /// command needs network, and most short agentic commands
+    /// (echoes, builds, file ops) don't. Network-using commands on
+    /// Linux retry naturally on `ENETDOWN` for TCP/UDP — the host
+    /// driver still fires `configure_network` concurrently in the
+    /// background, the route is typically up within 50 ms.
     ///
-    /// Set to `false` to skip the host-side barrier (guest still runs
-    /// `configure_network` in a goroutine concurrently). Use this only
-    /// for workloads that KNOW they won't touch the network in the
-    /// first milliseconds of exec. Documented as `--no-wait-network`
-    /// on the CLI.
+    /// **Caveat (read this before opt-out cargo-culting):**
+    /// `getaddrinfo` against an unreachable resolver returns
+    /// `NXDOMAIN` immediately without retry. Commands that hit DNS
+    /// in their first millisecond (`apt update`, `pip install`,
+    /// `curl example.com`) will fail with "Could not resolve host"
+    /// roughly 0–5% of the time on a cold disposable VM. If your
+    /// workload is DNS-sensitive, set this to `true` (or pass
+    /// `--wait-network` on the CLI). The guarantee is what it
+    /// always was — only the default changed.
+    ///
+    /// CLI: `--wait-network` opts in. The legacy `--no-wait-network`
+    /// flag is kept as a deprecated no-op alias for one release.
     public var awaitNetworkReady: Bool
 
     public static let `default` = RunOptions()
@@ -124,7 +134,7 @@ public struct RunOptions: Sendable {
         workingDirectory: String? = nil,
         diskSize: UInt64? = nil,
         stdin: Stdin = .closed,
-        awaitNetworkReady: Bool = true
+        awaitNetworkReady: Bool = false
     ) {
         self.timeout = timeout
         self.memory = memory

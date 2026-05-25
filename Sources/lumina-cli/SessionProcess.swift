@@ -96,7 +96,7 @@ struct SessionServe: AsyncParsableCommand {
         let vm = VM(options: vmOptions)
 
         do {
-            try await vm.bootResult().get()
+            try await vm.boot()
             // Configure network at session boot — one-time cost, all subsequent
             // exec commands have network available at no extra latency.
             try await vm.configureNetwork()
