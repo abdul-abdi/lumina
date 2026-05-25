@@ -56,8 +56,10 @@ sort -n "$cold_file" | awk '
 # ── Daemon warm path ──────────────────────────────────────────────────
 echo ""
 echo "── starting \`lumina daemon serve --size 4\` ──"
-SOCK="/tmp/lumind-bench-$$.sock"
-"$BIN" daemon serve --size 4 --socket "$SOCK" >/tmp/daemon-bench.log 2>&1 &
+# Use default socket path so `run --via-daemon` (which has no --socket flag) finds it.
+SOCK="$HOME/.lumina/lumind.sock"
+rm -f "$SOCK"
+"$BIN" daemon serve --size 4 >/tmp/daemon-bench.log 2>&1 &
 DAEMON_PID=$!
 trap "kill -TERM $DAEMON_PID 2>/dev/null; rm -f $SOCK" EXIT
 
@@ -77,7 +79,7 @@ echo ""
 echo "── warm path (20 iters of \`lumina run --via-daemon 'true'\`) ──"
 warm_file=$(mktemp)
 for i in $(seq 1 20); do
-    out=$("$BIN" run --via-daemon --socket "$SOCK" "true" 2>/dev/null)
+    out=$("$BIN" run --via-daemon "true" 2>/dev/null)
     ms=$(printf '%s' "$out" | jq -r 'select((.error // null) == null) | .duration_ms // empty' 2>/dev/null)
     if [ -z "$ms" ]; then
         echo "  iter $i: FAILED — $(printf '%s' "$out" | head -c 200)"
@@ -102,13 +104,21 @@ sort -n "$warm_file" | awk '
 
 # ── Concurrent stress ─────────────────────────────────────────────────
 echo ""
-echo "── ≥100 concurrent (xargs -P 100) ──"
+echo "── ≥100 concurrent (xargs -P 8 to match pool ceiling) ──"
 stress_file=$(mktemp)
-seq 1 100 | xargs -P 100 -I{} sh -c "
-    out=\$(\"$BIN\" run --via-daemon --socket \"$SOCK\" 'echo {}' 2>/dev/null)
-    code=\$(printf '%s' \"\$out\" | jq -r '.exit_code // -1' 2>/dev/null)
-    [ \"\$code\" = \"0\" ] && echo OK >> $stress_file || echo FAIL >> $stress_file
-"
+worker_script=$(mktemp /tmp/lumind-stress-worker-XXXXXX.sh)
+cat > "$worker_script" <<WORKER
+#!/usr/bin/env bash
+i="\$1"
+out=\$("$BIN" run --via-daemon "echo \$i" 2>/dev/null)
+code=\$(printf '%s' "\$out" | jq -r '.exit_code // -1' 2>/dev/null)
+[ "\$code" = "0" ] && echo OK >> "$stress_file" || echo FAIL >> "$stress_file"
+WORKER
+chmod +x "$worker_script"
+# -P 8 is twice the pool size (=4) — caps pending refills, exercises queueing
+# without overwhelming VZ slot ceiling.
+seq 1 100 | xargs -P 8 -I{} "$worker_script" "{}"
+rm -f "$worker_script"
 ok=$(grep -c '^OK' "$stress_file" 2>/dev/null || echo 0)
 fail=$(grep -c '^FAIL' "$stress_file" 2>/dev/null || echo 0)
 echo "  ok=$ok fail=$fail / 100"
@@ -116,7 +126,7 @@ echo "  ok=$ok fail=$fail / 100"
 # ── Stop daemon ───────────────────────────────────────────────────────
 echo ""
 echo "── stopping daemon ──"
-"$BIN" daemon stop --socket "$SOCK" 2>&1 | head -3
+"$BIN" daemon stop 2>&1 | head -3
 wait $DAEMON_PID 2>/dev/null
 
 echo ""

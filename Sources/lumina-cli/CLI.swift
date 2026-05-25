@@ -13,7 +13,7 @@ struct LuminaCLI: AsyncParsableCommand {
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
-                      Desktop.self, Doctor.self, Iso.self]
+                      Desktop.self, Doctor.self, Iso.self, DaemonCmd.self]
     )
 }
 
@@ -55,6 +55,9 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .customLong("no-wait-network"), help: "[deprecated] Was the v0.7.1 opt-out flag; v0.7.2+ does not wait by default, so this is now a no-op. Use --wait-network to opt back in to the legacy default.")
     var noWaitNetwork: Bool = false
 
+    @Flag(name: .customLong("via-daemon"), help: "Route through the warm-pool daemon (lumina daemon serve) when available. Falls back to cold boot with a stderr warning if the daemon is not reachable.")
+    var viaDaemon: Bool = false
+
     func run() async throws {
         installSignalHandlers()
         atexit { DiskClone.cleanOrphans() }
@@ -72,6 +75,46 @@ struct Run: AsyncParsableCommand {
                 "lumina: --pty on `run` requires a session. Use `lumina session start` then `lumina exec --pty <sid> \"<cmd>\"`.\n".utf8
             ))
             throw ExitCode.failure
+        }
+
+        // --via-daemon: try to route through the warm-pool daemon
+        if viaDaemon {
+            // The daemon wire protocol does not yet carry --copy/--download/--volume
+            // ops. Warn the user if any were passed so the missing semantics are visible.
+            if !copy.isEmpty || !download.isEmpty || !volume.isEmpty {
+                FileHandle.standardError.write(Data(
+                    "warning: --via-daemon ignores --copy/--download/--volume (daemon protocol v1 — falling back through to those flags would require an exec on the cold-boot path)\n".utf8
+                ))
+            }
+            let resolvedTimeoutForDaemon = resolveTimeout(flag: timeout, defaultValue: "60s")
+            let parsedTimeoutForDaemon = parseDuration(resolvedTimeoutForDaemon)
+            let timeoutSecs = parsedTimeoutForDaemon.map { Int($0.components.seconds) } ?? 60
+            let parsedEnvForDaemon = (try? parseEnvSpecs(env)) ?? [:]
+            if let result = try? await Daemon.tryRun(
+                image: image,
+                command: command,
+                timeout: timeoutSecs,
+                env: parsedEnvForDaemon,
+                cwd: workdir
+            ) {
+                let ms = result.wallTime.totalMilliseconds
+                let r = ResultJSON(
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
+                    stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
+                    exit_code: Int(result.exitCode),
+                    duration_ms: ms,
+                    network_metrics: result.networkMetrics
+                )
+                encodeAndPrint(r)
+                if result.exitCode != 0 { throw ExitCode(result.exitCode) }
+                return
+            } else {
+                FileHandle.standardError.write(Data(
+                    "daemon not reachable, falling back to cold boot\n".utf8
+                ))
+            }
         }
 
         // Auto-pull image if not present
@@ -1973,3 +2016,69 @@ private struct PoolResultJSON: Encodable {
 }
 
 // Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift
+
+// MARK: - Daemon
+
+struct DaemonCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "daemon",
+        abstract: "Manage the warm-pool daemon (lumind)",
+        subcommands: [DaemonServe.self, DaemonStop.self, DaemonStatusCmd.self]
+    )
+}
+
+struct DaemonServe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "serve",
+        abstract: "Start the warm-pool daemon — pre-boots VMs and serves lumina run --via-daemon"
+    )
+
+    @Option(name: .long, help: "Number of VMs to keep warm")
+    var size: Int = 4
+
+    @Option(name: .long, help: "Image to use for pool VMs")
+    var image: String = "default"
+
+    @Option(name: .long, help: "Unix socket path (default: ~/.lumina/lumind.sock)")
+    var socket: String? = nil
+
+    func run() async throws {
+        let sockURL = socket.map { URL(fileURLWithPath: $0) }
+        try await Daemon.serve(size: size, image: image, socketPath: sockURL)
+    }
+}
+
+struct DaemonStop: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "stop", abstract: "Stop the warm-pool daemon")
+
+    @Option(name: .long, help: "Unix socket path (default: ~/.lumina/lumind.sock)")
+    var socket: String? = nil
+
+    func run() async throws {
+        let sockURL = socket.map { URL(fileURLWithPath: $0) }
+        let stopped = await Daemon.stop(socketPath: sockURL)
+        if stopped {
+            print("daemon stopped")
+        } else {
+            print("daemon not running")
+        }
+    }
+}
+
+struct DaemonStatusCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "status", abstract: "Show daemon status")
+
+    @Option(name: .long, help: "Unix socket path (default: ~/.lumina/lumind.sock)")
+    var socket: String? = nil
+
+    func run() async throws {
+        let sockURL = socket.map { URL(fileURLWithPath: $0) }
+        let s = await Daemon.status(socketPath: sockURL)
+        switch s {
+        case .notRunning:
+            print("not running")
+        case .running(let poolSize, let warm, let image):
+            print("running — pool=\(poolSize) warm=\(warm) image=\(image) socket=\(Daemon.socketPath().path)")
+        }
+    }
+}
