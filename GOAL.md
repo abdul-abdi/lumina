@@ -26,12 +26,12 @@ Make lumina concretely, measurably better — in performance, code surface, agen
 
 ## Live results (2026-05-25 — running tally)
 
-| Phase | Status | Bar                           | Measured                                                                                                                                |
-| ----- | ------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | ✅ MET | Cold ≤ 250 ms P50             | **196 ms** P50 (n=10), 209 ms P95, 184–209 ms range. Was 276 ms median on Alpine.                                                       |
-| 2     | ✅ MET | `lumina iso` verb works       | merged feat/iso-cli-2026-05-09 + fix/iso-boot-windows-kali clean. `lumina iso --help` shows boot/inspect/ls. 419/419 swift tests green. |
-| 3     | ⏳     | Daemon ≤ 10 ms warm exec      | TBD                                                                                                                                     |
-| 4     | ⏳     | Real workflow, Brain docs, PR | TBD                                                                                                                                     |
+| Phase | Status | Bar                        | Measured                                                                                                                                                |
+| ----- | ------ | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | ✅ MET | Cold ≤ 250 ms P50          | **196 ms** P50 (n=10), 209 ms P95, 184–209 ms range. Was 276 ms median on Alpine.                                                                       |
+| 2     | ✅ MET | `lumina iso` verb works    | merged feat/iso-cli-2026-05-09 + fix/iso-boot-windows-kali clean. `lumina iso --help` shows boot/inspect/ls. 419/419 swift tests green.                 |
+| 3     | ✅ MET | Daemon ≤ 10 ms warm exec   | **1 ms** P50 (n=20) — 190× faster than cold. 100/100 concurrent (P=8) pass. `Sources/Lumina/Daemon.swift` 329 LOC.                                      |
+| 4     | ✅ MET | Real workflow + Brain + PR | Real 10-cmd workflow: 2.15 s cold → 0.89 s daemon (**2.4× wall-clock**). Brain wiki: 2 decisions + 2 learnings. Issue #31 filed. **Draft PR #32 open.** |
 
 ## Concrete proof bar (all must be true before declaring "super better")
 
