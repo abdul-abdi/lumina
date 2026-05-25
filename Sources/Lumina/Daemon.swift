@@ -189,7 +189,20 @@ public enum Daemon {
             "lumina daemon: ready on \(sockURL.path)\n".utf8
         ))
 
-        // Accept loop — blocking accept on a global thread, handed off to detached Task
+        // Accept loop — serial handler dispatch.
+        //
+        // Each accepted client is handled to completion before the next is
+        // accepted. This costs concurrency (clients queue) but avoids the
+        // N≥pool concurrent-exec race (CommandRunner vsock dispatcher trips
+        // `connectionFailed` when N exec()s hit N VMs simultaneously, see
+        // GitHub #33). Pool.run still uses the warm pool — first response
+        // is ~1 ms; subsequent queued clients pay queueing latency rather
+        // than wedge. For agent workloads with think-time between calls
+        // this is invisible; for synthetic burst (xargs -P N) clients are
+        // effectively serialized.
+        //
+        // Lifting this to detached Tasks (Task.detached { ... }) requires
+        // fixing the underlying CommandRunner race first.
         while true {
             let clientFd = await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
                 DispatchQueue.global().async {
@@ -197,15 +210,9 @@ public enum Daemon {
                 }
             }
             guard clientFd >= 0 else { continue }
-
-            let poolBox = UncheckedSendable(pool)
-            let imageCopy = image
-            let sockURLCopy = sockURL
-            Task.detached {
-                await handleDaemonClient(
-                    fd: clientFd, pool: poolBox.value, image: imageCopy, socketPath: sockURLCopy
-                )
-            }
+            await handleDaemonClient(
+                fd: clientFd, pool: pool, image: image, socketPath: sockURL
+            )
         }
     }
 }
