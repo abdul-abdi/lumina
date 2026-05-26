@@ -114,8 +114,7 @@ public struct RunOptions: Sendable {
     /// `--wait-network` on the CLI). The guarantee is what it
     /// always was — only the default changed.
     ///
-    /// CLI: `--wait-network` opts in. The legacy `--no-wait-network`
-    /// flag is kept as a deprecated no-op alias for one release.
+    /// CLI: `--wait-network` opts in.
     public var awaitNetworkReady: Bool
 
     public static let `default` = RunOptions()

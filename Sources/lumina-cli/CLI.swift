@@ -52,9 +52,6 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .customLong("wait-network"), help: "Block exec until the guest's network is up (~50-150ms cost). Recommended for commands that hit DNS in their first millisecond (apt update, curl, pip install). Off by default in v0.7.2+.")
     var waitNetwork: Bool = false
 
-    @Flag(name: .customLong("no-wait-network"), help: "[deprecated] Was the v0.7.1 opt-out flag; v0.7.2+ does not wait by default, so this is now a no-op. Use --wait-network to opt back in to the legacy default.")
-    var noWaitNetwork: Bool = false
-
     @Flag(name: .customLong("via-daemon"), help: "Route through the warm-pool daemon (lumina daemon serve) when available. Falls back to cold boot with a stderr warning if the daemon is not reachable.")
     var viaDaemon: Bool = false
 
@@ -178,15 +175,6 @@ struct Run: AsyncParsableCommand {
             stdin: resolveStdin(),
             awaitNetworkReady: waitNetwork
         )
-
-        // Mid-migration scripts may pass both flags. If --wait-network is
-        // also set, the user has clearly opted in — don't shout about the
-        // deprecated alias on top of that.
-        if noWaitNetwork && !waitNetwork {
-            FileHandle.standardError.write(Data(
-                "lumina: --no-wait-network is a no-op in v0.7.2+ (default behaviour). Pass --wait-network to opt back into the v0.7.1 default.\n".utf8
-            ))
-        }
 
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()
