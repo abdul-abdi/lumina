@@ -121,9 +121,33 @@ func (m *Manager) Input(msg protocol.PtyInputMsg) {
 	if !ok {
 		return
 	}
-	if _, err := unix.Write(p.masterFd, decoded); err != nil {
+	if err := writeAll(p.masterFd, decoded); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "pty master write (id=%s): %v\n", msg.ID, err)
 	}
+}
+
+// writeAll writes the full buffer to fd, looping past short writes
+// instead of discarding the unwritten remainder. A pasted block is
+// one Input() call; a short write here used to mean dropped
+// mid-paste characters with no error surfaced anywhere.
+func writeAll(fd int, b []byte) error {
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	for len(b) > 0 {
+		n, err := unix.Write(fd, b)
+		if n > 0 {
+			b = b[n:]
+		}
+		switch err {
+		case nil:
+		case unix.EAGAIN, unix.EINTR:
+			// Wait for writability instead of busy-spinning the retry.
+			pfd[0].Revents = 0
+			_, _ = unix.Poll(pfd, 50)
+		default:
+			return err
+		}
+	}
+	return nil
 }
 
 // Resize either applies a resize immediately (if the PTY is live) or
@@ -248,6 +272,12 @@ func (m *Manager) Execute(req protocol.PtyExecRequest) {
 func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 	defer close(done)
 	buf := make([]byte, readBufSize)
+	// pfd checks readability during the drain window below. O_NONBLOCK
+	// lives on the shared open file description, not the fd number —
+	// toggling it here would race Input()'s write on the same
+	// masterFd (a write landing mid-window could short-write or see
+	// EAGAIN). Polling leaves the fd's blocking mode untouched.
+	pfd := []unix.PollFd{{Fd: int32(masterFd), Events: unix.POLLIN}}
 	for {
 		n, err := unix.Read(masterFd, buf)
 		if n > 0 {
@@ -256,8 +286,16 @@ func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 			// Coalesce a drain window of additional bytes without
 			// holding up the master for long.
 			deadline := time.Now().Add(drainWindow)
-			_ = unix.SetNonblock(masterFd, true)
-			for time.Now().Before(deadline) {
+			for {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+				pfd[0].Revents = 0
+				pn, perr := unix.Poll(pfd, int(remaining.Milliseconds()))
+				if perr != nil || pn <= 0 || pfd[0].Revents&unix.POLLIN == 0 {
+					break
+				}
 				dn, derr := unix.Read(masterFd, buf)
 				if dn > 0 {
 					accum = append(accum, buf[:dn]...)
@@ -266,7 +304,6 @@ func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 					break
 				}
 			}
-			_ = unix.SetNonblock(masterFd, false)
 			_ = m.w.Send(protocol.PtyOutputMsg{
 				Type: protocol.TypePtyOutput,
 				ID:   id,
