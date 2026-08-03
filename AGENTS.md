@@ -20,7 +20,7 @@ Three defects stacked into one symptom — a VM that boots, execs, and has no ne
 
 **`RunOptions.awaitNetworkReady` is back to `true`**, reversing the v0.7.2 flip. That flip was priced against a guest that waited on DHCP and carrier — 50–150 ms. Host-driven config lands in ~4 ms, inside boot noise (measured no-wait/wait pairs: 183/179, 170/169, 173/168 ms), while opting out fails DNS 5/5: `getaddrinfo` returns NXDOMAIN immediately rather than retrying once the route appears. `--no-wait-network` is a real opt-out again.
 
-**Stale-image warning.** A guest whose `ready` frame reports a `protocol_version` below `expectedGuestProtocolVersion` triggers a one-shot stderr warning naming the symptom and the fix (`lumina pull --force`). The v0.7.0 release tarball — still the latest published image — is such a guest.
+**Stale-image warning.** A guest whose `ready` frame reports a `protocol_version` below `expectedGuestProtocolVersion` triggers a one-shot stderr warning naming the symptom and the fix (`lumina pull --force`). The v0.7.0 tarball — the last published image before this release, because no tag was cut for three months — is such a guest.
 
 ### The timeout envelope actually fires now
 

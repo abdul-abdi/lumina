@@ -5,8 +5,12 @@ name: Build baked image
 # kernel-boot savings vs. the legacy Alpine virt image.
 #
 # Triggers:
-#   - Manual via `workflow_dispatch` (for v0.7.1 rebuild with new agent)
-#   - On tag push `v*` (publish artifact alongside the GitHub Release)
+#   - Manual via `workflow_dispatch` ONLY.
+#
+# Tag publishing deliberately lives in release.yml, which builds the CLI and
+# the image in one run and publishes both. Commit 984c2e3 (2026-04-10) merged
+# them for exactly that reason: two tag-triggered workflows race, and whichever
+# finishes first fails with "release not found". Do not add a tag trigger here.
 #
 # Runner:
 #   - `ubuntu-24.04-arm` (native ARM64; no QEMU emulation)
@@ -25,12 +29,6 @@ on:
         description: "Attach to latest GitHub Release"
         type: boolean
         default: false
-  push:
-    tags:
-      # Release tags are 'lumina-v*'. This said 'v*' from the start, so it
-      # never once fired on a release — which is why the last published
-      # image is the v0.7.0 tarball from 2026-04-21.
-      - 'lumina-v*'
 
 # The default workflow token is read-only, so `gh release upload` returned
 # "HTTP 403: Resource not accessible by integration" — after a successful
