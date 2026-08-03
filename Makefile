@@ -1,4 +1,4 @@
-.PHONY: build release sign test test-integration test-cancellation test-desktop clean run dev-app doctor-signing
+.PHONY: build release sign test test-integration test-desktop clean run dev-app doctor-signing
 
 BINARY_DEBUG = $(shell swift build --show-bin-path)/lumina
 BINARY_RELEASE = $(shell swift build -c release --show-bin-path)/lumina
@@ -24,21 +24,18 @@ sign:
 test:
 	swift test
 
-# Run comprehensive e2e test suite via the actual CLI (requires VM image + jq)
+# The integration gate. Drives the signed CLI as a subprocess, which is the
+# only way VM-booting tests get the virtualization entitlement on macOS — a
+# SwiftPM test bundle is loaded by the system `xctest` host and cannot carry
+# entitlements, no matter what you codesign. See the header of
+# Tests/LuminaTests/IntegrationTests.swift.
+#
+# Depends on `build` because codesigning is a post-link step outside the build
+# graph: any later `swift build` relinks $(BINARY_DEBUG) and silently strips
+# its signature, after which every VM boot fails with VZErrorDomain Code=2.
+# Never interleave a `swift build`/`swift test` with this target.
 test-integration: build
 	@bash tests/e2e.sh $(BINARY_DEBUG)
-
-# Run the behaviour-level cancellation suite. Requires an entitled,
-# codesigned test bundle (so the VM actor can start a VZVirtualMachine)
-# and the default agent image at ~/.lumina/images/default/.
-# For the macOS install path (test runs only if gated):
-#   make test-cancellation IPSW=/path/to/UniversalMac.ipsw
-test-cancellation: build
-	swift build --build-tests
-	codesign --entitlements $(ENTITLEMENTS) --force -s - .build/debug/LuminaPackageTests.xctest
-	LUMINA_INTEGRATION_TESTS=1 \
-	$(if $(IPSW),LUMINA_IPSW_FIXTURE=$(IPSW)) \
-	swift test --filter 'boot_cancel\|macOSInstall_cancel'
 
 # v0.7.0 M3 — desktop (EFI) boot smoke test against a small Alpine ARM64 ISO.
 # Requires network on first run to fetch the ISO; caches under ~/.lumina/cache/.

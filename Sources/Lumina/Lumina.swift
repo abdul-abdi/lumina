@@ -201,8 +201,16 @@ public struct Lumina {
             }
         }
 
-        // Flush dirty pages before clone capture (same rationale as single-command path).
-        _ = try? await vm.exec("sync", timeout: 10)
+        // Flush dirty pages before clone capture. A discarded failure here
+        // yields an image missing the last build step's writes and reports
+        // success — a corrupt image is worse than a failed build.
+        let flush = try await vm.exec("sync", timeout: 10)
+        guard flush.success else {
+            await vm.shutdown()
+            throw LuminaError.sessionFailed(
+                "sync failed before image capture (exit \(flush.exitCode)): \(flush.stderr)"
+            )
+        }
 
         guard let clone = await vm.detachClone() else {
             await vm.shutdown()

@@ -440,6 +440,18 @@ $LUMINA run --volume "e2e-vol:/data" "echo vol_persist > /data/test.txt" >/dev/n
 OUT=$($LUMINA run --volume "e2e-vol:/data" "cat /data/test.txt" 2>/dev/null)
 echo "$OUT" | jq -e '.stdout | test("vol_persist")' >/dev/null 2>&1 && pass "9.1 volume persists across VMs" || fail "9.1 volume" "$OUT"
 
+# A mount that cannot land must fail loudly. Before v0.7.3 the guest mounted
+# shares from init with stderr discarded and neither side verified, so
+# `--volume ./src:/code "wc -l /code/*.py"` exited 0 having read an empty
+# directory — a wrong answer shaped like a real one. /proc/<x> is a path the
+# guest cannot mkdir, so the mount is guaranteed to fail.
+OUT=$($LUMINA run --volume "e2e-vol:/proc/cannot-mount-here" "true" 2>/dev/null)
+if echo "$OUT" | jq -e '(.error != null) and (.error_detail | test("not mounted"))' >/dev/null 2>&1; then
+  pass "9.1b failed mount reported, not silently empty"
+else
+  fail "9.1b failed mount" "$OUT"
+fi
+
 # Volume list
 $LUMINA volume list 2>/dev/null | grep -q "e2e-vol" && pass "9.2 volume list" || fail "9.2 vol list" "not found"
 
