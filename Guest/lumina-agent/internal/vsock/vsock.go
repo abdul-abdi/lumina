@@ -26,7 +26,9 @@ func Listen(port int) (net.Listener, error) {
 		return nil, fmt.Errorf("vsock bind port %d: %w", port, err)
 	}
 
-	if err := unix.Listen(fd, 1); err != nil {
+	// Backlog of 1 dropped a 3rd concurrent connection attempt (session
+	// clients, port-forward proxies, etc. all dial this same port).
+	if err := unix.Listen(fd, 16); err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("vsock listen port %d: %w", port, err)
 	}
@@ -49,7 +51,7 @@ func (l *listener) Accept() (net.Conn, error) {
 	return &conn{file: file}, nil
 }
 
-func (l *listener) Close() error { return unix.Close(l.fd) }
+func (l *listener) Close() error   { return unix.Close(l.fd) }
 func (l *listener) Addr() net.Addr { return addr{} }
 
 // ── conn ────────────────────────────────────────────────────────────
