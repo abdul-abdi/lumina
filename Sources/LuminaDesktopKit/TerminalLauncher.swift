@@ -95,6 +95,25 @@ public protocol TerminalEnvironment: Sendable {
     func runAppleScript(_ script: String) -> Bool
 }
 
+/// Lock-guarded box for the `openApplication` completion result. The
+/// handler runs on a queue outside the calling thread, so the result
+/// can't just be a captured `var` (Swift 6 flags the mutation as a data
+/// race even though the semaphore wait below makes it safe in practice).
+/// Matches the class-with-NSLock pattern used elsewhere in Lumina for
+/// synchronous completion-handler callbacks (see `DesktopCommand.ProgressBucket`).
+private final class OpenAppResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var succeeded = false
+
+    func set(_ value: Bool) {
+        lock.withLock { succeeded = value }
+    }
+
+    var value: Bool {
+        lock.withLock { succeeded }
+    }
+}
+
 public struct DefaultTerminalEnvironment: TerminalEnvironment {
     public init() {}
 
@@ -116,16 +135,16 @@ public struct DefaultTerminalEnvironment: TerminalEnvironment {
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.activates = true
         let sem = DispatchSemaphore(value: 0)
-        var success = false
+        let result = OpenAppResult()
         NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, err in
-            success = (err == nil)
+            result.set(err == nil)
             sem.signal()
         }
         // Short timeout — if NSWorkspace is this unhealthy, the user
         // has bigger problems than a missing terminal window. The
         // pasteboard fallback kicks in via the caller anyway.
         _ = sem.wait(timeout: .now() + .seconds(3))
-        return success
+        return result.value
     }
 
     public func runAppleScript(_ script: String) -> Bool {

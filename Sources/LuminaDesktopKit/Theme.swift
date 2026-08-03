@@ -110,30 +110,14 @@ public enum LuminaTheme {
 
     // ── Accent + status (same in both modes — brand) ───────────────
     public static let accent  = hex("#FFB347")  // phosphor amber
-    public static let accent2 = hex("#FF7A3D")
     public static let ok      = dynamic(dark: "#8FC97A", light: "#3F9B22")
     public static let warn    = dynamic(dark: "#E5C96A", light: "#A07700")
     public static let err     = dynamic(dark: "#E87272", light: "#B02A2A")
-
-    // ── Per-OS chip colors (for VM cards) ──────────────────────────
-    public static func osAccent(_ family: String) -> Color {
-        switch family {
-        case "linux": hex("#E95420")    // Ubuntu orange
-        case "windows": hex("#0078D4")  // Windows blue
-        case "macOS": dynamic(dark: "#C7CDD9", light: "#3A3D45")
-        default: hex("#9CA3AF")
-        }
-    }
 
     // ── Type ───────────────────────────────────────────────────────
     /// SF Mono — closest system substitute for JetBrains Mono.
     public static let mono = Font.system(.body, design: .monospaced)
     public static let monoSmall = Font.system(size: 11, design: .monospaced)
-    public static let monoTiny = Font.system(size: 10, design: .monospaced)
-
-    /// New York italic — closest system substitute for Fraunces.
-    public static let serifItalic = Font.system(.title3, design: .serif).italic()
-    public static let serifLargeItalic = Font.system(.largeTitle, design: .serif).italic()
 
     /// Hero display — mono, heavy weight, tight tracking.
     public static let hero = Font.system(size: 56, weight: .medium, design: .monospaced)
