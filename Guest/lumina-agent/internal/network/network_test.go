@@ -1,9 +1,17 @@
 package network
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
+	"net"
+	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/protocol"
+	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/wire"
 )
 
 func TestIPv4ToLittleEndianHex(t *testing.T) {
@@ -411,5 +419,123 @@ func TestCarrierUp(t *testing.T) {
 	}
 	if carrierUp("missing") {
 		t.Errorf("missing sysfs should not be up")
+	}
+}
+
+// configureDNS is the postcondition check for the whole reason
+// awaitNetworkReady exists: DNS must be live before the first exec.
+// Before this fix, a failed mkdir/write was logged to stderr (if at
+// all) and network_ready shipped regardless — callers found out at
+// the first getaddrinfo NXDOMAIN.
+func TestConfigureDNS(t *testing.T) {
+	origMkdir, origWrite, origRead := mkdirAll, writeFile, readFile
+	defer func() { mkdirAll, writeFile, readFile = origMkdir, origWrite, origRead }()
+
+	cases := []struct {
+		name     string
+		mkdirErr error
+		writeErr error
+		readBack []byte
+		readErr  error
+		want     bool
+	}{
+		{name: "write and readback succeed", readBack: []byte("nameserver 8.8.8.8\n"), want: true},
+		{name: "mkdir fails", mkdirErr: errors.New("read-only filesystem"), want: false},
+		{name: "write fails", writeErr: errors.New("no space left on device"), want: false},
+		{name: "readback fails", readErr: errors.New("permission denied"), want: false},
+		{name: "readback content mismatch", readBack: []byte("nameserver 1.1.1.1\n"), want: false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mkdirAll = func(_ string, _ os.FileMode) error { return c.mkdirErr }
+			var gotContent []byte
+			writeFile = func(_ string, data []byte, _ os.FileMode) error {
+				gotContent = data
+				return c.writeErr
+			}
+			readFile = func(_ string) ([]byte, error) {
+				if c.readErr != nil {
+					return nil, c.readErr
+				}
+				return c.readBack, nil
+			}
+
+			if got := configureDNS("8.8.8.8"); got != c.want {
+				t.Errorf("configureDNS() = %v, want %v", got, c.want)
+			}
+			if c.mkdirErr == nil && c.writeErr == nil && string(gotContent) != "nameserver 8.8.8.8\n" {
+				t.Errorf("wrote %q, want %q", gotContent, "nameserver 8.8.8.8\n")
+			}
+		})
+	}
+}
+
+// TestConfigure_ReportsDnsOkOnWireEnvelope drives Configure() end to
+// end over a real net.Pipe-backed wire.Writer and asserts the dns_ok
+// field on network_ready reflects whether resolv.conf actually landed
+// — not just whether the interface came up. Before this fix,
+// network_ready shipped unconditionally regardless of DNS state.
+func TestConfigure_ReportsDnsOkOnWireEnvelope(t *testing.T) {
+	origRunIP, origRoute, origAddr := runIP, readRouteFile, readIfaceIPv4
+	origPick, origSysfs, origClock := pickInterface, readNetSysfs, clock
+	origMkdir, origWrite, origRead := mkdirAll, writeFile, readFile
+	defer func() {
+		runIP, readRouteFile, readIfaceIPv4 = origRunIP, origRoute, origAddr
+		pickInterface, readNetSysfs, clock = origPick, origSysfs, origClock
+		mkdirAll, writeFile, readFile = origMkdir, origWrite, origRead
+	}()
+
+	runIP = func(_ string, _ ...string) error { return nil }
+	readRouteFile = func() ([]byte, error) { return []byte(sampleRouteFile), nil }
+	readIfaceIPv4 = func(_ string) string { return "192.168.64.2" }
+	pickInterface = func() string { return "eth0" }
+	readNetSysfs = sysfsStub(map[string]string{"eth0/operstate": "up"})
+	fixed := time.Now()
+	clock = func() time.Time { return fixed } // freezes the carrier-wait loop to one pass
+
+	cases := []struct {
+		name      string
+		writeErr  error
+		wantDnsOk bool
+	}{
+		{"dns write succeeds", nil, true},
+		{"dns write fails", errors.New("read-only filesystem"), false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mkdirAll = func(_ string, _ os.FileMode) error { return nil }
+			writeFile = func(_ string, _ []byte, _ os.FileMode) error { return c.writeErr }
+			readFile = func(_ string) ([]byte, error) { return []byte("nameserver 192.168.64.1\n"), nil }
+
+			hostConn, guestConn := net.Pipe()
+			defer hostConn.Close()
+			defer guestConn.Close()
+			w := wire.NewWriter(guestConn)
+
+			msgCh := make(chan map[string]any, 1)
+			go func() {
+				scanner := bufio.NewScanner(hostConn)
+				if scanner.Scan() {
+					var m map[string]any
+					_ = json.Unmarshal(scanner.Bytes(), &m)
+					msgCh <- m
+				}
+			}()
+
+			Configure(w, protocol.ConfigureNetworkMsg{
+				Type: protocol.TypeConfigureNetwork, IP: "192.168.64.2/24",
+				Gateway: "192.168.64.1", DNS: "192.168.64.1",
+			})
+
+			got := <-msgCh
+			if got["type"] != "network_ready" {
+				t.Fatalf("expected network_ready, got %v", got)
+			}
+			if got["dns_ok"] != c.wantDnsOk {
+				t.Errorf("dns_ok = %v, want %v", got["dns_ok"], c.wantDnsOk)
+			}
+		})
 	}
 }

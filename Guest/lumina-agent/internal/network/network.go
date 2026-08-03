@@ -61,13 +61,44 @@ const fallbackInterface = "eth0"
 // substitute them directly. In production they always point at the
 // defaults below.
 var (
-	runIP         func(iface string, args ...string) error = defaultRunIP
-	readRouteFile func() ([]byte, error)                   = defaultReadRouteFile
-	readIfaceIPv4 func(iface string) string                = defaultReadIfaceIPv4
-	pickInterface func() string                            = defaultPickInterface
-	readNetSysfs  func(iface, file string) ([]byte, error) = defaultReadNetSysfs
-	clock         func() time.Time                         = time.Now
+	runIP         func(iface string, args ...string) error               = defaultRunIP
+	readRouteFile func() ([]byte, error)                                 = defaultReadRouteFile
+	readIfaceIPv4 func(iface string) string                              = defaultReadIfaceIPv4
+	pickInterface func() string                                          = defaultPickInterface
+	readNetSysfs  func(iface, file string) ([]byte, error)               = defaultReadNetSysfs
+	clock         func() time.Time                                       = time.Now
+	mkdirAll      func(path string, perm os.FileMode) error              = os.MkdirAll
+	writeFile     func(path string, data []byte, perm os.FileMode) error = os.WriteFile
+	readFile      func(path string) ([]byte, error)                      = os.ReadFile
 )
+
+// resolvConfPath is where DNS config lands on the guest.
+const resolvConfPath = "/etc/resolv.conf"
+
+// configureDNS writes resolvConfPath and reads it back to confirm the
+// write actually landed, rather than trusting a nil error from
+// WriteFile — a read-only overlay or full disk can both return nil
+// from the mkdir/write calls on some filesystems while the content
+// never persists. Returns false (network_ready's DnsOk) on any
+// mismatch so the host learns DNS is broken instead of finding out at
+// the first getaddrinfo call.
+func configureDNS(dns string) bool {
+	if err := mkdirAll("/etc", 0o755); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "resolv.conf mkdir /etc: %v (continuing; DNS lookups will fail)\n", err)
+		return false
+	}
+	content := []byte("nameserver " + dns + "\n")
+	if err := writeFile(resolvConfPath, content, 0o644); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "resolv.conf write: %v (continuing; DNS lookups will fail)\n", err)
+		return false
+	}
+	got, err := readFile(resolvConfPath)
+	if err != nil || !bytes.Equal(got, content) {
+		_, _ = fmt.Fprintf(os.Stderr, "resolv.conf readback mismatch after write (continuing; DNS lookups may fail): err=%v\n", err)
+		return false
+	}
+	return true
+}
 
 // Configure applies msg to the primary ethernet interface (IP/route/DNS)
 // with retries, verifies the routing table reflects the requested
@@ -115,13 +146,13 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		return
 	}
 
-	// Step 2: DNS. Best-effort write — if /etc/resolv.conf fails to
-	// write, DNS lookups will still work via the host's /etc/hosts
-	// overlay or the gateway's DNS proxy if one exists.
-	_ = os.MkdirAll("/etc", 0o755)
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+msg.DNS+"\n"), 0o644); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "resolv.conf write: %v (continuing; network is usable without DNS)\n", err)
-	}
+	// Step 2: DNS. The write is attempted even on a resolv.conf we
+	// can't verify — a read-only /etc or a full disk means DNS
+	// lookups will fail, but the route/IP can still be usable for
+	// direct-IP traffic. dnsOk is reported on network_ready instead
+	// of assumed, since await-network-ready exists specifically to
+	// guarantee DNS is live before the first exec.
+	dnsOk := configureDNS(msg.DNS)
 
 	// Report the address the interface actually holds, not the one the
 	// host asked for: they diverge whenever something else on the guest
@@ -139,6 +170,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 				IP:       actualIP,
 				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "operstate",
+				DnsOk:    dnsOk,
 			})
 			return
 		}
@@ -150,6 +182,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 				IP:       actualIP,
 				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "carrier",
+				DnsOk:    dnsOk,
 			})
 			return
 		}
@@ -169,6 +202,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		IP:       actualIP,
 		ConfigMs: int(elapsed.Milliseconds()),
 		Stage:    "timeout-anyway",
+		DnsOk:    dnsOk,
 	})
 }
 
