@@ -49,6 +49,31 @@ Two bugs made `error: "timeout"` unreliable, and both are fixed:
 
 `/sbin/init` mounted devtmpfs but never mounted a devpts instance, so `openpty` failed with `open /dev/ptmx: no such file or directory` and every `exec --pty` died. Now mounted with `gid=5,mode=620,ptmxmode=666`.
 
+### Failures now say what actually failed
+
+`error` stays the same four-value contract (`timeout`, `vm_crashed`, `connection_failed`, `session_disconnected`), but a failure envelope now also carries **`error_detail`** — free text naming the underlying cause. It exists because `bootFailed`, `imageNotFound`, `cloneFailed` and a dropped vsock all collapsed into a bare `connection_failed` with nothing written anywhere. Do not match on its contents; match on `error`.
+
+It paid for itself immediately: an intermittent 1-in-15 concurrent-boot failure that had been invisible turned out on first reproduction to be `failed to clone disk image: The file "rootfs.img" doesn't exist.` — `DiskClone` wrote its PID file *after* copying the rootfs, so for the whole ~1GB clone the run directory looked like an orphan, and any concurrent run's cleanup sweep deleted it mid-copy. Fixed; 40 concurrent boots now pass clean.
+
+### Postconditions are checked, not assumed
+
+- **Volume mounts.** The guest mounts virtio-fs shares from init with stderr discarded and never reported back, so `lumina run --volume ./src:/code "wc -l /code/*.py"` exited 0 having counted an empty directory. The host now greps `/proc/mounts` for every requested path after boot and fails naming what is missing. Costs one exec, only when mounts were requested, and works against older images since the check is host-driven.
+- **DNS.** The guest reads `/etc/resolv.conf` back after writing it and reports `dns_ok` on `network_ready`; the host warns when it is false. Awaiting `network_ready` exists precisely to guarantee DNS is live before the first command, and that postcondition was never checked.
+- **Image install is atomic.** `pull` extracted over the live image directory, so a truncated download or failed `tar` destroyed a working image and left nothing. It now stages, verifies, and swaps.
+- **`createImage` verifies its flush.** `sync` ran under `try?`; a failed flush produced an image missing the last build step's writes and reported success.
+
+### Guest agent hardening
+
+- An upload no longer **discards** interleaved frames. Anything that is not an upload chunk (an `exec`, `cancel`, `stdin`, `pty_input`) used to be silently dropped mid-transfer, so that command never ran and its caller blocked until timeout. Non-upload frames are buffered and replayed through normal dispatch once the transfer finishes.
+- **PTY input is no longer truncated.** `unix.Write` discarded its byte count while the reader flipped the shared master fd to `O_NONBLOCK`, so pasting a block into `exec --pty` dropped characters. Writes now loop to completion, and the reader uses `poll()` instead of mutating flags on a descriptor the writer shares.
+- **vsock listen backlog** raised from 1 (a third concurrent connection was dropped) to 16.
+
+### Integration tests: what actually runs
+
+`swift test` **cannot** run `Tests/LuminaTests/IntegrationTests.swift`, and the instructions that said otherwise cost an hour to disprove. On macOS a SwiftPM test target is a *bundle* loaded by the system `xctest` host; entitlements apply to a process's main executable, so codesigning the bundle grants nothing and every VM boot fails with `VZErrorDomain Code=2`. `--disable-xctest` still emits a bundle.
+
+The integration gate that runs, in CI and locally, is `make test-integration` — the CLI e2e suite, which drives the *signed* binary as a subprocess. Note that target depends on `build` for a reason: codesigning is a post-link step outside the build graph, so any later `swift build` silently strips the signature.
+
 ### Usage errors are JSON when piped
 
 `{"error": "usage_error", "message": "Unknown option '--bogus'"}` on stdout, prose + usage still on stderr, exit 64. The documented `sid=$(lumina session start … | jq -r .sid)` pattern yields `null` on a bad flag instead of `jq: parse error: Invalid numeric literal`. Same JSON-on-pipe rule as everything else — a TTY or `LUMINA_FORMAT=text` leaves stdout empty.
