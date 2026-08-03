@@ -91,7 +91,7 @@ struct Doctor: AsyncParsableCommand {
                                detail: "No file at \(url.path). Double-check the path."))
             return DoctorReport(
                 generatedAt: Date(),
-                luminaVersion: "0.7.3",
+                luminaVersion: "0.7.4",
                 host: hostInfo(),
                 checks: checks
             )
@@ -117,7 +117,7 @@ struct Doctor: AsyncParsableCommand {
                                detail: "\(error). File may be unreadable, corrupted, or a non-ISO container."))
             return DoctorReport(
                 generatedAt: Date(),
-                luminaVersion: "0.7.3",
+                luminaVersion: "0.7.4",
                 host: hostInfo(),
                 checks: checks
             )
@@ -153,7 +153,7 @@ struct Doctor: AsyncParsableCommand {
 
         return DoctorReport(
             generatedAt: Date(),
-            luminaVersion: "0.7.3",
+            luminaVersion: "0.7.4",
             host: hostInfo(),
             checks: checks
         )
@@ -194,7 +194,7 @@ struct Doctor: AsyncParsableCommand {
 
         return DoctorReport(
             generatedAt: Date(),
-            luminaVersion: "0.7.3",
+            luminaVersion: "0.7.4",
             host: hostInfo(),
             checks: checks
         )

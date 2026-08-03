@@ -21,7 +21,7 @@ public struct ImagePuller: Sendable {
     /// API can't be reached (offline, rate-limited, 5xx). Bump in
     /// lockstep with the host release so the fallback never points
     /// at a more-than-one-minor-version-older image.
-    public static let fallbackTag = "lumina-v0.7.3"
+    public static let fallbackTag = "lumina-v0.7.4"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
 
     /// Back-compat alias — older code reads `ImagePuller.defaultTag`.

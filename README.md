@@ -38,7 +38,11 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
-### v0.7.3 — the guest actually reaches the network (current)
+### v0.7.4 — hardening pass (current)
+
+The same "success inferred from a proxy signal" audit, applied to everything the v0.7.3 fix touched on its way past. A concurrent `lumina run` could delete another run's disk clone mid-copy (~1 in 15 boots); a failed `--volume` mount returned exit 0 over an empty directory; an upload silently discarded any `exec` or `cancel` frame that arrived interleaved; PTY input dropped characters on paste; `--via-daemon` warned and dropped `--copy`/`--download`/stdin; one silent client could wedge the daemon's accept loop; a bad download destroyed your working image. All fixed, with the reasoning in [`AGENTS.md`](AGENTS.md).
+
+### v0.7.3 — the guest actually reaches the network
 
 The headline is a bug fix, because the bug was total: on the shipped image, an agent VM booted, ran commands, and had no network at all. Three defects stacked — the guest agent inherited an empty `PATH` so every `ip` invocation failed to resolve; `ip -batch` (added in v0.7.1 to save two forks) does not exist on BusyBox and exited 1 on every boot since; and readiness was verified by checking the default route without ever checking the address, so a route installed by anything else counted as success. Details in [`AGENTS.md`](AGENTS.md).
 
