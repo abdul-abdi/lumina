@@ -87,12 +87,8 @@ struct Doctor: AsyncParsableCommand {
 
         // File existence + size.
         guard FileManager.default.fileExists(atPath: url.path) else {
-            checks.append(DoctorCheck(
-                id: "iso-file",
-                severity: .error,
-                title: "ISO not found",
-                detail: "No file at \(url.path). Double-check the path."
-            ))
+            checks.append(.err(id: "iso-file", title: "ISO not found",
+                               detail: "No file at \(url.path). Double-check the path."))
             return DoctorReport(
                 generatedAt: Date(),
                 luminaVersion: "0.7.3",
@@ -102,19 +98,11 @@ struct Doctor: AsyncParsableCommand {
         }
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value ?? 0
         if size < 32 * 1024 * 1024 {
-            checks.append(DoctorCheck(
-                id: "iso-size",
-                severity: .warning,
-                title: "ISO suspiciously small",
-                detail: "File is \(formatBytesLocal(size)). A legitimate installer ISO is typically 150 MB+. Partial download?"
-            ))
+            checks.append(.warn(id: "iso-size", title: "ISO suspiciously small",
+                                detail: "File is \(formatBytesLocal(size)). A legitimate installer ISO is typically 150 MB+. Partial download?"))
         } else {
-            checks.append(DoctorCheck(
-                id: "iso-size",
-                severity: .info,
-                title: "ISO size \(formatBytesLocal(size))",
-                detail: "Within the normal range for an installer ISO."
-            ))
+            checks.append(.info(id: "iso-size", title: "ISO size \(formatBytesLocal(size))",
+                                detail: "Within the normal range for an installer ISO."))
         }
 
         // Architecture gate — the big one. ISOInspector scans the first
@@ -125,12 +113,8 @@ struct Doctor: AsyncParsableCommand {
         do {
             arch = try ISOInspector.detectArchitecture(at: url)
         } catch {
-            checks.append(DoctorCheck(
-                id: "iso-arch",
-                severity: .error,
-                title: "Couldn't read ISO",
-                detail: "\(error). File may be unreadable, corrupted, or a non-ISO container."
-            ))
+            checks.append(.err(id: "iso-arch", title: "Couldn't read ISO",
+                               detail: "\(error). File may be unreadable, corrupted, or a non-ISO container."))
             return DoctorReport(
                 generatedAt: Date(),
                 luminaVersion: "0.7.3",
@@ -141,16 +125,11 @@ struct Doctor: AsyncParsableCommand {
 
         switch arch {
         case .arm64:
-            checks.append(DoctorCheck(
-                id: "iso-arch",
-                severity: .info,
-                title: "ARM64 (aarch64) EFI bootloader detected",
-                detail: "BOOTAA64.EFI present. This ISO should boot in Lumina Desktop."
-            ))
+            checks.append(.info(id: "iso-arch", title: "ARM64 (aarch64) EFI bootloader detected",
+                                detail: "BOOTAA64.EFI present. This ISO should boot in Lumina Desktop."))
         case .x86_64:
-            checks.append(DoctorCheck(
+            checks.append(.err(
                 id: "iso-arch",
-                severity: .error,
                 title: "x86_64 ISO — will not boot",
                 detail:
                     "BOOTX64.EFI present. Apple Silicon's Virtualization.framework does not emulate x86. "
@@ -159,16 +138,11 @@ struct Doctor: AsyncParsableCommand {
                     + "Debian: 'netinst arm64')."
             ))
         case .riscv64:
-            checks.append(DoctorCheck(
-                id: "iso-arch",
-                severity: .error,
-                title: "RISC-V 64 ISO — will not boot",
-                detail: "BOOTRISCV64.EFI present. VZ on Apple Silicon only boots arm64 guests."
-            ))
+            checks.append(.err(id: "iso-arch", title: "RISC-V 64 ISO — will not boot",
+                               detail: "BOOTRISCV64.EFI present. VZ on Apple Silicon only boots arm64 guests."))
         case .unknown:
-            checks.append(DoctorCheck(
+            checks.append(.warn(
                 id: "iso-arch",
-                severity: .warning,
                 title: "Architecture could not be determined",
                 detail:
                     "No known EFI bootloader name (BOOTAA64/BOOTX64/BOOTRISCV64) found in the first 5MB. "
@@ -240,16 +214,14 @@ struct Doctor: AsyncParsableCommand {
             key: "com.apple.security.virtualization"
         )
         if hasEnt {
-            return DoctorCheck(
+            return .info(
                 id: "entitlements",
-                severity: .info,
                 title: "Binary entitlements present",
                 detail: "Running binary at \(argv0) has com.apple.security.virtualization."
             )
         } else {
-            return DoctorCheck(
+            return .err(
                 id: "entitlements",
-                severity: .error,
                 title: "Missing Virtualization entitlement",
                 detail: "The running lumina binary at \(argv0) lacks com.apple.security.virtualization. Boot will fail with VZErrorDomain Code 2. Re-run: codesign --entitlements lumina.entitlements --force -s - \(argv0)"
             )
@@ -320,8 +292,7 @@ struct Doctor: AsyncParsableCommand {
         // vm_stat output: `Pages free` / `Pages inactive` / etc.
         let result = runAndCapture(path: "/usr/bin/vm_stat", args: [])
         if result.exitCode != 0 {
-            return DoctorCheck(id: "memory", severity: .warning,
-                               title: "Couldn't query memory", detail: "vm_stat failed")
+            return .warn(id: "memory", title: "Couldn't query memory", detail: "vm_stat failed")
         }
         let str = result.stdout
 
@@ -340,25 +311,22 @@ struct Doctor: AsyncParsableCommand {
               let inactive = parsePages("Pages inactive:"),
               let wired = parsePages("Pages wired down:"),
               let spec = parsePages("Pages speculative:") else {
-            return DoctorCheck(id: "memory", severity: .warning,
-                               title: "Couldn't parse vm_stat",
-                               detail: "Memory pressure check skipped")
+            return .warn(id: "memory", title: "Couldn't parse vm_stat",
+                         detail: "Memory pressure check skipped")
         }
         let total = free + active + inactive + wired + spec
         let freePct = Double(free + inactive + spec) / Double(total)
         let freeMb = (free + inactive + spec) * 16384 / 1_048_576
 
         if freePct < 0.05 {
-            return DoctorCheck(
+            return .warn(
                 id: "memory",
-                severity: .warning,
                 title: "Low memory available",
                 detail: String(format: "Only %.1f%% free (~%d MB). VM cold-boot will be slow; 512 MB per VM recommended.", freePct * 100, freeMb)
             )
         }
-        return DoctorCheck(
+        return .info(
             id: "memory",
-            severity: .info,
             title: "Memory pressure OK",
             detail: String(format: "%.1f%% available (~%d MB).", freePct * 100, freeMb)
         )
@@ -367,9 +335,8 @@ struct Doctor: AsyncParsableCommand {
     private func checkCompetingVZProcesses() -> DoctorCheck {
         let result = runAndCapture(path: "/bin/ps", args: ["ax", "-o", "pid,etime,command"])
         if result.exitCode != 0 {
-            return DoctorCheck(id: "vz-processes", severity: .info,
-                               title: "VZ processes",
-                               detail: "ps unavailable; check skipped")
+            return .info(id: "vz-processes", title: "VZ processes",
+                         detail: "ps unavailable; check skipped")
         }
         let str = result.stdout
 
@@ -380,23 +347,17 @@ struct Doctor: AsyncParsableCommand {
         let count = vzLines.count
 
         if count == 0 {
-            return DoctorCheck(
-                id: "vz-processes",
-                severity: .info,
-                title: "No VZ processes running",
-                detail: "Clean host state."
-            )
+            return .info(id: "vz-processes", title: "No VZ processes running",
+                         detail: "Clean host state.")
         } else if count <= 3 {
-            return DoctorCheck(
+            return .info(
                 id: "vz-processes",
-                severity: .info,
                 title: "\(count) VZ VM(s) running",
                 detail: "Other VMs may compete for vmnet resources; this is normal up to ~10 on 18 GB hosts."
             )
         } else {
-            return DoctorCheck(
+            return .warn(
                 id: "vz-processes",
-                severity: .warning,
                 title: "\(count) VZ VMs — approaching host ceiling",
                 detail: "Heavy VZ contention. vmnet-NAT may degrade (bridge allocations become flaky). Consider stopping unused VMs."
             )
@@ -414,8 +375,7 @@ struct Doctor: AsyncParsableCommand {
     private func checkCompetingVmnetHolders() -> DoctorCheck {
         let result = runAndCapture(path: "/bin/ps", args: ["ax", "-o", "pid,command"])
         if result.exitCode != 0 {
-            return DoctorCheck(id: "vmnet-holders", severity: .info,
-                               title: "vmnet holders", detail: "ps unavailable; skipped")
+            return .info(id: "vmnet-holders", title: "vmnet holders", detail: "ps unavailable; skipped")
         }
 
         // Each entry: (matching-process-substring, friendly-name, fix hint).
@@ -437,19 +397,14 @@ struct Doctor: AsyncParsableCommand {
         }
 
         if found.isEmpty {
-            return DoctorCheck(
-                id: "vmnet-holders",
-                severity: .info,
-                title: "No competing vmnet holders",
-                detail: "No known NAT-reserving processes running."
-            )
+            return .info(id: "vmnet-holders", title: "No competing vmnet holders",
+                         detail: "No known NAT-reserving processes running.")
         }
 
         let names = found.map { $0.0 }.joined(separator: ", ")
         let hints = found.map { "- \($0.0): \($0.1)" }.joined(separator: "\n")
-        return DoctorCheck(
+        return .err(
             id: "vmnet-holders",
-            severity: .error,
             title: "Competing vmnet holder(s): \(names)",
             detail:
                 "Another tool has reserved vmnet's NAT subnet. VZ will silently fail to allocate a bridge IP; "
@@ -474,9 +429,8 @@ struct Doctor: AsyncParsableCommand {
     private func checkVmnetInterfaceLeak() -> DoctorCheck {
         let result = runAndCapture(path: "/sbin/ifconfig", args: ["-a"])
         if result.exitCode != 0 {
-            return DoctorCheck(id: "vmnet-leak", severity: .info,
-                               title: "vmnet leak check skipped",
-                               detail: "ifconfig unavailable")
+            return .info(id: "vmnet-leak", title: "vmnet leak check skipped",
+                         detail: "ifconfig unavailable")
         }
 
         var vmenetCount = 0
@@ -489,34 +443,24 @@ struct Doctor: AsyncParsableCommand {
         }
 
         if vmenetCount == 0 {
-            return DoctorCheck(
-                id: "vmnet-leak",
-                severity: .info,
-                title: "No leaked vmenet interfaces",
-                detail: "Clean vmnet state."
-            )
+            return .info(id: "vmnet-leak", title: "No leaked vmenet interfaces",
+                         detail: "Clean vmnet state.")
         }
         if vmenetCount < 8 {
-            return DoctorCheck(
-                id: "vmnet-leak",
-                severity: .info,
-                title: "\(vmenetCount) vmenet interface(s) present",
-                detail: "Normal — in-flight VMs each register one."
-            )
+            return .info(id: "vmnet-leak", title: "\(vmenetCount) vmenet interface(s) present",
+                         detail: "Normal — in-flight VMs each register one.")
         }
         if vmenetCount < 20 {
-            return DoctorCheck(
+            return .warn(
                 id: "vmnet-leak",
-                severity: .warning,
                 title: "\(vmenetCount) vmenet interfaces — accumulating",
                 detail:
                     "Some prior VM shutdowns leaked their guest-side vmnet interface. Not yet fatal but close. "
                     + "If networking starts silently failing, reboot to flush vmnet state."
             )
         }
-        return DoctorCheck(
+        return .err(
             id: "vmnet-leak",
-            severity: .error,
             title: "\(vmenetCount) leaked vmenet interfaces — vmnet is saturated",
             detail:
                 "vmnet's bridge allocator won't give VZ a working IPv4 bridge in this state. "
@@ -534,9 +478,8 @@ struct Doctor: AsyncParsableCommand {
         // managed range that VZ uses for NAT attachments.
         let result = runAndCapture(path: "/sbin/ifconfig", args: [])
         if result.exitCode != 0 {
-            return DoctorCheck(id: "vmnet", severity: .warning,
-                               title: "ifconfig unavailable",
-                               detail: "Can't inspect vmnet bridges")
+            return .warn(id: "vmnet", title: "ifconfig unavailable",
+                         detail: "Can't inspect vmnet bridges")
         }
 
         var bridges: [(name: String, ipv4: String?)] = []
@@ -571,30 +514,23 @@ struct Doctor: AsyncParsableCommand {
         let withIP = vmnetBridges.filter { $0.ipv4 != nil }
 
         if vmnetBridges.isEmpty {
-            return DoctorCheck(
+            return .info(
                 id: "vmnet",
-                severity: .info,
                 title: "No vmnet bridges yet",
                 detail: "No VZ NAT bridges (bridge100+) visible. A bridge will spawn on the next `lumina run`."
             )
         }
         if withIP.isEmpty {
             let names = vmnetBridges.map { $0.name }.joined(separator: ", ")
-            return DoctorCheck(
+            return .warn(
                 id: "vmnet",
-                severity: .warning,
                 title: "vmnet bridges up but no IPv4",
                 detail: "Bridges \(names) exist without IPv4 addresses. vmnet DHCP allocation is degraded. Next `lumina run` will emit stage=timeout-anyway. Common causes: competing VZ workloads holding bridges, stale state after VZ crash. Restart affected VMs or reboot vmnet."
             )
         }
         let summary = withIP.map { "\($0.name) → \($0.ipv4!)" }
             .joined(separator: ", ")
-        return DoctorCheck(
-            id: "vmnet",
-            severity: .info,
-            title: "vmnet bridges healthy",
-            detail: summary
-        )
+        return .info(id: "vmnet", title: "vmnet bridges healthy", detail: summary)
     }
 
     private func checkImages() -> DoctorCheck {
@@ -604,12 +540,8 @@ struct Doctor: AsyncParsableCommand {
         let baseDir = home.appendingPathComponent(".lumina/images")
 
         if names.isEmpty {
-            return DoctorCheck(
-                id: "images",
-                severity: .warning,
-                title: "No images installed",
-                detail: "Run `lumina pull` to download the default image."
-            )
+            return .warn(id: "images", title: "No images installed",
+                         detail: "Run `lumina pull` to download the default image.")
         }
 
         var issues: [String] = []
@@ -625,19 +557,11 @@ struct Doctor: AsyncParsableCommand {
             }
         }
         if issues.isEmpty {
-            return DoctorCheck(
-                id: "images",
-                severity: .info,
-                title: "\(names.count) image(s) installed",
-                detail: names.joined(separator: ", ")
-            )
+            return .info(id: "images", title: "\(names.count) image(s) installed",
+                         detail: names.joined(separator: ", "))
         }
-        return DoctorCheck(
-            id: "images",
-            severity: .error,
-            title: "Image integrity issues",
-            detail: issues.joined(separator: "; ")
-        )
+        return .err(id: "images", title: "Image integrity issues",
+                    detail: issues.joined(separator: "; "))
     }
 
     private func checkSessions() async -> DoctorCheck {
@@ -647,12 +571,7 @@ struct Doctor: AsyncParsableCommand {
             at: sessionsDir,
             includingPropertiesForKeys: [.isDirectoryKey]
         ) else {
-            return DoctorCheck(
-                id: "sessions",
-                severity: .info,
-                title: "No sessions directory",
-                detail: "No live sessions."
-            )
+            return .info(id: "sessions", title: "No sessions directory", detail: "No live sessions.")
         }
 
         var badPerms: [String] = []
@@ -672,19 +591,14 @@ struct Doctor: AsyncParsableCommand {
         }
 
         if !badPerms.isEmpty {
-            return DoctorCheck(
+            return .warn(
                 id: "sessions",
-                severity: .warning,
                 title: "Session sockets with weak perms",
                 detail: "Other users may be able to connect to: \(badPerms.joined(separator: "; ")). Restart the affected sessions on v0.7.1+ to auto-chmod."
             )
         }
-        return DoctorCheck(
-            id: "sessions",
-            severity: .info,
-            title: "\(live) live session(s)",
-            detail: live == 0 ? "No live sessions." : "All session sockets 0600."
-        )
+        return .info(id: "sessions", title: "\(live) live session(s)",
+                     detail: live == 0 ? "No live sessions." : "All session sockets 0600.")
     }
 
     private func checkRunOrphans(fix: Bool) -> DoctorCheck {
@@ -704,24 +618,18 @@ struct Doctor: AsyncParsableCommand {
             removed = entries.count
         }
         if removed == 0 {
-            return DoctorCheck(
-                id: "run-orphans",
-                severity: .info,
-                title: "No orphan run directories",
-                detail: "~/.lumina/runs/ is clean."
-            )
+            return .info(id: "run-orphans", title: "No orphan run directories",
+                         detail: "~/.lumina/runs/ is clean.")
         }
         if fix {
-            return DoctorCheck(
+            return .warn(
                 id: "run-orphans",
-                severity: .warning,
                 title: "Cleaned \(removed) orphan run director\(removed == 1 ? "y" : "ies")",
                 detail: "These accumulated from crashed `lumina run` invocations."
             )
         }
-        return DoctorCheck(
+        return .warn(
             id: "run-orphans",
-            severity: .warning,
             title: "Up to \(removed) run director\(removed == 1 ? "y" : "ies") in ~/.lumina/runs/",
             detail: "Some may be live runs from other processes; pass --fix to sweep only the ones whose owning `lumina run` has exited."
         )
@@ -742,16 +650,11 @@ struct Doctor: AsyncParsableCommand {
         let expected = ["images", "sessions", "volumes"]
         let criticallyMissing = missing.filter { expected.contains($0) }
         if criticallyMissing.isEmpty {
-            return DoctorCheck(
-                id: "home-layout",
-                severity: .info,
-                title: "~/.lumina/ layout looks OK",
-                detail: "Core subdirs present."
-            )
+            return .info(id: "home-layout", title: "~/.lumina/ layout looks OK",
+                         detail: "Core subdirs present.")
         }
-        return DoctorCheck(
+        return .info(
             id: "home-layout",
-            severity: .info,
             title: "~/.lumina/ partially initialised",
             detail: "Missing (created on demand): \(criticallyMissing.joined(separator: ", "))"
         )
@@ -760,26 +663,14 @@ struct Doctor: AsyncParsableCommand {
     // MARK: - Host info
 
     private func hostInfo() -> DoctorHost {
-        var unameInfo = utsname()
-        uname(&unameInfo)
-        let osName = withUnsafePointer(to: &unameInfo.sysname) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 256) {
-                String(cString: $0)
-            }
-        }
-        let osRelease = withUnsafePointer(to: &unameInfo.release) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 256) {
-                String(cString: $0)
-            }
-        }
-        let arch = withUnsafePointer(to: &unameInfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 256) {
-                String(cString: $0)
-            }
+        var u = utsname()
+        uname(&u)
+        func field<T>(_ ptr: UnsafePointer<T>) -> String {
+            ptr.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) }
         }
         return DoctorHost(
-            os: "\(osName) \(osRelease)",
-            arch: arch,
+            os: "\(field(&u.sysname)) \(field(&u.release))",
+            arch: field(&u.machine),
             cpuCount: ProcessInfo.processInfo.processorCount
         )
     }
@@ -842,5 +733,17 @@ private struct DoctorCheck: Codable {
         case info
         case warning
         case error
+    }
+
+    static func info(id: String, title: String, detail: String) -> DoctorCheck {
+        DoctorCheck(id: id, severity: .info, title: title, detail: detail)
+    }
+
+    static func warn(id: String, title: String, detail: String) -> DoctorCheck {
+        DoctorCheck(id: id, severity: .warning, title: title, detail: detail)
+    }
+
+    static func err(id: String, title: String, detail: String) -> DoctorCheck {
+        DoctorCheck(id: id, severity: .error, title: title, detail: detail)
     }
 }
