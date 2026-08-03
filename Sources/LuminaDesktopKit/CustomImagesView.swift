@@ -313,6 +313,47 @@ struct CustomImageEntry: Sendable {
     }
 }
 
+// MARK: - Shared row/card helpers
+//
+// Identical logic backed the list-row and grid-card presentations of
+// both installed images and catalog entries; hoisted here so there's
+// one copy each.
+
+/// Bytes-on-disk display for installed images. Shared by ImageRow and ImageCard.
+private func formatBytes(_ bytes: Int64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    return formatter.string(fromByteCount: bytes)
+}
+
+/// Approximate-size display for catalog entries. Shared by CatalogRow and CatalogCard.
+private func formatMB(_ bytes: Int64) -> String {
+    let mb = Double(bytes) / (1024 * 1024)
+    if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
+    return String(format: "%.0f MB", mb)
+}
+
+/// Copies the disposable-run command to the pasteboard and flashes
+/// `copiedFlash` true then false. Shared by ImageRow and ImageCard.
+private func copyRunCommand(imageName: String, copiedFlash: Binding<Bool>) {
+    let cmd = "lumina run --image \(imageName) 'uname -a'"
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(cmd, forType: .string)
+    copiedFlash.wrappedValue = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+        copiedFlash.wrappedValue = false
+    }
+}
+
+/// Opens `lumina session start --image <name>` via TerminalLauncher and
+/// surfaces the outcome through the caller's alert callback. Shared by
+/// ImageRow and ImageCard.
+private func openInTerminal(imageName: String, onLaunchOutcome: (TerminalLaunchOutcome) -> Void) {
+    let cmd = "lumina session start --image \(imageName)"
+    let outcome = TerminalLauncher().launch(command: cmd)
+    onLaunchOutcome(outcome)
+}
+
 @MainActor
 private struct ImageRow: View {
     let entry: CustomImageEntry
@@ -376,11 +417,11 @@ private struct ImageRow: View {
         .contentShape(Rectangle())
         .animation(.easeOut(duration: 0.12), value: hovering)
         .onHover { hovering = $0 }
-        .onTapGesture { openInTerminal() }
+        .onTapGesture { openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome) }
         .help("Click to open `lumina session start --image \(entry.name)` in Terminal")
         .contextMenu {
-            Button("Open in Terminal") { openInTerminal() }
-            Button("Copy `lumina run` command") { copyRunCommand() }
+            Button("Open in Terminal") { openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome) }
+            Button("Copy `lumina run` command") { copyRunCommand(imageName: entry.name, copiedFlash: $copiedFlash) }
             if !entry.isBaseline {
                 Divider()
                 Button("Remove", role: .destructive) { onRemove() }
@@ -400,7 +441,7 @@ private struct ImageRow: View {
     private var actions: some View {
         VStack(alignment: .trailing, spacing: 6) {
             Button {
-                copyRunCommand()
+                copyRunCommand(imageName: entry.name, copiedFlash: $copiedFlash)
             } label: {
                 Label(copiedFlash ? "Copied" : "Copy `run`",
                       systemImage: copiedFlash ? "checkmark" : "doc.on.doc")
@@ -409,7 +450,7 @@ private struct ImageRow: View {
             .controlSize(.small)
 
             Button {
-                openInTerminal()
+                openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome)
             } label: {
                 Label("Open in Terminal", systemImage: "terminal")
             }
@@ -427,35 +468,6 @@ private struct ImageRow: View {
                 .foregroundStyle(LuminaTheme.err)
             }
         }
-    }
-
-    private func copyRunCommand() {
-        let cmd = "lumina run --image \(entry.name) 'uname -a'"
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(cmd, forType: .string)
-        copiedFlash = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            copiedFlash = false
-        }
-    }
-
-    private func openInTerminal() {
-        // Route through TerminalLauncher — detects iTerm2/Ghostty/Warp
-        // from the user's pref or install order, falls back to
-        // Terminal.app, and surfaces a visible error instead of the
-        // previous `try?`-swallowed failure. ImageStore names are
-        // filesystem-safe by construction (no spaces, no quotes), so
-        // the command doesn't need shell-escaping beyond what the
-        // launcher already does.
-        let cmd = "lumina session start --image \(entry.name)"
-        let outcome = TerminalLauncher().launch(command: cmd)
-        onLaunchOutcome(outcome)
-    }
-
-    private func formatBytes(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
     }
 }
 
@@ -582,14 +594,6 @@ private struct CatalogRow: View {
             }
         }
     }
-
-    private func formatMB(_ bytes: Int64) -> String {
-        let mb = Double(bytes) / (1024 * 1024)
-        if mb >= 1024 {
-            return String(format: "%.1f GB", mb / 1024)
-        }
-        return String(format: "%.0f MB", mb)
-    }
 }
 
 // MARK: - Grid cards (parity with VMCard/VMGridView)
@@ -700,11 +704,11 @@ private struct ImageCard: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .animation(.easeOut(duration: 0.14), value: hovering)
         .onHover { hovering = $0 }
-        .onTapGesture { openInTerminal() }
+        .onTapGesture { openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome) }
         .help("Click to open `lumina session start --image \(entry.name)` in Terminal")
         .contextMenu {
-            Button("Open in Terminal") { openInTerminal() }
-            Button("Copy `lumina run` command") { copyRunCommand() }
+            Button("Open in Terminal") { openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome) }
+            Button("Copy `lumina run` command") { copyRunCommand(imageName: entry.name, copiedFlash: $copiedFlash) }
             if !entry.isBaseline {
                 Divider()
                 Button("Remove", role: .destructive) { onRemove() }
@@ -735,7 +739,7 @@ private struct ImageCard: View {
 
     private var terminalButton: some View {
         Button {
-            openInTerminal()
+            openInTerminal(imageName: entry.name, onLaunchOutcome: onLaunchOutcome)
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: "terminal")
@@ -752,26 +756,6 @@ private struct ImageCard: View {
         }
         .buttonStyle(.plain)
         .help("Open `lumina session start --image \(entry.name)` in Terminal")
-    }
-
-    private func copyRunCommand() {
-        let cmd = "lumina run --image \(entry.name) 'uname -a'"
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(cmd, forType: .string)
-        copiedFlash = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedFlash = false }
-    }
-
-    private func openInTerminal() {
-        let cmd = "lumina session start --image \(entry.name)"
-        let outcome = TerminalLauncher().launch(command: cmd)
-        onLaunchOutcome(outcome)
-    }
-
-    private func formatBytes(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
     }
 }
 
@@ -912,12 +896,6 @@ private struct CatalogCard: View {
 
     private var hasPlaceholderSHA: Bool {
         entry.sha256.lowercased() == String(repeating: "0", count: 64)
-    }
-
-    private func formatMB(_ bytes: Int64) -> String {
-        let mb = Double(bytes) / (1024 * 1024)
-        if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
-        return String(format: "%.0f MB", mb)
     }
 }
 
