@@ -11,9 +11,23 @@ import Testing
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
     #expect(opts.directoryDownloads.isEmpty)
-    // v0.7.2 default flip: do NOT block exec on network_ready by default.
-    // Regression guard against an accidental flip-back to true.
-    #expect(opts.awaitNetworkReady == false)
+    // v0.7.3: block exec on network_ready by default. The wait costs ~4ms
+    // now that the host drives config directly, and opting out fails DNS
+    // outright. Regression guard against another flip to false.
+    #expect(opts.awaitNetworkReady == true)
+}
+
+/// Deadlines handed to a seconds-only API must round up. Truncating gave
+/// `--timeout 2s` a 1-second command budget once ~250ms of boot came off the
+/// top, so short timeouts fired at roughly half the requested time.
+@Test func durationSecondsRoundedUp() {
+    #expect(Duration.milliseconds(1750).secondsRoundedUp == 2)
+    #expect(Duration.seconds(5).secondsRoundedUp == 5)
+    #expect(Duration.milliseconds(4001).secondsRoundedUp == 5)
+    // Floored at 1: a caller that has already overrun still gets one second,
+    // not a zero-second timeout that fires instantly.
+    #expect(Duration.milliseconds(10).secondsRoundedUp == 1)
+    #expect(Duration.seconds(-3).secondsRoundedUp == 1)
 }
 
 @Test func directoryUploadInit() {

@@ -121,25 +121,145 @@ func TestRouteVerified_acceptsMixedCaseHex(t *testing.T) {
 // end-to-end; the tests above cover the deterministic parsing and
 // lookup layers the reliability fix actually depends on.
 func TestStubsWireUp(t *testing.T) {
-	origBatch, origSingle, origRoute := runIPBatch, runIP, readRouteFile
+	origSingle, origRoute, origAddr := runIP, readRouteFile, readIfaceIPv4
 	defer func() {
-		runIPBatch = origBatch
 		runIP = origSingle
 		readRouteFile = origRoute
+		readIfaceIPv4 = origAddr
 	}()
 
-	runIPBatch = func(_ string, _, _ string) (bool, string) { return true, "" }
 	runIP = func(_ string, _ ...string) error { return nil }
 	readRouteFile = func() ([]byte, error) { return []byte(sampleRouteFile), nil }
+	readIfaceIPv4 = func(_ string) string { return "192.168.64.2" }
 
-	if ok, _ := runIPBatch("eth0", "1.2.3.4/24", "1.2.3.1"); !ok {
-		t.Fatalf("stubbed runIPBatch should return true")
-	}
 	if err := runIP("eth0", "link", "set", "eth0", "up"); err != nil {
 		t.Fatalf("stubbed runIP should return nil, got %v", err)
 	}
 	if data, err := readRouteFile(); err != nil || len(data) == 0 {
 		t.Fatalf("stubbed readRouteFile should return sample data, got err=%v len=%d", err, len(data))
+	}
+	if got := readIfaceIPv4("eth0"); got != "192.168.64.2" {
+		t.Fatalf("stubbed readIfaceIPv4 = %q, want 192.168.64.2", got)
+	}
+}
+
+// applyConfig must never invoke `ip -batch`. The shipped guest image
+// uses BusyBox `ip`, which has no -batch subcommand: it exits 1 with a
+// usage dump, so the batched fast path introduced in v0.7.1 failed on
+// every single boot and silently degraded to the retry path. Assert on
+// the argv so a future "let's batch it again" refactor fails here
+// instead of in production.
+func TestApplyConfig_issuesIndividualBusyBoxCommands(t *testing.T) {
+	orig := runIP
+	defer func() { runIP = orig }()
+
+	var calls [][]string
+	runIP = func(_ string, args ...string) error {
+		calls = append(calls, args)
+		return nil
+	}
+
+	if err := applyConfig("eth0", "192.168.64.2/24", "192.168.64.1"); err != nil {
+		t.Fatalf("applyConfig returned %v, want nil", err)
+	}
+
+	want := [][]string{
+		{"link", "set", "eth0", "up"},
+		{"addr", "add", "192.168.64.2/24", "dev", "eth0"},
+		{"route", "replace", "default", "via", "192.168.64.1"},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("got %d ip invocations %v, want %d", len(calls), calls, len(want))
+	}
+	for i := range want {
+		if strings.Join(calls[i], " ") != strings.Join(want[i], " ") {
+			t.Errorf("call %d = %v, want %v", i, calls[i], want[i])
+		}
+		if calls[i][0] == "-batch" {
+			t.Errorf("call %d uses `ip -batch`, unsupported by BusyBox", i)
+		}
+	}
+}
+
+// An address that already exists makes BusyBox `ip addr add` exit
+// non-zero ("File exists"). That is benign — configuring twice is a
+// no-op, not a failure — so applyConfig must not surface it as long as
+// the route command lands.
+func TestApplyConfig_tolerantOfExistingAddress(t *testing.T) {
+	orig := runIP
+	defer func() { runIP = orig }()
+
+	runIP = func(_ string, args ...string) error {
+		if args[0] == "addr" {
+			return errors.New("ip addr add: File exists")
+		}
+		return nil
+	}
+
+	if err := applyConfig("eth0", "192.168.64.2/24", "192.168.64.1"); err != nil {
+		t.Fatalf("applyConfig should tolerate an existing address, got %v", err)
+	}
+}
+
+// When the route command fails, the address error is folded into the
+// message so network_error names the root cause rather than the
+// downstream symptom.
+func TestApplyConfig_reportsRouteFailureWithAddrContext(t *testing.T) {
+	orig := runIP
+	defer func() { runIP = orig }()
+
+	runIP = func(_ string, args ...string) error {
+		switch args[0] {
+		case "addr":
+			return errors.New("permission denied")
+		case "route":
+			return errors.New("network is unreachable")
+		}
+		return nil
+	}
+
+	err := applyConfig("eth0", "192.168.64.2/24", "192.168.64.1")
+	if err == nil {
+		t.Fatal("expected an error when route replace fails")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("error %q should carry the addr-add context", err)
+	}
+	if !strings.Contains(err.Error(), "network is unreachable") {
+		t.Errorf("error %q should carry the route-replace cause", err)
+	}
+}
+
+// configured() is the gate that decides whether network_ready or
+// network_error goes on the wire. Before v0.7.3 it checked the default
+// route only, so a route installed by anything other than us (a DHCP
+// client, a leftover from a previous configure) counted as success
+// while the interface still had no address — the guest then reported
+// ready with no way to send a packet. Both halves must hold.
+func TestConfigured_requiresAddressAndRoute(t *testing.T) {
+	origRoute, origAddr := readRouteFile, readIfaceIPv4
+	defer func() {
+		readRouteFile = origRoute
+		readIfaceIPv4 = origAddr
+	}()
+
+	cases := []struct {
+		name  string
+		addr  string
+		route string
+		want  bool
+	}{
+		{"address and route", "192.168.64.2", sampleRouteFile, true},
+		{"route but no address", "", sampleRouteFile, false},
+		{"address but no route", "192.168.64.2", "", false},
+		{"neither", "", "", false},
+	}
+	for _, c := range cases {
+		readIfaceIPv4 = func(_ string) string { return c.addr }
+		readRouteFile = func() ([]byte, error) { return []byte(c.route), nil }
+		if got := configured("eth0", "192.168.64.1"); got != c.want {
+			t.Errorf("%s: configured() = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
@@ -251,9 +371,9 @@ func TestOperstateReady_acceptsUpAndUnknown(t *testing.T) {
 	defer func() { readNetSysfs = orig }()
 
 	readNetSysfs = sysfsStub(map[string]string{
-		"eth0/operstate":    "up\n",
-		"enp0s1/operstate":  "unknown",
-		"eth1/operstate":    "down",
+		"eth0/operstate":   "up\n",
+		"enp0s1/operstate": "unknown",
+		"eth1/operstate":   "down",
 	})
 
 	if !operstateReady("eth0") {

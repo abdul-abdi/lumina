@@ -171,9 +171,19 @@ cat > "$ROOTFS_DIR/sbin/init" << 'INITEOF'
 #!/bin/sh
 # Lumina init — baked into rootfs image
 
+# The kernel gives PID 1 only HOME and TERM. BusyBox ash finds commands
+# via a built-in default it never exports, so anything we exec that is
+# not a shell — the Go agent, and every process it spawns — would see an
+# empty PATH and fail to resolve `ip`, `mount`, or anything else by name.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
+# openpty(3) needs a devpts instance, not just /dev/ptmx. Without this every
+# `exec --pty` fails with "open /dev/ptmx: no such file or directory".
+mkdir -p /dev/pts 2>/dev/null
+mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 
 # Boot profile markers — parsed by host from dmesg (BootProfile).
 # Writes to /dev/kmsg; visible via SerialConsole or `dmesg | grep LUMINA_BOOT`.

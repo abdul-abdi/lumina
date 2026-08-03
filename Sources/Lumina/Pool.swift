@@ -160,16 +160,28 @@ public actor Pool {
 
     // MARK: - Private: Acquire / Release
 
-    /// Borrow a VM. Suspends if none available; times out with session error if pool is exhausted.
+    /// Borrow a VM: warm from inventory, else boot on the caller's own path.
+    ///
+    /// Queueing behind a refill measured worse than not pooling at all — warm
+    /// P50 1ms but P95 278ms, P99 327ms against a ~190ms cold floor, because a
+    /// burst that drains the pool leaves later callers waiting on a full boot
+    /// they didn't start. Booting here caps the tail at the cold path.
     private func acquire() async throws -> VM {
-        if let vm = available.first {
-            available.removeFirst()
-            return vm
+        if !available.isEmpty {
+            return available.removeFirst()
         }
-        // Suspend until a VM becomes available
-        return try await withCheckedThrowingContinuation { cont in
-            waiters.append(cont)
+        // An in-flight refill lands sooner than a boot started now.
+        if booting > 0 {
+            return try await withCheckedThrowingContinuation { cont in
+                waiters.append(cont)
+            }
         }
+        let vm = await bootSingleVM()
+        booting = max(0, booting - 1)
+        guard let vm else {
+            throw LuminaError.bootFailed(underlying: PoolError.allSlotsFailed)
+        }
+        return vm
     }
 
     /// Return a used VM, boot a replacement, hand off to the next waiter or inventory.

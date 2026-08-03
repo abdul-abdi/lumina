@@ -44,6 +44,7 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 	_ = w.Send(protocol.UploadAckMsg{Type: protocol.TypeUploadAck, Seq: first.Seq})
 
 	// Remaining chunks if any.
+	sawEOF := first.Eof
 	if !first.Eof {
 		for scanner.Scan() {
 			var msg protocol.UploadMsg
@@ -61,15 +62,39 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 			}
 			_ = w.Send(protocol.UploadAckMsg{Type: protocol.TypeUploadAck, Seq: msg.Seq})
 			if msg.Eof {
+				sawEOF = true
 				break
 			}
 		}
 	}
 
-	// Optional mode (octal string).
+	// A scanner that ends without an Eof frame means the connection dropped
+	// mid-transfer. Falling through to upload_done here left both sides
+	// believing a truncated file was complete; remove it so nothing reads a
+	// half-written path.
+	if !sawEOF {
+		_ = f.Close()
+		_ = os.Remove(first.Path)
+		err := scanner.Err()
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		sendUploadError(w, first.Path, err)
+		return
+	}
+
+	// Optional mode (octal string). A file the caller cannot execute is a
+	// failed upload, not a successful one — `lumina cp ./s.sh sid:/tmp/s.sh`
+	// followed by `sh /tmp/s.sh` should not be where you find out.
 	if first.Mode != "" {
-		if mode, perr := strconv.ParseUint(first.Mode, 8, 32); perr == nil {
-			_ = os.Chmod(first.Path, os.FileMode(mode))
+		mode, perr := strconv.ParseUint(first.Mode, 8, 32)
+		if perr != nil {
+			sendUploadError(w, first.Path, fmt.Errorf("invalid mode %q: %w", first.Mode, perr))
+			return
+		}
+		if cerr := os.Chmod(first.Path, os.FileMode(mode)); cerr != nil {
+			sendUploadError(w, first.Path, fmt.Errorf("chmod %s: %w", first.Mode, cerr))
+			return
 		}
 	}
 

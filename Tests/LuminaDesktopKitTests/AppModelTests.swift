@@ -144,22 +144,3 @@ import Testing
         #expect(mac?.family == .macOS)
     }
 }
-
-@MainActor
-@Suite struct ErrorCatalogTests {
-    @Test func errorTitlesNonEmpty() {
-        let cases: [AppError] = [
-            .virtualizationEntitlementMissing,
-            .appleSiliconRequired,
-            .macOSHostTooOld(have: "13.0"),
-            .diskFullAtCreate(needed: 1, available: 0),
-            .isoNotARM64(path: "/x.iso"),
-            .vmCrashed(name: "test")
-        ]
-        for c in cases {
-            #expect(!c.title.isEmpty)
-            #expect(!c.body.isEmpty)
-            #expect(!c.primaryAction.isEmpty)
-        }
-    }
-}

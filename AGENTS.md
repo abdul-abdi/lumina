@@ -6,14 +6,59 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.7.1.
+here reflects what ships in v0.7.3.
 
-## v0.7.1 deltas (current — read these first)
+## v0.7.3 deltas (current — read these first)
+
+### Guest networking actually works now
+
+Three defects stacked into one symptom — a VM that boots, execs, and has no network:
+
+- **The agent had no `PATH`.** The kernel hands PID 1 only `HOME` and `TERM`, and BusyBox ash resolves commands against a built-in default it never exports. Every `exec.Command("ip", …)` from the Go agent failed with `executable file not found in $PATH` while the same command worked from a shell. Fixed in both places: `/sbin/init` exports a PATH, and the agent installs a default when it inherits none.
+- **`ip -batch` does not exist on BusyBox.** The v0.7.1 "batch the three ip calls into one fork" optimization exited 1 with a usage dump on every boot, so the documented fast path never once ran. `applyConfig` issues the three commands individually; `TestApplyConfig_issuesIndividualBusyBoxCommands` asserts on the argv so it cannot come back.
+- **Readiness checked the route but not the address.** A default route installed by anything else (`udhcpc`, in images at or before v0.7.0) satisfied the check while the interface had no address, so the guest reported `network_ready` with no way to send a packet. `configured()` requires both, and `network_ready` now reports the address the interface actually holds instead of echoing the host's request.
+
+**`RunOptions.awaitNetworkReady` is back to `true`**, reversing the v0.7.2 flip. That flip was priced against a guest that waited on DHCP and carrier — 50–150 ms. Host-driven config lands in ~4 ms, inside boot noise (measured no-wait/wait pairs: 183/179, 170/169, 173/168 ms), while opting out fails DNS 5/5: `getaddrinfo` returns NXDOMAIN immediately rather than retrying once the route appears. `--no-wait-network` is a real opt-out again.
+
+**Stale-image warning.** A guest whose `ready` frame reports a `protocol_version` below `expectedGuestProtocolVersion` triggers a one-shot stderr warning naming the symptom and the fix (`lumina pull --force`). The v0.7.0 release tarball — still the latest published image — is such a guest.
+
+### The timeout envelope actually fires now
+
+Two bugs made `error: "timeout"` unreliable, and both are fixed:
+
+- **The remaining timeout truncated.** `Int(remaining.components.seconds)` turned the 1.75s left after boot into 1, so `--timeout 2s` gave the command a one-second budget. Rounds up now (`Duration.secondsRoundedUp`).
+- **The grace window swallowed the timeout.** v0.7.2 added a 250ms window after the deadline so a command finishing *naturally* at the boundary could still report its real exit code. But it accepted any exit — including the SIGTERM the watchdog itself had just sent. Whether you got `error: "timeout"` or `exit_code: -1` came down to whether the guest's death notice beat the hard deadline. Signal death past the soft deadline is now reported as the timeout; only a normal exit code inside the window is treated as a natural finish.
+
+### A newer guest no longer bricks an older host
+
+`decodeGuest` returned `.protocolError` for any unrecognized `type`, and the dispatcher treats a decode error as fatal — so one unknown frame tore down the connection for the whole VM and failed every in-flight exec, PTY, and transfer on it. Unknown frames now decode to `.unknown(type:)` and are logged and skipped. Malformed *known* frames still throw. This matters most right now: the image and the host binary ship separately, so new-guest/old-host pairings are guaranteed in the field.
+
+### File transfers stop reporting success on truncation
+
+`upload` and `download` computed `gotAck` / `done` / `receivedEof` and then never checked them. Their `for await` loops also end when the connection drops, so a mid-transfer disconnect wrote a truncated file and returned success — you found out when the tar you just downloaded failed to extract. All three are now asserted. Guest-side, `HandleUpload` fell through to `upload_done` when its scanner ended without an EOF frame; it now removes the partial file and reports the error, and a `chmod` failure is an upload failure rather than a surprise at `sh /tmp/s.sh`.
+
+### Pool degrades to the cold path instead of past it
+
+`Pool.acquire` queued on a continuation when inventory was empty, so a burst that drained the pool left every later caller waiting on a boot it hadn't started — measured warm P50 1ms but P95 278ms and P99 327ms, against a ~190ms cold floor. It now boots on the caller's own path when nothing is in flight, capping the tail at the cold path. Pooling can make a call faster, never slower. (This is the honest answer to #31: literal "reset and return" is impossible — isolation is the per-run COW clone and VZ cannot revert a live VM's disk.)
+
+### `--via-daemon` will not silently run your command twice
+
+`Daemon.tryRun` returned `nil` — which callers read as "daemon unreachable, fall back to cold boot" — for failures that happen *after* the request is on the wire. A non-idempotent command (`apt install`, a migration) could run on the daemon and then again cold. Post-send failures now throw.
+
+### PTY works in the rebuilt image
+
+`/sbin/init` mounted devtmpfs but never mounted a devpts instance, so `openpty` failed with `open /dev/ptmx: no such file or directory` and every `exec --pty` died. Now mounted with `gid=5,mode=620,ptmxmode=666`.
+
+### Usage errors are JSON when piped
+
+`{"error": "usage_error", "message": "Unknown option '--bogus'"}` on stdout, prose + usage still on stderr, exit 64. The documented `sid=$(lumina session start … | jq -r .sid)` pattern yields `null` on a bad flag instead of `jq: parse error: Invalid numeric literal`. Same JSON-on-pipe rule as everything else — a TTY or `LUMINA_FORMAT=text` leaves stdout empty.
+
+## v0.7.1 deltas
 
 ### Network reliability + speed (new in v0.7.1)
 
-- **Hardened network configure, default-await stays safe and is now fast.** Guest `internal/network/network.go` batches `ip link/addr/route` into one `ip -batch -` call, reads `/proc/net/route` to verify the default route actually landed, retries up to 3× on failure, and emits `network_error` with reason when setup truly breaks. `network_ready` carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings. Carrier wait ceiling shrunk 2s → 400ms. Net result: `lumina run "echo hello"` went from ~3050ms (pre-hardening) to ~680ms (P50, default-await, healthy host).
-- **`--no-wait-network` CLI flag / `RunOptions.awaitNetworkReady = false`.** Opt-out for workloads that know they don't touch DNS/TCP in the first ~20ms. Default stays `true` (reliable). Saves ~150ms on top of the already-fast default.
+- **Hardened network configure.** Guest `internal/network/network.go` reads `/proc/net/route` to verify the default route actually landed, retries up to 3× on failure, and emits `network_error` with a reason when setup truly breaks. `network_ready` carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings. Carrier wait ceiling shrunk 2s → 400ms. (The `ip -batch` half of this change was reverted in v0.7.3 — see above.)
+- **`--no-wait-network` CLI flag / `RunOptions.awaitNetworkReady`.** Opt-out for workloads that know they don't touch DNS/TCP in the first ~20ms.
 - **Network metrics wire msg + `RunResult.networkMetrics` (new).** Guest agent emits `{"type":"network_metrics","interfaces":{"eth0":{"rx_bytes":N,"tx_bytes":N,"rx_errors":N,"tx_errors":N,"rx_packets":N,"tx_packets":N}}}` periodically (first sample at 500ms, then every 2s). Host caches the latest snapshot and surfaces it on `RunResult.networkMetrics` + the piped CLI envelope's `network_metrics` field. Map-shape (plural `interfaces`) — multi-NIC is additive without a wire migration. Counters are cumulative from interface-up; loopback excluded. Short commands that exit before the 500ms first-sample tick get `null` in the envelope — use this field as an opt-in diagnostic, not a contract.
 - **`LUMINA_BOOT_TRACE=1` stderr trace.** Agent-path boot reports phase breakdown: `image resolve / disk clone / config build / vz start / vsock connect / guest agent ready / total`. Use this when diagnosing slow boots — the hotspot is rarely where you'd guess.
 - **`BootPhases.isValid`** accessor distinguishes populated vs. agent-path-attached (zero-valued) BootPhases for UI gating.

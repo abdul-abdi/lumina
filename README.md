@@ -38,13 +38,21 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 The agent path is protected by a CI gate: 5-run cold-boot P50 of `lumina run "true"` must stay ≤ 2000ms (measured 524–558ms on M3 Pro, release build). Every v0.7 addition lives behind opt-in `VMOptions.bootable`, `VMOptions.graphics`, or `VMOptions.sound` and compiles to a nil-check on the agent path.
 
-### v0.7.1 — desktop boot reliability + network speed (current)
+### v0.7.3 — the guest actually reaches the network (current)
+
+The headline is a bug fix, because the bug was total: on the shipped image, an agent VM booted, ran commands, and had no network at all. Three defects stacked — the guest agent inherited an empty `PATH` so every `ip` invocation failed to resolve; `ip -batch` (added in v0.7.1 to save two forks) does not exist on BusyBox and exited 1 on every boot since; and readiness was verified by checking the default route without ever checking the address, so a route installed by anything else counted as success. Details in [`AGENTS.md`](AGENTS.md).
+
+Underneath it was a delivery bug worth more than the code: **no guest image had been published since 2026-04-21.** The image workflow triggered on tags `v*` while every release tag is `lumina-v*`, and it uploaded an artifact name the client never looked for. Three months of guest fixes sat in git, reaching nobody. Both fixed; a stale image now announces itself on stderr with the command to fix it.
+
+The same "success inferred from a proxy signal" pattern turned out to be everywhere, and the rest of the release is those: the `timeout` envelope now actually fires (it was a race, and `--timeout 2s` silently meant 1s), file transfers no longer report success on a truncated stream, an unknown wire frame no longer tears down the whole VM, `--via-daemon` can't silently run your command twice, a drained `Pool` degrades to the cold path instead of past it, and failures carry an `error_detail` saying what actually went wrong. ~360 lines of never-wired scaffolding deleted.
+
+### v0.7.1 — desktop boot reliability + network speed
 
 Hardening changes that make "every ARM64 OS boots cleanly, every time" closer to real, plus a complete rewrite of the agent-path network configure for both reliability and speed, plus a visible boot story and agent-facing observability. Each is unit-tested; end-to-end installer validation is the current open item.
 
 **Network reliability + speed (new):**
 
-- **Hardened network configure.** Guest-side `internal/network` batches `ip link/addr/route` into a single `ip -batch -` call, verifies the default route actually landed in `/proc/net/route`, retries up to 3× with linear backoff if not, and emits an explicit `network_error` wire message when setup truly fails — no more silent `network_ready` followed by "Network unreachable" at exec time. `network_ready` additionally carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings.
+- **Hardened network configure.** Guest-side `internal/network` verifies the default route actually landed in `/proc/net/route`, retries up to 3× with linear backoff if not, and emits an explicit `network_error` wire message when setup truly fails — no more silent `network_ready` followed by "Network unreachable" at exec time. `network_ready` additionally carries `config_ms` + `stage` (`operstate` / `carrier` / `timeout-anyway`) so the host can surface soft-fallback warnings.
 - **Carrier-wait shrunk 2s → 400ms.** Profiling on M3 Pro shows VZ NAT brings `eth0` up in 40–80ms (P95 ~120ms); 2s was a defensive floor that cost every disposable `lumina run` ~1.5s for nothing. The 400ms ceiling still covers worst-case observed, and `timeout-anyway` is an explicit fallback path rather than an invisible one.
 - **`--no-wait-network` opt-out.** For workloads that know they won't touch DNS/TCP in the first ~20ms (benchmarks, `echo`, pure-CPU tools), skip the host-side barrier and save another ~400ms. Default stays await-network — reliability is the guarantee.
 - **`LUMINA_BOOT_TRACE=1` stderr instrumentation.** New `BootPhases` fields (`imageResolveMs`, `cloneMs`, `vsockConnectMs`, `runnerReadyMs`) populate on the agent path; setting the env var prints the full waterfall to stderr after every `lumina run`. Zero-cost when unset.
@@ -64,7 +72,7 @@ Hardening changes that make "every ARM64 OS boots cleanly, every time" closer to
 
 - **Stable MAC per `.luminaVM` bundle.** Every bundle persists a locally-administered MAC in `manifest.json` via `VMBundleManifest.macAddress` and `VMBundle.ensureMACAddress()`. Legacy (pre-v0.7.1) manifests are lazily backfilled on first boot. Pre-fix every VZ machine got a random MAC on each boot, so vmnet's bootpd churned DHCP leases and the Kali/Debian installers' short-timeout `netcfg` DISCOVER raced the new lease. Post-fix the guest sees the same MAC/IP across reboots and vmnet keeps the lease hot.
 - **Cancel-during-boot → clean retry.** `VM.boot()` now wraps `vm.start` in `withTaskCancellationHandler`; an outer Task cancel (user clicks Stop, window closes, session shutdown) calls `vm.stop(…)` on the executor queue which resumes the start continuation with an error, funnels through a single `catch` that calls `shutdownVM()` to release the `flock()` on `disk.img` + `efi.vars`, and throws `LuminaError.bootFailed(underlying: VMError.cancelled)`. The next `boot()` starts cold. Prior design leaked state and produced `VZErrorDomain Code 2` on retry.
-- **Pre-start delegate install.** `VMStopForwarder` is now attached *before* `vm.start(…)` via `VM.setDelegate(_:)`. Guest crashes in the 300–500 ms kernel → init window (kernel panic, dracut timeout, missing hardware model, Windows TPM refusal) fire `didStopWithError` into a live observer and the desktop session transitions to `.crashed(reason:)`. Prior design attached the delegate after boot returned and lost the callback for early crashes — the UI sat at `.running` over a dead VM.
+- **Pre-start delegate install.** `VMStopForwarder` is now attached _before_ `vm.start(…)` via `VM.setDelegate(_:)`. Guest crashes in the 300–500 ms kernel → init window (kernel panic, dracut timeout, missing hardware model, Windows TPM refusal) fire `didStopWithError` into a live observer and the desktop session transitions to `.crashed(reason:)`. Prior design attached the delegate after boot returned and lost the callback for early crashes — the UI sat at `.running` over a dead VM.
 - **Windows 11 ARM installer reliability + install-phase speed.** `EFIBootConfig.preferUSBCDROM` (default `true` for `osFamily == .windows`) attaches the installer ISO via `VZUSBMassStorageDeviceConfiguration` (macOS 13+) instead of virtio-block — Windows setup refuses "unknown media" from virtio and installs cleanly from USB mass-storage. `EFIBootConfig.installPhase` (`true` while `manifest.lastBootedAt == nil`) flips the primary disk from `.full` to `.fsync` synchronization on macOS 13+; partman / mkfs install time roughly halves on APFS. Post-install returns to `.full` for real crash safety.
 
 ## Install
@@ -101,31 +109,31 @@ chmod +x lumina && sudo mv lumina /usr/local/bin/
 
 AI agents running untrusted code need hardware isolation. Lumina is a `subprocess.run()` shape over that.
 
-| | Lumina | Docker | SSH to cloud VM |
-|---|--------|--------|-----------------|
-| **Cold start** | ~540ms P50 (M3 Pro) | ~3–5s | 30–60s |
-| **Exec after boot** | ~31ms P50 · 1ms stdev | ~50–100ms | ~20–50ms (RTT) |
-| **Isolation** | Hardware (Virtualization.framework) | Kernel namespaces (shared) | Full VM |
-| **Host exposure** | None — no mounted fs, no daemon socket | Container escape risk | Network-exposed |
-| **Cleanup** | Automatic — COW clone deleted on exit | Manual | Manual |
-| **Dependencies** | Zero — ships as one binary | Docker daemon | Cloud account |
-| **Agent-friendly** | Unified JSON envelope when piped | Text only | Text only |
+|                     | Lumina                                 | Docker                     | SSH to cloud VM |
+| ------------------- | -------------------------------------- | -------------------------- | --------------- |
+| **Cold start**      | ~540ms P50 (M3 Pro)                    | ~3–5s                      | 30–60s          |
+| **Exec after boot** | ~31ms P50 · 1ms stdev                  | ~50–100ms                  | ~20–50ms (RTT)  |
+| **Isolation**       | Hardware (Virtualization.framework)    | Kernel namespaces (shared) | Full VM         |
+| **Host exposure**   | None — no mounted fs, no daemon socket | Container escape risk      | Network-exposed |
+| **Cleanup**         | Automatic — COW clone deleted on exit  | Manual                     | Manual          |
+| **Dependencies**    | Zero — ships as one binary             | Docker daemon              | Cloud account   |
+| **Agent-friendly**  | Unified JSON envelope when piped       | Text only                  | Text only       |
 
 ### Against Parallels / UTM / VirtualBuddy (desktop workloads)
 
 For running full operating systems on your Mac, v0.7.0 Lumina Desktop competes differently.
 
-| | Lumina Desktop | Parallels | UTM | VirtualBuddy |
-|---|----------------|-----------|-----|--------------|
-| **Price** | Free · MIT | $120/yr | Free | Free |
-| **CLI ↔ app coherence** | Shared `~/.lumina/` — boot from Terminal or the app, same VM | Separate | Separate | None (macOS-only) |
-| **Per-OS card branding** | ✓ each VM looks like its OS | Generic chrome | Generic chrome | macOS-only |
-| **Live disk-growth sparklines** | ✓ every card | — | — | — |
-| **⌘K fuzzy launcher** | ✓ | — | — | — |
-| **FSEvents live library** | ✓ 80ms update | — | — | — |
-| **Rosetta-at-runtime** | ✓ | ✓ | — | — |
-| **Headless CLI for agents** | ✓ same binary | — | — | — |
-| **Apple Silicon native** | ✓ VZ | ✓ | ✓ | ✓ |
+|                                 | Lumina Desktop                                               | Parallels      | UTM            | VirtualBuddy      |
+| ------------------------------- | ------------------------------------------------------------ | -------------- | -------------- | ----------------- |
+| **Price**                       | Free · MIT                                                   | $120/yr        | Free           | Free              |
+| **CLI ↔ app coherence**         | Shared `~/.lumina/` — boot from Terminal or the app, same VM | Separate       | Separate       | None (macOS-only) |
+| **Per-OS card branding**        | ✓ each VM looks like its OS                                  | Generic chrome | Generic chrome | macOS-only        |
+| **Live disk-growth sparklines** | ✓ every card                                                 | —              | —              | —                 |
+| **⌘K fuzzy launcher**           | ✓                                                            | —              | —              | —                 |
+| **FSEvents live library**       | ✓ 80ms update                                                | —              | —              | —                 |
+| **Rosetta-at-runtime**          | ✓                                                            | ✓              | —              | —                 |
+| **Headless CLI for agents**     | ✓ same binary                                                | —              | —              | —                 |
+| **Apple Silicon native**        | ✓ VZ                                                         | ✓              | ✓              | ✓                 |
 
 ## Performance
 
@@ -133,32 +141,34 @@ Benchmarked on M3 Pro, macOS 26.4, release build.
 
 ### Agent path
 
-| Workload | P50 | P95 | Context |
-|---|---|---|---|
-| Cold boot `true` (default-await) | **~680ms** | ~900ms | boot + network_ready; carrier usually up in 40-80ms |
-| Cold boot `true` (`--no-wait-network`) | **~540ms** | ~600ms | skips host barrier; boot only |
-| `BootPhases.totalMs` alone | **~570ms** | ~600ms | VZ `start()` → vsock ready, excludes host overhead (`LUMINA_BOOT_TRACE=1`) |
-| Warm session exec `true` | **31ms** (1ms stdev) | 33ms | agent already connected |
-| 4 concurrent cold boots | **753ms** aggregate wall-clock | — | Apple Silicon + VZ scales cleanly |
-| Daemon idle memory | **0 MB** | — | no daemon — sessions are spawned processes |
-| Sustained session exec rate | **100/s** | — | 3-minute soak test |
-| Concurrent CLI clients / session | **1000+ / 200-in-2s** | — | async reader lifted pool-starvation ceiling |
+| Workload                               | P50                            | P95    | Context                                                                    |
+| -------------------------------------- | ------------------------------ | ------ | -------------------------------------------------------------------------- |
+| Cold boot `true` (default-await)       | **~680ms**                     | ~900ms | boot + network_ready; carrier usually up in 40-80ms                        |
+| Cold boot `true` (`--no-wait-network`) | **~540ms**                     | ~600ms | skips host barrier; boot only                                              |
+| `BootPhases.totalMs` alone             | **~570ms**                     | ~600ms | VZ `start()` → vsock ready, excludes host overhead (`LUMINA_BOOT_TRACE=1`) |
+| Warm session exec `true`               | **31ms** (1ms stdev)           | 33ms   | agent already connected                                                    |
+| 4 concurrent cold boots                | **753ms** aggregate wall-clock | —      | Apple Silicon + VZ scales cleanly                                          |
+| Daemon idle memory                     | **0 MB**                       | —      | no daemon — sessions are spawned processes                                 |
+| Sustained session exec rate            | **100/s**                      | —      | 3-minute soak test                                                         |
+| Concurrent CLI clients / session       | **1000+ / 200-in-2s**          | —      | async reader lifted pool-starvation ceiling                                |
 
-**v0.7.1 network-reliability change:** `lumina run` defaults to awaiting `network_ready` before exec (the guarantee users depend on for `curl`/`ping`/`apt`). The default cost on a healthy host is ~150ms on top of boot, down from ~2.5s pre-hardening after the guest's carrier-wait + ip-batch rewrite. On hosts where vmnet NAT is degraded (memory pressure, competing VZ workloads) the guest emits `network_ready` with `stage="timeout-anyway"` after 400ms — cap-bounded by design. Pass `--no-wait-network` on the CLI (or set `RunOptions.awaitNetworkReady = false`) for network-free workloads that want to skip the wait entirely.
+**Networking (v0.7.3):** `lumina run` awaits `network_ready` before exec, so `curl`/`ping`/`apt` work on the very first command. The wait costs ~4ms — host-driven configuration over vsock, no DHCP round trip — which is inside boot noise; measured no-wait/wait pairs came out at 183/179, 170/169, 173/168 ms. Skipping it fails DNS outright, since `getaddrinfo` returns NXDOMAIN immediately rather than retrying when the route lands a moment later, so `--no-wait-network` (or `RunOptions.awaitNetworkReady = false`) is only for workloads that genuinely touch no network. On a degraded host the guest still emits `network_ready` with `stage="timeout-anyway"` after 400ms, by design.
+
+Guest images at or before the v0.7.0 tarball ran `udhcpc` from init, which raced the host's configuration and could leave a VM with no address at all. v0.7.3+ hosts print a one-shot warning naming the symptom and the fix: `lumina pull --force`.
 
 ### Desktop path (v0.7.0 new)
 
-| Workload | Measured | Context |
-|---|---|---|
-| VM library cold launch (app) | **1,226ms** | fresh dyld cache, first Lumina.app open |
-| VM library warm launch | **542ms** (3-run median) | cached; hot dyld |
-| VM library memory (steady) | **114 MB** RSS | SwiftUI + NSVisualEffectView + AppModel |
-| EFI VM boot (Alpine cold) | **~852ms** | `vm.boot()` call → "Booted" message |
-| Host-side overhead per running VM | **~25 MB** RSS | Lumina process; VZ memory separate |
-| FSEvents pickup (new VM appears) | **80ms** | coalesced from directory write events |
-| Binary size (`Lumina.app`) | **4.6 MB** | no Sparkle, no bundled frameworks |
+| Workload                          | Measured                 | Context                                 |
+| --------------------------------- | ------------------------ | --------------------------------------- |
+| VM library cold launch (app)      | **1,226ms**              | fresh dyld cache, first Lumina.app open |
+| VM library warm launch            | **542ms** (3-run median) | cached; hot dyld                        |
+| VM library memory (steady)        | **114 MB** RSS           | SwiftUI + NSVisualEffectView + AppModel |
+| EFI VM boot (Alpine cold)         | **~852ms**               | `vm.boot()` call → "Booted" message     |
+| Host-side overhead per running VM | **~25 MB** RSS           | Lumina process; VZ memory separate      |
+| FSEvents pickup (new VM appears)  | **80ms**                 | coalesced from directory write events   |
+| Binary size (`Lumina.app`)        | **4.6 MB**               | no Sparkle, no bundled frameworks       |
 
-Validated under stress: 20 concurrent 512MB VMs (100% success), 1000 parallel CLI `exec` clients against one session (100% success, 1.99s wall), 100K-line stdout round-trip in ~1s, 100MB stdout byte-exact in 532ms, 3-minute sustained session with 171 periodic execs.  [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
+Validated under stress: 20 concurrent 512MB VMs (100% success), 1000 parallel CLI `exec` clients against one session (100% success, 1.99s wall), 100K-line stdout round-trip in ~1s, 100MB stdout byte-exact in 532ms, 3-minute sustained session with 171 periodic execs. [Full methodology →](https://github.com/abdul-abdi/lumina/wiki/Performance-Methodology)
 
 ---
 
@@ -213,18 +223,18 @@ lumina desktop ls
 
 Open `/Applications/Lumina.app` — or press **⌘K** once it's running to fuzzy-search and launch any VM with one keystroke.
 
-| Shortcut | Action |
-|---|---|
-| ⌘K | Command launcher — type a VM name, hit Enter, it boots |
-| ⌘N | New VM wizard (v0.7.1: auto-boots the VM on completion) |
-| Click card | Open VM window + boot it in one action (v0.7.1) |
-| ⌘B / ⌘. | Boot / Stop selected VM |
-| ⌘R | Restart selected VM |
-| ⌘T | Take snapshot |
-| ⌘⌃F | Fullscreen the running VM |
-| ⌘1 / ⌘2 | Grid / List layout |
-| ⌘, | Preferences |
-| ⌘/ | Keyboard shortcuts |
+| Shortcut   | Action                                                  |
+| ---------- | ------------------------------------------------------- |
+| ⌘K         | Command launcher — type a VM name, hit Enter, it boots  |
+| ⌘N         | New VM wizard (v0.7.1: auto-boots the VM on completion) |
+| Click card | Open VM window + boot it in one action (v0.7.1)         |
+| ⌘B / ⌘.    | Boot / Stop selected VM                                 |
+| ⌘R         | Restart selected VM                                     |
+| ⌘T         | Take snapshot                                           |
+| ⌘⌃F        | Fullscreen the running VM                               |
+| ⌘1 / ⌘2    | Grid / List layout                                      |
+| ⌘,         | Preferences                                             |
+| ⌘/         | Keyboard shortcuts                                      |
 
 Drag any `.iso`, `.img`, or `.ipsw` onto the window → wizard opens pre-filled.
 
@@ -239,30 +249,51 @@ Piped JSON is a single envelope. TTY is human-readable text.
 **Success:**
 
 ```json
-{"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 668}
+{ "stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 668 }
 ```
 
 v0.7.1+ envelopes may additionally carry `network_metrics` with the latest per-NIC counter snapshot captured from the guest during the run (absent on commands shorter than the 500ms first-sample tick, and on pre-v0.7.1 agents):
 
 ```json
-{"stdout":"...","stderr":"","exit_code":0,"duration_ms":1842,
- "network_metrics":{"interfaces":{"eth0":{"rx_bytes":124567,"tx_bytes":8932,"rx_packets":87,"tx_packets":42,"rx_errors":0,"tx_errors":0}}}}
+{
+  "stdout": "...",
+  "stderr": "",
+  "exit_code": 0,
+  "duration_ms": 1842,
+  "network_metrics": {
+    "interfaces": {
+      "eth0": {
+        "rx_bytes": 124567,
+        "tx_bytes": 8932,
+        "rx_packets": 87,
+        "tx_packets": 42,
+        "rx_errors": 0,
+        "tx_errors": 0
+      }
+    }
+  }
+}
 ```
 
 **Error** — `error` is set, `exit_code` absent, `partial_stdout` / `partial_stderr` present when the command actually ran:
 
 ```json
-{"error": "timeout", "duration_ms": 3910, "partial_stdout": "begin\n", "partial_stderr": ""}
+{
+  "error": "timeout",
+  "duration_ms": 3910,
+  "partial_stdout": "begin\n",
+  "partial_stderr": ""
+}
 ```
 
 Exhaustive, mutually exclusive error states:
 
-| `error` | Meaning | Partials? |
-|---------|---------|-----------|
-| `timeout` | Command's `--timeout` fired | yes |
-| `vm_crashed` | Guest kernel or agent died mid-exec | yes |
-| `session_disconnected` | Session IPC socket dropped mid-exec | yes |
-| `connection_failed` | VM/session unreachable — command never started | no |
+| `error`                | Meaning                                        | Partials? |
+| ---------------------- | ---------------------------------------------- | --------- |
+| `timeout`              | Command's `--timeout` fired                    | yes       |
+| `vm_crashed`           | Guest kernel or agent died mid-exec            | yes       |
+| `session_disconnected` | Session IPC socket dropped mid-exec            | yes       |
+| `connection_failed`    | VM/session unreachable — command never started | no        |
 
 Legacy per-chunk NDJSON streaming is preserved via `LUMINA_OUTPUT=ndjson` for migration, removed in v0.8.0.
 
@@ -270,15 +301,15 @@ Legacy per-chunk NDJSON streaming is preserved via `LUMINA_OUTPUT=ndjson` for mi
 
 ## Environment Variables
 
-| Variable | Controls | Default |
-|----------|----------|---------|
-| `LUMINA_MEMORY` | VM memory | `1GB` |
-| `LUMINA_CPUS` | CPU cores | `2` |
-| `LUMINA_TIMEOUT` | Command timeout | `60s` |
-| `LUMINA_DISK_SIZE` | Rootfs size | image default |
-| `LUMINA_FORMAT` | `json` / `text` | auto (JSON piped, text TTY) |
-| `LUMINA_STREAM` | `0` / `1`, text mode only | auto |
-| `LUMINA_OUTPUT` | `ndjson` for legacy streaming | unset (unified envelope) |
+| Variable           | Controls                      | Default                     |
+| ------------------ | ----------------------------- | --------------------------- |
+| `LUMINA_MEMORY`    | VM memory                     | `1GB`                       |
+| `LUMINA_CPUS`      | CPU cores                     | `2`                         |
+| `LUMINA_TIMEOUT`   | Command timeout               | `60s`                       |
+| `LUMINA_DISK_SIZE` | Rootfs size                   | image default               |
+| `LUMINA_FORMAT`    | `json` / `text`               | auto (JSON piped, text TTY) |
+| `LUMINA_STREAM`    | `0` / `1`, text mode only     | auto                        |
+| `LUMINA_OUTPUT`    | `ndjson` for legacy streaming | unset (unified envelope)    |
 
 For `lumina run`, resources come from env vars only. For `lumina session start` and `lumina desktop create`, flags (`--memory`, `--cpus`, `--disk-size`, `--forward`) override env vars.
 

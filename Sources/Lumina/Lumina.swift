@@ -14,18 +14,9 @@ public struct Lumina {
 
             try await vm.boot()
 
-            // Host-driven network config. Default in v0.7.2+:
-            // fire-and-forget, do NOT block exec on `network_ready`.
-            // Most short agentic commands (echoes, builds, file ops)
-            // don't need a usable network in their first ms; making
-            // every disposable run pay 50–150ms for the rare DNS
-            // command was the wrong default.
-            //
-            // Opt back in via `options.awaitNetworkReady = true` or
-            // `--wait-network` on the CLI when the command hits DNS
-            // immediately (apt update, pip install, curl). See the
-            // RunOptions.awaitNetworkReady docstring for the DNS
-            // NXDOMAIN race that motivates the opt-in path.
+            // Host-driven network config, awaited by default since
+            // v0.7.3 — see the RunOptions.awaitNetworkReady docstring
+            // for why the v0.7.2 fire-and-forget default was wrong.
             if options.awaitNetworkReady {
                 try await vm.configureNetwork()
             } else {
@@ -47,9 +38,10 @@ public struct Lumina {
                 try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
             }
 
+            // Round up: truncating gave `--timeout 2s` a 1-second command
+            // budget once ~250ms of boot came off the top.
             let remaining = options.timeout - elapsed
-            let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.exec(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
+            let result = try await vm.exec(command, timeout: remaining.secondsRoundedUp, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
 
             // Download after exec — auto-detect file vs directory on guest
             for dl in options.downloads {
@@ -93,9 +85,7 @@ public struct Lumina {
                         try await vm.boot()
                         let bootDone = ContinuousClock.now
 
-                        // Host-driven network config. See `Lumina.run`
-                        // for the v0.7.2 default-flip rationale and the
-                        // DNS NXDOMAIN race that motivates the opt-in.
+                        // Host-driven network config. See `Lumina.run`.
                         if options.awaitNetworkReady {
                             try await vm.configureNetwork()
                         } else {

@@ -1234,12 +1234,18 @@ public actor VM {
         guard let runner = commandRunner else { throw .connectionFailed }
         guard let lastByte = macLastByte else { throw .connectionFailed }
 
-        // Discover the actual vmnet gateway by reading the host bridge interface
-        // that VZNATNetworkDeviceAttachment created. The subnet can vary (e.g.
-        // 192.168.65.0/24 instead of 192.168.64.0/24) if another process or VPN
-        // already holds the default range. Fall back to the historic default if
-        // discovery fails (e.g. no bridge interfaces found yet).
-        let (gateway, subnetPrefix) = await Self.discoverVmnetGateway(macLastByte: self.macLastByte) ?? ("192.168.64.1", "192.168.64")
+        // Read the gateway off the host bridge VZNATNetworkDeviceAttachment
+        // created; vmnet picks 192.168.65.0/24 or higher when a VPN or another
+        // VM already holds .64. Falling back silently was the worst case: the
+        // guest installs a .64 address and route, verifies its own handiwork,
+        // and reports ready — a plausible address that routes nothing.
+        let discovered = await Self.discoverVmnetGateway(macLastByte: self.macLastByte)
+        if discovered == nil {
+            FileHandle.standardError.write(Data(
+                "[lumina] warning: could not read a vmnet bridge address; assuming 192.168.64.1. If vmnet chose another subnet this VM will not reach the network — `lumina doctor` lists the bridges.\n".utf8
+            ))
+        }
+        let (gateway, subnetPrefix) = discovered ?? ("192.168.64.1", "192.168.64")
 
         let hostNum = (Int(lastByte) % 253) + 2
         let ip = "\(subnetPrefix).\(hostNum)/24"
