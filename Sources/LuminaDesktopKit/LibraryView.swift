@@ -37,22 +37,6 @@ public enum SidebarSection: String, Hashable, CaseIterable {
         case .snapshots: "clock.arrow.circlepath"
         }
     }
-
-    var isOSFilter: Bool {
-        switch self {
-        case .linux, .windows, .macOS: true
-        default: false
-        }
-    }
-
-    var matchingFamily: OSFamily? {
-        switch self {
-        case .linux: .linux
-        case .windows: .windows
-        case .macOS: .macOS
-        default: nil
-        }
-    }
 }
 
 public enum LibraryLayout: String, CaseIterable, Sendable {
