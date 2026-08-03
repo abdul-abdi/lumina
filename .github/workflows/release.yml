@@ -222,13 +222,26 @@ jobs:
 
           echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      # Idempotent on purpose: a tag is often pushed for a release that was
+      # already drafted or created by hand, and `gh release create` fails
+      # outright on an existing one — failing the whole run *after* every
+      # artifact was successfully built.
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TITLE: ${{ steps.notes.outputs.title }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ steps.notes.outputs.title }}" \
-            --notes-file /tmp/release-body.md \
-            --latest \
-            artifacts/lumina \
-            artifacts/lumina-image-default.tar.gz
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              artifacts/lumina \
+              artifacts/lumina-image-default.tar.gz \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes-file /tmp/release-body.md \
+              --latest \
+              artifacts/lumina \
+              artifacts/lumina-image-default.tar.gz
+          fi

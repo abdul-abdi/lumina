@@ -32,6 +32,12 @@ on:
       # image is the v0.7.0 tarball from 2026-04-21.
       - 'lumina-v*'
 
+# The default workflow token is read-only, so `gh release upload` returned
+# "HTTP 403: Resource not accessible by integration" — after a successful
+# 10-minute kernel build. The image was built, then thrown away.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Kernel + baked image
