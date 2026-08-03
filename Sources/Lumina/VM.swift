@@ -606,6 +606,8 @@ public actor VM {
         self.commandRunner = runner
         _state = .ready
 
+        try await verifyMountsLanded()
+
         // Publish the trace if the caller opted in. Stderr so it stays
         // out of the piped JSON envelope and agents consuming stdout
         // aren't polluted. `BootPhases.formatTrace()` skips zero-valued
@@ -1230,6 +1232,37 @@ public actor VM {
     /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
     /// and waits for network_ready before returning — ensuring DNS is live for all
     /// subsequent exec commands.
+    /// Confirm every requested share is mounted before the caller's first
+    /// command runs. The guest mounts these from init with stderr discarded
+    /// and no report back, so a failure produced the worst kind of answer:
+    /// `lumina run --volume ./src:/code "wc -l /code/*.py"` exits 0 having
+    /// counted an empty directory.
+    private func verifyMountsLanded() async throws(LuminaError) {
+        guard !options.mounts.isEmpty, let runner = commandRunner else { return }
+
+        let checks = options.mounts.map { mount in
+            let escaped = mount.guestPath.replacingOccurrences(of: "'", with: "'\\''")
+            return "grep -q ' \(escaped) ' /proc/mounts || echo '\(escaped)'"
+        }
+        let result: RunResult
+        do {
+            result = try await runner.exec(
+                id: UUID().uuidString,
+                command: checks.joined(separator: "; "),
+                timeout: 10
+            )
+        } catch {
+            // A check that can't run is not evidence the mounts failed; the
+            // caller's own command will surface it.
+            return
+        }
+
+        let missing = result.stdout.split(separator: "\n").map(String.init)
+        guard missing.isEmpty else {
+            throw .bootFailed(underlying: VMError.mountsMissing(missing))
+        }
+    }
+
     public func configureNetwork() async throws(LuminaError) {
         guard let runner = commandRunner else { throw .connectionFailed }
         guard let lastByte = macLastByte else { throw .connectionFailed }
@@ -1573,6 +1606,20 @@ enum VMError: Error, Sendable {
     case noSocketDevice
     case pipeFailed
     case cancelled
+    case mountsMissing([String])
+}
+
+extension VMError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .invalidState(let s): return "invalid VM state: \(s)"
+        case .noSocketDevice: return "VM has no virtio socket device"
+        case .pipeFailed: return "failed to create a pipe for the VM console"
+        case .cancelled: return "VM boot was cancelled"
+        case .mountsMissing(let paths):
+            return "virtio-fs share(s) not mounted in the guest: \(paths.joined(separator: ", "))"
+        }
+    }
 }
 
 /// Host-side boot-phase timings in milliseconds. Populated during

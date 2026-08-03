@@ -85,8 +85,15 @@ func (a *Agent) Serve() {
 // decode error is logged but non-fatal — one malformed frame does not
 // kill the connection.
 func (a *Agent) dispatch(scanner *bufio.Scanner) {
+	a.dispatchLine(scanner, scanner.Bytes())
+}
+
+// dispatchLine routes a single frame to its handler. Split out from
+// dispatch so frames buffered mid-transfer (see handleUpload) can be
+// replayed through the exact same routing table once the transfer
+// that interrupted them finishes.
+func (a *Agent) dispatchLine(scanner *bufio.Scanner, line []byte) {
 	var env protocol.Envelope
-	line := scanner.Bytes()
 	if err := json.Unmarshal(line, &env); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid request: %v\n", err)
 		return
@@ -169,7 +176,14 @@ func (a *Agent) handleUpload(scanner *bufio.Scanner, line []byte) {
 		})
 		return
 	}
-	transfer.HandleUpload(a.w, scanner, msg)
+	leftover := transfer.HandleUpload(a.w, scanner, msg)
+	// Frames that arrived interleaved with the transfer (exec, cancel,
+	// stdin, pty_input, ...) were buffered instead of dropped — replay
+	// them in order now that the transfer is done, instead of the
+	// sender blocking until its own timeout for a command that never ran.
+	for _, frame := range leftover {
+		a.dispatchLine(scanner, frame)
+	}
 }
 
 func (a *Agent) handleDownload(line []byte) {
@@ -280,4 +294,3 @@ func (a *Agent) heartbeat(ctx context.Context) {
 		}
 	}
 }
-

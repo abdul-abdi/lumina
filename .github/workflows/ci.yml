@@ -215,16 +215,18 @@ jobs:
           fi
           echo "::notice::Agent-boot gate passed (${MEDIAN}ms / ${AGENT_BOOT_P50_MAX_MS}ms budget)."
 
-      # v0.7.1 #19: behaviour-level cancellation tests exist at
-      # Tests/LuminaTests/CancellationIntegrationTests.swift and can be
-      # run locally via `make test-cancellation`. They are NOT run in
-      # this CI workflow because the hosted macos-15 runner's test
-      # bundle loses its Virtualization entitlement during swift-test's
-      # implicit rebuild, causing VZErrorDomain Code 2 on every boot.
-      # A reliable CI run needs either:
-      #   - a self-hosted runner with persistent codesigned bundles, or
-      #   - a post-build hook that re-signs .build/debug/LuminaPackageTests.xctest
-      #     AFTER swift-test's rebuild-before-run pass (which the stock
-      #     SPM toolchain does not expose today).
-      # Tracked as a v0.7.2 follow-up. The tests still gate locally and
-      # on self-hosted runners via LUMINA_INTEGRATION_TESTS=1.
+      # Behaviour-level cancellation tests live at
+      # Tests/LuminaTests/CancellationIntegrationTests.swift and do not run
+      # here — or anywhere via `swift test`.
+      #
+      # The earlier note blamed swift-test's implicit rebuild stripping the
+      # signature and proposed re-signing the bundle afterwards. That fix
+      # cannot work: on macOS a SwiftPM test target *is* a bundle, loaded by
+      # the system `xctest` host, and entitlements apply to a process's main
+      # executable. Signing the bundle, or the Mach-O inside it, grants
+      # nothing. `--disable-xctest` still emits a bundle.
+      #
+      # Running them needs an entitled test *host* (an Xcode scheme), not a
+      # signing tweak. The integration coverage that does run is the CLI e2e
+      # suite in integration.yml, which drives the signed binary as a
+      # subprocess.

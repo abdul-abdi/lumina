@@ -203,6 +203,29 @@ func TestNewExit_BuildsCorrectDiscriminator(t *testing.T) {
 	}
 }
 
+func TestNetworkReadyMsg_DnsOkNeverOmitted(t *testing.T) {
+	// dns_ok:false is the zero value for bool — if it ever picks up
+	// `omitempty`, a DNS failure becomes indistinguishable on the wire
+	// from a pre-v0.7.3 agent that never sent the field at all, which
+	// defeats the whole point of reporting it.
+	msg := NetworkReadyMsg{Type: TypeNetworkReady, IP: "192.168.64.2", DnsOk: false}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	asMap := map[string]any{}
+	if err := json.Unmarshal(data, &asMap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dnsOk, present := asMap["dns_ok"]
+	if !present {
+		t.Fatalf("expected dns_ok present even when false, got %s", data)
+	}
+	if dnsOk != false {
+		t.Errorf("expected dns_ok=false, got %v", dnsOk)
+	}
+}
+
 func TestOutputMsg_BinaryEncodingTag(t *testing.T) {
 	// The binary streamer sets Encoding="base64"; text uses the
 	// zero value which `omitempty` hides. Locking both to the

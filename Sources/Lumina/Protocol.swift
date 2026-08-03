@@ -65,7 +65,7 @@ public enum GuestMessage: Sendable, Equatable {
     /// or "timeout-anyway" (the defensive fallback where route is
     /// verified but carrier poll timed out). Old-agent compatibility:
     /// configMs defaults to 0 and stage to empty when absent.
-    case networkReady(ip: String, configMs: Int, stage: String)
+    case networkReady(ip: String, configMs: Int, stage: String, dnsOk: Bool)
     /// Guest failed to bring up the network. `reason` is a human-
     /// readable diagnostic; `attempts` counts how many ip-command
     /// retries ran before giving up. The host propagates this to
@@ -258,7 +258,11 @@ enum LuminaProtocol {
             let ip = json["ip"] as? String ?? ""
             let configMs = json["config_ms"] as? Int ?? 0
             let stage = json["stage"] as? String ?? ""
-            return .networkReady(ip: ip, configMs: configMs, stage: stage)
+            // Absent on pre-v0.7.3 agents, which wrote resolv.conf without
+            // checking. Defaulting to true keeps them quiet rather than
+            // warning about a condition we cannot observe.
+            let dnsOk = json["dns_ok"] as? Bool ?? true
+            return .networkReady(ip: ip, configMs: configMs, stage: stage, dnsOk: dnsOk)
         case "network_error":
             let reason = json["reason"] as? String ?? "unspecified"
             let attempts = json["attempts"] as? Int ?? 0

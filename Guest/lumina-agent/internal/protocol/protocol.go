@@ -168,11 +168,11 @@ const ProtocolVersion Version = 1
 // ignore unknown strings); removing one IS breaking and must be
 // paired with a ProtocolVersion bump.
 var AgentCapabilities = []string{
-	"pty",              // pty_exec / pty_input / pty_output / window_resize
-	"port_forward",     // port_forward_start / stop / ready / error
-	"network_metrics",  // periodic network_metrics frames
-	"network_error",    // typed network_error on configure_network failure
-	"binary_output",    // base64-encoded output for non-UTF-8 chunks
+	"pty",             // pty_exec / pty_input / pty_output / window_resize
+	"port_forward",    // port_forward_start / stop / ready / error
+	"network_metrics", // periodic network_metrics frames
+	"network_error",   // typed network_error on configure_network failure
+	"binary_output",   // base64-encoded output for non-UTF-8 chunks
 	"configure_network",
 	"stdin",
 }
@@ -229,6 +229,13 @@ type NetworkReadyMsg struct {
 	// defensive fallback; host should treat this as a warning
 	// signal, not a hard guarantee. Absent on pre-v0.7.1 agents.
 	Stage string `json:"stage,omitempty"`
+	// DnsOk reports whether /etc/resolv.conf was written and read back
+	// with the expected content — the postcondition the whole point
+	// of awaiting network_ready rests on (see RunOptions.awaitNetworkReady).
+	// false means the route/IP are live but DNS lookups will fail.
+	// No omitempty: false must be distinguishable on the wire from a
+	// pre-v0.7.3 agent that never sent this field at all.
+	DnsOk bool `json:"dns_ok"`
 }
 
 // InterfaceCounters is the per-NIC counter snapshot shipped inside

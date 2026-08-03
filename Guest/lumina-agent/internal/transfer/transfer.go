@@ -21,25 +21,30 @@ import (
 const DownloadChunkSize = 45 * 1024
 
 // HandleUpload writes a file using the first UploadMsg and any
-// subsequent UploadMsg frames read from scanner until Eof=true.
-func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadMsg) {
+// subsequent UploadMsg frames read from scanner until Eof=true. A
+// frame of any other type that arrives interleaved (exec, cancel,
+// stdin, pty_input, ...) is buffered rather than dropped and
+// returned in leftover so the caller can replay it through normal
+// dispatch once the transfer finishes — see internal/agent's
+// handleUpload.
+func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadMsg) (leftover [][]byte) {
 	// Ensure parent directory exists.
 	if err := os.MkdirAll(filepath.Dir(first.Path), 0o755); err != nil {
 		sendUploadError(w, first.Path, err)
-		return
+		return leftover
 	}
 
 	f, err := os.Create(first.Path)
 	if err != nil {
 		sendUploadError(w, first.Path, err)
-		return
+		return leftover
 	}
 	defer f.Close()
 
 	// First chunk.
 	if err := writeChunk(f, first.Data); err != nil {
 		sendUploadError(w, first.Path, err)
-		return
+		return leftover
 	}
 	_ = w.Send(protocol.UploadAckMsg{Type: protocol.TypeUploadAck, Seq: first.Seq})
 
@@ -50,15 +55,17 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 			var msg protocol.UploadMsg
 			if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
 				sendUploadError(w, first.Path, err)
-				return
+				return leftover
 			}
-			// Skip interleaved heartbeat or unrelated frames.
 			if msg.Type != protocol.TypeUpload {
+				// scanner.Bytes() aliases a buffer the next Scan()
+				// call overwrites — copy before buffering.
+				leftover = append(leftover, append([]byte(nil), scanner.Bytes()...))
 				continue
 			}
 			if err := writeChunk(f, msg.Data); err != nil {
 				sendUploadError(w, first.Path, err)
-				return
+				return leftover
 			}
 			_ = w.Send(protocol.UploadAckMsg{Type: protocol.TypeUploadAck, Seq: msg.Seq})
 			if msg.Eof {
@@ -99,6 +106,7 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 	}
 
 	_ = w.Send(protocol.UploadDoneMsg{Type: protocol.TypeUploadDone, Path: first.Path})
+	return leftover
 }
 
 // HandleDownload streams a file back to the host as base64 chunks,

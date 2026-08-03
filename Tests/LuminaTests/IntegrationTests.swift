@@ -4,11 +4,22 @@ import Testing
 @testable import Lumina
 @testable import LuminaBootable
 
-// Integration tests — require:
-// 1. Alpine image at ~/.lumina/images/default/
-// 2. Test binary signed with com.apple.security.virtualization entitlement
-// Gate: set LUMINA_INTEGRATION_TESTS=1 after codesigning the test binary.
-// Example: swift build --build-tests && codesign --entitlements lumina.entitlements --force -s - .build/debug/LuminaPackageTests.xctest && LUMINA_INTEGRATION_TESTS=1 swift test
+// Integration tests — boot real VMs, so they need an image at
+// ~/.lumina/images/default/ and `com.apple.security.virtualization` on the
+// running process. Gate: LUMINA_INTEGRATION_TESTS=1.
+//
+// The instructions that used to live here ("codesign the .xctest bundle")
+// cannot work, and following them costs an hour: on macOS a SwiftPM test
+// target builds a *bundle* that `swift test` loads into the system `xctest`
+// host. Entitlements apply to a process's main executable, so signing the
+// bundle — or the Mach-O inside it — grants nothing and every test fails with
+// `VZErrorDomain Code=2`. `--disable-xctest` still emits a bundle.
+//
+// The integration gate that actually runs, in CI and locally, is the CLI e2e
+// suite (`make test-integration`, 81 checks) — it drives the *signed* `lumina`
+// binary as a subprocess. Run this file from an Xcode scheme with an entitled
+// test host; otherwise read it as the executable specification of the
+// library-level behaviour the CLI suite covers from the outside.
 
 private func integrationEnabled() -> Bool {
     guard ProcessInfo.processInfo.environment["LUMINA_INTEGRATION_TESTS"] == "1" else { return false }

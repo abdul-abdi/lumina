@@ -9,7 +9,7 @@ struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.7.3",
+        version: "0.7.4",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
@@ -116,24 +116,37 @@ struct Run: AsyncParsableCommand {
         }
 
         // --via-daemon: try to route through the warm-pool daemon
+        var daemonStdinBytes: Data? = nil
         if viaDaemon {
-            // The daemon wire protocol does not yet carry --copy/--download/--volume
-            // ops. Warn the user if any were passed so the missing semantics are visible.
-            if !copy.isEmpty || !download.isEmpty || !volume.isEmpty {
+            // Mounts are pool-level config baked in at `daemon serve` time —
+            // there's no per-request wire message that could apply a new one.
+            if !volume.isEmpty {
                 FileHandle.standardError.write(Data(
-                    "warning: --via-daemon ignores --copy/--download/--volume (daemon protocol v1 — falling back through to those flags would require an exec on the cold-boot path)\n".utf8
+                    "warning: --via-daemon ignores --volume (mounts are pool-level config — set at `lumina daemon serve` time instead)\n".utf8
                 ))
             }
             let resolvedTimeoutForDaemon = resolveTimeout(flag: timeout, defaultValue: "60s")
             let parsedTimeoutForDaemon = parseDuration(resolvedTimeoutForDaemon)
             let timeoutSecs = parsedTimeoutForDaemon.map { Int($0.components.seconds) } ?? 60
-            let parsedEnvForDaemon = (try? parseEnvSpecs(env)) ?? [:]
+            let parsedEnvForDaemon = try parseEnvSpecs(env)
+            let (daemonUploads, daemonDirUploads) = try parseCopySpecs(copy)
+            let daemonDownloads = try parseDownloadSpecs(download)
+            // Read to EOF up front — the daemon needs the whole blob to embed
+            // as base64 in one request. Stashed so the cold-boot fallback below
+            // can replay it; by then the real stdin fd has already hit EOF.
+            if isatty(fileno(stdin)) == 0 {
+                daemonStdinBytes = FileHandle.standardInput.readDataToEndOfFile()
+            }
             if let result = try? await Daemon.tryRun(
                 image: image,
                 command: command,
                 timeout: timeoutSecs,
                 env: parsedEnvForDaemon,
-                cwd: workdir
+                cwd: workdir,
+                uploads: daemonUploads,
+                directoryUploads: daemonDirUploads,
+                downloads: daemonDownloads,
+                stdinData: daemonStdinBytes
             ) {
                 let ms = result.wallTime.totalMilliseconds
                 let r = ResultJSON(
@@ -213,7 +226,7 @@ struct Run: AsyncParsableCommand {
             mounts: parsedMounts,
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
-            stdin: resolveStdin(),
+            stdin: daemonStdinBytes.map { $0.isEmpty ? Stdin.closed : Stdin.oneShot($0) } ?? resolveStdin(),
             awaitNetworkReady: waitNetwork || !noWaitNetwork
         )
 
@@ -2120,6 +2133,8 @@ struct DaemonStatusCmd: AsyncParsableCommand {
             print("not running")
         case .running(let poolSize, let warm, let image):
             print("running — pool=\(poolSize) warm=\(warm) image=\(image) socket=\(Daemon.socketPath().path)")
+        case .unreachable(let reason):
+            print("unreachable — \(reason) (socket=\(Daemon.socketPath().path))")
         }
     }
 }

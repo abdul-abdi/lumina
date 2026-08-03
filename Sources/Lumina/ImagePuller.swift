@@ -21,7 +21,7 @@ public struct ImagePuller: Sendable {
     /// API can't be reached (offline, rate-limited, 5xx). Bump in
     /// lockstep with the host release so the fallback never points
     /// at a more-than-one-minor-version-older image.
-    public static let fallbackTag = "lumina-v0.7.3"
+    public static let fallbackTag = "lumina-v0.7.4"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
 
     /// Back-compat alias — older code reads `ImagePuller.defaultTag`.
@@ -129,13 +129,16 @@ public struct ImagePuller: Sendable {
             progress("SHA-256 verified against catalog entry.")
         }
 
-        // 4. Prepare image directory (clean if partial previous attempt)
+        // 4. Extract into a staging directory and swap only once every check
+        //    has passed. Extracting over the live directory meant a corrupt
+        //    download or a failed `tar` destroyed the working image and left
+        //    the machine with none — a bad network turned a refresh into an
+        //    outage.
         let imageDir = imageStore.baseDir.appendingPathComponent(name)
-        if FileManager.default.fileExists(atPath: imageDir.path) {
-            try? FileManager.default.removeItem(at: imageDir)
-        }
+        let stagingDir = imageStore.baseDir
+            .appendingPathComponent(".staging-\(name)-\(UUID().uuidString)")
         do {
-            try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         } catch {
             throw .imageNotFound("Cannot create image directory: \(error.localizedDescription)")
         }
@@ -151,7 +154,7 @@ public struct ImagePuller: Sendable {
             "/usr/bin/tar", arguments: ["-tzf", downloadedFile.path]
         )
         guard listResult.exitCode == 0 else {
-            try? FileManager.default.removeItem(at: imageDir)
+            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Tarball listing failed (exit \(listResult.exitCode)): \(listResult.stderr)"
             )
@@ -161,7 +164,7 @@ public struct ImagePuller: Sendable {
             let path = String(member).trimmingCharacters(in: .whitespaces)
             if path.isEmpty { continue }
             if path.hasPrefix("/") {
-                try? FileManager.default.removeItem(at: imageDir)
+                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains absolute path: \(path). Refusing to extract."
                 )
@@ -169,7 +172,7 @@ public struct ImagePuller: Sendable {
             // Split on `/` and reject any `..` component after normalisation.
             let parts = path.split(separator: "/")
             if parts.contains(where: { $0 == ".." }) {
-                try? FileManager.default.removeItem(at: imageDir)
+                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains path-traversal member: \(path). Refusing to extract."
                 )
@@ -192,7 +195,7 @@ public struct ImagePuller: Sendable {
             "/usr/bin/tar",
             arguments: [
                 "xzf", downloadedFile.path,
-                "-C", imageDir.path,
+                "-C", stagingDir.path,
                 "--no-same-owner",
                 "--no-xattrs",
                 "--no-mac-metadata",
@@ -200,8 +203,7 @@ public struct ImagePuller: Sendable {
         )
 
         guard tarResult.exitCode == 0 else {
-            // Clean up partial extraction
-            try? FileManager.default.removeItem(at: imageDir)
+            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Extraction failed (exit \(tarResult.exitCode)): \(tarResult.stderr)"
             )
@@ -211,14 +213,14 @@ public struct ImagePuller: Sendable {
         let requiredFiles = ["vmlinuz", "rootfs.img"]
         var missingFiles: [String] = []
         for file in requiredFiles {
-            let path = imageDir.appendingPathComponent(file)
+            let path = stagingDir.appendingPathComponent(file)
             if !FileManager.default.fileExists(atPath: path.path) {
                 missingFiles.append(file)
             }
         }
 
         if !missingFiles.isEmpty {
-            try? FileManager.default.removeItem(at: imageDir)
+            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Image tarball is missing required files: \(missingFiles.joined(separator: ", ")). "
                 + "The release may be malformed."
@@ -226,18 +228,40 @@ public struct ImagePuller: Sendable {
         }
 
         // 7. Verify rootfs.img is non-trivial (at least 1MB)
-        let rootfsPath = imageDir.appendingPathComponent("rootfs.img")
+        let rootfsPath = stagingDir.appendingPathComponent("rootfs.img")
         let rootfsSize = (try? FileManager.default.attributesOfItem(
             atPath: rootfsPath.path
         )[.size] as? Int) ?? 0
 
         if rootfsSize < 1_048_576 {
-            try? FileManager.default.removeItem(at: imageDir)
+            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "rootfs.img is suspiciously small (\(formatBytes(rootfsSize))). "
                 + "The image may be corrupted."
             )
         }
+
+        // 8. Swap in. The old directory is moved aside first so a failure
+        //    here still leaves a usable image behind.
+        let retiredDir = imageStore.baseDir
+            .appendingPathComponent(".retired-\(name)-\(UUID().uuidString)")
+        let hadExisting = FileManager.default.fileExists(atPath: imageDir.path)
+        if hadExisting {
+            do {
+                try FileManager.default.moveItem(at: imageDir, to: retiredDir)
+            } catch {
+                try? FileManager.default.removeItem(at: stagingDir)
+                throw .imageNotFound("Cannot replace existing image: \(error.localizedDescription)")
+            }
+        }
+        do {
+            try FileManager.default.moveItem(at: stagingDir, to: imageDir)
+        } catch {
+            if hadExisting { try? FileManager.default.moveItem(at: retiredDir, to: imageDir) }
+            try? FileManager.default.removeItem(at: stagingDir)
+            throw .imageNotFound("Cannot install image: \(error.localizedDescription)")
+        }
+        if hadExisting { try? FileManager.default.removeItem(at: retiredDir) }
 
         progress("Image ready: \(formatBytes(rootfsSize)) rootfs")
     }

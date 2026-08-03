@@ -418,16 +418,18 @@ import Testing
 @Test func decodeNetworkReadyWithConfigMsAndStage() throws {
     let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","config_ms":127,"stage":"carrier"}"#.utf8)
     let msg = try Protocol.decodeGuest(raw)
-    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 127, stage: "carrier"))
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 127, stage: "carrier", dnsOk: true))
 }
 
 @Test func decodeNetworkReadyBackwardCompatOldAgent() throws {
     // v0.7.1 agents emit the old shape without config_ms or stage.
     // The host must still accept them — old images keep running after
-    // a host upgrade without needing to be rebuilt first.
+    // a host upgrade without needing to be rebuilt first. `dns_ok` is
+    // likewise absent there, and defaults to true: an agent that never
+    // checked resolv.conf is not evidence that DNS is broken.
     let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149"}"#.utf8)
     let msg = try Protocol.decodeGuest(raw)
-    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 0, stage: ""))
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 0, stage: "", dnsOk: true))
 }
 
 @Test func decodeNetworkReadyTimeoutAnywayStage() throws {
@@ -437,7 +439,16 @@ import Testing
     // doesn't silently drift between guest + host.
     let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","stage":"timeout-anyway","config_ms":401}"#.utf8)
     let msg = try Protocol.decodeGuest(raw)
-    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 401, stage: "timeout-anyway"))
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 401, stage: "timeout-anyway", dnsOk: true))
+}
+
+/// A v0.7.3+ guest that could not write resolv.conf reports it explicitly, so
+/// the host can warn rather than letting the caller's first DNS lookup be the
+/// messenger.
+@Test func decodeNetworkReadyCarriesDnsFailure() throws {
+    let raw = Data(#"{"type":"network_ready","ip":"192.168.64.149","config_ms":12,"stage":"operstate","dns_ok":false}"#.utf8)
+    let msg = try Protocol.decodeGuest(raw)
+    #expect(msg == .networkReady(ip: "192.168.64.149", configMs: 12, stage: "operstate", dnsOk: false))
 }
 
 @Test func decodeNetworkErrorMessage() throws {
