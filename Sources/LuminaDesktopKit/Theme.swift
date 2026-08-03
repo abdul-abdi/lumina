@@ -144,29 +144,6 @@ public enum LuminaTheme {
     public static let label = Font.system(size: 10, weight: .medium, design: .monospaced)
 }
 
-// ── ViewModifier helpers ───────────────────────────────────────────
-public extension View {
-    /// Apply Lumina's panel chrome: dark bg + 1px hairline border.
-    func luminaPanel(padding: CGFloat = 0) -> some View {
-        self
-            .padding(padding)
-            .background(LuminaTheme.bg1)
-            .overlay(
-                Rectangle()
-                    .stroke(LuminaTheme.rule, lineWidth: 1)
-            )
-    }
-
-    /// Tracked uppercase label (eyebrow) — used for section headers + cap text.
-    func luminaEyebrow() -> some View {
-        self
-            .font(LuminaTheme.label)
-            .tracking(2)
-            .textCase(.uppercase)
-            .foregroundStyle(LuminaTheme.inkMute)
-    }
-}
-
 // ── Color helpers ──────────────────────────────────────────────────
 private func hex(_ s: String) -> Color {
     var trimmed = s
@@ -193,19 +170,6 @@ private func dynamic(dark: String, light: String) -> Color {
 // the compiler still needs the symbols in the SDK. CI runs on
 // macos-15 (SDK 15.x) which doesn't have those types, so the build
 // failed. System materials render indistinguishably for our use.
-public extension View {
-    @ViewBuilder
-    func luminaGlass(intensity: GlassIntensity = .regular,
-                     in shape: some Shape = Rectangle()) -> some View {
-        self.background(intensity.fallback, in: shape)
-    }
-
-    @ViewBuilder
-    func luminaGlassRow() -> some View {
-        self.background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
 // ── Live state readers for the VM card ────────────────────────────
 
 import LuminaBootable
@@ -249,11 +213,6 @@ public extension VMBundle {
 
     var diskCapFormatted: String { fmtBytes(manifest.diskBytes) }
 
-    /// "Ubuntu 24.04 · Linux · 4 GB / 2 CPU" — used as subtitle.
-    var subtitle: String {
-        "\(manifest.osVariant) · \(fmtBytes(manifest.memoryBytes)) · \(manifest.cpuCount) CPU"
-    }
-
     private func fmtBytes(_ n: UInt64) -> String {
         let gb = Double(n) / (1024 * 1024 * 1024)
         if gb >= 1.0 { return String(format: "%.1f GB", gb) }
@@ -263,28 +222,3 @@ public extension VMBundle {
     }
 }
 
-// ── Brand color stripes per OS (thin-stripe identity, not body fill) ─
-public extension LuminaTheme {
-    /// Saturated OS stripe color — for 3pt left-edge chips, not card bodies.
-    /// These stay the same in dark + light modes (brand constants).
-    static func osStripe(_ family: String) -> Color {
-        switch family {
-        case "linux": hex("#E95420")    // Ubuntu orange, saturated
-        case "windows": hex("#0078D4")  // Windows blue
-        case "macOS": hex("#8E8E93")    // macOS system gray
-        default: hex("#9CA3AF")
-        }
-    }
-}
-
-public enum GlassIntensity: Sendable {
-    case thin, regular, thick
-
-    var fallback: Material {
-        switch self {
-        case .thin: .ultraThinMaterial
-        case .regular: .regularMaterial
-        case .thick: .thickMaterial
-        }
-    }
-}

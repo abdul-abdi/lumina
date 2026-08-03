@@ -71,11 +71,24 @@ public enum Daemon {
         line.append(0x0a) // newline
         writeAll(fd: fd, data: line)
 
-        // Read one response line
-        guard let respLine = try await asyncReadLine(fd: fd) else { return nil }
+        // Past this point the request is on the wire and the daemon may
+        // already have run the command. Returning nil here would read as
+        // "daemon unreachable" and the caller would re-run it cold — an
+        // `apt install` or a migration executed twice, silently. Anything that
+        // fails after the send must throw.
+        guard let respLine = try await asyncReadLine(fd: fd) else {
+            throw LuminaError.sessionFailed(
+                "daemon closed the connection after the request was sent; the command may have run — not retrying"
+            )
+        }
         let dec = JSONDecoder()
-        guard let envelope = try? dec.decode(RunResultEnvelope.self, from: respLine) else { return nil }
-        return envelope.toRunResult()
+        do {
+            return try dec.decode(RunResultEnvelope.self, from: respLine).toRunResult()
+        } catch {
+            throw LuminaError.protocolError(
+                "daemon sent an undecodable response after the request was sent; the command may have run — not retrying"
+            )
+        }
     }
 
     // MARK: - Client: status

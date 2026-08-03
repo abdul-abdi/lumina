@@ -214,7 +214,7 @@ struct Run: AsyncParsableCommand {
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
             stdin: resolveStdin(),
-            awaitNetworkReady: !noWaitNetwork
+            awaitNetworkReady: waitNetwork || !noWaitNetwork
         )
 
         let format = resolveOutputFormat()
@@ -292,7 +292,7 @@ struct Run: AsyncParsableCommand {
 
             let ms = millisSince(start)
             let (state, commandRan) = errorStateForRun(error)
-            var r = ResultJSON(error: state, duration_ms: ms)
+            var r = ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: ms)
             if commandRan {
                 if !stdoutBuf.isEmpty { r.partial_stdout = stdoutBuf }
                 if !stderrBuf.isEmpty { r.partial_stderr = stderrBuf }
@@ -318,6 +318,12 @@ struct Run: AsyncParsableCommand {
         if let code = exitCode, code != 0 {
             throw ExitCode(code)
         }
+    }
+
+    /// Human-readable cause behind an error state, for `error_detail`.
+    private func describeFailure(_ error: any Error) -> String {
+        guard let le = error as? LuminaError else { return String(describing: error) }
+        return le.errorDescription ?? String(describing: le)
     }
 
     /// Classify a `Lumina.stream` error into a v0.6.0 error state for `run`.
@@ -471,6 +477,12 @@ private struct ResultJSON: Encodable {
     var stderr_bytes: String?
     var exit_code: Int?
     var error: String?
+    /// v0.7.3: the underlying failure behind `error`. The four error states are
+    /// a stable contract, but they collapse boot failures, a missing image, a
+    /// failed COW clone and a dropped vsock into one `connection_failed` — so a
+    /// caller had no way to tell "out of host resources" from "typo in
+    /// --image". Present only alongside `error`; free text, do not match on it.
+    var error_detail: String?
     var duration_ms: Int
     // v0.6.0: partial data on error
     var partial_stdout: String?

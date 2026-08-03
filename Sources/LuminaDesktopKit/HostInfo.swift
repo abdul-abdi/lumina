@@ -30,24 +30,10 @@ public struct HostInfo: Sendable {
         return UInt64(values.volumeAvailableCapacityForImportantUsage ?? 0)
     }
 
-    /// Capacity of the volume containing `url`. Non-important-usage-aware.
-    public static func totalDiskBytes(at url: URL) -> UInt64? {
-        guard let values = try? url.resourceValues(
-            forKeys: [.volumeTotalCapacityKey]
-        ) else { return nil }
-        return UInt64(values.volumeTotalCapacity ?? 0)
-    }
-
     /// Apple's recommendation: guests should consume at most ~2/3 of host
     /// RAM to leave headroom for macOS itself. Used for the "warn" ceiling.
     public var safeMemoryCeilingBytes: UInt64 {
         UInt64(Double(physicalMemoryBytes) * 0.66)
-    }
-
-    /// Hard ceiling — anything above this is guaranteed to make macOS
-    /// struggle. VZ also hard-rejects allocations > host RAM.
-    public var hardMemoryCeilingBytes: UInt64 {
-        UInt64(Double(physicalMemoryBytes) * 0.85)
     }
 
     private static func readSysctlString(_ name: String) -> String? {

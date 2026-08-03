@@ -89,6 +89,10 @@ public enum GuestMessage: Sendable, Equatable {
     /// guest-side vsock bind failure. The host surfaces the reason to the
     /// caller waiting on `requestPortForward(...)`.
     case portForwardError(guestPort: Int, reason: String)
+    /// A well-formed frame whose `type` this host does not implement — almost
+    /// always a newer guest. Carried so the dispatcher can skip it instead of
+    /// treating it as a fatal decode error.
+    case unknown(type: String)
 }
 
 public enum OutputStream: String, Sendable, Equatable, Codable {
@@ -298,7 +302,14 @@ enum LuminaProtocol {
             let reason = json["reason"] as? String ?? "unspecified"
             return .portForwardError(guestPort: guestPort, reason: reason)
         default:
-            throw LuminaError.protocolError("Unknown message type: \(type)")
+            // Forward compatibility: a frame this host has never heard of must
+            // not be fatal. Throwing here reached handleDispatcherError, which
+            // tears down the dispatcher for the whole VM and fails every
+            // in-flight exec, PTY and transfer on it — so one new frame from a
+            // newer guest bricked a running VM. The `ready` handshake already
+            // carries protocol_version and capabilities for real negotiation.
+            // Malformed *known* types still throw, above.
+            return .unknown(type: type)
         }
     }
 }

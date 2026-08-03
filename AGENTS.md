@@ -22,6 +22,33 @@ Three defects stacked into one symptom — a VM that boots, execs, and has no ne
 
 **Stale-image warning.** A guest whose `ready` frame reports a `protocol_version` below `expectedGuestProtocolVersion` triggers a one-shot stderr warning naming the symptom and the fix (`lumina pull --force`). The v0.7.0 release tarball — still the latest published image — is such a guest.
 
+### The timeout envelope actually fires now
+
+Two bugs made `error: "timeout"` unreliable, and both are fixed:
+
+- **The remaining timeout truncated.** `Int(remaining.components.seconds)` turned the 1.75s left after boot into 1, so `--timeout 2s` gave the command a one-second budget. Rounds up now (`Duration.secondsRoundedUp`).
+- **The grace window swallowed the timeout.** v0.7.2 added a 250ms window after the deadline so a command finishing *naturally* at the boundary could still report its real exit code. But it accepted any exit — including the SIGTERM the watchdog itself had just sent. Whether you got `error: "timeout"` or `exit_code: -1` came down to whether the guest's death notice beat the hard deadline. Signal death past the soft deadline is now reported as the timeout; only a normal exit code inside the window is treated as a natural finish.
+
+### A newer guest no longer bricks an older host
+
+`decodeGuest` returned `.protocolError` for any unrecognized `type`, and the dispatcher treats a decode error as fatal — so one unknown frame tore down the connection for the whole VM and failed every in-flight exec, PTY, and transfer on it. Unknown frames now decode to `.unknown(type:)` and are logged and skipped. Malformed *known* frames still throw. This matters most right now: the image and the host binary ship separately, so new-guest/old-host pairings are guaranteed in the field.
+
+### File transfers stop reporting success on truncation
+
+`upload` and `download` computed `gotAck` / `done` / `receivedEof` and then never checked them. Their `for await` loops also end when the connection drops, so a mid-transfer disconnect wrote a truncated file and returned success — you found out when the tar you just downloaded failed to extract. All three are now asserted. Guest-side, `HandleUpload` fell through to `upload_done` when its scanner ended without an EOF frame; it now removes the partial file and reports the error, and a `chmod` failure is an upload failure rather than a surprise at `sh /tmp/s.sh`.
+
+### Pool degrades to the cold path instead of past it
+
+`Pool.acquire` queued on a continuation when inventory was empty, so a burst that drained the pool left every later caller waiting on a boot it hadn't started — measured warm P50 1ms but P95 278ms and P99 327ms, against a ~190ms cold floor. It now boots on the caller's own path when nothing is in flight, capping the tail at the cold path. Pooling can make a call faster, never slower. (This is the honest answer to #31: literal "reset and return" is impossible — isolation is the per-run COW clone and VZ cannot revert a live VM's disk.)
+
+### `--via-daemon` will not silently run your command twice
+
+`Daemon.tryRun` returned `nil` — which callers read as "daemon unreachable, fall back to cold boot" — for failures that happen *after* the request is on the wire. A non-idempotent command (`apt install`, a migration) could run on the daemon and then again cold. Post-send failures now throw.
+
+### PTY works in the rebuilt image
+
+`/sbin/init` mounted devtmpfs but never mounted a devpts instance, so `openpty` failed with `open /dev/ptmx: no such file or directory` and every `exec --pty` died. Now mounted with `gid=5,mode=620,ptmxmode=666`.
+
 ### Usage errors are JSON when piped
 
 `{"error": "usage_error", "message": "Unknown option '--bogus'"}` on stdout, prose + usage still on stderr, exit 64. The documented `sid=$(lumina session start … | jq -r .sid)` pattern yields `null` on a bad flag instead of `jq: parse error: Invalid numeric literal`. Same JSON-on-pipe rule as everything else — a TTY or `LUMINA_FORMAT=text` leaves stdout empty.

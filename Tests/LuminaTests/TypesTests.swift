@@ -17,6 +17,19 @@ import Testing
     #expect(opts.awaitNetworkReady == true)
 }
 
+/// Deadlines handed to a seconds-only API must round up. Truncating gave
+/// `--timeout 2s` a 1-second command budget once ~250ms of boot came off the
+/// top, so short timeouts fired at roughly half the requested time.
+@Test func durationSecondsRoundedUp() {
+    #expect(Duration.milliseconds(1750).secondsRoundedUp == 2)
+    #expect(Duration.seconds(5).secondsRoundedUp == 5)
+    #expect(Duration.milliseconds(4001).secondsRoundedUp == 5)
+    // Floored at 1: a caller that has already overrun still gets one second,
+    // not a zero-second timeout that fires instantly.
+    #expect(Duration.milliseconds(10).secondsRoundedUp == 1)
+    #expect(Duration.seconds(-3).secondsRoundedUp == 1)
+}
+
 @Test func directoryUploadInit() {
     let upload = DirectoryUpload(localPath: URL(fileURLWithPath: "/tmp/mydir"), remotePath: "/data")
     #expect(upload.localPath.path == "/tmp/mydir")

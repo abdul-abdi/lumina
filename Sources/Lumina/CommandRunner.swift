@@ -83,6 +83,12 @@ final class CommandRunner: @unchecked Sendable {
     // genuine timeouts feel sluggish.
     private static let lateExitGraceWindow: Duration = .milliseconds(250)
 
+    /// The guest reports a signal-killed process as a negative code; 128+N is
+    /// the shell convention for the same thing.
+    private static func isSignalDeath(_ code: Int32) -> Bool {
+        code < 0 || code == 128 + SIGTERM || code == 128 + SIGKILL
+    }
+
     // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
@@ -301,6 +307,14 @@ final class CommandRunner: @unchecked Sendable {
                     stderr += String(decoding: bytes, as: UTF8.self)
                 }
             case .exit(_, let code):
+                // The grace window exists to preserve a command that finished
+                // on its own just after the deadline. An exit past the soft
+                // deadline that reports signal death is not that — it is the
+                // watchdog's own SIGTERM coming back, and reporting it as an
+                // exit code loses the documented `timeout` envelope entirely.
+                if ContinuousClock.now > softDeadline, Self.isSignalDeath(code) {
+                    throw .timeout
+                }
                 return RunResult(
                     stdout: stdout,
                     stderr: stderr,
@@ -380,6 +394,12 @@ final class CommandRunner: @unchecked Sendable {
                     case .outputBinary(_, let stream, let bytes):
                         continuation.yield(stream == .stdout ? .stdoutBytes(bytes) : .stderrBytes(bytes))
                     case .exit(_, let code):
+                        // See exec(): signal death past the soft deadline is
+                        // our own SIGTERM, not a natural exit.
+                        if ContinuousClock.now > softDeadline, Self.isSignalDeath(code) {
+                            continuation.finish(throwing: LuminaError.timeout)
+                            return
+                        }
                         continuation.yield(.exit(code))
                         continuation.finish()
                         return
@@ -814,6 +834,14 @@ final class CommandRunner: @unchecked Sendable {
                 }
                 if gotAck { break }
             }
+            // Same shape as download: a finished stream means the connection
+            // dropped mid-transfer, not that the chunk was accepted.
+            guard gotAck else {
+                throw .uploadFailed(
+                    path: file.remotePath,
+                    reason: "connection closed waiting for ack of chunk \(seq)/\(totalChunks)"
+                )
+            }
         }
 
         // Wait for upload_done confirmation
@@ -830,6 +858,12 @@ final class CommandRunner: @unchecked Sendable {
                 throw .protocolError("Expected upload_done, got: \(response)")
             }
             if done { break }
+        }
+        guard done else {
+            throw .uploadFailed(
+                path: file.remotePath,
+                reason: "connection closed before upload_done; remote file may be incomplete"
+            )
         }
     }
 
@@ -875,6 +909,17 @@ final class CommandRunner: @unchecked Sendable {
                 throw .protocolError("Expected download_data, got: \(response)")
             }
             if receivedEof { break }
+        }
+
+        // The loop also ends when the stream is finished by a dropped
+        // connection (handleDispatcherError, resetForReconnect). Without this
+        // guard that path wrote a truncated file and returned success — the
+        // caller finds out later, when the tar it just "downloaded" fails.
+        guard receivedEof else {
+            throw .downloadFailed(
+                path: file.remotePath,
+                reason: "connection closed after \(expectedSeq) chunk(s) without EOF; file is incomplete"
+            )
         }
 
         // Write to local path
@@ -1010,6 +1055,8 @@ final class CommandRunner: @unchecked Sendable {
         case .ready:
             // Unexpected ready during active connection — ignore
             break
+        case .unknown(let type):
+            NSLog("[Lumina.CommandRunner] Ignoring unknown guest message type: %@", type)
         }
     }
 

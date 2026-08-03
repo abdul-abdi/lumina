@@ -38,9 +38,10 @@ public struct Lumina {
                 try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
             }
 
+            // Round up: truncating gave `--timeout 2s` a 1-second command
+            // budget once ~250ms of boot came off the top.
             let remaining = options.timeout - elapsed
-            let remainingSeconds = Int(remaining.components.seconds)
-            let result = try await vm.exec(command, timeout: max(remainingSeconds, 1), env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
+            let result = try await vm.exec(command, timeout: remaining.secondsRoundedUp, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
 
             // Download after exec — auto-detect file vs directory on guest
             for dl in options.downloads {

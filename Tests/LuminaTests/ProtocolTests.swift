@@ -99,8 +99,19 @@ import Testing
     #expect(msg == .heartbeat)
 }
 
-@Test func decodeUnknownType() {
-    let data = Data("{\"type\":\"unknown\"}\n".utf8)
+/// An unrecognized frame must decode to `.unknown`, never throw. Throwing
+/// reached handleDispatcherError, which tore down the dispatcher for the whole
+/// VM and failed every in-flight exec, PTY and transfer on it — one new frame
+/// from a newer guest bricked a running VM.
+@Test func decodeUnknownTypeIsNotFatal() throws {
+    let data = Data("{\"type\":\"some_future_frame\",\"x\":1}\n".utf8)
+    #expect(try Protocol.decodeGuest(data) == .unknown(type: "some_future_frame"))
+}
+
+/// Forward compatibility does not extend to corrupt frames: a *known* type
+/// missing its required fields is a real protocol error and must still throw.
+@Test func decodeKnownTypeWithMissingFieldsStillThrows() {
+    let data = Data("{\"type\":\"exit\"}\n".utf8)
     #expect(throws: LuminaError.self) {
         try Protocol.decodeGuest(data)
     }

@@ -262,21 +262,6 @@ struct VMActionButton: View {
     }
 }
 
-// ── OS STRIPE ──────────────────────────────────────────────────────
-
-/// Left-edge OS stripe — 3pt vertical strip. The card/row body stays
-/// neutral; identity comes from the stripe, not the background.
-struct OSStripe: View {
-    let family: OSFamily
-    let height: CGFloat
-    var body: some View {
-        Rectangle()
-            .fill(LuminaTheme.osStripe(family.rawValue))
-            .frame(width: 3)
-            .frame(maxHeight: height > 0 ? height : .infinity)
-    }
-}
-
 // ── DISTRO CHIP ────────────────────────────────────────────────────
 
 /// Distro badge — small pill with the OS's glyph + its own brand name
