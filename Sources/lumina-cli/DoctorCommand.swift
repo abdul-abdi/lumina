@@ -95,7 +95,7 @@ struct Doctor: AsyncParsableCommand {
             ))
             return DoctorReport(
                 generatedAt: Date(),
-                luminaVersion: "0.7.1",
+                luminaVersion: "0.7.3",
                 host: hostInfo(),
                 checks: checks
             )
@@ -133,7 +133,7 @@ struct Doctor: AsyncParsableCommand {
             ))
             return DoctorReport(
                 generatedAt: Date(),
-                luminaVersion: "0.7.1",
+                luminaVersion: "0.7.3",
                 host: hostInfo(),
                 checks: checks
             )
@@ -179,7 +179,7 @@ struct Doctor: AsyncParsableCommand {
 
         return DoctorReport(
             generatedAt: Date(),
-            luminaVersion: "0.7.1",
+            luminaVersion: "0.7.3",
             host: hostInfo(),
             checks: checks
         )
@@ -220,7 +220,7 @@ struct Doctor: AsyncParsableCommand {
 
         return DoctorReport(
             generatedAt: Date(),
-            luminaVersion: "0.7.1",
+            luminaVersion: "0.7.3",
             host: hostInfo(),
             checks: checks
         )

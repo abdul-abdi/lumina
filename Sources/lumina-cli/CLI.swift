@@ -9,12 +9,50 @@ struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.7.1",
+        version: "0.7.3",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
                       Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
                       Desktop.self, Doctor.self, Iso.self, DaemonCmd.self]
     )
+
+    /// Replaces ArgumentParser's generated entry point so that usage and
+    /// validation errors reach a piped caller as JSON.
+    ///
+    /// The documented agent pattern is `sid=$(lumina session start … | jq
+    /// -r .sid)`. When a flag is wrong, ArgumentParser prints prose to
+    /// stderr and stdout stays empty, so jq dies with "Invalid numeric
+    /// literal" and the operator debugs jq instead of the typo.
+    static func main() async {
+        do {
+            var command = try parseAsRoot()
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+        } catch {
+            emitUsageEnvelopeIfPiped(for: error)
+            exit(withError: error)
+        }
+    }
+
+    /// A bare `ExitCode` means the subcommand already reported its own
+    /// failure; `.success` covers `--help` and `--version`. Everything
+    /// else that lands here is a parse or validation error.
+    private static func emitUsageEnvelopeIfPiped(for error: any Error) {
+        guard !(error is ExitCode),
+              exitCode(for: error) != .success,
+              resolveOutputFormat() == .json else { return }
+
+        let envelope: [String: String] = [
+            "error": "usage_error",
+            "message": message(for: error),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope) else { return }
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
 }
 
 // MARK: - Run
@@ -49,10 +87,10 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
 
-    @Flag(name: .customLong("wait-network"), help: "Block exec until the guest's network is up (~50-150ms cost). Recommended for commands that hit DNS in their first millisecond (apt update, curl, pip install). Off by default in v0.7.2+.")
+    @Flag(name: .customLong("wait-network"), help: "[default] Block exec until the guest's network is up. On by default in v0.7.3+ — the wait costs ~4ms, well inside boot noise.")
     var waitNetwork: Bool = false
 
-    @Flag(name: .customLong("no-wait-network"), help: "[deprecated] Was the v0.7.1 opt-out flag; v0.7.2+ does not wait by default, so this is now a no-op. Use --wait-network to opt back in to the legacy default.")
+    @Flag(name: .customLong("no-wait-network"), help: "Exec without waiting for the guest network. Saves a few ms; commands that hit DNS immediately (curl, apt update, pip install) will fail with 'bad address'.")
     var noWaitNetwork: Bool = false
 
     @Flag(name: .customLong("via-daemon"), help: "Route through the warm-pool daemon (lumina daemon serve) when available. Falls back to cold boot with a stderr warning if the daemon is not reachable.")
@@ -176,17 +214,8 @@ struct Run: AsyncParsableCommand {
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
             stdin: resolveStdin(),
-            awaitNetworkReady: waitNetwork
+            awaitNetworkReady: !noWaitNetwork
         )
-
-        // Mid-migration scripts may pass both flags. If --wait-network is
-        // also set, the user has clearly opted in — don't shout about the
-        // deprecated alias on top of that.
-        if noWaitNetwork && !waitNetwork {
-            FileHandle.standardError.write(Data(
-                "lumina: --no-wait-network is a no-op in v0.7.2+ (default behaviour). Pass --wait-network to opt back into the v0.7.1 default.\n".utf8
-            ))
-        }
 
         let format = resolveOutputFormat()
         let shouldStream = resolveStreaming()

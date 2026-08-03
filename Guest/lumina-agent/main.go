@@ -19,10 +19,21 @@ import (
 // the host never has to discover it.
 const vsockPort = 1024
 
+// Installed when we inherit none. The kernel hands PID 1 only HOME and
+// TERM, and BusyBox ash resolves commands against a built-in default
+// without exporting it — so `exec.Command("ip", …)` fails with
+// "executable file not found in $PATH" while the same name works from a
+// shell. Every exec we run, and every command the host sends, inherits it.
+const defaultPATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 func main() {
 	// stderr → serial console on most VZ setups.
 	_, _ = fmt.Fprintln(os.Stderr, "lumina-agent starting")
 	bootmark.Mark("agent_start")
+
+	if os.Getenv("PATH") == "" {
+		_ = os.Setenv("PATH", defaultPATH)
+	}
 
 	ln, err := vsock.Listen(vsockPort)
 	if err != nil {

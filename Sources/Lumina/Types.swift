@@ -95,27 +95,16 @@ public struct RunOptions: Sendable {
     /// that send a packet in the first ~20 ms of exec (curl, ping,
     /// apt, DNS lookups) always see a usable network.
     ///
-    /// **Default flipped to `false` in v0.7.2** (audit follow-up).
-    /// Rationale: the audit observed that the ~50–150 ms cost is
-    /// paid on every disposable run regardless of whether the
-    /// command needs network, and most short agentic commands
-    /// (echoes, builds, file ops) don't. Network-using commands on
-    /// Linux retry naturally on `ENETDOWN` for TCP/UDP — the host
-    /// driver still fires `configure_network` concurrently in the
-    /// background, the route is typically up within 50 ms.
+    /// **Back to `true` in v0.7.3.** v0.7.2 flipped it to `false` to
+    /// avoid a 50–150 ms per-run cost — but that cost was the guest
+    /// waiting on DHCP and carrier, not on us. With host-driven
+    /// configuration landing in ~4 ms the wait is inside boot noise
+    /// (measured: 183/179, 170/169, 173/168 ms for
+    /// no-wait/wait pairs), while opting out fails DNS 5/5 —
+    /// `getaddrinfo` returns `NXDOMAIN` immediately, with no retry
+    /// for a route that shows up a moment later.
     ///
-    /// **Caveat (read this before opt-out cargo-culting):**
-    /// `getaddrinfo` against an unreachable resolver returns
-    /// `NXDOMAIN` immediately without retry. Commands that hit DNS
-    /// in their first millisecond (`apt update`, `pip install`,
-    /// `curl example.com`) will fail with "Could not resolve host"
-    /// roughly 0–5% of the time on a cold disposable VM. If your
-    /// workload is DNS-sensitive, set this to `true` (or pass
-    /// `--wait-network` on the CLI). The guarantee is what it
-    /// always was — only the default changed.
-    ///
-    /// CLI: `--wait-network` opts in. The legacy `--no-wait-network`
-    /// flag is kept as a deprecated no-op alias for one release.
+    /// CLI: `--no-wait-network` opts out.
     public var awaitNetworkReady: Bool
 
     public static let `default` = RunOptions()
@@ -134,7 +123,7 @@ public struct RunOptions: Sendable {
         workingDirectory: String? = nil,
         diskSize: UInt64? = nil,
         stdin: Stdin = .closed,
-        awaitNetworkReady: Bool = false
+        awaitNetworkReady: Bool = true
     ) {
         self.timeout = timeout
         self.memory = memory

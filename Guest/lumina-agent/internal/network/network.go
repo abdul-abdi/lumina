@@ -9,11 +9,16 @@
 // predictable names (enp0s1, ens3) or that enumerate virtio-net as
 // a non-eth0 name on first boot now configure cleanly. Fallback is
 // "eth0" so existing images keep working.
+//
+// v0.7.3 correctness pass: dropped the `ip -batch` fast path (BusyBox
+// has no -batch, so it failed on every boot), and readiness now
+// requires an address as well as a route — see configured().
 package network
 
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"sort"
@@ -37,11 +42,9 @@ const maxCarrierWait = 400 * time.Millisecond
 // measurably costing anything (open(2)+read(2)+close(2) = ~5µs).
 const carrierPollInterval = 5 * time.Millisecond
 
-// ipRetryAttempts is the maximum number of post-verification retry
-// iterations if `ip -batch` succeeds but the default route isn't
-// committed (transient EBUSY on concurrent netlink ops). On a
-// batch-fail path the same cap applies: one batch attempt + up to
-// (ipRetryAttempts - 1) individual retries.
+// ipRetryAttempts caps how many times we re-apply and re-verify when the
+// address or default route doesn't commit (transient EBUSY on concurrent
+// netlink ops).
 const ipRetryAttempts = 3
 
 // ipRetryBackoff is the linear backoff between ip retries.
@@ -58,12 +61,12 @@ const fallbackInterface = "eth0"
 // substitute them directly. In production they always point at the
 // defaults below.
 var (
-	runIP          func(iface string, args ...string) error             = defaultRunIP
-	runIPBatch     func(iface, ip, gateway string) (bool, string)       = defaultRunIPBatch
-	readRouteFile  func() ([]byte, error)                               = defaultReadRouteFile
-	pickInterface  func() string                                        = defaultPickInterface
-	readNetSysfs   func(iface, file string) ([]byte, error)             = defaultReadNetSysfs
-	clock          func() time.Time                                     = time.Now
+	runIP         func(iface string, args ...string) error = defaultRunIP
+	readRouteFile func() ([]byte, error)                   = defaultReadRouteFile
+	readIfaceIPv4 func(iface string) string                = defaultReadIfaceIPv4
+	pickInterface func() string                            = defaultPickInterface
+	readNetSysfs  func(iface, file string) ([]byte, error) = defaultReadNetSysfs
+	clock         func() time.Time                         = time.Now
 )
 
 // Configure applies msg to the primary ethernet interface (IP/route/DNS)
@@ -82,50 +85,23 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 	// time discovering a missing router. Cheap — a single writev.
 	_ = os.WriteFile("/proc/sys/net/ipv6/conf/all/disable_ipv6", []byte("1"), 0o644)
 
-	bareIP, _, _ := strings.Cut(msg.IP, "/")
-
-	// Step 1: apply link-up + addr + route. Try once as a batch
-	// (fastest), fall back to individual retries if the batch fails
-	// or if post-verification shows the route didn't land.
+	// Retry with linear backoff: `route replace` can return 0 without
+	// committing when netlink is busy with a concurrent op.
 	attempts := 0
 	var lastErr error
-	batchOK, batchStderr := runIPBatch(iface, msg.IP, msg.Gateway)
-	if !batchOK {
+	for {
 		attempts++
-		// Carry the batch failure into lastErr so a subsequent
-		// all-retries-fail path surfaces the root cause on the
-		// wire, not just the last individual retry.
-		if batchStderr != "" {
-			lastErr = fmt.Errorf("ip -batch: %s", strings.TrimSpace(batchStderr))
-		} else {
-			lastErr = fmt.Errorf("ip -batch failed")
+		if err := applyConfig(iface, msg.IP, msg.Gateway); err != nil {
+			lastErr = err
 		}
-	}
-	// Post-verification: the batch nominally succeeded, but verify
-	// the routing table actually reflects our gateway. On some
-	// kernels under load, `route replace` can return 0 without
-	// committing if netlink is busy with a concurrent op.
-	for !routeVerified(msg.Gateway) && attempts < ipRetryAttempts {
-		attempts++
+		if configured(iface, msg.Gateway) || attempts >= ipRetryAttempts {
+			break
+		}
 		time.Sleep(ipRetryBackoff * time.Duration(attempts))
-		// Retry individually — if only the route is missing, just
-		// replace the route; don't redo the link+addr since those
-		// are idempotent but add noise.
-		if err := runIP(iface, "link", "set", iface, "up"); err != nil {
-			lastErr = fmt.Errorf("link up: %w", err)
-		}
-		_ = runIP(iface, "addr", "add", msg.IP, "dev", iface) // benign if already set
-		if err := runIP(iface, "route", "replace", "default", "via", msg.Gateway); err != nil {
-			lastErr = fmt.Errorf("route replace: %w", err)
-		}
 	}
 
-	if !routeVerified(msg.Gateway) {
-		// Hard failure. The route isn't in the table; DNS + outbound
-		// traffic won't work. Surface to the host as a typed error
-		// so the caller can fail loud instead of silently waiting
-		// for packets that will never leave.
-		reason := "default route not installed after retries"
+	if !configured(iface, msg.Gateway) {
+		reason := "address or default route not installed after retries"
 		if lastErr != nil {
 			reason = lastErr.Error()
 		}
@@ -147,9 +123,12 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		_, _ = fmt.Fprintf(os.Stderr, "resolv.conf write: %v (continuing; network is usable without DNS)\n", err)
 	}
 
-	// Step 3: poll for carrier. The route is up; this is the final
-	// "link is actually carrying" check before we tell the host
-	// packets can flow.
+	// Report the address the interface actually holds, not the one the
+	// host asked for: they diverge whenever something else on the guest
+	// (a DHCP client in a legacy image, a user's netplan) got there
+	// first, and a host that trusts the request has no way to notice.
+	actualIP := readIfaceIPv4(iface)
+
 	deadline := started.Add(maxCarrierWait)
 	for clock().Before(deadline) {
 		if operstateReady(iface) {
@@ -157,7 +136,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 			_, _ = fmt.Fprintf(os.Stderr, "network operstate up on %s after %s\n", iface, elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
-				IP:       bareIP,
+				IP:       actualIP,
 				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "operstate",
 			})
@@ -168,7 +147,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 			_, _ = fmt.Fprintf(os.Stderr, "network carrier up on %s after %s\n", iface, elapsed)
 			_ = w.Send(protocol.NetworkReadyMsg{
 				Type:     protocol.TypeNetworkReady,
-				IP:       bareIP,
+				IP:       actualIP,
 				ConfigMs: int(elapsed.Milliseconds()),
 				Stage:    "carrier",
 			})
@@ -187,7 +166,7 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 		iface, elapsed)
 	_ = w.Send(protocol.NetworkReadyMsg{
 		Type:     protocol.TypeNetworkReady,
-		IP:       bareIP,
+		IP:       actualIP,
 		ConfigMs: int(elapsed.Milliseconds()),
 		Stage:    "timeout-anyway",
 	})
@@ -195,16 +174,16 @@ func Configure(w *wire.Writer, msg protocol.ConfigureNetworkMsg) {
 
 // defaultPickInterface enumerates /sys/class/net and returns the
 // primary ethernet-style interface. Order of preference:
-//   1. Any interface whose /sys/class/net/<name>/device/modalias
-//      starts with "virtio:" — this is the VZ virtio-net device,
-//      unambiguous when present.
-//   2. Any interface named like en* or eth* that is not a bridge,
-//      vlan, tap, tun, docker, or loopback. Handles kernel-named
-//      enp0s1, ens3, enX0 alongside the classic eth0.
-//   3. Any remaining non-loopback, non-virtual interface.
-//   4. Fallback: the literal string "eth0" — keeps old images that
-//      genuinely expose eth0 working if sysfs enumeration fails for
-//      any reason (unreadable, container environment, etc.).
+//  1. Any interface whose /sys/class/net/<name>/device/modalias
+//     starts with "virtio:" — this is the VZ virtio-net device,
+//     unambiguous when present.
+//  2. Any interface named like en* or eth* that is not a bridge,
+//     vlan, tap, tun, docker, or loopback. Handles kernel-named
+//     enp0s1, ens3, enX0 alongside the classic eth0.
+//  3. Any remaining non-loopback, non-virtual interface.
+//  4. Fallback: the literal string "eth0" — keeps old images that
+//     genuinely expose eth0 working if sysfs enumeration fails for
+//     any reason (unreadable, container environment, etc.).
 //
 // Called once per Configure invocation. No caching — cheap enough
 // (a handful of sysfs reads) and avoids a whole class of "stale
@@ -318,24 +297,58 @@ func isEthernet(name string) bool {
 	return bytes.Equal(bytes.TrimSpace(data), []byte("1"))
 }
 
-// defaultRunIPBatch runs link-set / addr-add / route-replace as a single
-// `ip -batch -` process. Returns (exitedZero, stderr); stderr is
-// captured so the caller can surface the root cause in network_error.
-func defaultRunIPBatch(iface, ip, gateway string) (bool, string) {
-	batch := strings.NewReader(
-		"link set " + iface + " up\n" +
-			"addr add " + ip + " dev " + iface + "\n" +
-			"route replace default via " + gateway + "\n",
-	)
-	cmd := exec.Command("ip", "-batch", "-")
-	cmd.Stdin = batch
-	var errBuf bytes.Buffer
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "ip -batch: %v; stderr=%s\n", err, errBuf.String())
-		return false, errBuf.String()
+// applyConfig brings iface up and installs the address and default route.
+//
+// Three separate `ip` invocations on purpose. v0.7.1 folded them into one
+// `ip -batch -` to save two forks; BusyBox `ip` — what the shipped guest
+// image actually has — has no -batch and exited 1 with a usage dump on
+// every boot, so that fast path never once succeeded. Two forks cost ~1ms.
+// Do not re-batch without checking `ip -V` in the target image.
+func applyConfig(iface, ip, gateway string) error {
+	if err := runIP(iface, "link", "set", iface, "up"); err != nil {
+		return fmt.Errorf("link up: %w", err)
 	}
-	return true, ""
+	// BusyBox reports "File exists" when already assigned; configured()
+	// is the real gate, so this alone is not fatal.
+	addrErr := runIP(iface, "addr", "add", ip, "dev", iface)
+	if err := runIP(iface, "route", "replace", "default", "via", gateway); err != nil {
+		if addrErr != nil {
+			return fmt.Errorf("addr add: %v; route replace: %w", addrErr, err)
+		}
+		return fmt.Errorf("route replace: %w", err)
+	}
+	return nil
+}
+
+// configured reports whether iface can actually send a packet. Checking
+// only the route lets one installed by someone else count as success
+// while the interface still has no address.
+func configured(iface, gateway string) bool {
+	return readIfaceIPv4(iface) != "" && routeVerified(gateway)
+}
+
+// defaultReadIfaceIPv4 returns the first global IPv4 address on iface, or "".
+func defaultReadIfaceIPv4(iface string) string {
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return ""
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		v4 := ipnet.IP.To4()
+		if v4 == nil || v4.IsLoopback() || v4.IsLinkLocalUnicast() {
+			continue
+		}
+		return v4.String()
+	}
+	return ""
 }
 
 // defaultRunIP runs a single `ip` command and returns any error along with

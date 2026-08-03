@@ -199,6 +199,7 @@ final class CommandRunner: @unchecked Sendable {
         // gating. v0.7.2+ agents populate these; older guests omit the
         // fields and decode as (0, []) which is fine.
         setHandshakeMetadata(protocolVersion: protocolVersion, capabilities: capabilities)
+        StaleGuestImageWarning.emitIfNeeded(guestProtocolVersion: protocolVersion)
 
         setState(.ready)
         startDispatcher(initialBuffer: readBuffer)

@@ -307,3 +307,33 @@ enum LuminaProtocol {
 
 /// Namespace alias to allow `Protocol.encode` / `Protocol.decodeGuest` call sites.
 typealias Protocol = LuminaProtocol
+
+// MARK: - Stale guest image detection
+
+let expectedGuestProtocolVersion = 1
+
+/// Images older than that run `udhcpc` from `/sbin/init`, whose `deconfig`
+/// hook flushes the address the host just installed over vsock. The VM
+/// boots and execs fine, so the only symptom is that nothing reaches the
+/// network — worth naming once, with the fix, rather than letting the next
+/// caller rediscover it.
+enum StaleGuestImageWarning {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var emitted = false
+
+    static func emitIfNeeded(guestProtocolVersion: Int) {
+        guard guestProtocolVersion < expectedGuestProtocolVersion else { return }
+        lock.lock()
+        let alreadyEmitted = emitted
+        emitted = true
+        lock.unlock()
+        guard !alreadyEmitted else { return }
+
+        FileHandle.standardError.write(Data("""
+        [lumina] warning: this guest image predates protocol v\(expectedGuestProtocolVersion) \
+        (agent reported v\(guestProtocolVersion)). Its init runs udhcpc, which races the \
+        host network setup and can leave the VM with no IP address. Refresh with \
+        `lumina pull --force`; custom images then need rebuilding from the new default.\n
+        """.utf8))
+    }
+}

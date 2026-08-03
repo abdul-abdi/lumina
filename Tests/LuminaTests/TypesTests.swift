@@ -11,9 +11,10 @@ import Testing
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
     #expect(opts.directoryDownloads.isEmpty)
-    // v0.7.2 default flip: do NOT block exec on network_ready by default.
-    // Regression guard against an accidental flip-back to true.
-    #expect(opts.awaitNetworkReady == false)
+    // v0.7.3: block exec on network_ready by default. The wait costs ~4ms
+    // now that the host drives config directly, and opting out fails DNS
+    // outright. Regression guard against another flip to false.
+    #expect(opts.awaitNetworkReady == true)
 }
 
 @Test func directoryUploadInit() {
