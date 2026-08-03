@@ -5,6 +5,10 @@ public struct DiskClone: Sendable {
     public let rootfs: URL
     public let pidFile: URL
 
+    /// How long a run directory with no PID file is assumed to be a clone in
+    /// flight rather than an orphan.
+    static let newCloneGracePeriod: TimeInterval = 60
+
     public static let defaultRunsDir: URL = {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".lumina/runs")
@@ -25,19 +29,23 @@ public struct DiskClone: Sendable {
             throw .cloneFailed(underlying: error)
         }
 
-        // APFS COW clone via copyItem (uses cloneFile internally on APFS)
+        // Claim the directory BEFORE cloning into it. `cleanOrphans` deletes
+        // any run dir lacking a live PID, and runs from every `lumina run`
+        // start and atexit — writing this afterwards left the entire ~1GB copy
+        // as a window for a concurrent run to delete the directory underneath
+        // us. Cost: ~1 in 15 concurrent boots died with "rootfs.img doesn't
+        // exist" or ".pid doesn't exist".
+        let pid = "\(ProcessInfo.processInfo.processIdentifier)"
         do {
-            try FileManager.default.copyItem(at: sourceImage, to: rootfs)
+            try Data(pid.utf8).write(to: pidFile)
         } catch {
-            // Cleanup the directory if clone fails
             try? FileManager.default.removeItem(at: dir)
             throw .cloneFailed(underlying: error)
         }
 
-        // Write PID file for orphan detection
-        let pid = "\(ProcessInfo.processInfo.processIdentifier)"
+        // APFS COW clone via copyItem (uses cloneFile internally on APFS)
         do {
-            try Data(pid.utf8).write(to: pidFile)
+            try FileManager.default.copyItem(at: sourceImage, to: rootfs)
         } catch {
             try? FileManager.default.removeItem(at: dir)
             throw .cloneFailed(underlying: error)
@@ -132,7 +140,13 @@ public struct DiskClone: Sendable {
             guard let pidStr = try? String(contentsOf: pidFile, encoding: .utf8),
                   let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines))
             else {
-                // No valid PID file — remove it
+                // A directory created moments ago with no PID yet is a clone
+                // in flight, not an orphan — another process is between
+                // mkdir and its first write. Deleting it corrupts a live boot.
+                if let created = try? fm.attributesOfItem(atPath: entry.path)[.creationDate] as? Date,
+                   Date().timeIntervalSince(created) < newCloneGracePeriod {
+                    continue
+                }
                 try? fm.removeItem(at: entry)
                 removed += 1
                 continue
