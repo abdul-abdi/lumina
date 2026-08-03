@@ -704,8 +704,17 @@ final class CommandRunner: @unchecked Sendable {
         } catch {
             throw .connectionFailed
         }
-        // network_ready received; DNS, route, and IP are now live on the guest.
-        if case .networkReady(_, let configMs, let stage) = reply {
+        if case .networkReady(_, let configMs, let stage, let dnsOk) = reply {
+            // The whole point of awaiting network_ready is that DNS resolves
+            // before the caller's first command. The guest now reads
+            // resolv.conf back rather than trusting its own write, so when it
+            // says DNS is broken, say so instead of letting `curl` be the
+            // messenger.
+            if !dnsOk {
+                FileHandle.standardError.write(Data(
+                    "[lumina] warning: the guest could not write /etc/resolv.conf; name resolution will fail. Traffic to literal IPs still works.\n".utf8
+                ))
+            }
             return (configMs: configMs, stage: stage)
         }
         return (configMs: 0, stage: "")
