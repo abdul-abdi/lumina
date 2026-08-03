@@ -691,6 +691,21 @@ fi
 section "16. OBSERVABILITY — lumina ps"
 # ═══════════════════════════════════════════════════════════════
 
+# --watch was advertised on lumina.run before it existed. It must exist, and
+# it must NOT stream forever when piped — the JSON envelope is one value per
+# invocation, so a piped --watch has to fall back to a single render.
+if $LUMINA ps --help 2>&1 | grep -q -- "--watch"; then
+  pass "16.0a ps --watch flag exists"
+else
+  fail "16.0a ps --watch" "flag missing"
+fi
+WATCH_OUT=$($LUMINA ps --watch 2>/dev/null | head -c 2000)
+if echo "$WATCH_OUT" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  pass "16.0b piped ps --watch renders once as JSON"
+else
+  fail "16.0b piped ps --watch" "$WATCH_OUT"
+fi
+
 # No sessions: ps returns []
 for sid in $($LUMINA session list 2>/dev/null | jq -r '.[].sid' 2>/dev/null); do
   $LUMINA session stop "$sid" 2>/dev/null || true

@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>lumina — subprocess.run() for virtual machines</title>
-<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~31ms, cold starts in ~390ms, sandbox sealed. Built for the agent loop on Apple Silicon." />
+<meta name="description" content="Boot a Linux VM, run a command, collect structured JSON. Sessions exec in ~31ms, warm execs in ~1ms via the daemon, sandbox sealed. Built for the agent loop on Apple Silicon." />
 <meta property="og:title" content="lumina — subprocess.run() for virtual machines" />
 <meta property="og:description" content="A native sandbox primitive for AI agents on Apple Silicon. Now with Lumina Desktop." />
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -848,7 +848,7 @@ footer .legal .sig {
       </ul>
       <div class="nav-status">
         <span class="dot"></span>
-        <span>v0.7.1 · stable</span>
+        <span>v0.7.4 · stable</span>
       </div>
     </div>
   </div>
@@ -857,7 +857,7 @@ footer .legal .sig {
 <div class="wrap">
   <div class="meta-strip">
     <span>LUMINA / <b>A SANDBOX PRIMITIVE FOR AGENTS</b></span>
-    <span>BUILD <b>0.7.1</b></span>
+    <span>BUILD <b>0.7.4</b></span>
     <span>PLATFORM <b>DARWIN-ARM64</b></span>
     <span>EXEC <b id="meta-lat">31MS</b></span>
     <span id="meta-clock">—</span>
@@ -876,10 +876,10 @@ footer .legal .sig {
         </h1>
         <p class="lede">
           Boot a Linux VM, run a command, collect <b>structured JSON</b>.
-          Sessions exec in <b>~31ms</b>, cold boots land in <b>~390ms P50</b>
+          Sessions exec in <b>~31ms</b>, cold boots land in <b>~962ms P50</b> on the shipped image (<b>~290ms</b> with the opt-in Apple containerization kernel)
           on an M3 Pro, and the sandbox is sealed by default — no host fs,
           no SSH, no escape hatch. Built for the agent loop.
-          <b>v0.7.1 hardens desktop boot</b> — stable MAC across reboots,
+          <b>v0.7.4 hardens the agent path</b> — stable MAC across reboots,
           cancel-safe retry, pre-start crash delegate, live serial tail
           when the framebuffer's still dark.
         </p>
@@ -908,7 +908,7 @@ footer .legal .sig {
       <div class="ps-panel">
         <div class="ps-head">
           <span class="ps-title">$ lumina ps --watch</span>
-          <span class="ps-meta"><span class="dot" style="background:var(--ok); animation:none"></span><span id="ps-count">—</span> live · streaming</span>
+          <span class="ps-meta"><span class="dot" style="background:var(--ok); animation:none"></span><span id="ps-count">—</span> sessions · simulated</span>
         </div>
         <div class="ps-colhead">
           <span>STATE</span><span>SID</span><span>IMAGE</span><span>UPTIME</span><span>EXECS</span><span>LAT</span>
@@ -924,7 +924,7 @@ footer .legal .sig {
     <div class="counters">
       <div>
         <div class="label">Cold start (P50)</div>
-        <div class="val" id="c-boot">390<span class="u">ms</span></div>
+        <div class="val" id="c-boot">962<span class="u">ms</span></div>
         <span class="tick"></span>
       </div>
       <div>
@@ -933,13 +933,13 @@ footer .legal .sig {
         <span class="tick"></span>
       </div>
       <div>
-        <div class="label">Live sessions</div>
-        <div class="val" id="c-sess">1,284</div>
+        <div class="label">Warm exec (daemon)</div>
+        <div class="val" id="c-warm">1<span class="u">ms</span></div>
         <span class="tick"></span>
       </div>
       <div>
-        <div class="label">Execs / hr</div>
-        <div class="val" id="c-execs">847,312</div>
+        <div class="label">Isolation</div>
+        <div class="val">VM</div>
         <span class="tick"></span>
       </div>
     </div>
@@ -952,7 +952,7 @@ footer .legal .sig {
     <div class="section-head reveal">
       <div class="no">§ 02</div>
       <h2>Watch it work<span class="it"> — a session, start to stop.</span></h2>
-      <div class="eyebrow">LIVE / LOOPING</div>
+      <div class="eyebrow">RECORDED / LOOPING</div>
     </div>
     <div class="term reveal">
       <div class="term-head">
@@ -970,14 +970,14 @@ footer .legal .sig {
   <div class="wrap">
     <div class="section-head reveal">
       <div class="no">§ 03</div>
-      <h2>Two shapes<span class="it"> — one-shot or session.</span></h2>
+      <h2>Three shapes<span class="it"> — one-shot, warm, or session.</span></h2>
       <div class="eyebrow">CORE API</div>
     </div>
     <div class="two-col">
       <div class="code reveal">
         <header>
           <span>one-shot · disposable VM</span>
-          <span class="right">~540ms</span>
+          <span class="right">~962ms</span>
         </header>
 <pre><span class="co"># boot, run, tear down. zero state.</span>
 <span class="kw">$</span> lumina run <span class="st">"uname -a"</span>
@@ -986,8 +986,25 @@ footer .legal .sig {
   <span class="kw">"stdout"</span>: <span class="st">"Linux lumina 6.12-virt …\n"</span>,
   <span class="kw">"stderr"</span>: <span class="st">""</span>,
   <span class="kw">"exit_code"</span>: <span class="nm">0</span>,
-  <span class="kw">"duration_ms"</span>: <span class="nm">542</span>
+  <span class="kw">"duration_ms"</span>: <span class="nm">967</span>
 <span class="co">}</span></pre>
+      </div>
+      <div class="code reveal">
+        <header>
+          <span>daemon · warm pool</span>
+          <span class="right">~1ms / exec</span>
+        </header>
+<pre><span class="co"># pre-boot a pool once; every run borrows from it.</span>
+<span class="kw">$</span> lumina daemon serve --size 4 &amp;
+<span class="kw">$</span> lumina run --via-daemon <span class="st">"echo hello"</span>
+
+<span class="co">{</span>
+  <span class="kw">"stdout"</span>: <span class="st">"hello\n"</span>,
+  <span class="kw">"exit_code"</span>: <span class="nm">0</span>,
+  <span class="kw">"duration_ms"</span>: <span class="nm">1</span>
+<span class="co">}</span>
+<span class="co"># carries --copy / --download / stdin too.</span>
+<span class="co"># drained pool degrades to the cold path, never past it.</span></pre>
       </div>
       <div class="code reveal">
         <header>
@@ -1083,7 +1100,7 @@ footer .legal .sig {
     <div class="section-head reveal">
       <div class="no">§ 05</div>
       <h2>Stable primitives<span class="it"> — what you can rely on.</span></h2>
-      <div class="eyebrow">CONTRACT / v0.7.1</div>
+      <div class="eyebrow">CONTRACT / v0.7.4</div>
     </div>
     <div class="prims reveal">
       <div class="prim">
@@ -1174,6 +1191,8 @@ footer .legal .sig {
       When stdout is a pipe, every <code style="color:var(--accent)">run</code> and <code style="color:var(--accent)">exec</code> emits a single JSON object.
       Success and error are disjoint — dispatch on the presence of the <code style="color:var(--accent)">error</code> field first.
       A non-zero <code style="color:var(--accent)">exit_code</code> is a successful exec, not an error.
+      Since v0.7.4 a failure also carries <code style="color:var(--accent)">error_detail</code>, free text naming the underlying cause —
+      branch on <code style="color:var(--accent)">error</code>, read <code style="color:var(--accent)">error_detail</code> when reporting to a human.
     </p>
     <div class="envelope reveal">
       <div class="env-col ok">
@@ -1189,6 +1208,7 @@ footer .legal .sig {
         <h4><span>// error</span><span>● error present</span></h4>
 <pre>{
   <span class="k">"error"</span>: <span class="err">"timeout"</span>,
+  <span class="k">"error_detail"</span>: <span class="s">"command exceeded 30s"</span>,
   <span class="k">"duration_ms"</span>: <span class="n">30012</span>,
   <span class="k">"partial_stdout"</span>: <span class="s">"starting…\n"</span>,
   <span class="k">"partial_stderr"</span>: <span class="s">""</span>
@@ -1244,13 +1264,14 @@ footer .legal .sig {
     <div class="bench reveal">
       <div>
         <h5>Cold boot <code style="font-size:11px; color:var(--ink-mute)">true</code></h5>
-        <div class="big">390<span class="u">ms</span></div>
-        <div class="sub">P50 — fresh VM to vsock-ready. P95: 558ms.</div>
+        <div class="big">962<span class="u">ms</span></div>
+        <div class="sub">P50 over n=15 on the published image — fresh VM to vsock-ready.</div>
         <div class="bars">
-          <div class="bar"><span>P50</span><span class="t"><i style="width:20%"></i></span><span class="v">390ms</span></div>
-          <div class="bar"><span>P95</span><span class="t"><i style="width:30%"></i></span><span class="v">558ms</span></div>
-          <div class="bar"><span>4× concurrent</span><span class="t"><i style="width:40%"></i></span><span class="v">753ms agg</span></div>
-          <div class="bar"><span>cold + first exec</span><span class="t"><i style="width:29%"></i></span><span class="v">542ms</span></div>
+          <div class="bar"><span>P50</span><span class="t"><i style="width:38%"></i></span><span class="v">962ms</span></div>
+          <div class="bar"><span>P95</span><span class="t"><i style="width:50%"></i></span><span class="v">1280ms</span></div>
+          <div class="bar"><span>4× concurrent</span><span class="t"><i style="width:54%"></i></span><span class="v">1362ms agg</span></div>
+          <div class="bar"><span>cold + first exec</span><span class="t"><i style="width:37%"></i></span><span class="v">921ms</span></div>
+          <div class="bar"><span>Apple kernel (opt-in)</span><span class="t"><i style="width:12%"></i></span><span class="v">291ms</span></div>
         </div>
       </div>
       <div>
@@ -1373,7 +1394,7 @@ footer .legal .sig {
           </span>
         </p>
         <div style="display: flex; gap: 10px; font-size: 11px; color: var(--ink-mute); letter-spacing: .1em; text-transform: uppercase;">
-          <span>v0.7.1</span> ·
+          <span>v0.7.4</span> ·
           <span>MIT</span> ·
           <span id="foot-clock">—</span>
         </div>
@@ -1431,25 +1452,11 @@ function copyInstall(btn) {
   setTimeout(() => btn.textContent = orig, 1400);
 }
 
-/* ───── live counters (jitter + drift) ───── */
-const counters = {
-  boot: { el: document.getElementById('c-boot'), base: 390, jit: 14 },
-  exec: { el: document.getElementById('c-exec'), base: 31, jit: 3 },
-  sess: { el: document.getElementById('c-sess'), base: 1284 },
-  execs: { el: document.getElementById('c-execs'), base: 847312 },
-};
-let execsCount = counters.execs.base;
-setInterval(() => {
-  const b = counters.boot.base + Math.floor(Math.random()*counters.boot.jit*2 - counters.boot.jit);
-  const e = counters.exec.base + Math.floor(Math.random()*counters.exec.jit*2 - counters.exec.jit);
-  const s = counters.sess.base + Math.floor(Math.random()*4 - 2);
-  execsCount += Math.floor(Math.random()*60 + 10);
-  counters.boot.el.innerHTML = b + '<span class="u">ms</span>';
-  counters.exec.el.innerHTML = e + '<span class="u">ms</span>';
-  counters.sess.el.textContent = s.toLocaleString();
-  counters.execs.el.textContent = execsCount.toLocaleString();
-  document.getElementById('meta-lat').textContent = e + 'MS';
-}, 900);
+/* The panel above used to animate a fleet-wide session count and an
+   execs-per-hour figure off Math.random(). There is no telemetry backend —
+   those were invented numbers presented as live data. The values shown now
+   are fixed measurements you can reproduce with `lumina run` on an M3 Pro. */
+document.getElementById('meta-lat').textContent = '31MS';
 
 /* clock */
 function tick() {

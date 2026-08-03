@@ -1150,13 +1150,31 @@ struct Ps: AsyncParsableCommand {
         abstract: "List running sessions with live status"
     )
 
+    @Flag(name: .long, help: "Redraw continuously until interrupted. Requires a TTY; ignored when piped.")
+    var watch: Bool = false
+
+    @Option(name: .long, help: "Seconds between redraws in --watch mode.")
+    var interval: Double = 1.0
+
     func run() async throws {
-        let sessions = SessionPaths.listAll().filter { $0.status == .running }
         let format = resolveOutputFormat()
 
-        // Gather a status row for each live session. Unreachable sessions
-        // produce a row with `error` so ps still reflects their presence on disk.
-        let rows = sessions.map { PsRowBuilder.build(for: $0) }
+        // Watching a pipe would emit an endless stream no one framed — the
+        // JSON envelope is a single value per invocation. Poll from a script
+        // instead.
+        guard watch, format == .text else {
+            try renderOnce(format: format)
+            return
+        }
+        try await runWatchLoop()
+    }
+
+    private func renderOnce(format: OutputFormat) throws {
+        // Unreachable sessions produce a row with `error` so ps still reflects
+        // their presence on disk.
+        let rows = SessionPaths.listAll()
+            .filter { $0.status == .running }
+            .map { PsRowBuilder.build(for: $0) }
 
         switch format {
         case .text:
@@ -1166,23 +1184,63 @@ struct Ps: AsyncParsableCommand {
         }
     }
 
+    private func runWatchLoop() async throws {
+        let tick = max(0.2, interval)
+        // Alternate screen buffer, cursor hidden — restored on the way out so
+        // an interrupted watch doesn't leave the terminal without a cursor.
+        FileHandle.standardOutput.write(Data("\u{1B}[?1049h\u{1B}[?25l".utf8))
+        defer { FileHandle.standardOutput.write(Data("\u{1B}[?25h\u{1B}[?1049l".utf8)) }
+
+        let interrupted = SignalFlag()
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        for src in [sigint, sigterm] {
+            src.setEventHandler { interrupted.set() }
+            src.resume()
+        }
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+        defer {
+            sigint.cancel()
+            sigterm.cancel()
+            signal(SIGINT, SIG_DFL)
+            signal(SIGTERM, SIG_DFL)
+        }
+
+        while !interrupted.isSet {
+            let rows = SessionPaths.listAll()
+                .filter { $0.status == .running }
+                .map { PsRowBuilder.build(for: $0) }
+
+            var frame = "\u{1B}[H\u{1B}[2J"
+            frame += "lumina ps — \(rows.count) session\(rows.count == 1 ? "" : "s") · refreshing every \(String(format: "%.1f", tick))s · ctrl-c to exit\n\n"
+            frame += psTextTable(rows: rows)
+            FileHandle.standardOutput.write(Data(frame.utf8))
+
+            try? await Task.sleep(for: .seconds(tick))
+        }
+    }
+
     private func printPsTextTable(rows: [PsRow]) {
+        print(psTextTable(rows: rows), terminator: "")
+    }
+
+    private func psTextTable(rows: [PsRow]) -> String {
         if rows.isEmpty {
-            print("No active sessions.")
-            return
+            return "No active sessions.\n"
         }
         // Fixed-width columns. Kept inline — formatting is pure and small.
-        print("SID                                  IMAGE           UPTIME     EXECS")
+        var out = "SID                                  IMAGE           UPTIME     EXECS\n"
         for row in rows {
-            let line = String(
+            out += String(
                 format: "%-36s %-15s %-10s %s",
                 row.sid,
                 row.image.prefix(15).padding(toLength: 15, withPad: " ", startingAt: 0),
                 row.uptimeText.padding(toLength: 10, withPad: " ", startingAt: 0),
                 row.execsText
-            )
-            print(line)
+            ) + "\n"
         }
+        return out
     }
 
     private func printPsJson(rows: [PsRow]) throws {
@@ -1209,6 +1267,22 @@ struct Ps: AsyncParsableCommand {
 
 /// One row of `lumina ps` output. Constructed from a `SessionInfo` + a single
 /// `.status` round-trip. Unreachable sessions carry `error` instead of status.
+/// One-way flag set from a DispatchSource signal handler and read from the
+/// watch loop. Lock-guarded because those are different threads.
+final class SignalFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() {
+        lock.lock(); value = true; lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
 struct PsRow: Sendable {
     let sid: String
     let image: String
