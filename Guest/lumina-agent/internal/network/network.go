@@ -240,7 +240,6 @@ func defaultPickInterface() string {
 	// when readdir order is not.
 	sort.Strings(names)
 
-	// Pass 1: virtio-net modalias is the ground truth on a VZ guest.
 	for _, n := range names {
 		data, err := readNetSysfs(n, "device/modalias")
 		if err != nil {
@@ -258,66 +257,7 @@ func defaultPickInterface() string {
 		}
 	}
 
-	// Pass 2: predictable naming + classic eth* names.
-	for _, n := range names {
-		if !looksLikeEthernet(n) {
-			continue
-		}
-		if isVirtualInterface(n) {
-			continue
-		}
-		if isEthernet(n) {
-			return n
-		}
-	}
-
-	// Pass 3: anything else that is an ethernet device and not
-	// obviously virtual.
-	for _, n := range names {
-		if isVirtualInterface(n) {
-			continue
-		}
-		if isEthernet(n) {
-			return n
-		}
-	}
-
 	return fallbackInterface
-}
-
-// looksLikeEthernet filters by name pattern only — cheap, no I/O.
-// Matches en*, eth*, enX* (predictable naming), enp*, ens*, eno*.
-func looksLikeEthernet(name string) bool {
-	if strings.HasPrefix(name, "eth") {
-		return true
-	}
-	if strings.HasPrefix(name, "en") {
-		return true
-	}
-	return false
-}
-
-// isVirtualInterface rejects bridges, tap devices, docker links,
-// wireguard tunnels, and the like. These are userspace-created
-// and should never be the VZ guest's primary NIC.
-func isVirtualInterface(name string) bool {
-	switch {
-	case strings.HasPrefix(name, "br"):
-		return true
-	case strings.HasPrefix(name, "docker"):
-		return true
-	case strings.HasPrefix(name, "veth"):
-		return true
-	case strings.HasPrefix(name, "tap"):
-		return true
-	case strings.HasPrefix(name, "tun"):
-		return true
-	case strings.HasPrefix(name, "wg"):
-		return true
-	case strings.HasPrefix(name, "vnet"):
-		return true
-	}
-	return false
 }
 
 // isEthernet reads /sys/class/net/<name>/type and confirms it
@@ -461,27 +401,11 @@ func routeVerified(gateway string) bool {
 // 8-char uppercase hex representation used in /proc/net/route.
 // Returns "" for malformed input.
 func ipv4ToLittleEndianHex(ip string) string {
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
+	b := net.ParseIP(ip).To4()
+	if b == nil || strings.Contains(ip, ":") {
 		return ""
 	}
-	b := make([]byte, 4)
-	for i, part := range parts {
-		if part == "" {
-			return ""
-		}
-		var val int
-		if _, err := fmt.Sscanf(part, "%d", &val); err != nil || val < 0 || val > 255 {
-			return ""
-		}
-		// Reject leading-zero or trailing-junk inputs that Sscanf
-		// accepts but aren't valid dotted-quad octets.
-		if fmt.Sprintf("%d", val) != part {
-			return ""
-		}
-		b[3-i] = byte(val) // little-endian
-	}
-	return fmt.Sprintf("%02X%02X%02X%02X", b[0], b[1], b[2], b[3])
+	return fmt.Sprintf("%02X%02X%02X%02X", b[3], b[2], b[1], b[0])
 }
 
 // operstateReady returns true when /sys/class/net/<iface>/operstate
