@@ -979,43 +979,35 @@ struct SessionStop: AsyncParsableCommand {
 
     func run() async throws {
         let sid = parseSID(self.sid)
-        let client = SessionClient()
+        let client = try connectSession(sid)
         do {
-            try client.connect(sid: sid)
             try client.send(.shutdown)
-            // Verify the server acknowledged the shutdown
-            let response = try? client.receive()
-            client.disconnect()
-
-            let confirmed: Bool
-            if let response = response {
-                switch response {
-                case .exit: confirmed = true
-                default: confirmed = false
-                }
-            } else {
-                // Connection closed — server shut down (success)
-                confirmed = true
-            }
-
-            let format = resolveOutputFormat()
-            switch format {
-            case .json:
-                struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
-                encodeAndPrint(StopResult(stopped: sid, confirmed: confirmed))
-            case .text:
-                print("Session '\(sid)' stopped.")
-            }
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
+        } catch {
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
             throw ExitCode.failure
+        }
+        // Verify the server acknowledged the shutdown
+        let response = try? client.receive()
+        client.disconnect()
+
+        let confirmed: Bool
+        if let response = response {
+            switch response {
+            case .exit: confirmed = true
+            default: confirmed = false
+            }
+        } else {
+            // Connection closed — server shut down (success)
+            confirmed = true
+        }
+
+        let format = resolveOutputFormat()
+        switch format {
+        case .json:
+            struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
+            encodeAndPrint(StopResult(stopped: sid, confirmed: confirmed))
+        case .text:
+            print("Session '\(sid)' stopped.")
         }
     }
 }
@@ -1291,20 +1283,7 @@ struct Exec: AsyncParsableCommand {
 
         let parsedEnv = try parseEnvSpecs(env)
 
-        let client = SessionClient()
-        do {
-            try client.connect(sid: sid)
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
-            throw ExitCode.failure
-        }
+        let client = try connectSession(sid)
         defer { client.disconnect() }
 
         // PTY mode: interactive, raw-byte bidirectional streaming.
@@ -1564,20 +1543,7 @@ struct Cp: AsyncParsableCommand {
     func run() async throws {
         let (sid, isUpload, localPath, remotePath) = try parseCpArgs()
 
-        let client = SessionClient()
-        do {
-            try client.connect(sid: sid)
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
-            throw ExitCode.failure
-        }
+        let client = try connectSession(sid)
         defer { client.disconnect() }
 
         if isUpload {

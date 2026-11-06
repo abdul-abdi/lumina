@@ -1,4 +1,5 @@
 // Sources/lumina-cli/Helpers.swift
+import ArgumentParser
 import Foundation
 import Lumina
 
@@ -161,6 +162,24 @@ func parseSID(_ input: String) -> String {
         return sid
     }
     return trimmed
+}
+
+func connectSession(_ sid: String) throws -> SessionClient {
+    let client = SessionClient()
+    do {
+        try client.connect(sid: sid)
+    } catch let error as LuminaError {
+        switch error {
+        case .sessionNotFound:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+        case .sessionDead:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+        default:
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+        }
+        throw ExitCode.failure
+    }
+    return client
 }
 
 // MARK: - Stdin Auto-Detect
