@@ -17,37 +17,42 @@ struct LuminaCLI: AsyncParsableCommand {
     )
 
     /// Replaces ArgumentParser's generated entry point so that usage and
-    /// validation errors reach a piped caller as JSON.
+    /// runtime errors reach a piped caller as JSON.
     ///
     /// The documented agent pattern is `sid=$(lumina session start … | jq
     /// -r .sid)`. When a flag is wrong, ArgumentParser prints prose to
     /// stderr and stdout stays empty, so jq dies with "Invalid numeric
     /// literal" and the operator debugs jq instead of the typo.
     static func main() async {
+        var command: any ParsableCommand
         do {
-            var command = try parseAsRoot()
+            command = try parseAsRoot()
+        } catch {
+            emitErrorEnvelopeIfPiped("usage_error", for: error)
+            exit(withError: error)
+        }
+        do {
             if var asyncCommand = command as? AsyncParsableCommand {
                 try await asyncCommand.run()
             } else {
                 try command.run()
             }
         } catch {
-            emitUsageEnvelopeIfPiped(for: error)
+            emitErrorEnvelopeIfPiped("failed", for: error)
             exit(withError: error)
         }
     }
 
     /// A bare `ExitCode` means the subcommand already reported its own
-    /// failure; `.success` covers `--help` and `--version`. Everything
-    /// else that lands here is a parse or validation error.
-    private static func emitUsageEnvelopeIfPiped(for error: any Error) {
+    /// failure; `.success` covers `--help` and `--version`.
+    private static func emitErrorEnvelopeIfPiped(_ kind: String, for error: any Error) {
         guard !(error is ExitCode),
               exitCode(for: error) != .success,
               resolveOutputFormat() == .json else { return }
 
         let envelope: [String: String] = [
-            "error": "usage_error",
-            "message": message(for: error),
+            "error": kind,
+            "message": kind == "usage_error" ? message(for: error) : friendlyError(error),
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: envelope) else { return }
         FileHandle.standardOutput.write(data)
@@ -115,56 +120,55 @@ struct Run: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // --via-daemon: try to route through the warm-pool daemon
         var daemonStdinBytes: Data? = nil
-        if viaDaemon {
-            // Mounts are pool-level config baked in at `daemon serve` time —
-            // there's no per-request wire message that could apply a new one.
+        let autoDaemon = ProcessInfo.processInfo.environment["LUMINA_DAEMON"] != "0"
+            && volume.isEmpty && resolveDiskSize(flag: nil) == nil
+            && FileManager.default.fileExists(atPath: Daemon.socketPath().path)
+        if viaDaemon || autoDaemon {
             if !volume.isEmpty {
                 FileHandle.standardError.write(Data(
                     "warning: --via-daemon ignores --volume (mounts are pool-level config — set at `lumina daemon serve` time instead)\n".utf8
                 ))
             }
-            let resolvedTimeoutForDaemon = resolveTimeout(flag: timeout, defaultValue: "60s")
-            let parsedTimeoutForDaemon = parseDuration(resolvedTimeoutForDaemon)
-            let timeoutSecs = parsedTimeoutForDaemon.map { Int($0.components.seconds) } ?? 60
-            let parsedEnvForDaemon = try parseEnvSpecs(env)
+            let timeoutSecs = parseDuration(resolveTimeout(flag: timeout, defaultValue: "60s"))
+                .map { Int($0.components.seconds) } ?? 60
             let (daemonUploads, daemonDirUploads) = try parseCopySpecs(copy)
-            let daemonDownloads = try parseDownloadSpecs(download)
-            // Read to EOF up front — the daemon needs the whole blob to embed
-            // as base64 in one request. Stashed so the cold-boot fallback below
-            // can replay it; by then the real stdin fd has already hit EOF.
+            // The daemon needs the whole blob in one request; the cold
+            // fallback below replays it because stdin is already at EOF.
             if isatty(fileno(stdin)) == 0 {
                 daemonStdinBytes = FileHandle.standardInput.readDataToEndOfFile()
             }
-            if let result = try? await Daemon.tryRun(
-                image: image,
-                command: command,
-                timeout: timeoutSecs,
-                env: parsedEnvForDaemon,
-                cwd: workdir,
-                uploads: daemonUploads,
-                directoryUploads: daemonDirUploads,
-                downloads: daemonDownloads,
-                stdinData: daemonStdinBytes
-            ) {
-                let ms = result.wallTime.totalMilliseconds
-                let r = ResultJSON(
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
-                    stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
-                    exit_code: Int(result.exitCode),
-                    duration_ms: ms,
-                    network_metrics: result.networkMetrics
-                )
-                encodeAndPrint(r)
-                if result.exitCode != 0 { throw ExitCode(result.exitCode) }
-                return
-            } else {
-                FileHandle.standardError.write(Data(
-                    "daemon not reachable, falling back to cold boot\n".utf8
-                ))
+            let start = ContinuousClock.now
+            do {
+                if let result = try await Daemon.tryRun(
+                    image: image,
+                    memory: parseMemory(resolveMemory(flag: "1GB")) ?? 0,
+                    cpuCount: resolveCpus(flag: 2),
+                    command: command,
+                    timeout: timeoutSecs,
+                    env: try parseEnvSpecs(env),
+                    cwd: workdir,
+                    uploads: daemonUploads,
+                    directoryUploads: daemonDirUploads,
+                    downloads: try parseDownloadSpecs(download),
+                    stdinData: daemonStdinBytes
+                ) {
+                    try emitDaemonResult(result)
+                    return
+                }
+            } catch {
+                // The request reached the daemon, so the command may have
+                // run: report it rather than running it again cold.
+                let (state, _) = errorStateForRun(error)
+                if resolveOutputFormat() == .json {
+                    encodeAndPrint(ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: millisSince(start)))
+                } else {
+                    FileHandle.standardError.write(Data("lumina: \(friendlyError(error))\n".utf8))
+                }
+                throw ExitCode.failure
+            }
+            if viaDaemon {
+                FileHandle.standardError.write(Data("daemon not reachable, falling back to cold boot\n".utf8))
             }
         }
 
@@ -331,6 +335,24 @@ struct Run: AsyncParsableCommand {
         if let code = exitCode, code != 0 {
             throw ExitCode(code)
         }
+    }
+
+    private func emitDaemonResult(_ result: RunResult) throws {
+        if resolveOutputFormat() == .json {
+            encodeAndPrint(ResultJSON(
+                stdout: result.stdout,
+                stderr: result.stderr,
+                stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
+                stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
+                exit_code: Int(result.exitCode),
+                duration_ms: result.wallTime.totalMilliseconds,
+                network_metrics: result.networkMetrics
+            ))
+        } else {
+            FileHandle.standardOutput.write(result.stdoutBytes ?? Data(result.stdout.utf8))
+            FileHandle.standardError.write(result.stderrBytes ?? Data(result.stderr.utf8))
+        }
+        if result.exitCode != 0 { throw ExitCode(result.exitCode) }
     }
 
     /// Human-readable cause behind an error state, for `error_detail`.
@@ -884,7 +906,7 @@ struct Clean: ParsableCommand {
 struct Session: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Manage persistent VM sessions",
-        subcommands: [SessionStart.self, SessionStop.self, SessionList.self]
+        subcommands: [SessionStart.self, SessionStop.self, SessionList.self, SessionSave.self]
     )
 }
 
@@ -1057,6 +1079,40 @@ struct SessionStart: AsyncParsableCommand {
             print(String(data: output, encoding: .utf8)!)
         case .text:
             print(sid)
+        }
+    }
+}
+
+struct SessionSave: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "save",
+        abstract: "Save a running session's disk as a new image (`lumina run --image <name>` boots it)"
+    )
+
+    @Argument(help: "Session ID")
+    var sid: String
+
+    @Argument(help: "Name for the new image")
+    var image: String
+
+    func run() async throws {
+        let client = SessionClient()
+        try client.connect(sid: parseSID(sid))
+        defer { client.disconnect() }
+        try client.send(.save(image: image))
+        switch try client.receive() {
+        case .exit(_, let ms):
+            if resolveOutputFormat() == .json {
+                struct Saved: Encodable { var image: String; var duration_ms: Int }
+                encodeAndPrint(Saved(image: image, duration_ms: ms))
+            } else {
+                print("saved '\(image)' — lumina run --image \(image) \"…\"")
+            }
+        case .error(let message):
+            FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
+            throw ExitCode.failure
+        default:
+            throw LuminaError.protocolError("unexpected reply to save")
         }
     }
 }
@@ -1864,45 +1920,32 @@ struct NetworkRun: AsyncParsableCommand {
         //
         // Ignore the default disposition so the dispatch source receives the
         // signal instead of the process being terminated before cleanup runs.
-        Foundation.signal(SIGINT, SIG_IGN)
-        Foundation.signal(SIGTERM, SIG_IGN)
-
-        let signalQueue = DispatchQueue(label: "com.lumina.network-run.signals")
         let myPid = "\(ProcessInfo.processInfo.processIdentifier)"
-        let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
-            let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
-            src.setEventHandler {
-                // Clean up COW clones this process owns (matching our PID),
-                // then exit with the conventional 128+signal status. Running
-                // on a dispatch queue so Swift calls are safe.
-                //
-                // DiskClone.cleanOrphans() only removes clones whose PID is
-                // DEAD — it won't remove our own because we're still alive.
-                // So we scan runs/ ourselves and remove entries whose .pid
-                // file matches our current PID.
-                let runsDir = DiskClone.defaultRunsDir
-                if let entries = try? FileManager.default.contentsOfDirectory(
-                    at: runsDir, includingPropertiesForKeys: nil
-                ) {
-                    for entry in entries {
-                        let pidFile = entry.appendingPathComponent(".pid")
-                        guard let content = try? String(contentsOf: pidFile, encoding: .utf8) else {
-                            continue
-                        }
-                        if content.trimmingCharacters(in: .whitespacesAndNewlines) == myPid {
-                            try? FileManager.default.removeItem(at: entry)
-                        }
+        onTerminationSignal { sig in
+            // Clean up COW clones this process owns (matching our PID),
+            // then exit with the conventional 128+signal status. Running
+            // on a dispatch queue so Swift calls are safe.
+            //
+            // DiskClone.cleanOrphans() only removes clones whose PID is
+            // DEAD — it won't remove our own because we're still alive.
+            // So we scan runs/ ourselves and remove entries whose .pid
+            // file matches our current PID.
+            let runsDir = DiskClone.defaultRunsDir
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: runsDir, includingPropertiesForKeys: nil
+            ) {
+                for entry in entries {
+                    let pidFile = entry.appendingPathComponent(".pid")
+                    guard let content = try? String(contentsOf: pidFile, encoding: .utf8) else {
+                        continue
+                    }
+                    if content.trimmingCharacters(in: .whitespacesAndNewlines) == myPid {
+                        try? FileManager.default.removeItem(at: entry)
                     }
                 }
-                Darwin.exit(128 + sig)
             }
-            src.resume()
-            return src
+            Darwin.exit(128 + sig)
         }
-        // Retain the sources for the lifetime of dispatchMain().
-        // The event handlers capture them via closure, but keep an explicit
-        // reference so a compiler pass won't strip them.
-        _ = sources
 
         // Also register an atexit for normal (non-signal) exit paths.
         atexit { DiskClone.cleanOrphans() }
@@ -2151,14 +2194,14 @@ struct DaemonCmd: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "daemon",
         abstract: "Manage the warm-pool daemon (lumind)",
-        subcommands: [DaemonServe.self, DaemonStop.self, DaemonStatusCmd.self]
+        subcommands: [DaemonServe.self, DaemonStop.self, DaemonStatusCmd.self, DaemonInstall.self, DaemonUninstall.self]
     )
 }
 
 struct DaemonServe: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "serve",
-        abstract: "Start the warm-pool daemon — pre-boots VMs and serves lumina run --via-daemon"
+        abstract: "Start the warm-pool daemon. While it runs, `lumina run` uses its pre-booted VMs (LUMINA_DAEMON=0 opts out)."
     )
 
     @Option(name: .long, help: "Number of VMs to keep warm")
@@ -2210,5 +2253,72 @@ struct DaemonStatusCmd: AsyncParsableCommand {
         case .unreachable(let reason):
             print("unreachable — \(reason) (socket=\(Daemon.socketPath().path))")
         }
+    }
+}
+
+enum LaunchAgent {
+    static let label = "app.lumina.daemon"
+    static var plist: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    @discardableResult
+    static func launchctl(_ args: String...) -> Int32 {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = args
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
+        return proc.terminationStatus
+    }
+}
+
+struct DaemonInstall: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install",
+        abstract: "Run the warm pool at login via launchd, so every `lumina run` starts warm."
+    )
+
+    @Option(name: .long, help: "Number of VMs to keep warm (~110 MB resident each)")
+    var size: Int = 2
+
+    @Option(name: .long, help: "Image to use for pool VMs")
+    var image: String = "default"
+
+    func run() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let agent: [String: Any] = [
+            "Label": LaunchAgent.label,
+            "ProgramArguments": [exe, "daemon", "serve", "--size", "\(size)", "--image", image],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "StandardErrorPath": home.appendingPathComponent(".lumina/lumind.log").path,
+        ]
+        try FileManager.default.createDirectory(
+            at: LaunchAgent.plist.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try PropertyListSerialization.data(fromPropertyList: agent, format: .xml, options: 0)
+            .write(to: LaunchAgent.plist, options: .atomic)
+        let domain = "gui/\(getuid())"
+        LaunchAgent.launchctl("bootout", "\(domain)/\(LaunchAgent.label)")
+        guard LaunchAgent.launchctl("bootstrap", domain, LaunchAgent.plist.path) == 0 else {
+            FileHandle.standardError.write(Data("error: launchctl bootstrap failed for \(LaunchAgent.plist.path)\n".utf8))
+            throw ExitCode.failure
+        }
+        print("installed: \(size) warm VM(s) of '\(image)' start at login; `lumina daemon uninstall` removes them")
+    }
+}
+
+struct DaemonUninstall: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "uninstall", abstract: "Remove the login warm pool.")
+
+    func run() throws {
+        LaunchAgent.launchctl("bootout", "gui/\(getuid())/\(LaunchAgent.label)")
+        try? FileManager.default.removeItem(at: LaunchAgent.plist)
+        print("uninstalled")
     }
 }

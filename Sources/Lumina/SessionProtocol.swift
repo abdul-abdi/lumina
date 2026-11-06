@@ -21,6 +21,7 @@ public enum SessionRequest: Sendable, Equatable {
     /// v0.6.0: Query the server for live session status (uptime + active execs).
     /// Used by `lumina ps` for observability.
     case status
+    case save(image: String)
 }
 
 // MARK: - Session Response (session server → host)
@@ -75,6 +76,8 @@ public enum SessionProtocol {
             dict = ["type": "window_resize", "cols": cols, "rows": rows]
         case .status:
             dict = ["type": "status"]
+        case .save(let image):
+            dict = ["type": "save", "image": image]
         }
         var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         data.append(contentsOf: [UInt8(ascii: "\n")])
@@ -167,6 +170,11 @@ public enum SessionProtocol {
                 throw LuminaError.protocolError("Malformed pty_input request")
             }
             return .ptyInput(data: data)
+        case "save":
+            guard let image = json["image"] as? String else {
+                throw LuminaError.protocolError("Malformed save request")
+            }
+            return .save(image: image)
         case "window_resize":
             guard let cols = json["cols"] as? Int,
                   let rows = json["rows"] as? Int else {

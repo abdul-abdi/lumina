@@ -445,6 +445,15 @@ public final class SessionServer: @unchecked Sendable {
                 // outside that window.
                 break
 
+            case .save(let image):
+                let start = ContinuousClock.now
+                do {
+                    try await vm.saveDisk(asImage: image, from: imageName)
+                    try? writeResponse(.exit(code: 0, durationMs: (ContinuousClock.now - start).totalMilliseconds), to: handles.write)
+                } catch {
+                    try? writeResponse(.error(message: "save failed: \(error.localizedDescription)"), to: handles.write)
+                }
+
             case .status:
                 let uptime = Date().timeIntervalSince(bootTime)
                 let activeExecs = await vm.activeExecCount

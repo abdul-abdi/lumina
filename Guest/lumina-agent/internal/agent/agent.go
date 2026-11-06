@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/bootmark"
+	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/clock"
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/execmgr"
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/network"
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/portfwd"
@@ -135,6 +136,7 @@ func (a *Agent) handleExec(line []byte) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid exec request: %v\n", err)
 		return
 	}
+	clock.Sync()
 	stdinR, stdinW, err := a.exec.Register(req.ID)
 	if err != nil {
 		_ = a.w.Send(protocol.OutputMsg{
@@ -234,6 +236,7 @@ func (a *Agent) handlePtyExec(line []byte) {
 		_ = a.w.Send(protocol.NewExit(req.ID, 1))
 		return
 	}
+	clock.Sync()
 	go a.pty.Execute(req)
 }
 

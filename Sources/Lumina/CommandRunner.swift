@@ -95,9 +95,7 @@ final class CommandRunner: @unchecked Sendable {
     // with a bogus vsock port.
     private var portForwardContinuations: [Int: CheckedContinuation<Int, any Error>] = [:]
 
-    /// Background task that reads all messages from the vsock and dispatches
-    /// them to registered handlers.
-    private var dispatcherTask: Task<Void, Never>?
+    private var dispatcherGeneration = 0
 
     private static let vsockPort: UInt32 = 1024
     private static let maxRetries = 2000     // 2000 * 10ms = 20s max
@@ -586,9 +584,8 @@ final class CommandRunner: @unchecked Sendable {
     /// Reset all connection state. Sends cancel to guest, closes fd,
     /// finishes all exec handlers and any active transfer.
     private func resetForReconnect() {
-        dispatcherTask?.cancel()
-
         lock.lock()
+        dispatcherGeneration += 1
         let fd = _connection?.fileDescriptor
         _connection = nil
         _inputHandle = nil
@@ -640,8 +637,6 @@ final class CommandRunner: @unchecked Sendable {
         if let fd = fd {
             Darwin.close(fd)
         }
-
-        dispatcherTask = nil
     }
 
     // MARK: - Cancel
@@ -945,20 +940,32 @@ final class CommandRunner: @unchecked Sendable {
     /// messages to the appropriate handler.
     private func startDispatcher(initialBuffer: Data = Data()) {
         guard let input = getInputHandle() else { return }
-        dispatcherTask = Task.detached { [weak self] in
+        let generation = lock.withLock {
+            dispatcherGeneration += 1
+            return dispatcherGeneration
+        }
+        spawnBlockingThread("lumina.vsock-dispatcher") { [weak self] in
             var readBuffer = initialBuffer
-            while !Task.isCancelled {
-                guard let self = self else { return }
-                let msg: GuestMessage
+            while let self {
                 do {
-                    msg = try self.readGuestMessage(from: input, buffer: &readBuffer)
+                    let msg = try self.readGuestMessage(from: input, buffer: &readBuffer)
+                    self.dispatchMessage(msg)
                 } catch {
-                    self.handleDispatcherError(error)
+                    if self.lock.withLock({ self.dispatcherGeneration == generation }) {
+                        self.handleDispatcherError(error)
+                    }
                     return
                 }
-                self.dispatchMessage(msg)
             }
         }
+    }
+
+    func close() {
+        let fd = lock.withLock { () -> Int32? in
+            dispatcherGeneration += 1
+            return _connection?.fileDescriptor
+        }
+        if let fd { Darwin.shutdown(fd, SHUT_RDWR) }
     }
 
     /// Route a guest message to the appropriate handler.
@@ -1285,12 +1292,7 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
-    /// Buffered line reader. The buffer is owned by the caller (the dispatcher task)
-    /// to avoid shared mutable state. Stays synchronous: the dispatcher is a
-    /// single long-lived `Task.detached` per VM, so blocking on its own thread
-    /// does not starve the cooperative pool the way per-connection handlers
-    /// would. (Per-connection callers in SessionServer use an async read for
-    /// exactly that reason; see SessionServer.readMessage.)
+    /// Buffered line reader. The buffer is owned by the dispatcher thread.
     private func readLine(from handle: FileHandle, buffer: inout Data) throws(LuminaError) -> Data {
         if let line = extractLine(from: &buffer) {
             return line
@@ -1330,4 +1332,10 @@ final class CommandRunner: @unchecked Sendable {
         buffer.removeSubrange(buffer.startIndex..<lineEnd)
         return line
     }
+}
+
+public func spawnBlockingThread(_ name: String, _ body: @escaping @Sendable () -> Void) {
+    let thread = Thread(block: body)
+    thread.name = name
+    thread.start()
 }

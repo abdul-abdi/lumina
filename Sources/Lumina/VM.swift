@@ -173,11 +173,6 @@ public actor VM {
     private var _bootPhases = BootPhases()
 
     public var bootPhases: BootPhases { _bootPhases }
-
-    /// Background tasks reading serial console output. Retained so
-    /// `shutdownVM()` can cancel them explicitly rather than relying
-    /// on EOF-from-pipe-close as the termination signal.
-    private var serialReadTasks: [Task<Void, Never>] = []
     private var macLastByte: UInt8?  // Last byte of MAC for IP derivation
 
     /// The actor executor, backed by a serial DispatchQueue.
@@ -339,19 +334,12 @@ public actor VM {
         config.serialPorts = [serialPort]
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
-        // Drain serial output in the background. Retained so teardown can
-        // cancel explicitly; the blocking `availableData` read still
-        // unblocks via pipe-close EOF, but cooperative cancellation is
-        // now expressed in the loop condition rather than implicit.
         let console = self.serialConsole
-        serialReadTasks.append(Task.detached {
-            let handle = guestToHostRead
-            while !Task.isCancelled {
-                let data = handle.availableData
-                if data.isEmpty { break }
+        spawnBlockingThread("lumina.serial") {
+            while case let data = guestToHostRead.availableData, !data.isEmpty {
                 console.append(data)
             }
-        })
+        }
 
         // Network (pluggable via NetworkProvider protocol)
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
@@ -651,17 +639,12 @@ public actor VM {
                 pipeHandles.append(h)
             }
 
-            serialReadTasks.append(Task.detached {
-                let handle = guestToHostRead
-                while !Task.isCancelled {
-                    let data = handle.availableData
-                    if data.isEmpty { break }
+            spawnBlockingThread("lumina.serial") {
+                while case let data = guestToHostRead.availableData, !data.isEmpty {
                     console.append(data)
-                    if let h = persistHandle {
-                        _ = try? h.write(contentsOf: data)
-                    }
+                    _ = try? persistHandle?.write(contentsOf: data)
                 }
-            })
+            }
 
             // Network — same pluggable provider as the agent path, plus the
             // same MAC-pinning behavior so desktop .luminaVM bundles present a
@@ -1402,6 +1385,19 @@ public actor VM {
         }
     }
 
+    public func saveDisk(asImage name: String, from base: String) async throws {
+        guard let clone else { throw LuminaError.sessionFailed("VM has no disk clone") }
+        let sync = try await exec("sync", timeout: 60)
+        guard sync.exitCode == 0 else { throw LuminaError.sessionFailed("guest sync failed: \(sync.stderr)") }
+        let fd = open(clone.rootfs.path, O_RDONLY)
+        guard fd >= 0, fcntl(fd, F_FULLFSYNC) == 0 else {
+            if fd >= 0 { Darwin.close(fd) }
+            throw LuminaError.sessionFailed("flushing \(clone.rootfs.lastPathComponent) failed: \(String(cString: strerror(errno)))")
+        }
+        Darwin.close(fd)
+        try imageStore.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: "lumina session save")
+    }
+
     /// Detach the disk clone from this VM (caller takes ownership).
     public func detachClone() -> DiskClone? {
         let c = clone
@@ -1496,6 +1492,7 @@ public actor VM {
     // MARK: - Private
 
     private func shutdownVM() async {
+        commandRunner?.close()
         if let vm = virtualMachine {
             let queue = executor.queue
             let vmBox = UncheckedSendable(vm)
@@ -1509,12 +1506,7 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
-        // Cancel serial drain tasks before closing handles so the cooperative
-        // cancellation signal arrives first; the handle close then delivers
-        // the EOF that unblocks any in-flight `availableData` read.
-        for task in serialReadTasks { task.cancel() }
-        serialReadTasks = []
-        for handle in pipeHandles {
+        for handle in pipeHandles.reversed() {
             try? handle.close()
         }
         pipeHandles = []

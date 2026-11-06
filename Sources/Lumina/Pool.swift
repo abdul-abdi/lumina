@@ -55,7 +55,7 @@ public actor Pool {
 
     public init(size: Int = 4, image: String) {
         self.size = size
-        self.options = VMOptions(image: image)
+        self.options = VMOptions(image: image, rosetta: ImageStore().readMeta(name: image)?.rosetta ?? false)
     }
 
     // MARK: - Boot

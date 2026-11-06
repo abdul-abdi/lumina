@@ -62,7 +62,10 @@ public enum Daemon {
 
     /// `~/.lumina/lumind.sock`
     public static func socketPath() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let path = ProcessInfo.processInfo.environment["LUMINA_DAEMON_SOCKET"] {
+            return URL(fileURLWithPath: path)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".lumina")
             .appendingPathComponent("lumind.sock")
     }
@@ -73,6 +76,8 @@ public enum Daemon {
     /// Never throws on connection failure — callers fall back to cold boot on `nil`.
     public static func tryRun(
         image: String = "default",
+        memory: UInt64 = VMOptions.default.memory,
+        cpuCount: Int = VMOptions.default.cpuCount,
         command: String,
         timeout: Int = 60,
         env: [String: String] = [:],
@@ -92,6 +97,9 @@ public enum Daemon {
         // the daemon reads/writes them directly since it's on the same host.
         var req: [String: Any] = [
             "op": "run",
+            "image": image,
+            "memory": memory,
+            "cpus": cpuCount,
             "cmd": command,
             "timeout": timeout,
             "env": env,
@@ -128,13 +136,22 @@ public enum Daemon {
                 "daemon closed the connection after the request was sent; the command may have run — not retrying"
             )
         }
-        let dec = JSONDecoder()
+        if let declined = try? JSONDecoder().decode([String: String].self, from: respLine), declined["declined"] != nil {
+            return nil
+        }
+        let envelope: RunResultEnvelope
         do {
-            return try dec.decode(RunResultEnvelope.self, from: respLine).toRunResult()
+            envelope = try JSONDecoder().decode(RunResultEnvelope.self, from: respLine)
         } catch {
             throw LuminaError.protocolError(
                 "daemon sent an undecodable response after the request was sent; the command may have run — not retrying"
             )
+        }
+        switch envelope.error {
+        case nil: return envelope.toRunResult()
+        case "timeout": throw LuminaError.timeout
+        case let e? where e.hasPrefix("guestCrashed"): throw LuminaError.guestCrashed(serialOutput: "")
+        case let e?: throw LuminaError.sessionFailed("daemon: \(e)")
         }
     }
 
@@ -228,22 +245,12 @@ public enum Daemon {
             ))
         }
 
-        // Install SIGINT/SIGTERM via DispatchSource (NOT C signal() — see learning)
-        Foundation.signal(SIGINT, SIG_IGN)
-        Foundation.signal(SIGTERM, SIG_IGN)
         let sockPathCopy = sockURL.path
-        let signalQueue = DispatchQueue(label: "com.lumina.daemon.signals")
-        let sigSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
-            let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
-            src.setEventHandler {
-                FileHandle.standardError.write(Data("\nlumina daemon: shutting down\n".utf8))
-                try? FileManager.default.removeItem(atPath: sockPathCopy)
-                Darwin.exit(0)
-            }
-            src.resume()
-            return src
+        onTerminationSignal { _ in
+            FileHandle.standardError.write(Data("\nlumina daemon: shutting down\n".utf8))
+            try? FileManager.default.removeItem(atPath: sockPathCopy)
+            Darwin.exit(0)
         }
-        _ = sigSources // retain
 
         // Boot pool
         let pool = Pool(size: size, image: image)
@@ -299,9 +306,11 @@ public enum Daemon {
             setReceiveTimeout(fd: clientFd, seconds: Self.clientReceiveTimeoutSeconds)
             disableSigpipe(fd: clientFd)
 
-            await handleDaemonClient(
-                fd: clientFd, pool: pool, image: image, socketPath: sockURL
-            )
+            Task {
+                await handleDaemonClient(
+                    fd: clientFd, pool: pool, image: image, socketPath: sockURL
+                )
+            }
         }
     }
 }
@@ -344,6 +353,15 @@ private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath
 }
 
 private func runOnDaemon(json: [String: Any], fd: Int32, pool: Pool) async {
+    let wanted = (
+        json["image"] as? String ?? pool.options.image,
+        (json["memory"] as? NSNumber)?.uint64Value ?? pool.options.memory,
+        json["cpus"] as? Int ?? pool.options.cpuCount
+    )
+    guard wanted == (pool.options.image, pool.options.memory, pool.options.cpuCount) else {
+        writeAll(fd: fd, data: Data(#"{"declined":"pool shape differs"}"#.utf8 + [0x0a]))
+        return
+    }
     let cmd = (json["cmd"] as? String) ?? ""
     let env = (json["env"] as? [String: String]) ?? [:]
     let cwd = json["cwd"] as? String
@@ -618,4 +636,18 @@ func unixConnect(path: String) -> Int32? {
     }
     if rc != 0 { Darwin.close(fd); return nil }
     return fd
+}
+
+private let terminationQueue = DispatchQueue(label: "com.lumina.signals")
+nonisolated(unsafe) private var terminationSources: [DispatchSourceSignal] = []
+
+public func onTerminationSignal(_ handler: @escaping @Sendable (Int32) -> Void) {
+    let sources = [SIGINT, SIGTERM].map { sig in
+        Foundation.signal(sig, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: terminationQueue)
+        src.setEventHandler { handler(sig) }
+        src.resume()
+        return src
+    }
+    terminationQueue.sync { terminationSources += sources }
 }
