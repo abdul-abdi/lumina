@@ -318,12 +318,6 @@ against — Apple IPSWs are signed and verified by `VZMacOSRestoreImage`.
 - The ISO must be Microsoft's "Windows 11 (multi-edition) ARM64" retail
   ISO. Microsoft requires a Microsoft Account to download; Lumina cannot
   redistribute. Drop the downloaded ISO on `desktop create --iso`.
-- A few keys hit a translation gap between macOS HID and Windows 11 ARM's
-  inbox keyboard driver — most visibly the backslash and the F-key row.
-  v0.7.0 ships the remap table at `Sources/LuminaBootable/WindowsSupport.swift`
-  (`WindowsInputQuirks`); the Desktop app applies it at the input
-  layer when the focused VM is `osFamily == .windows`. Headless `lumina
-  desktop boot` users won't notice — there's no keyboard input over serial.
 - **v0.7.1**: the installer ISO attaches via `VZUSBMassStorageDeviceConfiguration`
   (not virtio-block) for `osFamily == .windows`. Windows setup was
   refusing to detect virtio-block-as-CD-ROM ("Windows cannot find media");

@@ -216,6 +216,10 @@ lumina desktop create --name "Ubuntu Dev" --os-variant ubuntu-24.04 \
 lumina desktop boot ~/.lumina/desktop-vms/<uuid>           # windowed, default
 lumina desktop boot ~/.lumina/desktop-vms/<uuid> --headless --serial out.log
 
+# Unattended installs: --seed DIR is packed into a `cidata` ISO on first boot
+# (cloud-init NoCloud). scripts/omarchy-vm.sh uses it to install Omarchy.
+scripts/omarchy-vm.sh omarchy        # then boot "omarchy" in Lumina.app
+
 # macOS guests — restore from IPSW (needs ~15GB)
 lumina desktop install-macos ~/.lumina/desktop-vms/<uuid> --ipsw ./UniversalMac.ipsw
 
@@ -371,7 +375,7 @@ let vm = VM(options: opts)
 try await vm.boot()
 ```
 
-Deeper patterns — `MacOSVM` actor, `IPSWCatalog`, snapshots, `withNetwork`, custom image builds — on the [Swift Library wiki page](https://github.com/abdul-abdi/lumina/wiki/Swift-Library).
+Deeper patterns — `MacOSVM` actor, snapshots, `withNetwork`, custom image builds — on the [Swift Library wiki page](https://github.com/abdul-abdi/lumina/wiki/Swift-Library).
 
 ---
 
@@ -387,14 +391,13 @@ bash scripts/build-app.sh --install   # build + install + launch Lumina.app
 swift scripts/generate-icon.swift  # regenerate AppIcon.icns
 ```
 
-Guest agent + custom kernel + baked image + xcodegen app project instructions on the [Building from Source wiki page](https://github.com/abdul-abdi/lumina/wiki/Building-from-Source).
+`Guest/fetch-kernel.sh` pins the guest kernel (Kata Containers' arm64 build). Guest agent + baked image + xcodegen app project instructions on the [Building from Source wiki page](https://github.com/abdul-abdi/lumina/wiki/Building-from-Source).
 
 ## Project Structure
 
 ```
 Sources/
 ├── Lumina/                 — headless agent runtime (zero external deps)
-├── LuminaGraphics/         — virtio-GPU + input device helpers
 ├── LuminaBootable/         — EFI + IPSW boot pipelines, DesktopOSCatalog
 ├── LuminaDesktopKit/       — SwiftUI primitives: AppModel, LibraryView, VMCard, ⌘K launcher, OSBrand
 ├── LuminaDesktopApp/       — @main entry for Lumina.app (SPM-buildable)
