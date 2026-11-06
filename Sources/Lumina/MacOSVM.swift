@@ -49,9 +49,7 @@ public actor MacOSVM {
         cpuCount: Int = 4,
         graphics: GraphicsConfig? = GraphicsConfig(
             widthInPixels: 2560,
-            heightInPixels: 1440,
-            keyboardKind: .mac,
-            pointingDeviceKind: .trackpad
+            heightInPixels: 1440
         ),
         sound: SoundConfig? = SoundConfig(enabled: true),
         macAddress: String? = nil
@@ -330,20 +328,13 @@ private func attachMacGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    var displays: [VZMacGraphicsDisplayConfiguration] = [
+    let displays: [VZMacGraphicsDisplayConfiguration] = [
         VZMacGraphicsDisplayConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels,
             pixelsPerInch: 220
         )
     ]
-    for extra in graphics.additionalDisplays {
-        displays.append(VZMacGraphicsDisplayConfiguration(
-            widthInPixels: extra.widthInPixels,
-            heightInPixels: extra.heightInPixels,
-            pixelsPerInch: 220
-        ))
-    }
     let gpu = VZMacGraphicsDeviceConfiguration()
     gpu.displays = displays
     config.graphicsDevices = [gpu]

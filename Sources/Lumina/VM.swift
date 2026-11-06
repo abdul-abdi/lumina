@@ -1723,59 +1723,14 @@ private func attachGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    // Virtio-GPU scanouts: primary display plus any `additionalDisplays`.
-    // The SwiftUI running-VM window still renders display 0 only; extra
-    // scanouts are live on the VZ side (Linux guests see multiple
-    // framebuffers via `/sys/class/drm/`) for callers driving the VM from
-    // their own view layer. Multi-display UI in the Desktop app is
-    // follow-up work.
     let gfx = VZVirtioGraphicsDeviceConfiguration()
-    var scanouts: [VZVirtioGraphicsScanoutConfiguration] = [
+    gfx.scanouts = [
         VZVirtioGraphicsScanoutConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels
         )
     ]
-    for extra in graphics.additionalDisplays {
-        scanouts.append(VZVirtioGraphicsScanoutConfiguration(
-            widthInPixels: extra.widthInPixels,
-            heightInPixels: extra.heightInPixels
-        ))
-    }
-    gfx.scanouts = scanouts
     config.graphicsDevices = [gfx]
-
-    // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic
-    // VM it falls back to USB so the caller doesn't get a validation error.
-    switch graphics.keyboardKind {
-    case .usb:
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-    case .mac:
-        #if swift(>=6)
-        if #available(macOS 14.0, *) {
-            config.keyboards = [VZMacKeyboardConfiguration()]
-        } else {
-            config.keyboards = [VZUSBKeyboardConfiguration()]
-        }
-        #else
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        #endif
-    }
-
-    // Pointing device. Trackpad requires a macOS guest for full fidelity;
-    // on Linux/Windows it doesn't validate, so fall back to USB mouse.
-    switch graphics.pointingDeviceKind {
-    case .usbScreenCoordinate:
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-    case .trackpad:
-        #if swift(>=6)
-        if #available(macOS 14.0, *) {
-            config.pointingDevices = [VZMacTrackpadConfiguration()]
-        } else {
-            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        }
-        #else
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        #endif
-    }
+    config.keyboards = [VZUSBKeyboardConfiguration()]
+    config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 }
