@@ -48,10 +48,6 @@ public final class SessionServer: @unchecked Sendable {
         }
     }
 
-    private func currentPtyId() -> String? {
-        ptyLock.withLock { activePtyId }
-    }
-
     /// Wall-clock instant of the most recent client activity. Used by the
     /// idle-TTL watchdog. Guarded by `lock`. Seeded to `bootTime` so the
     /// TTL is measured from the server coming up, not from a distant past.

@@ -167,8 +167,7 @@ public enum PointingDeviceKind: Sendable {
 /// untouched.
 ///
 /// For agent workloads, leave `VMOptions.graphics` as `nil`. For desktop
-/// workloads, pass a `GraphicsConfig`. See `LuminaGraphics` for convenience
-/// factories (`.defaultDesktop`, `.retina`, etc.).
+/// workloads, pass a `GraphicsConfig`.
 public struct GraphicsConfig: Sendable {
     public var widthInPixels: Int
     public var heightInPixels: Int

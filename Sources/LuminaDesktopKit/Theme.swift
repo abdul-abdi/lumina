@@ -115,15 +115,10 @@ public enum LuminaTheme {
     public static let err     = dynamic(dark: "#E87272", light: "#B02A2A")
 
     // ── Type ───────────────────────────────────────────────────────
-    /// SF Mono — closest system substitute for JetBrains Mono.
-    public static let mono = Font.system(.body, design: .monospaced)
     public static let monoSmall = Font.system(size: 11, design: .monospaced)
 
-    /// Hero display — mono, heavy weight, tight tracking.
-    public static let hero = Font.system(size: 56, weight: .medium, design: .monospaced)
     public static let title = Font.system(size: 24, weight: .medium, design: .monospaced)
     public static let headline = Font.system(size: 14, weight: .medium, design: .monospaced)
-    public static let body = Font.system(size: 13, weight: .regular, design: .monospaced)
     public static let caption = Font.system(size: 11, weight: .regular, design: .monospaced)
     public static let label = Font.system(size: 10, weight: .medium, design: .monospaced)
 }

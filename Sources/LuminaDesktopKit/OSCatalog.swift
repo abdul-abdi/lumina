@@ -3,7 +3,7 @@
 // v0.7.0 M6 — unified catalog of OS tiles for the New VM wizard.
 // Wraps `LuminaBootable.DesktopOSCatalog` (Linux distros) and adds
 // Windows 11 ARM (BYO ISO only — Microsoft can't be redistributed) and
-// macOS (downloaded from `MesuIPSWCatalogScraper`).
+// macOS.
 
 import Foundation
 import LuminaBootable

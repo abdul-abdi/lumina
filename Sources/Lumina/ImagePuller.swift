@@ -24,10 +24,6 @@ public struct ImagePuller: Sendable {
     public static let fallbackTag = "lumina-v0.7.4"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
 
-    /// Back-compat alias — older code reads `ImagePuller.defaultTag`.
-    /// Reports the fallback, not the resolved tag.
-    public static var defaultTag: String { fallbackTag }
-
     private let repo: String
     /// nil means "resolve at pull time" (env → API latest → fallback).
     /// Non-nil means the caller pinned a specific tag explicitly.

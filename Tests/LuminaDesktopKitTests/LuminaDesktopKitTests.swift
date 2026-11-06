@@ -3,10 +3,6 @@
 import Testing
 @testable import LuminaDesktopKit
 
-@Test func moduleVersionIsV070() {
-    #expect(LuminaDesktopKit.version.hasPrefix("0.7"))
-}
-
 @MainActor
 @Test func virtualMachineViewIsConstructible() {
     // Can instantiate without a live VM — the M3 boot-and-render test

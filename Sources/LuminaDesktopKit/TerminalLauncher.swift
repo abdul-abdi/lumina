@@ -64,15 +64,6 @@ public enum TerminalKind: String, CaseIterable, Sendable, Equatable {
         }
     }
 
-    /// Human-readable hint stored in the preference UI picker.
-    public var hint: String {
-        switch self {
-        case .terminal: return "macOS default — always available"
-        case .iterm2:   return "auto-executes via AppleScript"
-        case .ghostty:  return "copies to pasteboard, paste with ⌘V"
-        case .warp:     return "copies to pasteboard, paste with ⌘V"
-        }
-    }
 }
 
 /// Pluggable surface so tests can swap the AppKit / Process calls.

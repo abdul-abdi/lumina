@@ -54,7 +54,7 @@ targets:
         PRODUCT_MODULE_NAME: LuminaDesktopApp
         SWIFT_MODULE_NAME: LuminaDesktopApp
     sources:
-      - path: LuminaDesktop
+      - path: ../../Sources/LuminaDesktopApp
     info:
       path: LuminaDesktop/Info.plist
       properties:
@@ -100,8 +100,6 @@ targets:
     dependencies:
       - package: Lumina
         product: Lumina
-      - package: Lumina
-        product: LuminaGraphics
       - package: Lumina
         product: LuminaBootable
       - package: Lumina
