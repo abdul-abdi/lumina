@@ -41,20 +41,6 @@ public struct AutounattendSeed: Sendable {
         self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname)
     }
 
-    public enum Error: Swift.Error, CustomStringConvertible {
-        case hdiutilNotAvailable
-        case hdiutilFailed(Int32, String)
-        case writeFailed(URL, String)
-
-        public var description: String {
-            switch self {
-            case .hdiutilNotAvailable: return "hdiutil missing"
-            case .hdiutilFailed(let c, let s): return "hdiutil exit \(c): \(s)"
-            case .writeFailed(let u, let s): return "write \(u.lastPathComponent): \(s)"
-            }
-        }
-    }
-
     /// Standard autounattend covering:
     ///   1. WindowsPE pass — registry bypass for TPM, SecureBoot, RAM, CPU,
     ///      storage. These are the five compatibility checks the Win11
@@ -242,59 +228,12 @@ public struct AutounattendSeed: Sendable {
 
     /// Generate `<bundle>/autounattend.iso`. Returns the URL.
     public func generate() throws -> URL {
-        let hdiutilPath = "/usr/bin/hdiutil"
-        guard FileManager.default.isExecutableFile(atPath: hdiutilPath) else {
-            throw Error.hdiutilNotAvailable
-        }
-
-        let outURL = bundleRootURL.appendingPathComponent("autounattend.iso")
-        // hdiutil makehybrid refuses to overwrite — pre-delete so a
-        // bundle with a stale ISO from a prior boot regenerates cleanly.
-        // Without this, the orchestrator's autounattendFailed path
-        // fires on every subsequent boot and Win11 Setup hits the
-        // compat check on a black framebuffer.
-        try? FileManager.default.removeItem(at: outURL)
-        let staging = bundleRootURL.appendingPathComponent("autounattend-staging-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: staging) }
-
-        do {
-            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-            // Windows Setup looks at the root for `autounattend.xml`. The
-            // Setup binary also accepts `unattend.xml` later in the install,
-            // so we drop both — same content. Belt + suspenders.
-            try Data(xml.utf8).write(to: staging.appendingPathComponent("autounattend.xml"))
-            try Data(xml.utf8).write(to: staging.appendingPathComponent("unattend.xml"))
-        } catch {
-            throw Error.writeFailed(staging, "\(error)")
-        }
-
-        // Volume label "AUTOUNATTEND" — Windows finds the file by its
-        // filename + drive root, label is just for human readability.
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: hdiutilPath)
-        proc.arguments = [
-            "makehybrid",
-            "-iso", "-joliet",
-            "-default-volume-name", "AUTOUNATTEND",
-            "-o", outURL.path,
-            staging.path,
-        ]
-        proc.standardOutput = FileHandle.nullDevice
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            throw Error.hdiutilFailed(-1, "\(error)")
-        }
-        if proc.terminationStatus != 0 {
-            let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw Error.hdiutilFailed(proc.terminationStatus, stderr)
-        }
-
-        return outURL
+        let data = Data(xml.utf8)
+        return try SeedISO.make(
+            files: ["autounattend.xml": data, "unattend.xml": data],
+            volumeName: "AUTOUNATTEND",
+            at: bundleRootURL.appendingPathComponent("autounattend.iso")
+        )
     }
 
     private static func xmlEscape(_ s: String) -> String {

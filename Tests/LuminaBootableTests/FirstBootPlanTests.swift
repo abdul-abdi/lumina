@@ -71,7 +71,7 @@ import Testing
         #expect(plan.linuxDirectKernel == nil)
         #expect(plan.linuxDirectInitramfs == nil)
         #expect(plan.linuxDirectCmdline == nil)
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         #expect(plan.events.isEmpty)
     }
 
@@ -122,7 +122,7 @@ import Testing
         #expect(cmdline.contains("auto=true"))
         #expect(cmdline.contains("preseed/file=/preseed.cfg"))
 
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         #expect(plan.events.contains(.linuxDirectMatched(layoutName: "Debian arm64 netinst")))
         #expect(plan.events.contains(.preseedInjected(initrd: patchedInitrd)))
     }
@@ -233,7 +233,7 @@ import Testing
             dependencies: deps
         )
         #expect(plan.linuxDirectKernel == nil)
-        #expect(plan.extraDisks == [unattendISO])
+        #expect(plan.seedISOs == [unattendISO])
         #expect(plan.events.contains(.autounattendGenerated(iso: unattendISO)))
     }
 
@@ -246,7 +246,7 @@ import Testing
             extract: Self.unreachableDeps.extract,
             injectPreseed: Self.unreachableDeps.injectPreseed,
             generateAutounattend: { _ in
-                throw AutounattendSeed.Error.hdiutilNotAvailable
+                throw SeedISO.Error(description: "hdiutil missing")
             }
         )
         let plan = try prepareFirstBoot(
@@ -256,7 +256,7 @@ import Testing
             isFirstBoot: true,
             dependencies: deps
         )
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         if case .autounattendFailed = plan.events.first {
             // expected
         } else {
@@ -479,6 +479,40 @@ import Testing
             osVariant: "windows-11-arm",
             isFirstBoot: false
         )
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: false,
+            dependencies: Self.unreachableDeps
+        )
+        #expect(plan == FirstBootPlan.empty)
+    }
+
+    private func writeSeed(into bundle: VMBundle) throws {
+        try FileManager.default.createDirectory(at: bundle.seedDirectory, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: bundle.seedDirectory.appendingPathComponent("user_configuration.json"))
+    }
+
+    @Test func firstBoot_withSeedDirectory_attachesCidata() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "omarchy")
+        try writeSeed(into: bundle)
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: Self.unreachableDeps
+        )
+        let iso = bundle.rootURL.appendingPathComponent("cidata.iso")
+        #expect(plan.seedISOs == [iso])
+        #expect(plan.events == [.seedAttached(iso: iso)])
+        #expect(FileManager.default.fileExists(atPath: iso.path))
+    }
+
+    @Test func laterBoots_leaveSeedDetached() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "omarchy", isFirstBoot: false)
+        try writeSeed(into: bundle)
         let plan = try prepareFirstBoot(
             bundle: bundle,
             attachedISO: nil,

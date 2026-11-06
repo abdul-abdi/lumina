@@ -70,16 +70,6 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        public var label: String {
-            switch self {
-            case .stopped: "Stopped"
-            case .booting: "Booting…"
-            case .running: "Running"
-            case .paused: "Paused"
-            case .crashed(let r): "Crashed: \(r)"
-            case .shuttingDown: "Shutting down…"
-            }
-        }
     }
 
     public var status: Status = .stopped
@@ -202,11 +192,10 @@ public final class LuminaDesktopSession: Identifiable {
         // single-probe-timeout issue unfixable on the host side — the
         // workaround is "Retry network autoconfiguration" in the
         // installer's failure screen.)
-        let stableMAC = mutableBundle.ensureMACAddress()
+        mutableBundle.ensureMACAddress()
 
-        let isWindows = mutableBundle.manifest.osFamily == .windows
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
-        let cdromURL = pendingCDROM()
+        let cdromURL = mutableBundle.pendingISO
 
         // First-boot orchestration — preseed injection (Debian/Kali) and
         // Windows 11 autounattend sidecar. Same call the CLI makes from
@@ -241,42 +230,8 @@ public final class LuminaDesktopSession: Identifiable {
         // Best-effort; failures are non-fatal.
         appendFirstBootLog(events: firstBootPlan.events, to: mutableBundle.logsDirectory)
 
-        var opts = VMOptions.default
-        opts.memory = mutableBundle.manifest.memoryBytes
-        opts.cpuCount = mutableBundle.manifest.cpuCount
-        opts.macAddress = stableMAC
-        // Resolve the network provider from the manifest. Nil / .nat keep
-        // the historical VZNAT path; .bridged swaps in a bridge to the
-        // host LAN so the guest's DHCP goes to the user's real router
-        // instead of vmnet's embedded bootpd — the only reliable fix
-        // for vmnet degradation and the Debian-netcfg first-probe race
-        // (user edits `manifest.json` `networkMode.mode = "bridged"` or
-        // passes `--network=bridged` on `lumina desktop create`).
-        opts.networkProvider = Self.networkProvider(for: mutableBundle.manifest.networkMode)
-        // Persist serial output to bundle/logs/serial.log for post-mortem
-        // diagnosis. When a Debian/Kali installer reaches "Network
-        // autoconfiguration failed" or Windows setup prints a cryptic
-        // error, this file is the ground truth for what the guest
-        // actually saw. Appended on every boot with a dated delimiter.
-        opts.serialLogURL = mutableBundle.logsDirectory
-            .appendingPathComponent("serial.log")
-        opts.bootable = .efi(EFIBootConfig(
-            variableStoreURL: mutableBundle.efiVarsURL,
-            primaryDisk: mutableBundle.primaryDiskURL,
-            cdromISO: cdromURL,
-            extraDisks: firstBootPlan.extraDisks,
-            preferUSBCDROM: isWindows,
-            installPhase: isInstallPhase,
-            linuxDirectKernel: firstBootPlan.linuxDirectKernel,
-            linuxDirectInitramfs: firstBootPlan.linuxDirectInitramfs,
-            linuxDirectCmdline: firstBootPlan.linuxDirectCmdline
-        ))
-        opts.graphics = GraphicsConfig(
-            widthInPixels: 1920,
-            heightInPixels: 1080,
-            keyboardKind: .usb,
-            pointingDeviceKind: .usbScreenCoordinate
-        )
+        var opts = mutableBundle.vmOptions(cdrom: cdromURL, plan: firstBootPlan)
+        opts.graphics = GraphicsConfig()
         opts.sound = SoundConfig(enabled: true)
 
         // Migrate existing bundles to the Spotlight opt-out applied at
@@ -339,12 +294,7 @@ public final class LuminaDesktopSession: Identifiable {
                 serialDigest: serialDigest,
                 bootPhases: phases
             ))
-            // Persist lastBootedAt. On the very first successful boot we
-            // also detach the installer ISO sidecar — the install has
-            // completed and EFI now prefers the HDD, so keeping the CD-ROM
-            // mounted just clutters every card with "installer attached"
-            // forever. Both writes are non-fatal.
-            persistBootRecord()
+            try? mutableBundle.recordBoot()
         } catch {
             bootPhasesMirrorTask?.cancel()
             bootPhasesMirrorTask = nil
@@ -433,42 +383,10 @@ public final class LuminaDesktopSession: Identifiable {
             return "windows: autounattend sidecar at \(iso.lastPathComponent)"
         case .autounattendFailed(let reason):
             return "windows: autounattend failed (\(reason)); compat check will fire"
-        }
-    }
-
-    private func persistBootRecord() {
-        let isFirstBoot = bundle.manifest.lastBootedAt == nil
-        if isFirstBoot {
-            let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
-            try? FileManager.default.removeItem(at: sidecar)
-        }
-        var updated = bundle
-        updated.manifest.lastBootedAt = Date()
-        try? updated.save()
-    }
-
-    /// Map a persisted `NetworkMode` to the corresponding `NetworkProvider`.
-    ///
-    /// Nil → `.nat` for backward compatibility with pre-v0.7.1 bundles
-    /// and for every ad-hoc-signed install: the default distribution
-    /// does not carry the `com.apple.vm.networking` entitlement because
-    /// macOS 14+ refuses to launch ad-hoc binaries that declare it.
-    ///
-    /// `.bridged` uses `VZBridgedNetworkDeviceAttachment`. Requires a
-    /// signed build with the `com.apple.vm.networking` entitlement —
-    /// add an Apple ID in Xcode > Settings > Accounts, open the
-    /// xcodeproj, flip the target to Automatic signing with your
-    /// Personal Team, add `com.apple.vm.networking` under Signing &
-    /// Capabilities, Run. If the binary is missing the entitlement, VZ
-    /// rejects the config at `validate()` and `VM.boot()` surfaces a
-    /// `LuminaError.bootFailed` — no silent downgrade; the user flips
-    /// `manifest.json.networkMode` back to `nat` or rebuilds signed.
-    private static func networkProvider(for mode: NetworkMode?) -> any NetworkProvider {
-        switch mode ?? .nat {
-        case .nat:
-            return NATNetworkProvider()
-        case .bridged(let iface):
-            return BridgedNetworkProvider(interfaceIdentifier: iface)
+        case .seedAttached(let iso):
+            return "seed: attached \(iso.lastPathComponent)"
+        case .seedFailed(let reason):
+            return "seed: failed (\(reason))"
         }
     }
 
@@ -601,32 +519,6 @@ public final class LuminaDesktopSession: Identifiable {
         status = .stopped
     }
 
-    /// Returns the underlying `VZVirtualMachine` for `LuminaVirtualMachineView`
-    /// to render. Nil when no VM is booted.
-    public func virtualMachine() async -> VZVirtualMachine? {
-        guard let vm = self.vm else { return nil }
-        let handle = await vm.vzMachine()
-        return handle.machine
-    }
-
-    /// Read the current pending-iso sidecar (set by `lumina desktop create
-    /// --iso`). Stale sidecars pointing at deleted/moved/temp files are
-    /// silently cleared — VZ would fail with POSIX 45 (Operation not
-    /// supported) on a missing volume, and forcing the user to diagnose
-    /// that is hostile when the fix is "just boot without the CD-ROM."
-    private func pendingCDROM() -> URL? {
-        let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
-        guard let data = try? Data(contentsOf: sidecar),
-              let path = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = URL(fileURLWithPath: trimmed)
-        if FileManager.default.fileExists(atPath: url.path) {
-            return url
-        }
-        // Stale sidecar — remove it so subsequent boots don't hit this path.
-        try? FileManager.default.removeItem(at: sidecar)
-        return nil
-    }
 }
 
 /// NSObject-backed forwarder for `VZVirtualMachineDelegate`. VZ calls the

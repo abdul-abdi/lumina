@@ -143,6 +143,7 @@ public struct VMBundle: Sendable, Equatable {
     public var auxiliaryStorageURL: URL { rootURL.appendingPathComponent("aux.img") }
     public var snapshotsDirectory: URL { rootURL.appendingPathComponent("snapshots") }
     public var logsDirectory: URL { rootURL.appendingPathComponent("logs") }
+    public var seedDirectory: URL { rootURL.appendingPathComponent("cidata") }
 
     public enum Error: Swift.Error, Equatable {
         case alreadyExists(URL)
@@ -262,6 +263,16 @@ public struct VMBundle: Sendable, Equatable {
 
     public func save() throws {
         try Self.writeManifest(manifest, into: rootURL)
+    }
+
+    public mutating func recordBoot(at date: Date = Date()) throws {
+        if manifest.lastBootedAt == nil {
+            for leftover in ["pending-iso.path", "cidata", "cidata.iso"] {
+                try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(leftover))
+            }
+        }
+        manifest.lastBootedAt = date
+        try save()
     }
 
     private static func writeManifest(_ manifest: VMBundleManifest, into rootURL: URL) throws {

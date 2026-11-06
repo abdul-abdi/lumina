@@ -7,6 +7,7 @@ import ArgumentParser
 import Foundation
 import Lumina
 import LuminaBootable
+import Virtualization
 
 struct Desktop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -39,6 +40,77 @@ enum DesktopHelpers {
     /// Parse a disk-size string like "32GB" into bytes.
     static func parseDiskOrExit(_ raw: String) -> UInt64 {
         parseMemoryOrExit(raw)  // same grammar
+    }
+
+    static func createBundle(
+        at root: URL,
+        name: String,
+        osFamily: OSFamily,
+        osVariant: String,
+        memory: String,
+        cpus: Int,
+        diskSize: String,
+        network: String,
+        bridgeInterface: String?,
+        id: UUID = UUID()
+    ) throws -> VMBundle {
+        let networkMode: NetworkMode?
+        switch network.lowercased() {
+        case "nat": networkMode = nil
+        case "bridged": networkMode = .bridged(interface: bridgeInterface)
+        default:
+            FileHandle.standardError.write(Data("error: --network must be 'nat' or 'bridged' (got '\(network)')\n".utf8))
+            throw ExitCode(2)
+        }
+        do {
+            let bundle = try VMBundle.create(
+                at: root, name: name, osFamily: osFamily, osVariant: osVariant,
+                memoryBytes: parseMemoryOrExit(memory), cpuCount: cpus,
+                diskBytes: parseDiskOrExit(diskSize), networkMode: networkMode, id: id
+            )
+            try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: bundle.manifest.diskBytes)
+            return bundle
+        } catch VMBundle.Error.alreadyExists(let u) {
+            FileHandle.standardError.write(Data("error: \(u.path) already exists\n".utf8))
+            throw ExitCode(2)
+        } catch {
+            FileHandle.standardError.write(Data("error: failed to create bundle at \(root.path): \(error)\n".utf8))
+            throw ExitCode(1)
+        }
+    }
+
+    static func checkArchitecture(_ iso: URL, displayPath: String) throws {
+        guard FileManager.default.fileExists(atPath: iso.path) else {
+            FileHandle.standardError.write(Data("error: ISO not found: \(displayPath)\n".utf8))
+            throw ExitCode(2)
+        }
+        let arch: ISOInspector.Architecture
+        do {
+            arch = try ISOInspector.detectArchitecture(at: iso)
+        } catch {
+            FileHandle.standardError.write(Data("warning: ISO inspection failed (\(error)); proceeding.\n".utf8))
+            return
+        }
+        switch arch {
+        case .arm64:
+            return
+        case .unknown:
+            FileHandle.standardError.write(Data(
+                "warning: could not detect ISO architecture for \(displayPath); proceeding (pass --force to silence).\n".utf8
+            ))
+        case .x86_64, .riscv64:
+            let name = arch == .x86_64 ? "x86_64" : "RISC-V"
+            var msg = """
+            error: \(displayPath) is an \(name) ISO. Apple Virtualization (and therefore
+                   Lumina) only boots ARM64 (aarch64) guests on Apple Silicon.
+
+            """
+            if let entry = DesktopOSCatalog.suggestArm64Equivalent(forFilename: iso.lastPathComponent) {
+                msg += "\n       For \(entry.displayName), use the ARM64 build:\n         \(entry.isoURL.absoluteString)\n\n"
+            }
+            FileHandle.standardError.write(Data((msg + "       To override (will fail to boot), pass --force.\n").utf8))
+            throw ExitCode(2)
+        }
     }
 
     /// Resolve a bundle path to a VMBundle, exiting on failure with a
@@ -89,6 +161,9 @@ struct DesktopCreate: AsyncParsableCommand {
     @Option(name: .customLong("iso"), help: "Optional ISO to attach on first boot (installer).")
     var isoPath: String?
 
+    @Option(name: .customLong("seed"), help: "Directory packed into a 'cidata' ISO on first boot (cloud-init NoCloud, Omarchy autoinstall).")
+    var seedPath: String?
+
     @Flag(name: .customLong("json"), help: "Emit the resulting manifest as JSON.")
     var emitJSON = false
 
@@ -108,43 +183,10 @@ struct DesktopCreate: AsyncParsableCommand {
     var bridgeInterface: String?
 
     mutating func run() async throws {
-        let memBytes = DesktopHelpers.parseMemoryOrExit(memory)
-        let diskBytes = DesktopHelpers.parseDiskOrExit(diskSize)
-
-        // v0.7.0 M4: ARM64 pre-flight check on the ISO. Catches "downloaded
-        // the x86 ISO by accident" before allocating disk + booting.
         if let iso = isoPath, !force {
-            let isoURL = URL(fileURLWithPath: (iso as NSString).expandingTildeInPath)
-            let arch: ISOInspector.Architecture
-            do {
-                arch = try ISOInspector.detectArchitecture(at: isoURL)
-            } catch ISOInspector.Error.fileNotFound {
-                FileHandle.standardError.write(Data("error: ISO not found: \(iso)\n".utf8))
-                throw ExitCode(2)
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "warning: could not inspect ISO \(iso) (\(error)); proceeding.\n".utf8
-                ))
-                arch = .unknown
-            }
-            switch arch {
-            case .arm64:
-                break
-            case .x86_64:
-                FileHandle.standardError.write(Data(
-                    "error: \(iso) is an x86_64 ISO. Lumina only boots ARM64 (aarch64) guests on Apple Silicon. Use --force to override.\n".utf8
-                ))
-                throw ExitCode(2)
-            case .riscv64:
-                FileHandle.standardError.write(Data(
-                    "error: \(iso) is a RISC-V ISO. Lumina only boots ARM64 (aarch64) guests. Use --force to override.\n".utf8
-                ))
-                throw ExitCode(2)
-            case .unknown:
-                FileHandle.standardError.write(Data(
-                    "warning: could not detect ISO architecture for \(iso); proceeding anyway. Pass --force to silence this warning.\n".utf8
-                ))
-            }
+            try DesktopHelpers.checkArchitecture(
+                URL(fileURLWithPath: (iso as NSString).expandingTildeInPath), displayPath: iso
+            )
         }
 
         // v0.7.1 M3: SHA-256 verification on catalog ISOs. The Desktop
@@ -177,19 +219,9 @@ struct DesktopCreate: AsyncParsableCommand {
             }
         }
 
-        let osFamily: OSFamily
-        switch osVariant.lowercased() {
-        case let v where v.hasPrefix("ubuntu"), let v where v.hasPrefix("kali"),
-             let v where v.hasPrefix("fedora"), let v where v.hasPrefix("debian"),
-             let v where v.hasPrefix("alpine"):
-            osFamily = .linux
-        case let v where v.hasPrefix("windows"):
-            osFamily = .windows
-        case let v where v.hasPrefix("macos"):
-            osFamily = .macOS
-        default:
-            osFamily = .linux
-        }
+        let variant = osVariant.lowercased()
+        let osFamily: OSFamily = variant.hasPrefix("windows") ? .windows
+            : variant.hasPrefix("macos") ? .macOS : .linux
 
         let id = UUID()
         let rootURL: URL
@@ -201,60 +233,20 @@ struct DesktopCreate: AsyncParsableCommand {
             rootURL = base.appendingPathComponent(id.uuidString)
         }
 
-        // Parse --network. Unknown values are a hard error rather than
-        // silent fallback to nat — the user explicitly chose bridged and
-        // should know when a typo prevents that.
-        let parsedNetworkMode: NetworkMode
-        switch networkMode.lowercased() {
-        case "nat":
-            parsedNetworkMode = .nat
-        case "bridged":
-            parsedNetworkMode = .bridged(interface: bridgeInterface)
-        default:
-            FileHandle.standardError.write(Data(
-                "error: --network must be 'nat' or 'bridged' (got '\(networkMode)')\n".utf8
-            ))
-            throw ExitCode(2)
-        }
+        let bundle = try DesktopHelpers.createBundle(
+            at: rootURL, name: name, osFamily: osFamily, osVariant: osVariant,
+            memory: memory, cpus: cpus, diskSize: diskSize,
+            network: networkMode, bridgeInterface: bridgeInterface, id: id
+        )
 
-        var bundle: VMBundle
-        do {
-            bundle = try VMBundle.create(
-                at: rootURL,
-                name: name,
-                osFamily: osFamily,
-                osVariant: osVariant,
-                memoryBytes: memBytes,
-                cpuCount: cpus,
-                diskBytes: diskBytes,
-                id: id
-            )
-        } catch VMBundle.Error.alreadyExists(let u) {
-            FileHandle.standardError.write(Data("error: \(u.path) already exists\n".utf8))
-            throw ExitCode(2)
-        } catch {
-            FileHandle.standardError.write(Data("error: failed to create bundle: \(error)\n".utf8))
-            throw ExitCode(1)
-        }
-
-        // Persist the chosen network mode. Default (`.nat`) is left as
-        // nil so the manifest stays minimal for the common case; explicit
-        // `.bridged` is written so the boot layer picks it up on every
-        // subsequent invocation.
-        switch parsedNetworkMode {
-        case .nat:
-            break
-        case .bridged:
-            bundle.manifest.networkMode = parsedNetworkMode
-            try? bundle.save()
-        }
-
-        // Allocate the primary disk.
-        do {
-            try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: diskBytes)
-        } catch {
-            FileHandle.standardError.write(Data("error: disk allocation failed: \(error)\n".utf8))
-            throw ExitCode(1)
+        if let seed = seedPath {
+            let seedURL = URL(fileURLWithPath: (seed as NSString).expandingTildeInPath)
+            do {
+                try FileManager.default.copyItem(at: seedURL, to: bundle.seedDirectory)
+            } catch {
+                FileHandle.standardError.write(Data("error: --seed: \(error.localizedDescription)\n".utf8))
+                throw ExitCode(2)
+            }
         }
 
         // Stage the installer ISO path into the logs directory's sidecar
@@ -314,147 +306,75 @@ struct DesktopBoot: AsyncParsableCommand {
     var captureSerial = false
 
     mutating func run() async throws {
-        var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
-
-        // Resolve the pending ISO sidecar if this is the first boot.
-        var cdromURL: URL?
-        let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
-        if let data = try? Data(contentsOf: sidecar),
-           let path = String(data: data, encoding: .utf8) {
-            cdromURL = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        // First-boot orchestration: linux-direct extraction + preseed
-        // injection (Debian/Kali/Ubuntu) and Windows 11 autounattend
-        // sidecar. Centralized in `LuminaBootable.prepareFirstBoot` so
-        // the GUI desktop session calls the same function — see
-        // `LuminaDesktopSession.boot()`.
-        //
-        // `--capture-serial` keeps its previous semantics (force linux-
-        // direct boot for serial diagnostics). It composes with the
-        // Debian preseed: if both fire, we get linux-direct AND the
-        // preseed.
-        //
-        // Replaces feat/iso-cli-2026-05-09's inline
-        // `IsoBootHelpers.runCaptureSerialExtraction` call — same behavior,
-        // broader scope (Windows autounattend + Debian preseed too).
-        let isFirstBoot = bundle.manifest.lastBootedAt == nil
-
-        let plan: FirstBootPlan
+        let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
         do {
-            plan = try prepareFirstBoot(
-                bundle: bundle,
-                attachedISO: cdromURL,
-                captureSerial: captureSerial,
-                isFirstBoot: isFirstBoot
+            _ = try await DesktopRunner.boot(
+                bundle, cdrom: bundle.pendingISO, graphics: !headless, rosetta: rosetta,
+                captureSerial: captureSerial, serialFile: serialFile, timeout: timeoutSec,
+                banner: "Booted \(bundle.manifest.name). Press Ctrl-C to stop.\n"
             )
         } catch let error as FirstBootError {
-            // Fatal classes: missing ISO and (in capture-serial mode)
-            // unknown layout. Translate to ExitCode.
             FileHandle.standardError.write(Data("error: \(error)\n".utf8))
             throw ExitCode(1)
         }
+    }
+}
 
-        // Translate the plan's structured events into the human-readable
-        // stderr lines the CLI used to emit inline. Order preserved.
+enum DesktopRunner {
+    enum Stop { case signal, timeout, guest }
+
+    static func boot(
+        _ bundle: VMBundle,
+        cdrom: URL?,
+        graphics: Bool,
+        rosetta: Bool,
+        captureSerial: Bool,
+        serialFile: String?,
+        timeout: Int,
+        banner: String
+    ) async throws -> Stop {
+        var bundle = bundle
+        bundle.ensureMACAddress()
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: cdrom,
+            captureSerial: captureSerial,
+            isFirstBoot: bundle.manifest.lastBootedAt == nil
+        )
         for event in plan.events {
             FileHandle.standardError.write(Data(formatFirstBootEvent(event).utf8))
         }
-        let extraDisks = plan.extraDisks
-        let linuxDirectKernel = plan.linuxDirectKernel
-        let linuxDirectInitramfs = plan.linuxDirectInitramfs
-        let linuxDirectCmdline = plan.linuxDirectCmdline
-
-        // Ensure + persist a stable MAC on first boot. See
-        // `LuminaDesktopSession.boot()` for the full rationale.
-        let stableMAC = bundle.ensureMACAddress()
-
-        let isWindows = bundle.manifest.osFamily == .windows
-        let isInstallPhase = bundle.manifest.lastBootedAt == nil
-
-        var opts = VMOptions.default
-        opts.memory = bundle.manifest.memoryBytes
-        opts.cpuCount = bundle.manifest.cpuCount
-        opts.macAddress = stableMAC
-        // Respect the manifest's network mode — .bridged here flows to
-        // VZBridgedNetworkDeviceAttachment which delegates DHCP to the
-        // user's LAN router instead of vmnet's bootpd.
-        switch bundle.manifest.networkMode ?? .nat {
-        case .nat:
-            opts.networkProvider = NATNetworkProvider()
-        case .bridged(let iface):
-            opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
+        var opts = bundle.vmOptions(cdrom: cdrom, plan: plan)
+        if let serialFile {
+            opts.serialLogURL = URL(fileURLWithPath: (serialFile as NSString).expandingTildeInPath)
         }
-        // Serial log to bundle/logs/serial.log so failures are
-        // post-mortem diagnosable without retrying the boot.
-        opts.serialLogURL = bundle.logsDirectory
-            .appendingPathComponent("serial.log")
-        opts.bootable = .efi(EFIBootConfig(
-            variableStoreURL: bundle.efiVarsURL,
-            primaryDisk: bundle.primaryDiskURL,
-            cdromISO: cdromURL,
-            extraDisks: extraDisks,
-            preferUSBCDROM: isWindows,
-            installPhase: isInstallPhase,
-            linuxDirectKernel: linuxDirectKernel,
-            linuxDirectInitramfs: linuxDirectInitramfs,
-            linuxDirectCmdline: linuxDirectCmdline
-        ))
-        if !headless {
-            opts.graphics = GraphicsConfig(
-                widthInPixels: 1920,
-                heightInPixels: 1080,
-                keyboardKind: .usb,
-                pointingDeviceKind: .usbScreenCoordinate
-            )
-        }
+        if graphics { opts.graphics = GraphicsConfig() }
         opts.rosetta = rosetta
-
-        let vm = VM(options: opts)
-
-        // Record last-booted timestamp.
-        bundle.manifest.lastBootedAt = Date()
-        try? bundle.save()
-
-        // Kick off an async task that mirrors serial output to `serialFile`
-        // if requested. We poll vm.serialOutput until shutdown.
-        let serialTask: Task<Void, Never>? = serialFile.map { path in
-            Task.detached {
-                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-                guard let handle = try? FileHandle(forWritingTo: url) else { return }
-                defer { try? handle.close() }
-                var last = ""
-                while !Task.isCancelled {
-                    let current = await vm.serialOutput
-                    if current != last {
-                        let delta = String(current.dropFirst(last.count))
-                        try? handle.write(contentsOf: Data(delta.utf8))
-                        last = current
-                    }
-                    try? await Task.sleep(for: .milliseconds(100))
-                }
-            }
+        return try await run(VM(options: opts), timeout: timeout) {
+            try? bundle.recordBoot()
+            FileHandle.standardError.write(Data(banner.utf8))
         }
-        defer { serialTask?.cancel() }
+    }
+
+    static func run(
+        _ vm: VM,
+        timeout: Int,
+        onBooted: () throws -> Void = {}
+    ) async throws -> Stop {
+        let guestStop = GuestStopSignal()
+        await vm.setDelegate(guestStop)
 
         do {
             try await vm.boot()
         } catch {
-            FileHandle.standardError.write(Data("error: boot failed: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("error: boot failed: \(friendlyError(error))\n".utf8))
             throw ExitCode(1)
         }
+        try onBooted()
 
-        print("Booted \(bundle.manifest.name). Press Ctrl-C to stop.")
-
-        // SIGINT/SIGTERM via DispatchSource, NOT the default POSIX handler —
-        // the default disposition terminates the process without giving
-        // vm.shutdown() a chance to run, which aborts any in-flight disk.img
-        // writes. We bridge the dispatch source into the async context via
-        // AsyncStream and await the first event (or the timeout).
-        let signalQueue = DispatchQueue(label: "com.lumina.desktop-boot.signals")
-        let (signalStream, signalContinuation) = AsyncStream<Int32>.makeStream()
-        let signalSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
+        let signalQueue = DispatchQueue(label: "com.lumina.desktop.signals")
+        let (signals, signalContinuation) = AsyncStream<Int32>.makeStream()
+        let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
             Foundation.signal(sig, SIG_IGN)
             let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
             src.setEventHandler { signalContinuation.yield(sig) }
@@ -462,29 +382,51 @@ struct DesktopBoot: AsyncParsableCommand {
             return src
         }
         defer {
-            signalSources.forEach { $0.cancel() }
+            sources.forEach { $0.cancel() }
             signalContinuation.finish()
+            Foundation.signal(SIGINT, SIG_DFL)
+            Foundation.signal(SIGTERM, SIG_DFL)
         }
 
-        let timeoutSeconds = timeoutSec
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                for await _ in signalStream {
-                    FileHandle.standardError.write(Data("\nShutting down...\n".utf8))
-                    return
-                }
-            }
-            if timeoutSeconds > 0 {
+        let stop = await withTaskGroup(of: Stop?.self) { group -> Stop in
+            group.addTask { for await _ in signals { return .signal }; return nil }
+            group.addTask { for await _ in guestStop.stream { return .guest }; return nil }
+            if timeout > 0 {
                 group.addTask {
-                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    try? await Task.sleep(for: .seconds(timeout))
+                    return Task.isCancelled ? nil : .timeout
                 }
             }
-            await group.next()
-            group.cancelAll()
+            defer { group.cancelAll() }
+            while let next = await group.next() {
+                if let reason = next { return reason }
+            }
+            return .signal
         }
-
+        switch stop {
+        case .signal: FileHandle.standardError.write(Data("\nshutting down…\n".utf8))
+        case .timeout: FileHandle.standardError.write(Data("→ --timeout reached, shutting down…\n".utf8))
+        case .guest: FileHandle.standardError.write(Data("→ guest powered off\n".utf8))
+        }
         await vm.shutdown()
-        serialTask?.cancel()
+        withExtendedLifetime(guestStop) {}
+        return stop
+    }
+}
+
+private final class GuestStopSignal: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
+    let stream: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    override init() {
+        (stream, continuation) = AsyncStream.makeStream()
+        super.init()
+    }
+
+    func guestDidStop(_ virtualMachine: VZVirtualMachine) { continuation.yield() }
+
+    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
+        continuation.yield()
     }
 }
 
@@ -511,6 +453,10 @@ private func formatFirstBootEvent(_ event: FirstBootPlan.Event) -> String {
             + "bypasses TPM/SecureBoot/RAM/CPU/Storage checks; skips MSA OOBE\n"
     case .autounattendFailed(let reason):
         return "warning: autounattend generation failed (\(reason)); Win11 Setup may refuse compat check\n"
+    case .seedAttached(let iso):
+        return "seed: attached \(iso.lastPathComponent) (volume cidata)\n"
+    case .seedFailed(let reason):
+        return "warning: seed ISO failed (\(reason)); the installer will run interactively\n"
     }
 }
 

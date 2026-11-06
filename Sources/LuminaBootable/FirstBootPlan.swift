@@ -20,12 +20,13 @@
 //     in non-capture mode) emit an `Event` and the plan continues.
 
 import Foundation
+import Lumina
 
 public struct FirstBootPlan: Sendable, Equatable {
     public var linuxDirectKernel: URL?
     public var linuxDirectInitramfs: URL?
     public var linuxDirectCmdline: String?
-    public var extraDisks: [URL]
+    public var seedISOs: [URL]
     public var events: [Event]
 
     public enum Event: Sendable, Equatable {
@@ -47,18 +48,20 @@ public struct FirstBootPlan: Sendable, Equatable {
         /// Preseed injection failed; we kept the unpatched initrd and
         /// the user will see d-i's "DHCP autoconfig failed" screen.
         case preseedFailed(reason: String)
-        /// `autounattend.iso` written + appended to `extraDisks`.
+        /// `autounattend.iso` written + appended to `seedISOs`.
         case autounattendGenerated(iso: URL)
         /// Autounattend generation failed; Win11 Setup will hit the
         /// compat check.
         case autounattendFailed(reason: String)
+        case seedAttached(iso: URL)
+        case seedFailed(reason: String)
     }
 
     public static let empty = FirstBootPlan(
         linuxDirectKernel: nil,
         linuxDirectInitramfs: nil,
         linuxDirectCmdline: nil,
-        extraDisks: [],
+        seedISOs: [],
         events: []
     )
 }
@@ -123,7 +126,7 @@ public struct FirstBootDependencies: Sendable {
 }
 
 /// Returns a `FirstBootPlan` of artifacts + diagnostic events. Callers
-/// assign the linux-direct fields and `extraDisks` into their
+/// assign the linux-direct fields and `seedISOs` into their
 /// `EFIBootConfig`, and translate `events` into whatever surface they
 /// want (CLI: stderr writes; GUI: boot waterfall / serial log).
 ///
@@ -143,8 +146,10 @@ public func prepareFirstBoot(
         || osVariantLower.contains("ubuntu")
     let needsLinuxDirect = captureSerial || (isDebianFamily && isFirstBoot)
     let isWindowsFirstBoot = bundle.manifest.osFamily == .windows && isFirstBoot
+    let hasSeed = isFirstBoot
+        && FileManager.default.fileExists(atPath: bundle.seedDirectory.path)
 
-    if !needsLinuxDirect && !isWindowsFirstBoot {
+    if !needsLinuxDirect && !isWindowsFirstBoot && !hasSeed {
         return .empty
     }
 
@@ -160,6 +165,20 @@ public func prepareFirstBoot(
     }
 
     var plan = FirstBootPlan.empty
+
+    if hasSeed {
+        do {
+            let iso = try SeedISO.make(
+                directory: bundle.seedDirectory,
+                volumeName: "cidata",
+                at: bundle.rootURL.appendingPathComponent("cidata.iso")
+            )
+            plan.seedISOs.append(iso)
+            plan.events.append(.seedAttached(iso: iso))
+        } catch {
+            plan.events.append(.seedFailed(reason: "\(error)"))
+        }
+    }
 
     if needsLinuxDirect {
         guard let iso = attachedISO else {
@@ -254,7 +273,7 @@ public func prepareFirstBoot(
     if isWindowsFirstBoot {
         do {
             let unattendISO = try dependencies.generateAutounattend(bundle.rootURL)
-            plan.extraDisks.append(unattendISO)
+            plan.seedISOs.append(unattendISO)
             plan.events.append(.autounattendGenerated(iso: unattendISO))
         } catch {
             // Recoverable — Win11 will hit the compat check, but we
@@ -264,4 +283,41 @@ public func prepareFirstBoot(
     }
 
     return plan
+}
+
+extension VMBundle {
+    public var pendingISO: URL? {
+        let sidecar = rootURL.appendingPathComponent("pending-iso.path")
+        guard let path = try? String(contentsOf: sidecar, encoding: .utf8) else { return nil }
+        let url = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            try? FileManager.default.removeItem(at: sidecar)
+            return nil
+        }
+        return url
+    }
+
+    public func vmOptions(cdrom: URL?, plan: FirstBootPlan) -> VMOptions {
+        var opts = VMOptions.default
+        opts.memory = manifest.memoryBytes
+        opts.cpuCount = manifest.cpuCount
+        opts.macAddress = manifest.macAddress
+        switch manifest.networkMode ?? .nat {
+        case .nat: opts.networkProvider = NATNetworkProvider()
+        case .bridged(let iface): opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
+        }
+        opts.serialLogURL = logsDirectory.appendingPathComponent("serial.log")
+        opts.bootable = .efi(EFIBootConfig(
+            variableStoreURL: efiVarsURL,
+            primaryDisk: primaryDiskURL,
+            cdromISO: cdrom,
+            preferUSBCDROM: manifest.osFamily == .windows,
+            installPhase: manifest.lastBootedAt == nil,
+            linuxDirectKernel: plan.linuxDirectKernel,
+            linuxDirectInitramfs: plan.linuxDirectInitramfs,
+            linuxDirectCmdline: plan.linuxDirectCmdline,
+            extraCDROMs: plan.seedISOs
+        ))
+        return opts
+    }
 }
