@@ -73,11 +73,8 @@ jobs:
           go vet ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o lumina-agent .
 
-      - name: Fetch guest kernel
-        run: bash Guest/fetch-kernel.sh /tmp/lumina-kernel/vmlinuz
-
       - name: Build VM image (baked)
-        run: LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz bash Guest/build-image.sh /tmp/lumina-image
+        run: bash Guest/build-image.sh /tmp/lumina-image
 
       - name: Package image
         run: |

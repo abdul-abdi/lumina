@@ -294,38 +294,9 @@ public actor VM {
         config.cpuCount = options.cpuCount
         config.memorySize = options.memory
 
-        // Boot loader
-        // ── Boot loader: initrd setup ──
         let bootLoader = VZLinuxBootLoader(kernelURL: imagePaths.kernel)
 
-        if let baseInitrd = imagePaths.initrd {
-            // Legacy image: has initrd (Alpine kernel with modules)
-            if let agentURL = imagePaths.agent {
-                let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
-                try InitrdPatcher.createCombinedInitrd(
-                    baseInitrd: baseInitrd,
-                    agentBinary: agentURL,
-                    modulesDir: imagePaths.modulesDir,
-                    outputURL: combinedInitrd
-                )
-                if let hosts = options.networkHosts, let ip = options.networkIP {
-                    try InitrdPatcher.appendNetworkOverlay(
-                        initrdURL: combinedInitrd,
-                        hosts: hosts,
-                        ip: ip
-                    )
-                }
-                bootLoader.initialRamdiskURL = combinedInitrd
-            } else {
-                bootLoader.initialRamdiskURL = baseInitrd
-            }
-        }
-        // else: baked image — no initrd, kernel boots directly to rootfs
-
         // ── Kernel command line ──
-        // All cmdline params built in one block. Both paths share mounts and IP;
-        // baked images additionally pass hosts via cmdline (legacy uses initrd overlay).
-        //
         // md=noautodetect — skip the kernel's autodetect-RAID-arrays pass
         //   at init time. Negligible on its own (<50ms), but semantically
         //   correct: Lumina VMs never host MD devices.
@@ -338,10 +309,7 @@ public actor VM {
         if let ip = options.networkIP {
             cmdLine += " lumina_ip=\(ip)"
         }
-        // For baked images, hosts go through the kernel cmdline (no initrd overlay
-        // available). For legacy images, InitrdPatcher.appendNetworkOverlay writes
-        // them into /lumina-hosts instead.
-        if imagePaths.bootContract == .baked, let hosts = options.networkHosts {
+        if let hosts = options.networkHosts {
             cmdLine += " lumina_hosts=\(Self.encodeHosts(hosts))"
         }
 

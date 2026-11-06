@@ -61,14 +61,10 @@ jobs:
             -ldflags="-s -w" -o lumina-agent .
           ls -la lumina-agent
 
-      - name: Fetch guest kernel
-        run: bash Guest/fetch-kernel.sh /tmp/lumina-kernel/vmlinuz
-
       - name: Build baked image
         run: |
           mkdir -p /tmp/lumina-image-out
-          LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz \
-            bash Guest/build-image.sh /tmp/lumina-image-out
+          bash Guest/build-image.sh /tmp/lumina-image-out
           ls -la /tmp/lumina-image-out/
           # Baked-mode output is 2 files: vmlinuz + rootfs.img.
           # No initrd, no modules/ dir.

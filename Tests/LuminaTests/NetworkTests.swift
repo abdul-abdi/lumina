@@ -33,36 +33,6 @@ import Testing
     #expect(vmOpts.networkIP == nil)
 }
 
-@Test func initrdPatcherNetworkOverlay() throws {
-    // Create a temporary "base initrd" (just some dummy gzip data)
-    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: tempDir) }
-
-    let initrdURL = tempDir.appendingPathComponent("test-initrd")
-
-    // Create a minimal gzip file as the base initrd
-    let baseContent = Data("base-initrd-content".utf8)
-    try baseContent.write(to: initrdURL)
-
-    let hosts: [String: String] = ["db": "192.168.100.2", "api": "192.168.100.3"]
-    let ip = "192.168.100.2"
-
-    // Should not throw — appends network overlay
-    try InitrdPatcher.appendNetworkOverlay(
-        initrdURL: initrdURL,
-        hosts: hosts,
-        ip: ip
-    )
-
-    // Verify the file grew (overlay was appended)
-    let resultData = try Data(contentsOf: initrdURL)
-    #expect(resultData.count > baseContent.count)
-
-    // Verify it starts with original content
-    #expect(resultData.prefix(baseContent.count) == baseContent)
-}
-
 @Test func networkActorInit() async {
     // Just verify Network can be initialized
     let network = Network(name: "test")
