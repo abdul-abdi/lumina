@@ -92,9 +92,6 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
 
-    @Flag(name: .customLong("wait-network"), help: "[default] Block exec until the guest's network is up. On by default in v0.7.3+ — the wait costs ~4ms, well inside boot noise.")
-    var waitNetwork: Bool = false
-
     @Flag(name: .customLong("no-wait-network"), help: "Exec without waiting for the guest network. Saves a few ms; commands that hit DNS immediately (curl, apt update, pip install) will fail with 'bad address'.")
     var noWaitNetwork: Bool = false
 
@@ -231,7 +228,7 @@ struct Run: AsyncParsableCommand {
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
             stdin: daemonStdinBytes.map { $0.isEmpty ? Stdin.closed : Stdin.oneShot($0) } ?? resolveStdin(),
-            awaitNetworkReady: waitNetwork || !noWaitNetwork
+            awaitNetworkReady: !noWaitNetwork
         )
 
         switch resolveOutputFormat() {
