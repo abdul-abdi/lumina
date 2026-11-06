@@ -151,8 +151,6 @@ func resolveDiskSize(flag: String?) -> String? {
 //
 // Default: TTY = stream (humans want real-time), pipe = buffer.
 // Override: LUMINA_STREAM=0|1 env var.
-// JSON format uses the unified envelope (buffered) by default; set
-// LUMINA_OUTPUT=ndjson for legacy per-chunk NDJSON streaming.
 
 /// Resolve streaming mode for text output: LUMINA_STREAM env > isatty auto-detect.
 func resolveStreaming() -> Bool {
@@ -197,35 +195,6 @@ func resolveStdin() -> Stdin {
         let chunk = handle.availableData
         return chunk.isEmpty ? nil : chunk
     }
-}
-
-// MARK: - Legacy Output Mode
-
-/// Check if legacy NDJSON output is requested for exec.
-/// `LUMINA_OUTPUT=ndjson` preserves pre-v0.6.0 streaming behavior for exec when piped.
-/// Default (absent or any other value) = unified envelope. Removed in v0.8.0.
-func useLegacyExecOutput() -> Bool {
-    ProcessInfo.processInfo.environment["LUMINA_OUTPUT"]?.lowercased() == "ndjson"
-}
-
-// MARK: - NDJSON Output Types (streaming / session exec)
-
-/// Stream chunk: stdout or stderr data.
-struct StreamChunk: Encodable {
-    var stream: String
-    var data: String
-}
-
-/// Exit status for streaming / session exec.
-struct ExitChunk: Encodable {
-    var exit_code: Int
-    var duration_ms: Int
-}
-
-/// Error for streaming / session exec.
-struct ErrorChunk: Encodable {
-    var error: String
-    var duration_ms: Int
 }
 
 /// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.

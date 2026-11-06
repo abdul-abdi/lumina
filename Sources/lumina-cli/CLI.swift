@@ -234,18 +234,12 @@ struct Run: AsyncParsableCommand {
             awaitNetworkReady: waitNetwork || !noWaitNetwork
         )
 
-        let format = resolveOutputFormat()
-        let shouldStream = resolveStreaming()
-        let legacyNDJSON = useLegacyExecOutput()
-
-        switch (format, legacyNDJSON) {
-        case (.json, false):
+        switch resolveOutputFormat() {
+        case .json:
             try await runUnifiedJSON(options: options)
-        case (.json, true):
-            try await runStreaming(options: options, format: .json)
-        case (.text, _):
-            if shouldStream {
-                try await runStreaming(options: options, format: .text)
+        case .text:
+            if resolveStreaming() {
+                try await runStreaming(options: options)
             } else {
                 try await runBuffered(options: options, format: .text)
             }
@@ -426,53 +420,27 @@ struct Run: AsyncParsableCommand {
 
     // MARK: - Streaming
 
-    private func runStreaming(options: RunOptions, format: OutputFormat) async throws {
-        let start = ContinuousClock.now
+    private func runStreaming(options: RunOptions) async throws {
         do {
             let chunks = Lumina.stream(command, options: options)
             for try await chunk in chunks {
-                switch format {
-                case .json:
-                    // NDJSON: one JSON object per line
-                    switch chunk {
-                    case .stdout(let data):
-                        printNDJSONLine(StreamChunk(stream: "stdout", data: data))
-                    case .stderr(let data):
-                        printNDJSONLine(StreamChunk(stream: "stderr", data: data))
-                    case .stdoutBytes(let bytes):
-                        // Binary stdout: write raw bytes to stdout fd directly (bypasses print buffering)
-                        FileHandle.standardOutput.write(bytes)
-                    case .stderrBytes(let bytes):
-                        FileHandle.standardError.write(bytes)
-                    case .exit(let code):
-                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: millisSince(start)))
-                        if code != 0 { throw ExitCode(code) }
-                    }
-                case .text:
-                    switch chunk {
-                    case .stdout(let data):
-                        print(data, terminator: "")
-                    case .stderr(let data):
-                        FileHandle.standardError.write(Data(data.utf8))
-                    case .stdoutBytes(let bytes):
-                        FileHandle.standardOutput.write(bytes)
-                    case .stderrBytes(let bytes):
-                        FileHandle.standardError.write(bytes)
-                    case .exit(let code):
-                        if code != 0 { throw ExitCode(code) }
-                    }
+                switch chunk {
+                case .stdout(let data):
+                    print(data, terminator: "")
+                case .stderr(let data):
+                    FileHandle.standardError.write(Data(data.utf8))
+                case .stdoutBytes(let bytes):
+                    FileHandle.standardOutput.write(bytes)
+                case .stderrBytes(let bytes):
+                    FileHandle.standardError.write(bytes)
+                case .exit(let code):
+                    if code != 0 { throw ExitCode(code) }
                 }
             }
         } catch let exitCode as ExitCode {
             throw exitCode
         } catch {
-            switch format {
-            case .json:
-                printNDJSONLine(ErrorChunk(error: friendlyError(error), duration_ms: millisSince(start)))
-            case .text:
-                try handleTextError(error, timeout: timeout)
-            }
-            throw ExitCode.failure
+            try handleTextError(error, timeout: timeout)
         }
     }
 }
@@ -1497,12 +1465,9 @@ struct Exec: AsyncParsableCommand {
         }
         defer { stdinTask?.cancel() }
 
-        // Output routing: v0.6.0 unifies JSON output for exec with run (single envelope).
-        // Legacy NDJSON streaming is preserved behind LUMINA_OUTPUT=ndjson.
-        let legacyNDJSON = useLegacyExecOutput()
         let start = ContinuousClock.now
 
-        if format == .json && !legacyNDJSON {
+        if format == .json {
             // Unified envelope: buffer output, emit single JSON object (matches `run`)
             var stdoutBuf = ""
             var stderrBuf = ""
@@ -1564,29 +1529,17 @@ struct Exec: AsyncParsableCommand {
                 }
             }
         } else {
-            // Legacy NDJSON (LUMINA_OUTPUT=ndjson) or text mode: existing streaming behavior.
             while true {
                 let response = try client.receive()
                 switch response {
                 case .output(let outputStream, let data):
-                    switch format {
-                    case .json:
-                        printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
-                    case .text:
-                        if outputStream == .stdout {
-                            print(data, terminator: "")
-                        } else {
-                            FileHandle.standardError.write(Data(data.utf8))
-                        }
+                    if outputStream == .stdout {
+                        print(data, terminator: "")
+                    } else {
+                        FileHandle.standardError.write(Data(data.utf8))
                     }
-                case .exit(let code, let durationMs):
+                case .exit(let code, _):
                     stdinTask?.cancel()
-                    switch format {
-                    case .json:
-                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
-                    case .text:
-                        break
-                    }
                     if code != 0 { throw ExitCode(code) }
                     return
                 case .outputBytes(let outputStream, let base64):
