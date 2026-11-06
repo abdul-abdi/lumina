@@ -21,7 +21,6 @@ public struct CustomImagesView: View {
     @State private var images: [CustomImageEntry] = []
     @State private var error: String?
     @State private var launchNotice: LaunchNotice?
-    @State private var catalogPullingID: String?
 
     public init(layout: LibraryLayout = .list) {
         self.layout = layout
@@ -36,11 +35,10 @@ public struct CustomImagesView: View {
                         .font(LuminaTheme.caption)
                         .foregroundStyle(LuminaTheme.err)
                         .padding(16)
-                } else if images.isEmpty && uninstalledCatalog.isEmpty {
+                } else if images.isEmpty {
                     emptyState
                 } else {
-                    if !images.isEmpty { installedList }
-                    if !uninstalledCatalog.isEmpty { catalogSection }
+                    installedList
                 }
             }
         }
@@ -58,14 +56,6 @@ public struct CustomImagesView: View {
         } message: {
             Text(launchNotice?.message ?? "")
         }
-    }
-
-    /// Catalog entries whose id isn't already installed locally.
-    /// Installed entries would just duplicate rows from the main list,
-    /// so we hide them.
-    private var uninstalledCatalog: [AgentImageEntry] {
-        let installed = Set(images.map { $0.name })
-        return AgentImageCatalog.all.filter { !installed.contains($0.id) }
     }
 
     /// Alert payload surfaced after a launch attempt. `.info` is a
@@ -150,105 +140,11 @@ public struct CustomImagesView: View {
         }
     }
 
-    private var catalogSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("CATALOG")
-                        .font(LuminaTheme.label)
-                        .tracking(2.5)
-                        .foregroundStyle(LuminaTheme.accent)
-                    Spacer()
-                }
-                Text("Curated images from github.com/abdul-abdi/lumina/releases. Pull verifies SHA-256 before extraction.")
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.inkDim)
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 18)
-            .padding(.bottom, 10)
-
-            switch layout {
-            case .grid:
-                LazyVGrid(columns: gridColumns, spacing: 14) {
-                    ForEach(uninstalledCatalog, id: \.id) { entry in
-                        CatalogCard(
-                            entry: entry,
-                            isPulling: catalogPullingID == entry.id,
-                            disabled: catalogPullingID != nil && catalogPullingID != entry.id,
-                            onPull: { pull(entry) }
-                        )
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 20)
-            case .list:
-                LazyVStack(spacing: 8) {
-                    ForEach(uninstalledCatalog, id: \.id) { entry in
-                        CatalogRow(
-                            entry: entry,
-                            isPulling: catalogPullingID == entry.id,
-                            disabled: catalogPullingID != nil && catalogPullingID != entry.id,
-                            onPull: { pull(entry) }
-                        )
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 20)
-            }
-        }
-    }
-
     /// Same column spec as VMGridView for visual parity with the main
     /// library. Adaptive so agent images tile symmetrically with VMs
     /// when the window is resized.
     private var gridColumns: [GridItem] {
         [GridItem(.adaptive(minimum: 300, maximum: 380), spacing: 14)]
-    }
-
-    private func pull(_ entry: AgentImageEntry) {
-        // Refuse placeholder sha256 — mirrors the CLI behaviour.
-        let placeholder = String(repeating: "0", count: 64)
-        if entry.sha256.lowercased() == placeholder {
-            launchNotice = LaunchNotice(
-                title: "Not yet published",
-                message: "\(entry.displayName) hasn't been released yet. The build-baked-image.yml workflow will publish the tarball to GitHub Releases on the next tag. Try again after v0.7.1 ships.",
-                isError: false
-            )
-            return
-        }
-        catalogPullingID = entry.id
-        Task {
-            do {
-                let puller = ImagePuller(
-                    repo: "abdul-abdi/lumina",
-                    tag: "catalog-\(entry.id)",
-                    assetName: entry.url.lastPathComponent,
-                    directURL: entry.url,
-                    expectedSHA256: entry.sha256,
-                    imageName: entry.id
-                )
-                try await puller.pull { _ in }
-                await MainActor.run {
-                    catalogPullingID = nil
-                    refresh()
-                    launchNotice = LaunchNotice(
-                        title: "Pulled \(entry.displayName)",
-                        message: "Installed at ~/.lumina/images/\(entry.id)/. Try: `lumina run --image \(entry.id) 'uname -a'`",
-                        isError: false
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    catalogPullingID = nil
-                    launchNotice = LaunchNotice(
-                        title: "Pull failed",
-                        message: "\(entry.displayName): \(error)",
-                        isError: true
-                    )
-                }
-            }
-        }
     }
 
     /// Translate a launch outcome into a user-facing alert payload.
@@ -314,23 +210,12 @@ struct CustomImageEntry: Sendable {
 }
 
 // MARK: - Shared row/card helpers
-//
-// Identical logic backed the list-row and grid-card presentations of
-// both installed images and catalog entries; hoisted here so there's
-// one copy each.
 
 /// Bytes-on-disk display for installed images. Shared by ImageRow and ImageCard.
 private func formatBytes(_ bytes: Int64) -> String {
     let formatter = ByteCountFormatter()
     formatter.countStyle = .file
     return formatter.string(fromByteCount: bytes)
-}
-
-/// Approximate-size display for catalog entries. Shared by CatalogRow and CatalogCard.
-private func formatMB(_ bytes: Int64) -> String {
-    let mb = Double(bytes) / (1024 * 1024)
-    if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
-    return String(format: "%.0f MB", mb)
 }
 
 /// Copies the disposable-run command to the pasteboard and flashes
@@ -466,131 +351,6 @@ private struct ImageRow: View {
                 .buttonStyle(.borderless)
                 .controlSize(.mini)
                 .foregroundStyle(LuminaTheme.err)
-            }
-        }
-    }
-}
-
-// MARK: - Catalog row (uninstalled entries from AgentImageCatalog)
-
-@MainActor
-private struct CatalogRow: View {
-    let entry: AgentImageEntry
-    let isPulling: Bool
-    let disabled: Bool
-    let onPull: () -> Void
-
-    @State private var hovering: Bool = false
-
-    /// True when the row should respond to taps. Pending (placeholder
-    /// SHA) rows still fire onPull, which surfaces the "not yet
-    /// published" alert — clicking a COMING SOON entry should give
-    /// feedback, not silently do nothing. Rows are inert when another
-    /// pull is in flight (disabled) or this row is already pulling.
-    private var tappable: Bool { !isPulling && !disabled }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            glyph
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(entry.id)
-                        .font(LuminaTheme.title)
-                        .foregroundStyle(LuminaTheme.ink)
-                    if hasPlaceholderSHA {
-                        Text("COMING SOON")
-                            .font(.system(size: 9, weight: .semibold))
-                            .tracking(1.5)
-                            .foregroundStyle(LuminaTheme.inkDim)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
-                    } else {
-                        Text("CATALOG")
-                            .font(.system(size: 9, weight: .semibold))
-                            .tracking(1.5)
-                            .foregroundStyle(LuminaTheme.accent)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .overlay(Rectangle().stroke(LuminaTheme.accent, lineWidth: 1))
-                    }
-                }
-                Text(entry.displayName)
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.inkDim)
-                Text(entry.summary)
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.ink)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 6) {
-                    Text("~\(formatMB(entry.approximateSize))")
-                        .font(LuminaTheme.caption)
-                        .foregroundStyle(LuminaTheme.inkMute)
-                    if !entry.tags.isEmpty {
-                        Text("·")
-                            .font(LuminaTheme.caption)
-                            .foregroundStyle(LuminaTheme.inkMute)
-                        Text(entry.tags.joined(separator: ", "))
-                            .font(LuminaTheme.caption)
-                            .foregroundStyle(LuminaTheme.inkMute)
-                    }
-                }
-            }
-            Spacer()
-            pullButton
-        }
-        .padding(14)
-        .background(hovering && tappable ? LuminaTheme.bg1.opacity(0.85) : LuminaTheme.bg1)
-        .overlay(Rectangle().stroke(
-            hovering && tappable ? LuminaTheme.accent.opacity(0.5) : LuminaTheme.rule,
-            lineWidth: 1
-        ))
-        .opacity(disabled ? 0.5 : 1.0)
-        .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.12), value: hovering)
-        .onHover { hovering = $0 }
-        .onTapGesture {
-            if tappable { onPull() }
-        }
-        .help(tappable
-              ? (hasPlaceholderSHA ? "Click — placeholder build, will surface publish status"
-                                   : "Click to pull \(entry.displayName)")
-              : "")
-    }
-
-    private var hasPlaceholderSHA: Bool {
-        entry.sha256.lowercased() == String(repeating: "0", count: 64)
-    }
-
-    private var glyph: some View {
-        Image(systemName: hasPlaceholderSHA ? "cloud" : "cloud.fill")
-            .font(.system(size: 26, weight: .light))
-            .foregroundStyle(LuminaTheme.accent.opacity(hasPlaceholderSHA ? 0.4 : 1.0))
-            .frame(width: 40, height: 40)
-            .background(LuminaTheme.bg2)
-            .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
-    }
-
-    private var pullButton: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            if isPulling {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Pulling…")
-                        .font(LuminaTheme.caption)
-                        .foregroundStyle(LuminaTheme.inkDim)
-                }
-            } else {
-                Button {
-                    onPull()
-                } label: {
-                    Label(hasPlaceholderSHA ? "Pending" : "Pull",
-                          systemImage: hasPlaceholderSHA ? "clock" : "arrow.down.circle")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(disabled)
             }
         }
     }
@@ -756,146 +516,6 @@ private struct ImageCard: View {
         }
         .buttonStyle(.plain)
         .help("Open `lumina session start --image \(entry.name)` in Terminal")
-    }
-}
-
-/// Grid-layout card for an uninstalled catalog entry. Visual parity
-/// with ImageCard — same dimensions, same hover + tap-to-primary-
-/// action pattern. Primary action = pull (or surface the "not yet
-/// published" alert for placeholder-SHA rows).
-@MainActor
-private struct CatalogCard: View {
-    let entry: AgentImageEntry
-    let isPulling: Bool
-    let disabled: Bool
-    let onPull: () -> Void
-
-    @State private var hovering: Bool = false
-
-    private var tappable: Bool { !isPulling && !disabled }
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Rectangle()
-                .fill(hasPlaceholderSHA ? LuminaTheme.inkMute : LuminaTheme.accent)
-                .frame(width: 4)
-                .shadow(color: hovering && tappable ? LuminaTheme.accent.opacity(0.4) : .clear,
-                        radius: hovering && tappable ? 4 : 0)
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(entry.id)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(LuminaTheme.ink)
-                        .lineLimit(1)
-                    Spacer()
-                    badge
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: hasPlaceholderSHA ? "cloud" : "cloud.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color.black)
-                    Text("CATALOG")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .tracking(1.5)
-                        .foregroundStyle(Color.black)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(LuminaTheme.accent.opacity(hasPlaceholderSHA ? 0.4 : 1.0)))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(entry.displayName)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(LuminaTheme.inkDim)
-                        .lineLimit(1)
-                    Text(entry.summary)
-                        .font(.system(size: 11))
-                        .foregroundStyle(LuminaTheme.ink)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("› size   ~\(formatMB(entry.approximateSize))")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(LuminaTheme.inkDim)
-                }
-                HStack {
-                    if !entry.tags.isEmpty {
-                        Text(entry.tags.joined(separator: " · "))
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .tracking(0.4)
-                            .textCase(.uppercase)
-                            .foregroundStyle(LuminaTheme.inkMute)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                    pullFooter
-                }
-            }
-            .padding(14)
-        }
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(LuminaTheme.bg1.opacity(hovering && tappable ? 0.82 : 0.62))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(hovering && tappable ? LuminaTheme.accent.opacity(0.7) : LuminaTheme.rule,
-                        lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-        .opacity(disabled ? 0.5 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: hovering)
-        .onHover { hovering = $0 }
-        .onTapGesture {
-            if tappable { onPull() }
-        }
-        .help(tappable
-              ? (hasPlaceholderSHA ? "Click — placeholder build, will surface publish status"
-                                   : "Click to pull \(entry.displayName)")
-              : "")
-    }
-
-    @ViewBuilder
-    private var badge: some View {
-        if hasPlaceholderSHA {
-            Text("COMING SOON")
-                .font(.system(size: 9, weight: .semibold))
-                .tracking(1.5)
-                .foregroundStyle(LuminaTheme.inkDim)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
-        }
-    }
-
-    @ViewBuilder
-    private var pullFooter: some View {
-        if isPulling {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Pulling…")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .tracking(0.5)
-                    .foregroundStyle(LuminaTheme.inkDim)
-            }
-        } else if hovering && tappable {
-            HStack(spacing: 5) {
-                Image(systemName: hasPlaceholderSHA ? "clock" : "arrow.down.circle")
-                    .font(.system(size: 11, weight: .semibold))
-                Text(hasPlaceholderSHA ? "PENDING" : "PULL")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .tracking(0.5)
-            }
-            .foregroundStyle(LuminaTheme.accent)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Capsule().fill(LuminaTheme.accent.opacity(0.1)))
-            .overlay(Capsule().stroke(LuminaTheme.accent.opacity(0.5), lineWidth: 1))
-            .transition(.opacity)
-        }
-    }
-
-    private var hasPlaceholderSHA: Bool {
-        entry.sha256.lowercased() == String(repeating: "0", count: 64)
     }
 }
 
