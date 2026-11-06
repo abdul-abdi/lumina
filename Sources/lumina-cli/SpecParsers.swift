@@ -111,3 +111,19 @@ func parseVolumeSpecs(_ specs: [String], volumeStore: VolumeStore) throws -> [Mo
     }
     return parsed
 }
+
+func parseTimeoutOrExit(_ raw: String) throws -> Duration {
+    guard let duration = parseDuration(raw) else {
+        FileHandle.standardError.write(Data("lumina: invalid timeout '\(raw)'. Use e.g. 30s, 5m\n".utf8))
+        throw ExitCode.failure
+    }
+    return duration
+}
+
+func parseMemoryOrExit(_ raw: String, what: String = "memory") throws -> UInt64 {
+    guard let bytes = parseMemory(raw) else {
+        FileHandle.standardError.write(Data("lumina: invalid \(what) '\(raw)'. Use e.g. 512MB, 1GB\n".utf8))
+        throw ExitCode.failure
+    }
+    return bytes
+}

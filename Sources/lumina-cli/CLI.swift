@@ -190,15 +190,8 @@ struct Run: AsyncParsableCommand {
         let resolvedCpus = resolveCpus(flag: 2)
         let resolvedDiskSize = resolveDiskSize(flag: nil)
 
-        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'. Use e.g. 30s, 5m\n".utf8))
-            throw ExitCode.failure
-        }
-
-        guard let parsedMemory = parseMemory(resolvedMemory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'. Use e.g. 512MB, 1GB\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedTimeout = try parseTimeoutOrExit(resolvedTimeout)
+        let parsedMemory = try parseMemoryOrExit(resolvedMemory)
 
         let parsedEnv = try parseEnvSpecs(env)
         let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
@@ -206,14 +199,7 @@ struct Run: AsyncParsableCommand {
         let volumeStore = VolumeStore()
         let parsedMounts = try parseVolumeSpecs(volume, volumeStore: volumeStore)
 
-        var parsedDiskSize: UInt64? = nil
-        if let ds = resolvedDiskSize {
-            guard let size = parseMemory(ds) else {
-                FileHandle.standardError.write(Data("lumina: invalid disk-size '\(ds)'. Use e.g. 2GB, 4GB\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedDiskSize = size
-        }
+        let parsedDiskSize = try resolvedDiskSize.map { try parseMemoryOrExit($0, what: "disk-size") }
 
         let options = RunOptions(
             timeout: parsedTimeout,
@@ -558,10 +544,7 @@ struct ImageCreate: AsyncParsableCommand {
     var rosetta = false
 
     func run() async throws {
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 60s, 5m\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedTimeout = try parseTimeoutOrExit(timeout)
 
         guard !buildCommands.isEmpty else {
             FileHandle.standardError.write(Data("lumina: at least one --run command is required\n".utf8))
@@ -840,10 +823,7 @@ struct SessionStart: AsyncParsableCommand {
         let resolvedMemory = resolveMemory(flag: memory)
         let resolvedCpus = resolveCpus(flag: cpus)
 
-        guard let parsedMemory = parseMemory(resolvedMemory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedMemory = try parseMemoryOrExit(resolvedMemory)
 
         let bootTimeoutSecs = 60 // Hardcoded — if boot takes >60s, something is broken
 
@@ -1275,11 +1255,7 @@ struct Exec: AsyncParsableCommand {
     func run() async throws {
         let sid = parseSID(self.sid)
         let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
-        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'\n".utf8))
-            throw ExitCode.failure
-        }
-        let timeoutSecs = Int(parsedTimeout.components.seconds)
+        let timeoutSecs = Int(try parseTimeoutOrExit(resolvedTimeout).components.seconds)
 
         let parsedEnv = try parseEnvSpecs(env)
 
@@ -1767,16 +1743,7 @@ struct NetworkRun: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let timeoutDuration: Duration?
-        if !timeout.isEmpty {
-            guard let parsed = parseDuration(timeout) else {
-                FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 30s, 5m\n".utf8))
-                throw ExitCode.failure
-            }
-            timeoutDuration = parsed
-        } else {
-            timeoutDuration = nil
-        }
+        let timeoutDuration = timeout.isEmpty ? nil : try parseTimeoutOrExit(timeout)
 
         FileHandle.standardError.write(Data("Starting \(manifest.sessions.count) sessions on shared network...\n".utf8))
 
@@ -1881,14 +1848,8 @@ struct PoolRun: AsyncParsableCommand {
         let totalRuns = count ?? size
         let maxConcurrent = concurrency ?? size
 
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout: \(timeout)\n".utf8))
-            throw ExitCode.failure
-        }
-        guard let parsedMemory = parseMemory(memory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory: \(memory)\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedTimeout = try parseTimeoutOrExit(timeout)
+        let parsedMemory = try parseMemoryOrExit(memory)
         let parsedEnv = try parseEnvSpecs(env)
         let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
         let parsedDownloads = try parseDownloadSpecs(download)
