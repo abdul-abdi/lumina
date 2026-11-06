@@ -238,11 +238,7 @@ struct Run: AsyncParsableCommand {
         case .json:
             try await runUnifiedJSON(options: options)
         case .text:
-            if resolveStreaming() {
-                try await runStreaming(options: options)
-            } else {
-                try await runBuffered(options: options, format: .text)
-            }
+            try await runStreaming(options: options)
         }
     }
 
@@ -378,46 +374,6 @@ struct Run: AsyncParsableCommand {
         }
     }
 
-    // MARK: - Buffered (non-streaming)
-
-    private func runBuffered(options: RunOptions, format: OutputFormat) async throws {
-        let start = ContinuousClock.now
-        do {
-            let result = try await Lumina.run(command, options: options)
-            let ms = millisSince(start)
-            switch format {
-            case .json:
-                printResultJSON(result, durationMs: ms)
-            case .text:
-                // Prefer raw bytes when available (binary output); fall back to lossy UTF-8 string
-                if let bytes = result.stdoutBytes {
-                    FileHandle.standardOutput.write(bytes)
-                } else {
-                    print(result.stdout, terminator: "")
-                }
-                if let bytes = result.stderrBytes {
-                    FileHandle.standardError.write(bytes)
-                } else if !result.stderr.isEmpty {
-                    FileHandle.standardError.write(Data(result.stderr.utf8))
-                }
-            }
-            if !result.success {
-                throw ExitCode(result.exitCode)
-            }
-        } catch let exitCode as ExitCode {
-            throw exitCode
-        } catch {
-            let ms = millisSince(start)
-            switch format {
-            case .json:
-                printErrorJSON(error, durationMs: ms, friendly: true)
-            case .text:
-                try handleTextError(error, timeout: timeout)
-            }
-            throw ExitCode.failure
-        }
-    }
-
     // MARK: - Streaming
 
     private func runStreaming(options: RunOptions) async throws {
@@ -426,7 +382,7 @@ struct Run: AsyncParsableCommand {
             for try await chunk in chunks {
                 switch chunk {
                 case .stdout(let data):
-                    print(data, terminator: "")
+                    FileHandle.standardOutput.write(Data(data.utf8))
                 case .stderr(let data):
                     FileHandle.standardError.write(Data(data.utf8))
                 case .stdoutBytes(let bytes):
@@ -494,19 +450,6 @@ private struct ResultJSON: Encodable {
     // command was shorter than the guest's first metrics tick or on
     // pre-v0.7.1 agents.
     var network_metrics: NetworkMetricsSummary?
-}
-
-private func printResultJSON(_ result: RunResult, durationMs: Int) {
-    let r = ResultJSON(
-        stdout: result.stdout,
-        stderr: result.stderr,
-        stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
-        stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
-        exit_code: Int(result.exitCode),
-        duration_ms: durationMs,
-        network_metrics: result.networkMetrics
-    )
-    encodeAndPrint(r)
 }
 
 /// Map a session server's `.error(message:)` payload to a v0.6.0 error state.
@@ -1533,11 +1476,8 @@ struct Exec: AsyncParsableCommand {
                 let response = try client.receive()
                 switch response {
                 case .output(let outputStream, let data):
-                    if outputStream == .stdout {
-                        print(data, terminator: "")
-                    } else {
-                        FileHandle.standardError.write(Data(data.utf8))
-                    }
+                    let fd = outputStream == .stdout ? FileHandle.standardOutput : FileHandle.standardError
+                    fd.write(Data(data.utf8))
                 case .exit(let code, _):
                     stdinTask?.cancel()
                     if code != 0 { throw ExitCode(code) }

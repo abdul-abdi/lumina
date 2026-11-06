@@ -147,19 +147,6 @@ func resolveDiskSize(flag: String?) -> String? {
     return ProcessInfo.processInfo.environment["LUMINA_DISK_SIZE"]
 }
 
-// MARK: - Streaming Mode (text format only)
-//
-// Default: TTY = stream (humans want real-time), pipe = buffer.
-// Override: LUMINA_STREAM=0|1 env var.
-
-/// Resolve streaming mode for text output: LUMINA_STREAM env > isatty auto-detect.
-func resolveStreaming() -> Bool {
-    if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
-        return envVal == "1" || envVal == "true"
-    }
-    return isatty(STDOUT_FILENO) != 0
-}
-
 // MARK: - Session ID Parsing
 
 /// Parse a session ID from either a bare UUID string or a JSON {"sid":"UUID"} object.
