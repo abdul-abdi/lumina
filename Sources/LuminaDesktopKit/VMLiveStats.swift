@@ -11,7 +11,6 @@
 // This is information the static text can't convey.
 
 import SwiftUI
-import Combine
 import LuminaBootable
 
 @MainActor

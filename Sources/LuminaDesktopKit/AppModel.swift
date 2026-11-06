@@ -16,9 +16,7 @@ public final class AppModel {
     public var bundles: [VMBundle] = []
     public var sessions: [UUID: LuminaDesktopSession] = [:]
     public var sortOrder: SortOrder = .lastUsed
-    public var groupBy: GroupBy = .none
     public var search: String = ""
-    public var selection: UUID?
     public var pendingError: String?
 
     public let store: VMStore
@@ -103,12 +101,6 @@ public final class AppModel {
         case lastUsed = "Last used"
         case created = "Created"
         case name = "Name"
-        case osFamily = "OS"
-    }
-
-    public enum GroupBy: String, CaseIterable, Sendable {
-        case none = "None"
-        case status = "Status"
         case osFamily = "OS"
     }
 

@@ -13,7 +13,6 @@ public struct OSWizardTile: Sendable, Identifiable {
     public let displayName: String
     public let family: OSFamily
     public let glyph: String       // SF Symbol name
-    public let accentHex: String   // Catppuccin-aligned per OS
     public let description: String
     public let constraint: String? // e.g. "Needs retail license"
     public let acquisition: Acquisition
@@ -21,7 +20,6 @@ public struct OSWizardTile: Sendable, Identifiable {
     public enum Acquisition: Sendable {
         case catalogISO(DesktopOSEntry)        // Linux — URL + checksum
         case microsoftAccountDownload          // Windows 11 ARM — opens browser
-        case appleIPSW                          // macOS — IPSW catalog
         case userProvided                       // BYO file
     }
 }
@@ -29,14 +27,14 @@ public struct OSWizardTile: Sendable, Identifiable {
 public enum OSCatalog {
     public static let allTiles: [OSWizardTile] = [
         // Linux from DesktopOSCatalog
-        tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill", accentHex: "#E95420",
+        tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill",
              desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
              constraint: "Server ISO · GUI is a one-liner post-install"),
-        tile(for: "kali-rolling", glyph: "shield.lefthalf.filled", accentHex: "#367BF0",
+        tile(for: "kali-rolling", glyph: "shield.lefthalf.filled",
              desc: "Penetration-testing distribution; rolling release. Installer offers XFCE desktop out of the box."),
-        tile(for: "fedora-42", glyph: "circle.grid.cross.fill", accentHex: "#3C6EB4",
+        tile(for: "fedora-42", glyph: "circle.grid.cross.fill",
              desc: "Bleeding-edge GNOME experience from Red Hat. Live ISO boots straight into the desktop — no post-install steps."),
-        tile(for: "debian-12", glyph: "leaf.fill", accentHex: "#A80030",
+        tile(for: "debian-12", glyph: "leaf.fill",
              desc: "Conservative, dependable; the foundation many other distros build on. Netinst lets you pick GNOME/KDE/XFCE during setup."),
 
         // Windows
@@ -45,31 +43,17 @@ public enum OSCatalog {
             displayName: "Windows 11 (ARM64)",
             family: .windows,
             glyph: "macwindow",
-            accentHex: "#0078D4",
             description: "Microsoft's ARM build of Windows 11. Activation needs your own license.",
             constraint: "Needs retail license",
             acquisition: .microsoftAccountDownload
         ),
 
-        // macOS
-        OSWizardTile(
-            id: "macos-latest",
-            displayName: "macOS (latest available)",
-            family: .macOS,
-            glyph: "apple.logo",
-            accentHex: "#1D1D1F",
-            description: "Apple's macOS as a guest. Restored from an IPSW (~15 GB).",
-            constraint: "Apple Silicon host only",
-            acquisition: .appleIPSW
-        ),
-
         // BYO
         OSWizardTile(
             id: "byo-file",
-            displayName: "Use my own ISO/IPSW",
+            displayName: "Use my own ISO",
             family: .linux,  // displayed under linux family but can be anything
             glyph: "doc.badge.plus",
-            accentHex: "#9CA3AF",
             description: "Drop a file you've already downloaded.",
             constraint: nil,
             acquisition: .userProvided
@@ -79,7 +63,6 @@ public enum OSCatalog {
     private static func tile(
         for catalogID: String,
         glyph: String,
-        accentHex: String,
         desc: String,
         constraint: String? = nil
     ) -> OSWizardTile {
@@ -94,7 +77,6 @@ public enum OSCatalog {
             displayName: entry.displayName,
             family: entry.family,
             glyph: glyph,
-            accentHex: accentHex,
             description: desc,
             constraint: constraint,
             acquisition: .catalogISO(entry)

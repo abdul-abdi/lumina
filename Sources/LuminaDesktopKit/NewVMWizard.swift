@@ -206,7 +206,7 @@ public struct NewVMWizard: View {
                                 NSPasteboard.general.setString(entry.isoURL.absoluteString, forType: .string)
                             }
                         }
-                        Text("≈ \(formatGB(entry.isoSizeBytes)) download. Once you have the ISO on disk, attach it below.")
+                        Text("≈ \(formatBytesHuman(entry.isoSizeBytes)) download. Once you have the ISO on disk, attach it below.")
                             .font(.system(size: 11))
                             .foregroundStyle(LuminaTheme.inkMute)
                             .padding(.top, 4)
@@ -229,17 +229,6 @@ public struct NewVMWizard: View {
                             .padding(.top, 4)
                             isoPicker
                             windowsTPMAdvisory
-                        }
-                        .padding(8)
-                    }
-                case .appleIPSW:
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Lumina downloads the macOS IPSW directly from Apple (~15 GB).")
-                                .font(.headline)
-                            Text("By continuing you accept Apple's licensing terms. You can also pick an IPSW file you already have.")
-                                .foregroundStyle(.secondary)
-                            ipswPicker
                         }
                         .padding(8)
                     }
@@ -516,34 +505,8 @@ public struct NewVMWizard: View {
                 // Empty allowedContentTypes would block all files. Nil = allow any.
                 // We accept anything since users may have .iso, .img, .dmg,
                 // or a renamed distribution ISO.
-                panel.title = "Pick an ISO or IPSW file"
-                panel.message = "Select a .iso, .img, or .ipsw file"
-                if panel.runModal() == .OK { byoFile = panel.url }
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(LuminaTheme.accent)
-        }
-    }
-
-    private var ipswPicker: some View {
-        HStack {
-            if let f = byoFile {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc.fill")
-                        .foregroundStyle(LuminaTheme.accent)
-                    Text(f.lastPathComponent).foregroundStyle(LuminaTheme.ink)
-                }
-            } else {
-                Text("No file selected").foregroundStyle(LuminaTheme.inkMute)
-            }
-            Spacer()
-            Button("Choose IPSW…") {
-                let panel = NSOpenPanel()
-                panel.allowsMultipleSelection = false
-                panel.canChooseDirectories = false
-                panel.canChooseFiles = true
-                panel.title = "Pick an IPSW file"
-                panel.message = "Apple macOS restore image (.ipsw)"
+                panel.title = "Pick an ISO file"
+                panel.message = "Select a .iso or .img file"
                 if panel.runModal() == .OK { byoFile = panel.url }
             }
             .buttonStyle(.borderedProminent)
@@ -562,10 +525,6 @@ public struct NewVMWizard: View {
                 // User must attach the ISO before we can proceed — we don't
                 // run a background downloader in v0.7.0.
                 return byoFile != nil
-            case .appleIPSW:
-                // macOS IPSW can go without a pre-picked file; the restore
-                // runs through `lumina desktop install-macos` with the URL.
-                return true
             }
         case .resources: return true
         case .review: return !isVerifying
@@ -667,8 +626,6 @@ public struct NewVMWizard: View {
             diskGB = Double(entry.recommendedDiskBytes / (1024 * 1024 * 1024))
         case .microsoftAccountDownload:
             memoryGB = 8; cpus = 4; diskGB = 64
-        case .appleIPSW:
-            memoryGB = 8; cpus = 4; diskGB = 64
         case .userProvided:
             break
         }
@@ -731,10 +688,6 @@ public struct NewVMWizard: View {
         }
     }
 
-
-    private func formatGB(_ bytes: UInt64) -> String {
-        String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))
-    }
 
     /// Collapse the UI choice + selected bridge interface into the
     /// persisted `NetworkMode` shape. Returns nil for NAT so older

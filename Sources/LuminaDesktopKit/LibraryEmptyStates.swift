@@ -36,7 +36,7 @@ public struct EmptyStateView: View {
                             .foregroundStyle(LuminaTheme.inkDim)
                     }
                 }
-                Text("Spin up Ubuntu, Kali, Windows 11 ARM, or macOS — \nand throw it away when you're done.")
+                Text("Spin up Ubuntu, Kali, Fedora or Windows 11 ARM — \nand throw it away when you're done.")
                     .font(.system(size: 14))
                     .foregroundStyle(LuminaTheme.inkDim)
                     .multilineTextAlignment(.center)
@@ -49,9 +49,6 @@ public struct EmptyStateView: View {
                     PrimaryAction(label: "Install Windows 11", systemImage: "macwindow") {
                         onChoose("windows-11-arm")
                     }
-                    PrimaryAction(label: "Install macOS", systemImage: "apple.logo") {
-                        onChoose("macos-latest")
-                    }
                     PrimaryAction(label: "Use my own…", systemImage: "doc.badge.plus") {
                         onChoose("byo-file")
                     }
@@ -62,7 +59,7 @@ public struct EmptyStateView: View {
             HStack(spacing: 14) {
                 Image(systemName: "arrow.down.doc")
                     .foregroundStyle(LuminaTheme.inkMute)
-                Text("Drop an ISO or IPSW anywhere on this window")
+                Text("Drop an ISO anywhere on this window")
                     .font(.system(size: 12))
                     .foregroundStyle(LuminaTheme.inkMute)
             }

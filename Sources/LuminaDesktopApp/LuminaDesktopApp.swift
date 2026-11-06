@@ -237,54 +237,15 @@ struct LuminaCommands: Commands {
                 Divider()
                 Button("Windows 11 on ARM") { openWizard(tile: "windows-11-arm") }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
-                Button("macOS (latest)") { openWizard(tile: "macos-latest") }
-                    .keyboardShortcut("m", modifiers: [.command, .shift])
                 Divider()
-                Button("From ISO or IPSW file…") { openWizard(tile: "byo-file") }
+                Button("From ISO file…") { openWizard(tile: "byo-file") }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
             }
 
-            Divider()
-
-            Button("Open Bundle…") {
-                let panel = NSOpenPanel()
-                panel.allowsMultipleSelection = false
-                panel.canChooseDirectories = true
-                panel.canChooseFiles = false
-                panel.title = "Open .luminaVM bundle"
-                if panel.runModal() == .OK, let _ = panel.url {
-                    model.refresh()
-                }
-            }
-            .keyboardShortcut("o", modifiers: .command)
         }
 
         // ── VM menu ──
         CommandMenu("VM") {
-            Button("Boot Selected") { runSelected(.boot) }
-                .keyboardShortcut("b", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Stop Selected") { runSelected(.stop) }
-                .keyboardShortcut(".", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Restart Selected") { runSelected(.restart) }
-                .keyboardShortcut("r", modifiers: .command)
-                .disabled(model.selection == nil)
-            Divider()
-            Button("Take Snapshot") { runSelected(.snapshot) }
-                .keyboardShortcut("t", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Clone VM…") { runSelected(.clone) }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(model.selection == nil)
-            Divider()
-            Button("Reveal in Finder") { runSelected(.reveal) }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(model.selection == nil)
-            Button("Delete…") { runSelected(.delete) }
-                .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(model.selection == nil)
-            Divider()
             // Standard macOS pattern: label flips based on whether any
             // window is already fullscreen. No floating chrome — the
             // menu bar itself is the escape route (OS reveals it on
@@ -339,37 +300,6 @@ struct LuminaCommands: Commands {
 
     // ── Helpers ──
 
-    private enum VMAction {
-        case boot, stop, restart, snapshot, clone, reveal, delete
-    }
-
-    private func runSelected(_ action: VMAction) {
-        guard let id = model.selection,
-              let bundle = model.bundles.first(where: { $0.manifest.id == id }) else { return }
-        let session = model.session(for: bundle)
-        switch action {
-        case .boot: Task { await session.boot() }
-        case .stop: Task { await session.shutdown() }
-        case .restart: Task {
-            await session.shutdown()
-            await session.boot()
-        }
-        case .snapshot: break  // wired in M8
-        case .clone: break
-        case .reveal: NSWorkspace.shared.activateFileViewerSelecting([bundle.rootURL])
-        case .delete:
-            let alert = NSAlert()
-            alert.messageText = "Move '\(bundle.manifest.name)' to Trash?"
-            alert.informativeText = "The bundle disk image and snapshots will be moved. You can restore from Trash."
-            alert.addButton(withTitle: "Move to Trash")
-            alert.addButton(withTitle: "Cancel")
-            alert.alertStyle = .warning
-            if alert.runModal() == .alertFirstButtonReturn {
-                model.deleteBundle(bundle)
-            }
-        }
-    }
-
     private func openWizard(tile: String) {
         coordinator.openWizard(preselecting: tile)
     }
@@ -403,11 +333,6 @@ struct PreferencesView: View {
             Picker("Sort order", selection: $model.sortOrder) {
                 ForEach(AppModel.SortOrder.allCases, id: \.rawValue) { o in
                     Text(o.rawValue).tag(o)
-                }
-            }
-            Picker("Group by", selection: $model.groupBy) {
-                ForEach(AppModel.GroupBy.allCases, id: \.rawValue) { g in
-                    Text(g.rawValue).tag(g)
                 }
             }
         }

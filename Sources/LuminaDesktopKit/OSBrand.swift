@@ -15,7 +15,6 @@ public struct OSBrand: Sendable {
     public let textOnAccent: Color
     public let glyph: String             // SF Symbol name
     public let bodyGradient: [Color]     // top → bottom subtle tint
-    public let stripeWidth: CGFloat
     public let nameStyle: NameStyle
 
     public enum NameStyle: Sendable {
@@ -26,14 +25,12 @@ public struct OSBrand: Sendable {
 
     public init(displayName: String, accent: Color, textOnAccent: Color,
                 glyph: String, bodyGradient: [Color],
-                stripeWidth: CGFloat = 3,
                 nameStyle: NameStyle = .caps) {
         self.displayName = displayName
         self.accent = accent
         self.textOnAccent = textOnAccent
         self.glyph = glyph
         self.bodyGradient = bodyGradient
-        self.stripeWidth = stripeWidth
         self.nameStyle = nameStyle
     }
 }
@@ -158,15 +155,4 @@ public enum OSBranding {
             return .system(size: 12, weight: .semibold, design: .default)
         }
     }
-}
-
-private func hex(_ s: String) -> Color {
-    var t = s
-    if t.hasPrefix("#") { t.removeFirst() }
-    guard t.count == 6, let v = UInt32(t, radix: 16) else { return .gray }
-    return Color(
-        red: Double((v >> 16) & 0xFF) / 255,
-        green: Double((v >> 8) & 0xFF) / 255,
-        blue: Double(v & 0xFF) / 255
-    )
 }

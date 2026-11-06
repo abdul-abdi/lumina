@@ -124,7 +124,7 @@ public enum LuminaTheme {
 }
 
 // ── Color helpers ──────────────────────────────────────────────────
-private func hex(_ s: String) -> Color {
+func hex(_ s: String) -> Color {
     var trimmed = s
     if trimmed.hasPrefix("#") { trimmed.removeFirst() }
     guard trimmed.count == 6, let value = UInt32(trimmed, radix: 16) else {
@@ -187,17 +187,9 @@ public extension VMBundle {
 
     /// "1.2 GB" / "480 MB" — sparse disk usage, human.
     var diskUsedFormatted: String {
-        fmtBytes(actualDiskBytes)
+        formatBytesHuman(actualDiskBytes)
     }
 
-    var diskCapFormatted: String { fmtBytes(manifest.diskBytes) }
-
-    private func fmtBytes(_ n: UInt64) -> String {
-        let gb = Double(n) / (1024 * 1024 * 1024)
-        if gb >= 1.0 { return String(format: "%.1f GB", gb) }
-        let mb = Double(n) / (1024 * 1024)
-        if mb >= 1.0 { return String(format: "%.0f MB", mb) }
-        return "\(n) B"
-    }
+    var diskCapFormatted: String { formatBytesHuman(manifest.diskBytes) }
 }
 

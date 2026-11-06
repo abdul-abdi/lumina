@@ -133,14 +133,11 @@ import Testing
         #expect(ids.contains("fedora-42"))
         #expect(ids.contains("debian-12"))
         #expect(ids.contains("windows-11-arm"))
-        #expect(ids.contains("macos-latest"))
         #expect(ids.contains("byo-file"))
     }
 
     @Test func tileLookupReturnsCorrectFamily() {
         let win = OSCatalog.tile(id: "windows-11-arm")
         #expect(win?.family == .windows)
-        let mac = OSCatalog.tile(id: "macos-latest")
-        #expect(mac?.family == .macOS)
     }
 }
