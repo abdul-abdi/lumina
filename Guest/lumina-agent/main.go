@@ -9,6 +9,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/user"
 
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/agent"
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/bootmark"
@@ -33,6 +34,11 @@ func main() {
 
 	if os.Getenv("PATH") == "" {
 		_ = os.Setenv("PATH", defaultPATH)
+	}
+	if home := os.Getenv("HOME"); home == "" || home == "/" {
+		if u, err := user.Current(); err == nil && u.HomeDir != "" {
+			_ = os.Setenv("HOME", u.HomeDir)
+		}
 	}
 
 	ln, err := vsock.Listen(vsockPort)

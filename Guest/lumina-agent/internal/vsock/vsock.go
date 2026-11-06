@@ -43,7 +43,7 @@ type listener struct {
 }
 
 func (l *listener) Accept() (net.Conn, error) {
-	nfd, _, err := unix.Accept(l.fd)
+	nfd, _, err := unix.Accept4(l.fd, unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
 	if err != nil {
 		return nil, err
 	}
