@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${1:-$HOME/.lumina/images/default}"
 CUSTOM_KERNEL="${LUMINA_KERNEL:-}"  # Path to pre-built custom kernel (optional)
 WORK_DIR=$(mktemp -d)
-ALPINE_VERSION="3.20"
+ALPINE_VERSION="3.24"
 ALPINE_ARCH="aarch64"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}"
 ROOTFS_SIZE_MB=1024
@@ -317,7 +317,6 @@ mkdir -p "$OUTPUT_DIR"
 
 # --- 6a: Copy kernel ---
 if [ "$BAKED_MODE" = true ]; then
-    # Custom kernel is already a raw ARM64 Image (built by build-kernel.sh)
     cp "$VMLINUZ" "$OUTPUT_DIR/vmlinuz"
     echo "  vmlinuz:    $(du -h "$OUTPUT_DIR/vmlinuz" | cut -f1) (custom)"
 else
