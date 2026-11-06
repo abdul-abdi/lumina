@@ -46,25 +46,7 @@ struct SessionServe: AsyncParsableCommand {
 
         let paths = SessionPaths(sid: sid)
 
-        // Parse --volume: host path or named volume
-        let volumeStore = VolumeStore()
-        var mounts: [MountPoint] = []
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else { continue }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                let hostURL = URL(fileURLWithPath: left)
-                mounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
-            } else {
-                guard let hostDir = volumeStore.resolve(name: left) else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                mounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
-            }
-        }
+        let mounts = try parseVolumeSpecs(volume, volumeStore: VolumeStore())
 
         // Parse --forward early so bad input fails before boot.
         var forwardSpecs: [ForwardSpec] = []

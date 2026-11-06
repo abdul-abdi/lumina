@@ -847,36 +847,7 @@ struct SessionStart: AsyncParsableCommand {
 
         let bootTimeoutSecs = 60 // Hardcoded — if boot takes >60s, something is broken
 
-        // Parse --volume: host path (starts with / or .) forwarded as mount,
-        // otherwise resolved as named volume
-        var sessionVolumes: [(String, String)] = [] // (left, guestPath) pairs for subprocess
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
-                throw ExitCode.failure
-            }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                // Validate host directory exists
-                let hostURL = URL(fileURLWithPath: left)
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
-                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
-                    throw ExitCode.failure
-                }
-                sessionVolumes.append((left, guestPath))
-            } else {
-                // Validate named volume exists
-                let volumeStore = VolumeStore()
-                guard volumeStore.resolve(name: left) != nil else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                sessionVolumes.append((left, guestPath))
-            }
-        }
+        _ = try parseVolumeSpecs(volume, volumeStore: VolumeStore())
 
         // Parse --forward early so invalid specs fail before spawning the child.
         // Forwarded specs are passed verbatim to _session-serve, which re-parses
@@ -901,8 +872,8 @@ struct SessionStart: AsyncParsableCommand {
             "--cpus", String(resolvedCpus),
             "--memory", String(parsedMemory),
         ]
-        for (left, guestPath) in sessionVolumes {
-            process.arguments! += ["--volume", "\(left):\(guestPath)"]
+        for spec in volume {
+            process.arguments! += ["--volume", spec]
         }
         if let ds = resolveDiskSize(flag: diskSize) {
             process.arguments! += ["--disk-size", ds]
