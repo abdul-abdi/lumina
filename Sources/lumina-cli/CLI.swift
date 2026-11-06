@@ -153,7 +153,7 @@ struct Run: AsyncParsableCommand {
                     downloads: try parseDownloadSpecs(download),
                     stdinData: daemonStdinBytes
                 ) {
-                    try emitDaemonResult(result)
+                    try emitResult(result)
                     return
                 }
             } catch {
@@ -249,30 +249,26 @@ struct Run: AsyncParsableCommand {
     /// and `partial_stdout` / `partial_stderr` when the command actually ran.
     private func runUnifiedJSON(options: RunOptions) async throws {
         let start = ContinuousClock.now
-        var stdoutBuf = ""
-        var stderrBuf = ""
-        var stdoutBytes: [UInt8] = []
-        var stderrBytes: [UInt8] = []
+        var stdoutData = Data()
+        var stderrData = Data()
         var sawBinaryStdout = false
         var sawBinaryStderr = false
         var exitCode: Int32? = nil
+        var transferFailed = false
 
         do {
-            let chunks = Lumina.stream(command, options: options)
-            for try await chunk in chunks {
+            for try await chunk in Lumina.stream(command, options: options) {
                 switch chunk {
                 case .stdout(let s):
-                    stdoutBuf += s
+                    stdoutData.append(contentsOf: s.utf8)
                 case .stderr(let s):
-                    stderrBuf += s
+                    stderrData.append(contentsOf: s.utf8)
                 case .stdoutBytes(let bytes):
                     sawBinaryStdout = true
-                    stdoutBytes.append(contentsOf: bytes)
-                    stdoutBuf += String(decoding: bytes, as: UTF8.self)
+                    stdoutData.append(bytes)
                 case .stderrBytes(let bytes):
                     sawBinaryStderr = true
-                    stderrBytes.append(contentsOf: bytes)
-                    stderrBuf += String(decoding: bytes, as: UTF8.self)
+                    stderrData.append(bytes)
                 case .exit(let code):
                     exitCode = code
                 }
@@ -281,53 +277,32 @@ struct Run: AsyncParsableCommand {
             // If the command already completed (we captured an exit chunk) and the
             // error is a post-exit download/transfer failure, surface the successful
             // exit but log the transfer error to stderr.
-            if let code = exitCode {
-                FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
-                let ms = millisSince(start)
-                var r = ResultJSON(
-                    stdout: stdoutBuf,
-                    stderr: stderrBuf,
-                    exit_code: Int(code),
-                    duration_ms: ms
-                )
-                if sawBinaryStdout { r.stdout_bytes = Data(stdoutBytes).base64EncodedString() }
-                if sawBinaryStderr { r.stderr_bytes = Data(stderrBytes).base64EncodedString() }
+            guard exitCode != nil else {
+                let (state, commandRan) = errorStateForRun(error)
+                var r = ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: millisSince(start))
+                if commandRan {
+                    if !stdoutData.isEmpty { r.partial_stdout = String(decoding: stdoutData, as: UTF8.self) }
+                    if !stderrData.isEmpty { r.partial_stderr = String(decoding: stderrData, as: UTF8.self) }
+                }
                 encodeAndPrint(r)
-                if code != 0 { throw ExitCode(code) }
                 throw ExitCode.failure
             }
-
-            let ms = millisSince(start)
-            let (state, commandRan) = errorStateForRun(error)
-            var r = ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: ms)
-            if commandRan {
-                if !stdoutBuf.isEmpty { r.partial_stdout = stdoutBuf }
-                if !stderrBuf.isEmpty { r.partial_stderr = stderrBuf }
-            }
-            encodeAndPrint(r)
-            throw ExitCode.failure
+            FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
+            transferFailed = true
         }
 
-        let ms = millisSince(start)
-        var r = ResultJSON(
-            stdout: stdoutBuf,
-            stderr: stderrBuf,
-            exit_code: Int(exitCode ?? 0),
-            duration_ms: ms
-        )
-        if sawBinaryStdout {
-            r.stdout_bytes = Data(stdoutBytes).base64EncodedString()
-        }
-        if sawBinaryStderr {
-            r.stderr_bytes = Data(stderrBytes).base64EncodedString()
-        }
-        encodeAndPrint(r)
-        if let code = exitCode, code != 0 {
-            throw ExitCode(code)
-        }
+        try emitResult(RunResult(
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self),
+            exitCode: exitCode ?? 0,
+            wallTime: ContinuousClock.now - start,
+            stdoutBytes: sawBinaryStdout ? stdoutData : nil,
+            stderrBytes: sawBinaryStderr ? stderrData : nil
+        ))
+        if transferFailed { throw ExitCode.failure }
     }
 
-    private func emitDaemonResult(_ result: RunResult) throws {
+    private func emitResult(_ result: RunResult) throws {
         if resolveOutputFormat() == .json {
             encodeAndPrint(ResultJSON(
                 stdout: result.stdout,
