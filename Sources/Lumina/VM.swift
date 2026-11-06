@@ -329,16 +329,6 @@ public actor VM {
         // md=noautodetect — skip the kernel's autodetect-RAID-arrays pass
         //   at init time. Negligible on its own (<50ms), but semantically
         //   correct: Lumina VMs never host MD devices.
-        //
-        // Note: the single largest boot cost on current images is the
-        //   kernel's 8-way RAID6 algorithm benchmark (~545ms on M3 Pro,
-        //   measured 2026-04-24). That benchmark runs only when the
-        //   kernel is compiled with RAID6 code (CONFIG_RAID6_PQ=y),
-        //   and there is no runtime cmdline to skip it on upstream
-        //   kernels. The eliminating fix is in `Guest/build-kernel.sh`
-        //   which now disables CONFIG_MD — next image build drops ~550ms
-        //   cold-boot. Existing images continue to pay the cost until
-        //   a new image tarball ships.
         var cmdLine = "console=hvc0 root=/dev/vda rw md=noautodetect"
 
         if !options.mounts.isEmpty {
@@ -1398,9 +1388,7 @@ public actor VM {
         candidates.sort { $0.name < $1.name }
 
         if candidates.count == 1 {
-            let c = candidates[0]
-            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@", c.gateway, c.name)
-            return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+            return (gateway: candidates[0].gateway, subnetPrefix: candidates[0].subnetPrefix)
         }
 
         // Multiple bridges: go through the process-wide registry so
@@ -1412,13 +1400,6 @@ public actor VM {
         let claimed = await VmnetBridgeRegistry.shared.claim(
             mac: macLastByte, candidates: candidates
         )
-        if let mac = macLastByte {
-            NSLog("[Lumina.VM] Claimed vmnet gateway %@ on %@ (MAC last byte 0x%02X)",
-                  claimed.gateway, claimed.name, mac)
-        } else {
-            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@ (no MAC hint — first-found)",
-                  claimed.gateway, claimed.name)
-        }
         return (gateway: claimed.gateway, subnetPrefix: claimed.subnetPrefix)
     }
 
