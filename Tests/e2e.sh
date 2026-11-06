@@ -16,6 +16,7 @@ SKIP=0
 FAILURES=()
 
 export LUMINA_FORMAT=json
+export LUMINA_DAEMON=0
 
 if [ -t 1 ]; then
   GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; NC='\033[0m'; BOLD='\033[1m'
@@ -882,6 +883,61 @@ else
 fi
 
 $LUMINA session stop "$SID_T" 2>/dev/null
+
+section "19. WARM-POOL DAEMON"
+
+DSOCK="$HOME/.lumina/e2e-$$.sock"
+DLOG=/tmp/lumina-e2e-daemon.log
+LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA daemon serve --size 2 --socket "$DSOCK" > "$DLOG" 2>&1 &
+for _ in $(seq 1 150); do grep -q "ready on" "$DLOG" 2>/dev/null && break; sleep 0.2; done
+if ! grep -q "ready on" "$DLOG"; then
+  fail "19.0 daemon ready" "$(cat "$DLOG")"
+else
+  pass "19.0 daemon ready"
+  drun() { LUMINA_DAEMON=1 LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA run "$@" 2>/dev/null; }
+
+  OUT=$(drun "echo warm")
+  echo "$OUT" | jq -e '.stdout == "warm\n" and .exit_code == 0 and .duration_ms < 100' >/dev/null 2>&1 \
+    && pass "19.1 run routes through a running daemon" || fail "19.1 auto-route" "$OUT"
+
+  PIDS=(); for i in 1 2 3 4; do drun "echo c$i" > "/tmp/lumina-e2e-d$i.out" & PIDS+=($!); done; wait "${PIDS[@]}"
+  OK=0; for i in 1 2 3 4; do jq -e ".stdout == \"c$i\n\"" "/tmp/lumina-e2e-d$i.out" >/dev/null 2>&1 && OK=$((OK + 1)); done
+  [ "$OK" -eq 4 ] && pass "19.2 4 concurrent runs on a pool of 2" || fail "19.2 concurrent" "$OK/4 ok"
+
+  OUT=$(LUMINA_MEMORY=512MB drun "echo cold")
+  echo "$OUT" | jq -e '.stdout == "cold\n" and .duration_ms >= 100' >/dev/null 2>&1 \
+    && pass "19.3 pool-shape mismatch falls back to cold boot" || fail "19.3 decline" "$OUT"
+
+  OUT=$(drun --timeout 1s "sleep 5")
+  echo "$OUT" | jq -e '.error == "timeout"' >/dev/null 2>&1 \
+    && pass "19.4 daemon timeout surfaces as error=timeout" || fail "19.4 daemon timeout" "$OUT"
+
+  OUT=$(LUMINA_FORMAT=text drun "echo plain")
+  [ "$OUT" = "plain" ] && pass "19.5 text output on daemon path" || fail "19.5 text output" "$OUT"
+fi
+LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA daemon stop >/dev/null 2>&1
+
+section "20. GUEST CLOCK"
+
+SID_C=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+$LUMINA exec "$SID_C" 'date -s "2020-01-01 00:00:00" >/dev/null' >/dev/null 2>&1
+GUEST=$($LUMINA exec "$SID_C" 'date -u +%s' 2>/dev/null | jq -r '.stdout' | tr -d '\n')
+DRIFT=$(( $(date -u +%s) - ${GUEST:-0} ))
+[ "${DRIFT#-}" -le 3 ] && pass "20.1 exec resyncs a stale guest clock from the RTC" || fail "20.1 clock" "drift ${DRIFT}s"
+$LUMINA session stop "$SID_C" >/dev/null 2>&1
+
+section "21. SESSION SAVE"
+
+SID_S=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+IMG="e2e-save-$$"
+$LUMINA exec "$SID_S" 'echo saved-state > /root/marker' >/dev/null 2>&1
+OUT=$($LUMINA session save "$SID_S" "$IMG" 2>/dev/null)
+echo "$OUT" | jq -e ".image == \"$IMG\"" >/dev/null 2>&1 && pass "21.1 session save" || fail "21.1 session save" "$OUT"
+OUT=$($LUMINA run --image "$IMG" 'cat /root/marker' 2>/dev/null)
+echo "$OUT" | jq -e '.stdout == "saved-state\n"' >/dev/null 2>&1 \
+  && pass "21.2 saved image boots with the session's files" || fail "21.2 saved image" "$OUT"
+$LUMINA session stop "$SID_S" >/dev/null 2>&1
+$LUMINA images remove "$IMG" >/dev/null 2>&1
 
 # ═══════════════════════════════════════════════════════════════
 # RESULTS
