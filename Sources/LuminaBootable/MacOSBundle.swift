@@ -34,6 +34,11 @@ extension VMBundle {
         ipsw: URL? = nil,
         progress: @escaping @Sendable (MacOSPhase, Double) -> Void = { _, _ in }
     ) async throws {
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .userInitiated],
+            reason: "Installing macOS into \(manifest.name)"
+        )
+        defer { ProcessInfo.processInfo.endActivity(activity) }
         ensureMACAddress()
         let restoreImage: URL
         if let ipsw = ipsw ?? pendingISO {
