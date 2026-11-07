@@ -83,6 +83,7 @@ public struct MacOSBootable: Sendable {
         case invalidMachineIdentifier
         case auxiliaryStorageFailed(String)
         case primaryDiskFailed(String)
+        case missingRestoreImage
     }
 
     public func apply(to vzConfig: VZVirtualMachineConfiguration) throws {
@@ -138,7 +139,8 @@ public struct MacOSBootable: Sendable {
     public static func prepare(
         bootConfig: MacOSBootConfig
     ) async throws -> (config: MacOSBootConfig, restoreImage: VZMacOSRestoreImage) {
-        let restore = try await VZMacOSRestoreImage.image(from: bootConfig.ipsw)
+        guard let ipsw = bootConfig.ipsw else { throw Error.missingRestoreImage }
+        let restore = try await VZMacOSRestoreImage.image(from: ipsw)
         guard let supported = restore.mostFeaturefulSupportedConfiguration else {
             throw Error.invalidHardwareModel
         }

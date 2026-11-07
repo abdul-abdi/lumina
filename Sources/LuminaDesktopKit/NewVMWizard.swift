@@ -65,6 +65,10 @@ public struct NewVMWizard: View {
                 step = .variant  // skip step 1 since tile is pre-picked
                 applyOSDefaults()
             }
+            if let dropped = UserDefaults.standard.string(forKey: "lumina.wizard.droppedFile") {
+                UserDefaults.standard.removeObject(forKey: "lumina.wizard.droppedFile")
+                byoFile = URL(fileURLWithPath: dropped)
+            }
         }
         // Swapping the attached ISO invalidates any prior SHA-256 verdict;
         // the next Next-click has to re-verify.
@@ -224,6 +228,17 @@ public struct NewVMWizard: View {
                             .padding(.top, 4)
                             isoPicker
                             windowsTPMAdvisory
+                        }
+                        .padding(8)
+                    }
+                case .appleIPSW:
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Lumina downloads the newest macOS IPSW this Mac supports from Apple (~18 GB) on first boot.")
+                                .font(.headline)
+                            Text("By continuing you accept Apple's licensing terms. You can also pick an IPSW you already have.")
+                                .foregroundStyle(.secondary)
+                            ipswPicker
                         }
                         .padding(8)
                     }
@@ -508,6 +523,23 @@ public struct NewVMWizard: View {
         }
     }
 
+    private var ipswPicker: some View {
+        HStack {
+            Text(byoFile?.lastPathComponent ?? "Download the latest").foregroundStyle(byoFile == nil ? LuminaTheme.inkMute : LuminaTheme.ink)
+            Spacer()
+            Button("Choose IPSW…") {
+                let panel = NSOpenPanel()
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                panel.canChooseFiles = true
+                panel.title = "Pick an IPSW file"
+                panel.message = "Apple macOS restore image (.ipsw)"
+                if panel.runModal() == .OK { byoFile = panel.url }
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
     private var canAdvance: Bool {
         switch step {
         case .chooseOS: return selectedTile != nil
@@ -517,6 +549,8 @@ public struct NewVMWizard: View {
             switch tile.acquisition {
             case .userProvided, .microsoftAccountDownload, .catalogISO:
                 return byoFile != nil
+            case .appleIPSW:
+                return true
             }
         case .resources: return true
         case .review: return !isVerifying
@@ -539,7 +573,7 @@ public struct NewVMWizard: View {
             //      they can re-attach a fresh download without losing
             //      configuration.
             guard let tile = selectedTile else { step = .resources; return }
-            if let picked = byoFile, !architectureCheck(tile: tile, file: picked) {
+            if tile.family != .macOS, let picked = byoFile, !architectureCheck(tile: tile, file: picked) {
                 return // architectureCheck surfaced the error already
             }
             if case .catalogISO(let entry) = tile.acquisition,
@@ -616,7 +650,7 @@ public struct NewVMWizard: View {
             memoryGB = Double(entry.recommendedMemoryBytes / (1024 * 1024 * 1024))
             cpus = entry.recommendedCPUs
             diskGB = Double(entry.recommendedDiskBytes / (1024 * 1024 * 1024))
-        case .microsoftAccountDownload:
+        case .microsoftAccountDownload, .appleIPSW:
             memoryGB = 8; cpus = 4; diskGB = 64
         case .userProvided:
             break

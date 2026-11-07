@@ -30,6 +30,7 @@ public actor MacOSVM {
     }
 
     private var virtualMachine: VZVirtualMachine?
+    private var pendingDelegate: (any VZVirtualMachineDelegate)?
     private var _state: State = .idle
     private var _bootConfig: MacOSBootConfig
     private let memoryBytes: UInt64
@@ -40,6 +41,15 @@ public actor MacOSVM {
 
     public var state: State { _state }
     public var bootConfig: MacOSBootConfig { _bootConfig }
+
+    public func vzMachine() -> VM.VZMachineHandle {
+        VM.VZMachineHandle(machine: virtualMachine)
+    }
+
+    public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
+        pendingDelegate = delegate
+        virtualMachine?.delegate = delegate
+    }
 
     public init(
         bootConfig: MacOSBootConfig,
@@ -249,6 +259,7 @@ public actor MacOSVM {
 
             let queue = executor.queue
             let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
+            vm.delegate = pendingDelegate
             self.virtualMachine = vm
 
             let vmBox = UncheckedSendable(vm)

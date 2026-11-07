@@ -65,6 +65,7 @@ public final class LuminaDesktopSession: Identifiable {
     public var bootDuration: Duration?
     public var serialDigest: String = ""
     public var bootPhases: BootPhases = BootPhases()
+    public var installProgress: (label: String, fraction: Double)?
 
     public var snapshot: SessionSnapshot {
         SessionSnapshot(
@@ -101,6 +102,8 @@ public final class LuminaDesktopSession: Identifiable {
     public var vzMachine: VZVirtualMachine?
 
     private var vm: VM?
+    private var macVM: MacOSVM?
+    private var installTask: Task<Void, any Error>?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
     /// VZ holds the delegate weakly, so we retain it here until the
@@ -162,6 +165,10 @@ public final class LuminaDesktopSession: Identifiable {
         // workaround is "Retry network autoconfiguration" in the
         // installer's failure screen.)
         mutableBundle.ensureMACAddress()
+        if mutableBundle.manifest.osFamily == .macOS {
+            await bootMacOS(mutableBundle, start: start)
+            return
+        }
 
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
         let cdromURL = mutableBundle.pendingISO
@@ -215,14 +222,7 @@ public final class LuminaDesktopSession: Identifiable {
         // live; post-boot install (prior design) leaves a gap where a
         // kernel-boot-window crash silently lands on a nil delegate and
         // the UI sits at `.running` with a dead VM.
-        let forwarder = VMStopForwarder(
-            onGuestStop: { [weak self] in
-                Task { @MainActor in self?.handleExternalStop(reason: nil) }
-            },
-            onError: { [weak self] err in
-                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
-            }
-        )
+        let forwarder = makeStopForwarder()
         self.vmDelegate = forwarder
 
         let newVM = VM(options: opts)
@@ -284,6 +284,68 @@ public final class LuminaDesktopSession: Identifiable {
                 ))
             }
         }
+    }
+
+    private func bootMacOS(_ bundle: VMBundle, start: ContinuousClock.Instant) async {
+        var bundle = bundle
+        do {
+            if !bundle.isMacOSInstalled {
+                let installing = bundle
+                let task = Task { [weak self] in
+                    var target = installing
+                    try await target.installMacOS { phase, fraction in
+                        let label = phase == .downloading ? "Downloading macOS" : "Installing macOS"
+                        Task { @MainActor in self?.installProgress = (label, fraction) }
+                    }
+                }
+                installTask = task
+                try await task.value
+                installTask = nil
+                installProgress = nil
+                bundle = (try? VMBundle.load(from: bundle.rootURL)) ?? bundle
+            }
+            ensureSpotlightDisabled()
+            let forwarder = makeStopForwarder()
+            vmDelegate = forwarder
+            let newVM = bundle.macOSVM()
+            macVM = newVM
+            await newVM.setDelegate(forwarder)
+            try await newVM.boot()
+            vzMachine = await newVM.vzMachine().machine
+            applyAtomic(SessionSnapshot(
+                status: .running,
+                lastError: nil,
+                bootDuration: ContinuousClock.now - start,
+                serialDigest: "",
+                bootPhases: BootPhases()
+            ))
+            try? bundle.recordBoot()
+        } catch {
+            installTask = nil
+            installProgress = nil
+            macVM = nil
+            vmDelegate = nil
+            vzMachine = nil
+            let cancelled = error is CancellationError || status == .shuttingDown || status == .stopped
+            applyAtomic(SessionSnapshot(
+                status: cancelled ? .stopped : .crashed(reason: "\(error)"),
+                lastError: cancelled ? nil : "\(error)",
+                bootDuration: bootDuration,
+                serialDigest: serialDigest,
+                bootPhases: BootPhases()
+            ))
+        }
+    }
+
+    private func makeStopForwarder() -> VMStopForwarder {
+        VMStopForwarder(
+            onGuestStop: { [weak self] in
+                Task { @MainActor in self?.handleExternalStop(reason: nil) }
+            },
+            onError: { [weak self] err in
+                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
+            }
+        )
     }
 
     private func ensureSpotlightDisabled() {
@@ -369,6 +431,7 @@ public final class LuminaDesktopSession: Identifiable {
         vmDelegate = nil
         vzMachine = nil
         vm = nil
+        macVM = nil
         // Atomic transition — crashed(reason) must not be observed
         // without lastError populated, and stopped must not carry a
         // stale lastError from a prior crash. Single observation tick.
@@ -455,11 +518,17 @@ public final class LuminaDesktopSession: Identifiable {
         serialMirrorTask = nil
         bootPhasesMirrorTask?.cancel()
         bootPhasesMirrorTask = nil
+        installTask?.cancel()
         if let vm = self.vm {
             await vm.setDelegate(nil)
             await vm.shutdown()
         }
+        if let macVM {
+            await macVM.setDelegate(nil)
+            await macVM.shutdown()
+        }
         self.vm = nil
+        self.macVM = nil
         status = .stopped
     }
 

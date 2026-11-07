@@ -226,14 +226,14 @@ public struct EFIBootConfig: Sendable, Equatable {
 /// "pick a reasonable default at install time" — the installer fills them in
 /// and the final values persist in the VM bundle.
 public struct MacOSBootConfig: Sendable, Equatable {
-    public var ipsw: URL
+    public var ipsw: URL?
     public var auxiliaryStorage: URL
     public var primaryDisk: URL
     public var hardwareModel: Data?
     public var machineIdentifier: Data?
 
     public init(
-        ipsw: URL,
+        ipsw: URL? = nil,
         auxiliaryStorage: URL,
         primaryDisk: URL,
         hardwareModel: Data? = nil,

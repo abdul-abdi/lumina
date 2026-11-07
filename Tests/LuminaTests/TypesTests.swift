@@ -134,7 +134,7 @@ import Testing
         auxiliaryStorage: tmp.appendingPathComponent("aux.img"),
         primaryDisk: tmp.appendingPathComponent("disk.img")
     )
-    #expect(cfg.ipsw.lastPathComponent == "UniversalMac.ipsw")
+    #expect(cfg.ipsw?.lastPathComponent == "UniversalMac.ipsw")
     #expect(cfg.auxiliaryStorage.lastPathComponent == "aux.img")
     #expect(cfg.primaryDisk.lastPathComponent == "disk.img")
     #expect(cfg.hardwareModel == nil)

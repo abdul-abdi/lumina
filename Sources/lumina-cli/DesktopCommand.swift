@@ -265,7 +265,7 @@ struct DesktopCreate: AsyncParsableCommand {
 struct DesktopBoot: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "boot",
-        abstract: "Boot a .luminaVM bundle (EFI guests)."
+        abstract: "Boot a .luminaVM bundle."
     )
 
     @Argument(help: "Path to the .luminaVM bundle.")
@@ -288,6 +288,10 @@ struct DesktopBoot: AsyncParsableCommand {
 
     mutating func run() async throws {
         let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
+        if bundle.manifest.osFamily == .macOS {
+            _ = try await DesktopRunner.runMacOS(bundle, timeout: timeoutSec)
+            return
+        }
         do {
             _ = try await DesktopRunner.boot(
                 bundle, cdrom: bundle.pendingISO, graphics: !headless, rosetta: rosetta,
@@ -352,7 +356,36 @@ enum DesktopRunner {
             throw ExitCode(1)
         }
         try onBooted()
+        let stop = await waitForStop(guestStop, timeout: timeout)
+        await vm.shutdown()
+        withExtendedLifetime(guestStop) {}
+        return stop
+    }
 
+    static func runMacOS(_ bundle: VMBundle, timeout: Int) async throws -> Stop {
+        guard bundle.isMacOSInstalled else {
+            FileHandle.standardError.write(Data("error: macOS is not installed in this bundle yet; run 'lumina desktop install-macos \(bundle.rootURL.path)'\n".utf8))
+            throw ExitCode(1)
+        }
+        let vm = bundle.macOSVM()
+        let guestStop = GuestStopSignal()
+        await vm.setDelegate(guestStop)
+        do {
+            try await vm.boot()
+        } catch {
+            FileHandle.standardError.write(Data("error: boot failed: \(error)\n".utf8))
+            throw ExitCode(1)
+        }
+        var booted = bundle
+        try? booted.recordBoot()
+        FileHandle.standardError.write(Data("Booted \(bundle.manifest.name) (headless; open it in Lumina.app to see the screen). Press Ctrl-C to stop.\n".utf8))
+        let stop = await waitForStop(guestStop, timeout: timeout)
+        await vm.shutdown()
+        withExtendedLifetime(guestStop) {}
+        return stop
+    }
+
+    private static func waitForStop(_ guestStop: GuestStopSignal, timeout: Int) async -> Stop {
         let signalQueue = DispatchQueue(label: "com.lumina.desktop.signals")
         let (signals, signalContinuation) = AsyncStream<Int32>.makeStream()
         let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
@@ -389,8 +422,6 @@ enum DesktopRunner {
         case .timeout: FileHandle.standardError.write(Data("→ --timeout reached, shutting down…\n".utf8))
         case .guest: FileHandle.standardError.write(Data("→ guest powered off\n".utf8))
         }
-        await vm.shutdown()
-        withExtendedLifetime(guestStop) {}
         return stop
     }
 }
@@ -511,81 +542,38 @@ private extension DateFormatter {
 struct DesktopInstallMacOS: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "install-macos",
-        abstract: "Restore a macOS guest from an IPSW into a .luminaVM bundle."
+        abstract: "Restore macOS into a .luminaVM bundle (downloads the newest supported IPSW unless --ipsw is given)."
     )
 
-    @Argument(help: "Path to the .luminaVM bundle (must already exist via 'desktop create').")
+    @Argument(help: "Path to the .luminaVM bundle (create it with 'desktop create --os-variant macos').")
     var bundlePath: String
 
     @Option(name: .customLong("ipsw"), help: "Path to a macOS IPSW file (Apple's restore image).")
-    var ipswPath: String
-
-    @Option(name: .customLong("memory"), help: "Memory allocation for the install run (e.g. 8GB).")
-    var memory: String = "8GB"
-
-    @Option(name: .customLong("cpus"), help: "CPU cores for the install run.")
-    var cpus: Int = 4
+    var ipswPath: String?
 
     mutating func run() async throws {
         var bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
-        let ipswURL = URL(fileURLWithPath: (ipswPath as NSString).expandingTildeInPath)
-
-        guard FileManager.default.fileExists(atPath: ipswURL.path) else {
-            FileHandle.standardError.write(Data("error: IPSW not found: \(ipswPath)\n".utf8))
+        let ipsw = ipswPath.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        if let ipsw, !FileManager.default.fileExists(atPath: ipsw.path) {
+            FileHandle.standardError.write(Data("error: IPSW not found: \(ipsw.path)\n".utf8))
             throw ExitCode(2)
         }
-
-        // Ensure the bundle has a persisted MAC before install so regular
-        // boots after install match what VZ saw during the install run.
-        let stableMAC = bundle.ensureMACAddress()
-
-        let cfg = MacOSBootConfig(
-            ipsw: ipswURL,
-            auxiliaryStorage: bundle.auxiliaryStorageURL,
-            primaryDisk: bundle.primaryDiskURL
-        )
-        let vm = MacOSVM(
-            bootConfig: cfg,
-            memoryBytes: try parseMemoryOrExit(memory),
-            cpuCount: cpus,
-            macAddress: stableMAC
-        )
-
-        print("Restoring macOS from \(ipswPath) into \(bundle.rootURL.path)")
-        print("This may take 30+ minutes; progress prints in 5% increments.")
-
-        let lastBucket = ProgressBucket()
+        print("Restoring macOS into \(bundle.rootURL.path). This takes 15-30 minutes.")
+        let reported = ProgressBucket()
         do {
-            try await vm.install { fraction in
-                let bucket = Int(fraction * 20)  // 0..20 = 5% increments
-                if lastBucket.advanceTo(bucket) {
-                    print("  \(Int(fraction * 100))% complete")
+            try await bundle.installMacOS(ipsw: ipsw) { phase, fraction in
+                if reported.advanceTo(phase == .downloading ? Int(fraction * 20) : 21 + Int(fraction * 20)) {
+                    print("  \(phase == .downloading ? "downloading" : "installing") \(Int(fraction * 100))%")
                 }
             }
         } catch {
             FileHandle.standardError.write(Data("error: install failed: \(error)\n".utf8))
             throw ExitCode(1)
         }
-
-        await vm.shutdown()
-        print("Installation complete.")
-
-        // Persist the resolved hardware model + machine identifier into the
-        // bundle manifest so future boots know which IPSW lineage to use.
-        let resolved = await vm.bootConfig
-        if let hw = resolved.hardwareModel {
-            try? hw.write(to: bundle.rootURL.appendingPathComponent("macos.hwmodel"), options: .atomic)
-        }
-        if let mid = resolved.machineIdentifier {
-            try? mid.write(to: bundle.rootURL.appendingPathComponent("macos.machineid"), options: .atomic)
-        }
+        print("Installation complete. Boot it in Lumina.app or with 'lumina desktop boot'.")
     }
 }
 
-/// Single-write tracker so progress callbacks don't flood stdout. Actor
-/// would be overkill — a class-with-NSLock matches the existing Lumina
-/// patterns (see CommandRunner) and avoids dragging an actor into a
-/// synchronous KVO callback.
 private final class ProgressBucket: @unchecked Sendable {
     private let lock = NSLock()
     private var current: Int = -1

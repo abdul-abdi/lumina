@@ -13,6 +13,7 @@ public struct OSWizardTile: Sendable, Identifiable {
     public enum Acquisition: Sendable {
         case catalogISO(DesktopOSEntry)        // Linux — URL + checksum
         case microsoftAccountDownload          // Windows 11 ARM — opens browser
+        case appleIPSW
         case userProvided                       // BYO file
     }
 }
@@ -37,6 +38,16 @@ public enum OSCatalog {
             description: "Microsoft's ARM build of Windows 11. Activation needs your own license.",
             constraint: "Needs retail license",
             acquisition: .microsoftAccountDownload
+        ),
+
+        OSWizardTile(
+            id: "macos-latest",
+            displayName: "macOS (latest supported)",
+            family: .macOS,
+            glyph: "apple.logo",
+            description: "Apple's macOS as a guest, restored from the newest IPSW this Mac supports (~18 GB download, cached).",
+            constraint: "First boot installs macOS (15-30 min)",
+            acquisition: .appleIPSW
         ),
 
         OSWizardTile(

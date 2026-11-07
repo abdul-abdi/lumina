@@ -144,8 +144,8 @@ public struct LibraryView: View {
             guard let p = path else { continue }
             let url = URL(fileURLWithPath: p)
             let ext = url.pathExtension.lowercased()
-            guard ["iso", "img"].contains(ext) else { continue }
-            wizardInitialTile = "byo-file"
+            guard ["iso", "img", "ipsw"].contains(ext) else { continue }
+            wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
             showingWizard = true
             UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
             break

@@ -217,6 +217,8 @@ struct LuminaCommands: Commands {
                 Divider()
                 Button("Windows 11 on ARM") { openWizard(tile: "windows-11-arm") }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
+                Button("macOS (latest)") { openWizard(tile: "macos-latest") }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
                 Divider()
                 Button("From ISO file…") { openWizard(tile: "byo-file") }
                     .keyboardShortcut("o", modifiers: [.command, .shift])

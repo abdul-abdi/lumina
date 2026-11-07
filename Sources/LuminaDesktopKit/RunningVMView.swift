@@ -128,11 +128,24 @@ public struct RunningVMView: View {
                     .foregroundStyle(LuminaTheme.inkDim)
             }
             .padding(.bottom, 12)
-            HStack(spacing: 10) {
-                Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
-                Text("vm.boot() — initializing virtio devices, EFI variable store…")
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.inkDim)
+            if let progress = session.installProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("\(progress.label) — \(Int(progress.fraction * 100))%")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                    ProgressView(value: progress.fraction)
+                        .tint(LuminaTheme.accent)
+                }
+                .frame(maxWidth: 520)
+            } else {
+                HStack(spacing: 10) {
+                    Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
+                    Text(session.bundle.manifest.osFamily == .macOS
+                         ? "vm.boot() — starting macOS…"
+                         : "vm.boot() — initializing virtio devices, EFI variable store…")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                }
             }
             // Live phase waterfall — fills in as each phase completes
             // via the session's bootPhasesMirrorTask. The view itself
