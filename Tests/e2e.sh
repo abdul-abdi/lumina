@@ -122,7 +122,7 @@ fi
 
 # Large output — tests backpressure and buffer handling; every line must arrive
 OUT=$($LUMINA run "seq 1 5000" --timeout 30s 2>/dev/null)
-LINES=$(echo "$OUT" | jq -r '.stdout' | wc -l | tr -d ' ')
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
 if echo "$OUT" | jq -e '.exit_code == 0 and (.stdout | endswith("\n5000\n"))' >/dev/null 2>&1 && [ "$LINES" -eq 5000 ]; then
   pass "3.3 5K lines arrive complete"
 else
@@ -349,7 +349,7 @@ $OK && pass "7.2 5 alternating text/envelope pairs" || fail "7.2 alternating" "p
 
 # Large output through a session — no dropped frames
 OUT=$($LUMINA exec "$SID" "seq 1 3000" --timeout 30s 2>/dev/null)
-LINES=$(echo "$OUT" | jq -r '.stdout' | wc -l | tr -d ' ')
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
 if echo "$OUT" | jq -e '.exit_code == 0 and (.stdout | endswith("\n3000\n"))' >/dev/null 2>&1 && [ "$LINES" -eq 3000 ]; then
   pass "7.3 3K line session output (no dropped frames)"
 else
@@ -590,7 +590,7 @@ fi
 
 # 10K lines — tests chunking + buffering
 OUT=$($LUMINA run "seq 1 10000" --timeout 60s 2>/dev/null)
-LINES=$(echo "$OUT" | jq -r '.stdout' | wc -l | tr -d ' ')
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
 if echo "$OUT" | jq -e '.exit_code == 0' >/dev/null 2>&1 && [ "$LINES" -eq 10000 ]; then
   pass "13.2 10K lines arrive complete"
 else
