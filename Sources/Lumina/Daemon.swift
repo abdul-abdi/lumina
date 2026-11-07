@@ -95,31 +95,15 @@ public enum Daemon {
 
         // Build NDJSON request. Uploads/downloads carry host paths only —
         // the daemon reads/writes them directly since it's on the same host.
-        var req: [String: Any] = [
-            "op": "run",
-            "image": image,
-            "memory": memory,
-            "cpus": cpuCount,
-            "cmd": command,
-            "timeout": timeout,
-            "env": env,
-        ]
-        if let c = cwd { req["cwd"] = c }
-        if !uploads.isEmpty {
-            req["uploads"] = uploads.map { ["local": $0.localPath.path, "remote": $0.remotePath, "mode": $0.mode] }
-        }
-        if !directoryUploads.isEmpty {
-            req["directory_uploads"] = directoryUploads.map { ["local": $0.localPath.path, "remote": $0.remotePath] }
-        }
-        if !downloads.isEmpty {
-            req["downloads"] = downloads.map { ["remote": $0.remotePath, "local": $0.localPath.path] }
-        }
-        if let stdinData, !stdinData.isEmpty {
-            req["stdin_b64"] = stdinData.base64EncodedString()
-        }
-        guard let reqData = try? JSONSerialization.data(withJSONObject: req) else { return nil }
-        var line = reqData
-        line.append(0x0a) // newline
+        let request = DaemonRequest(
+            op: "run", image: image, memory: memory, cpus: cpuCount, cmd: command, timeout: timeout,
+            env: env, cwd: cwd,
+            uploads: uploads.map { .init(local: $0.localPath.path, remote: $0.remotePath, mode: $0.mode) },
+            directory_uploads: directoryUploads.map { .init(local: $0.localPath.path, remote: $0.remotePath) },
+            downloads: downloads.map { .init(local: $0.localPath.path, remote: $0.remotePath) },
+            stdin_b64: stdinData.flatMap { $0.isEmpty ? nil : $0.base64EncodedString() }
+        )
+        guard let line = request.line else { return nil }
 
         // A failed write means the request never reliably reached the daemon —
         // treat it the same as a failed connect (safe to retry cold) rather
@@ -168,30 +152,17 @@ public enum Daemon {
         }
         defer { Darwin.close(fd) }
 
-        let req: [String: Any] = ["op": "ping"]
-        guard let reqData = try? JSONSerialization.data(withJSONObject: req) else {
-            return .unreachable(reason: "failed to encode ping request")
-        }
-        var line = reqData
-        line.append(0x0a)
-        guard writeAll(fd: fd, data: line) else {
+        guard let line = DaemonRequest(op: "ping").line, writeAll(fd: fd, data: line) else {
             return .unreachable(reason: "write to daemon socket failed")
         }
 
         guard let respLine = await asyncReadLine(fd: fd) else {
             return .unreachable(reason: "no response from daemon (timed out or disconnected)")
         }
-        guard let json = try? JSONSerialization.jsonObject(with: respLine) as? [String: Any] else {
-            return .unreachable(reason: "malformed (non-JSON) response from daemon")
+        guard let pong = try? JSONDecoder().decode(DaemonPong.self, from: respLine) else {
+            return .unreachable(reason: "malformed ping response from daemon")
         }
-        guard let poolSize = json["poolSize"] as? Int,
-              let warm = json["warm"] as? Int,
-              let image = json["image"] as? String
-        else {
-            return .unreachable(reason: "ping response missing poolSize/warm/image fields")
-        }
-
-        return .running(poolSize: poolSize, warm: warm, image: image)
+        return .running(poolSize: pong.poolSize, warm: pong.warm, image: pong.image)
     }
 
     // MARK: - Client: stop
@@ -202,10 +173,7 @@ public enum Daemon {
         guard FileManager.default.fileExists(atPath: sockURL.path) else { return false }
         guard let fd = unixConnect(path: sockURL.path) else { return false }
 
-        let req: [String: Any] = ["op": "shutdown"]
-        if let reqData = try? JSONSerialization.data(withJSONObject: req) {
-            var line = reqData
-            line.append(0x0a)
+        if let line = DaemonRequest(op: "shutdown").line {
             writeAll(fd: fd, data: line)
         }
         Darwin.close(fd)
@@ -322,18 +290,14 @@ private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath
 
     // Read one NDJSON line
     guard let line = await asyncReadLine(fd: fd),
-          let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-          let op = json["op"] as? String
+          let request = try? JSONDecoder().decode(DaemonRequest.self, from: line)
     else { return }
 
-    switch op {
+    switch request.op {
     case "ping":
-        let poolSize = pool.size // nonisolated
-        let warm = await pool.availableCount
-        let resp: [String: Any] = ["poolSize": poolSize, "warm": warm, "image": image]
-        if let data = try? JSONSerialization.data(withJSONObject: resp) {
-            var out = data; out.append(0x0a)
-            writeAll(fd: fd, data: out)
+        let pong = DaemonPong(poolSize: pool.size, warm: await pool.availableCount, image: image)
+        if let data = try? JSONEncoder().encode(pong) {
+            writeAll(fd: fd, data: data + [0x0a])
         }
 
     case "shutdown":
@@ -341,44 +305,43 @@ private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath
         Darwin.exit(0)
 
     case "run":
-        await runOnDaemon(json: json, fd: fd, pool: pool)
+        await runOnDaemon(request, fd: fd, pool: pool)
 
     default:
-        let err: [String: Any] = ["error": "unknown op: \(op)"]
-        if let data = try? JSONSerialization.data(withJSONObject: err) {
-            var out = data; out.append(0x0a)
-            writeAll(fd: fd, data: out)
+        if let data = try? JSONEncoder().encode(["error": "unknown op: \(request.op)"]) {
+            writeAll(fd: fd, data: data + [0x0a])
         }
     }
 }
 
-private func runOnDaemon(json: [String: Any], fd: Int32, pool: Pool) async {
+private func runOnDaemon(_ request: DaemonRequest, fd: Int32, pool: Pool) async {
     let wanted = (
-        json["image"] as? String ?? pool.options.image,
-        (json["memory"] as? NSNumber)?.uint64Value ?? pool.options.memory,
-        json["cpus"] as? Int ?? pool.options.cpuCount
+        request.image ?? pool.options.image,
+        request.memory ?? pool.options.memory,
+        request.cpus ?? pool.options.cpuCount
     )
     guard wanted == (pool.options.image, pool.options.memory, pool.options.cpuCount) else {
         writeAll(fd: fd, data: Data(#"{"declined":"pool shape differs"}"#.utf8 + [0x0a]))
         return
     }
-    let cmd = (json["cmd"] as? String) ?? ""
-    let env = (json["env"] as? [String: String]) ?? [:]
-    let cwd = json["cwd"] as? String
-    let timeoutSec = (json["timeout"] as? Int) ?? 60
-
     let start = ContinuousClock.now
     let result: RunResult
     do {
         result = try await pool.run(
-            cmd,
-            timeout: .seconds(timeoutSec),
-            env: env,
-            workingDirectory: cwd,
-            uploads: decodeFileUploads(json["uploads"]),
-            directoryUploads: decodeDirectoryUploads(json["directory_uploads"]),
-            downloads: decodeFileDownloads(json["downloads"]),
-            stdin: decodeStdin(json["stdin_b64"])
+            request.cmd ?? "",
+            timeout: .seconds(request.timeout ?? 60),
+            env: request.env ?? [:],
+            workingDirectory: request.cwd,
+            uploads: (request.uploads ?? []).map {
+                FileUpload(localPath: URL(fileURLWithPath: $0.local), remotePath: $0.remote, mode: $0.mode ?? "0644")
+            },
+            directoryUploads: (request.directory_uploads ?? []).map {
+                DirectoryUpload(localPath: URL(fileURLWithPath: $0.local), remotePath: $0.remote)
+            },
+            downloads: (request.downloads ?? []).map {
+                FileDownload(remotePath: $0.remote, localPath: URL(fileURLWithPath: $0.local))
+            },
+            stdin: request.stdin_b64.flatMap { Data(base64Encoded: $0) }.map(Stdin.oneShot) ?? .closed
         )
     } catch {
         let ms = Int((ContinuousClock.now - start).totalMilliseconds)
@@ -400,44 +363,6 @@ private func runOnDaemon(json: [String: Any], fd: Int32, pool: Pool) async {
     }
 }
 
-// MARK: - Request-side transfer / stdin decoding
-//
-// uploads/downloads carry host paths (see wire protocol note at the top of
-// this file) — decode straight into the same types Pool.run already accepts.
-
-private func decodeFileUploads(_ raw: Any?) -> [FileUpload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let local = spec["local"], let remote = spec["remote"] else { return nil }
-        return FileUpload(localPath: URL(fileURLWithPath: local), remotePath: remote, mode: spec["mode"] ?? "0644")
-    }
-}
-
-private func decodeDirectoryUploads(_ raw: Any?) -> [DirectoryUpload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let local = spec["local"], let remote = spec["remote"] else { return nil }
-        return DirectoryUpload(localPath: URL(fileURLWithPath: local), remotePath: remote)
-    }
-}
-
-private func decodeFileDownloads(_ raw: Any?) -> [FileDownload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let remote = spec["remote"], let local = spec["local"] else { return nil }
-        return FileDownload(remotePath: remote, localPath: URL(fileURLWithPath: local))
-    }
-}
-
-/// Rehydrates the base64 stdin blob as a one-shot source — the request
-/// already carries the whole thing, so there's nothing left to stream.
-private func decodeStdin(_ raw: Any?) -> Stdin {
-    guard let b64 = raw as? String, let data = Data(base64Encoded: b64), !data.isEmpty else {
-        return .closed
-    }
-    return .oneShot(data)
-}
-
 extension Stdin {
     /// Wraps already-read bytes as a one-shot `Stdin.source`: the exec pump
     /// gets the whole blob on its first call, then EOF. Used where the real
@@ -451,6 +376,35 @@ extension Stdin {
         channel.close()
         return .source { @Sendable [channel] in await channel.next() }
     }
+}
+
+struct DaemonRequest: Codable {
+    struct Transfer: Codable {
+        var local: String
+        var remote: String
+        var mode: String?
+    }
+
+    var op: String
+    var image: String?
+    var memory: UInt64?
+    var cpus: Int?
+    var cmd: String?
+    var timeout: Int?
+    var env: [String: String]?
+    var cwd: String?
+    var uploads: [Transfer]?
+    var directory_uploads: [Transfer]?
+    var downloads: [Transfer]?
+    var stdin_b64: String?
+
+    var line: Data? { (try? JSONEncoder().encode(self)).map { $0 + [0x0a] } }
+}
+
+struct DaemonPong: Codable {
+    var poolSize: Int
+    var warm: Int
+    var image: String
 }
 
 // MARK: - Wire envelope (mirrors CLI's private ResultJSON shape exactly)
