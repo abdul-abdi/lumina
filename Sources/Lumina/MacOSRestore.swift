@@ -37,7 +37,11 @@ public enum MacOSRestore {
         let partial = destination.appendingPathExtension("part")
         let curl = Process()
         curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        curl.arguments = ["-fsSL", "--retry", "5", "-C", "-", "-o", partial.path, remote.absoluteString]
+        curl.arguments = [
+            "-fsSL", "--retry", "10", "--retry-all-errors", "--retry-delay", "2",
+            "--speed-limit", "65536", "--speed-time", "60",
+            "-C", "-", "-o", partial.path, remote.absoluteString,
+        ]
         let stderr = Pipe()
         curl.standardError = stderr
         try curl.run()
