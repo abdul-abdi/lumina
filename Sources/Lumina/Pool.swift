@@ -105,13 +105,7 @@ public actor Pool {
         let vm = try await acquire()
         defer { Task { await self.releaseAndRefill(vm) } }
 
-        // Upload files before exec
-        if !uploads.isEmpty {
-            try await vm.uploadFiles(uploads)
-        }
-        for dir in directoryUploads {
-            try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
-        }
+        try await vm.upload(files: uploads, directories: directoryUploads)
 
         let timeoutSecs = max(Int(timeout.components.seconds), 1)
         let result = try await vm.exec(
@@ -122,16 +116,7 @@ public actor Pool {
             stdin: stdin
         )
 
-        // Download after exec — auto-detect file vs directory on guest (mirrors Lumina.run)
-        for dl in downloads {
-            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
-            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
-            if check.exitCode == 0 {
-                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
-            } else {
-                try await vm.downloadFiles([dl])
-            }
-        }
+        try await vm.download(downloads)
 
         return result
     }
