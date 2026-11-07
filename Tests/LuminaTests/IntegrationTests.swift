@@ -1,5 +1,6 @@
 // Tests/LuminaTests/IntegrationTests.swift
 import Foundation
+import os
 import Testing
 @testable import Lumina
 @testable import LuminaBootable
@@ -761,37 +762,9 @@ func integrationConcurrentExecOneTimeout() async throws {
 
 // MARK: - Stdin Tests (P3 — pipe data to running commands)
 
-@Test(.enabled(if: integrationEnabled()))
-func integrationStdinBasic() async throws {
-    // Use the VM actor directly with a known exec ID to test stdin.
-    let vm = VM(options: VMOptions(memory: 512 * 1024 * 1024, cpuCount: 2))
-    defer { Task { await vm.shutdown() } }
-
-    try await vm.boot()
-
-    // Use a caller-supplied exec ID so we can target sendStdin at this specific exec.
-    let id = UUID().uuidString
-    let stream = try await vm.execStream(id: id, "head -1", timeout: 30)
-
-    // Give the command a moment to start
-    try await Task.sleep(for: .milliseconds(500))
-
-    // Send stdin data
-    try await vm.sendStdin("hello from stdin\n", execId: id)
-
-    // Collect output
-    var output = ""
-    var exitCode: Int32?
-    for try await chunk in stream {
-        switch chunk {
-        case .stdout(let s): output += s
-        case .exit(let code): exitCode = code
-        default: break
-        }
-    }
-
-    #expect(output.contains("hello from stdin"), "Expected stdin data in output, got: \(output)")
-    #expect(exitCode == 0, "Expected exit 0, got: \(String(describing: exitCode))")
+private func stdinLines(_ lines: [String]) -> Stdin {
+    let pending = OSAllocatedUnfairLock(initialState: lines.map { Data($0.utf8) }[...])
+    return .source { pending.withLock { $0.popFirst() } }
 }
 
 @Test(.enabled(if: integrationEnabled()))
@@ -802,16 +775,9 @@ func integrationStdinMultiLine() async throws {
 
     try await vm.boot()
 
-    let id = UUID().uuidString
-    let stream = try await vm.execStream(id: id, "wc -l", timeout: 30)
-
-    try await Task.sleep(for: .milliseconds(500))
-
-    // Send 5 lines then close stdin
-    for i in 1...5 {
-        try await vm.sendStdin("line \(i)\n", execId: id)
-    }
-    try await vm.closeStdin(execId: id)
+    let stream = try await vm.stream(
+        "wc -l", timeout: 30, stdin: stdinLines((1...5).map { "line \($0)\n" })
+    )
 
     var output = ""
     for try await chunk in stream {
@@ -830,16 +796,7 @@ func integrationStdinCloseTriggersEOF() async throws {
 
     try await vm.boot()
 
-    let id = UUID().uuidString
-    let stream = try await vm.execStream(id: id, "cat", timeout: 30)
-
-    try await Task.sleep(for: .milliseconds(500))
-
-    // Send some data
-    try await vm.sendStdin("payload\n", execId: id)
-
-    // Close stdin — cat should see EOF and exit
-    try await vm.closeStdin(execId: id)
+    let stream = try await vm.stream("cat", timeout: 30, stdin: stdinLines(["payload\n"]))
 
     var output = ""
     var exitCode: Int32?
@@ -867,12 +824,7 @@ func integrationStdinConcurrentWithExec() async throws {
     try await withThrowingTaskGroup(of: (String, String).self) { group in
         // Task 1: stdin-consuming command
         group.addTask {
-            let id = UUID().uuidString
-            let stream = try await vm.execStream(id: id, "cat", timeout: 30)
-
-            try await Task.sleep(for: .milliseconds(300))
-            try await vm.sendStdin("STDIN_DATA\n", execId: id)
-            try await vm.closeStdin(execId: id)
+            let stream = try await vm.stream("cat", timeout: 30, stdin: stdinLines(["STDIN_DATA\n"]))
 
             var output = ""
             for try await chunk in stream {
@@ -1024,7 +976,6 @@ func integrationStreamCancelThenExec() async throws {
 @Test(.enabled(if: integrationEnabled()))
 func integrationSessionExecStdinViaIPC() async throws {
     // Exercise the SessionServer/SessionClient IPC path for stdin piping.
-    // Existing stdin tests use the VM actor directly (execStream + sendStdin).
     // This test goes through: SessionClient → Unix socket → SessionServer.handleExec
     //   → StdinChannel → CommandRunner → vsock → guest.
 

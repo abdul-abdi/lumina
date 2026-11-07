@@ -186,9 +186,6 @@ public actor VM {
 
     public var state: VMState { _state }
 
-    /// Expose the current disk clone for image creation workflows.
-    public var diskClone: DiskClone? { clone }
-
     /// Wire-format protocol version the guest agent reported on its
     /// `ready` frame. 0 when no handshake has happened yet, or when
     /// the guest pre-dates v0.7.2 (no `protocol_version` field on
@@ -1008,36 +1005,6 @@ public actor VM {
         }
     }
 
-    // MARK: - Stdin
-
-    /// Send stdin data to a running command.
-    public func sendStdin(_ data: String, execId: String) throws(LuminaError) {
-        guard let runner = commandRunner else { throw .connectionFailed }
-        try runner.sendStdin(id: execId, data: data)
-    }
-
-    /// Close the stdin pipe for a running command.
-    public func closeStdin(execId: String) throws(LuminaError) {
-        guard let runner = commandRunner else { throw .connectionFailed }
-        try runner.closeStdin(id: execId)
-    }
-
-    /// Low-level streaming exec with a caller-supplied exec ID.
-    /// Use this when you need to interleave sendStdin(_:execId:) calls during execution.
-    /// The caller is responsible for stdin timing — no StdinPumpGate is applied.
-    public func execStream(
-        id: String,
-        _ command: String,
-        timeout: Int = 60,
-        env: [String: String] = [:],
-        cwd: String? = nil
-    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
-        guard _state == .ready, let runner = commandRunner else {
-            throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
-        }
-        return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
-    }
-
     // MARK: - PTY Exec (v0.6.0)
 
     /// Execute a command in a PTY on the guest. Returns a stream of PtyChunk
@@ -1141,16 +1108,6 @@ public actor VM {
             throw .connectionFailed
         }
         return fd
-    }
-
-    /// Attempt to reconnect to the guest agent after a connection drop.
-    /// State is only set to `.ready` after the reconnect succeeds.
-    public func reconnect() async throws(LuminaError) {
-        guard let runner = commandRunner else {
-            throw .connectionFailed
-        }
-        try await runner.reconnect()
-        _state = .ready
     }
 
     /// Configure guest network via host-driven protocol.
@@ -1343,16 +1300,10 @@ public actor VM {
         commandRunner?.activeExecCount ?? 0
     }
 
-    /// Send a signal to a running guest command (by ID) or all commands (nil).
+    /// Send a signal to every running guest command.
     public func cancel(signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
         guard let runner = commandRunner else { return }
         try runner.cancel(id: nil, signal: signal, gracePeriod: gracePeriod)
-    }
-
-    /// Send a signal to a specific running guest command.
-    public func cancel(execId: String, signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
-        guard let runner = commandRunner else { return }
-        try runner.cancel(id: execId, signal: signal, gracePeriod: gracePeriod)
     }
 
     public func shutdown() async {
@@ -1387,10 +1338,6 @@ public actor VM {
         let c = clone
         clone = nil
         return c
-    }
-
-    public var serialOutput: String {
-        serialConsole.output
     }
 
     /// Monotonic version counter bumped by `SerialConsole.append`.
