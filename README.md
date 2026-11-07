@@ -303,7 +303,7 @@ Exhaustive, mutually exclusive error states:
 | `session_disconnected` | Session IPC socket dropped mid-exec            | yes       |
 | `connection_failed`    | VM/session unreachable — command never started | no        |
 
-Legacy per-chunk NDJSON streaming is preserved via `LUMINA_OUTPUT=ndjson` for migration, removed in v0.8.0.
+When stdout or stderr contained bytes that are not valid UTF-8, `stdout_bytes` / `stderr_bytes` carry the whole stream as base64 and `stdout` / `stderr` are a lossy UTF-8 rendering.
 
 ---
 
@@ -316,8 +316,6 @@ Legacy per-chunk NDJSON streaming is preserved via `LUMINA_OUTPUT=ndjson` for mi
 | `LUMINA_TIMEOUT`   | Command timeout               | `60s`                       |
 | `LUMINA_DISK_SIZE` | Rootfs size                   | image default               |
 | `LUMINA_FORMAT`    | `json` / `text`               | auto (JSON piped, text TTY) |
-| `LUMINA_STREAM`    | `0` / `1`, text mode only     | auto                        |
-| `LUMINA_OUTPUT`    | `ndjson` for legacy streaming | unset (unified envelope)    |
 
 For `lumina run`, resources come from env vars only. For `lumina session start` and `lumina desktop create`, flags (`--memory`, `--cpus`, `--disk-size`, `--forward`) override env vars.
 

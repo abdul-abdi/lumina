@@ -2,17 +2,16 @@
 import ArgumentParser
 import Foundation
 import Lumina
-import LuminaBootable
 
 @main
 struct LuminaCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "lumina",
         abstract: "Native Apple Workload Runtime for Agents — subprocess.run() for virtual machines.",
-        version: "0.7.4",
+        version: "0.8.0",
         subcommands: [Run.self, Pull.self, Images.self, Clean.self,
                       Session.self, Exec.self, Cp.self, SessionServe.self,
-                      Volume.self, NetworkCmd.self, PoolCmd.self, Ps.self,
+                      Volume.self, NetworkCmd.self, Ps.self,
                       Desktop.self, Doctor.self, Iso.self, DaemonCmd.self]
     )
 
@@ -92,9 +91,6 @@ struct Run: AsyncParsableCommand {
     @Flag(name: .long, help: "Run in PTY mode (interactive terminal) — use `exec --pty` against a session")
     var pty: Bool = false
 
-    @Flag(name: .customLong("wait-network"), help: "[default] Block exec until the guest's network is up. On by default in v0.7.3+ — the wait costs ~4ms, well inside boot noise.")
-    var waitNetwork: Bool = false
-
     @Flag(name: .customLong("no-wait-network"), help: "Exec without waiting for the guest network. Saves a few ms; commands that hit DNS immediately (curl, apt update, pip install) will fail with 'bad address'.")
     var noWaitNetwork: Bool = false
 
@@ -153,7 +149,7 @@ struct Run: AsyncParsableCommand {
                     downloads: try parseDownloadSpecs(download),
                     stdinData: daemonStdinBytes
                 ) {
-                    try emitDaemonResult(result)
+                    try emitResult(result)
                     return
                 }
             } catch {
@@ -172,19 +168,18 @@ struct Run: AsyncParsableCommand {
             }
         }
 
-        // Auto-pull image if not present
-        let puller = ImagePuller()
-        if !puller.imageExists() {
-            FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
-            do {
-                try await puller.pull { msg in
-                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
-                }
-            } catch {
-                FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
-                FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
-                throw ExitCode.failure
+        let imageCheckStart = ContinuousClock.now
+        do {
+            try await ensureImage(image)
+        } catch {
+            if resolveOutputFormat() == .json {
+                encodeAndPrint(ResultJSON(
+                    error: "connection_failed",
+                    error_detail: describeFailure(LuminaError.imageNotFound(image)),
+                    duration_ms: millisSince(imageCheckStart)
+                ))
             }
+            throw error
         }
 
         // Resolve from env vars with built-in defaults
@@ -193,15 +188,8 @@ struct Run: AsyncParsableCommand {
         let resolvedCpus = resolveCpus(flag: 2)
         let resolvedDiskSize = resolveDiskSize(flag: nil)
 
-        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'. Use e.g. 30s, 5m\n".utf8))
-            throw ExitCode.failure
-        }
-
-        guard let parsedMemory = parseMemory(resolvedMemory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'. Use e.g. 512MB, 1GB\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedTimeout = try parseTimeoutOrExit(resolvedTimeout)
+        let parsedMemory = try parseMemoryOrExit(resolvedMemory)
 
         let parsedEnv = try parseEnvSpecs(env)
         let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
@@ -209,14 +197,7 @@ struct Run: AsyncParsableCommand {
         let volumeStore = VolumeStore()
         let parsedMounts = try parseVolumeSpecs(volume, volumeStore: volumeStore)
 
-        var parsedDiskSize: UInt64? = nil
-        if let ds = resolvedDiskSize {
-            guard let size = parseMemory(ds) else {
-                FileHandle.standardError.write(Data("lumina: invalid disk-size '\(ds)'. Use e.g. 2GB, 4GB\n".utf8))
-                throw ExitCode.failure
-            }
-            parsedDiskSize = size
-        }
+        let parsedDiskSize = try resolvedDiskSize.map { try parseMemoryOrExit($0, what: "disk-size") }
 
         let options = RunOptions(
             timeout: parsedTimeout,
@@ -231,24 +212,14 @@ struct Run: AsyncParsableCommand {
             workingDirectory: workdir,
             diskSize: parsedDiskSize,
             stdin: daemonStdinBytes.map { $0.isEmpty ? Stdin.closed : Stdin.oneShot($0) } ?? resolveStdin(),
-            awaitNetworkReady: waitNetwork || !noWaitNetwork
+            awaitNetworkReady: !noWaitNetwork
         )
 
-        let format = resolveOutputFormat()
-        let shouldStream = resolveStreaming()
-        let legacyNDJSON = useLegacyExecOutput()
-
-        switch (format, legacyNDJSON) {
-        case (.json, false):
+        switch resolveOutputFormat() {
+        case .json:
             try await runUnifiedJSON(options: options)
-        case (.json, true):
-            try await runStreaming(options: options, format: .json)
-        case (.text, _):
-            if shouldStream {
-                try await runStreaming(options: options, format: .text)
-            } else {
-                try await runBuffered(options: options, format: .text)
-            }
+        case .text:
+            try await runStreaming(options: options)
         }
     }
 
@@ -259,30 +230,26 @@ struct Run: AsyncParsableCommand {
     /// and `partial_stdout` / `partial_stderr` when the command actually ran.
     private func runUnifiedJSON(options: RunOptions) async throws {
         let start = ContinuousClock.now
-        var stdoutBuf = ""
-        var stderrBuf = ""
-        var stdoutBytes: [UInt8] = []
-        var stderrBytes: [UInt8] = []
+        var stdoutData = Data()
+        var stderrData = Data()
         var sawBinaryStdout = false
         var sawBinaryStderr = false
         var exitCode: Int32? = nil
+        var transferFailed = false
 
         do {
-            let chunks = Lumina.stream(command, options: options)
-            for try await chunk in chunks {
+            for try await chunk in Lumina.stream(command, options: options) {
                 switch chunk {
                 case .stdout(let s):
-                    stdoutBuf += s
+                    stdoutData.append(contentsOf: s.utf8)
                 case .stderr(let s):
-                    stderrBuf += s
+                    stderrData.append(contentsOf: s.utf8)
                 case .stdoutBytes(let bytes):
                     sawBinaryStdout = true
-                    stdoutBytes.append(contentsOf: bytes)
-                    stdoutBuf += String(decoding: bytes, as: UTF8.self)
+                    stdoutData.append(bytes)
                 case .stderrBytes(let bytes):
                     sawBinaryStderr = true
-                    stderrBytes.append(contentsOf: bytes)
-                    stderrBuf += String(decoding: bytes, as: UTF8.self)
+                    stderrData.append(bytes)
                 case .exit(let code):
                     exitCode = code
                 }
@@ -291,53 +258,32 @@ struct Run: AsyncParsableCommand {
             // If the command already completed (we captured an exit chunk) and the
             // error is a post-exit download/transfer failure, surface the successful
             // exit but log the transfer error to stderr.
-            if let code = exitCode {
-                FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
-                let ms = millisSince(start)
-                var r = ResultJSON(
-                    stdout: stdoutBuf,
-                    stderr: stderrBuf,
-                    exit_code: Int(code),
-                    duration_ms: ms
-                )
-                if sawBinaryStdout { r.stdout_bytes = Data(stdoutBytes).base64EncodedString() }
-                if sawBinaryStderr { r.stderr_bytes = Data(stderrBytes).base64EncodedString() }
+            guard exitCode != nil else {
+                let (state, commandRan) = errorStateForRun(error)
+                var r = ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: millisSince(start))
+                if commandRan {
+                    if !stdoutData.isEmpty { r.partial_stdout = String(decoding: stdoutData, as: UTF8.self) }
+                    if !stderrData.isEmpty { r.partial_stderr = String(decoding: stderrData, as: UTF8.self) }
+                }
                 encodeAndPrint(r)
-                if code != 0 { throw ExitCode(code) }
                 throw ExitCode.failure
             }
-
-            let ms = millisSince(start)
-            let (state, commandRan) = errorStateForRun(error)
-            var r = ResultJSON(error: state, error_detail: describeFailure(error), duration_ms: ms)
-            if commandRan {
-                if !stdoutBuf.isEmpty { r.partial_stdout = stdoutBuf }
-                if !stderrBuf.isEmpty { r.partial_stderr = stderrBuf }
-            }
-            encodeAndPrint(r)
-            throw ExitCode.failure
+            FileHandle.standardError.write(Data("lumina: post-exit transfer failed: \(friendlyError(error))\n".utf8))
+            transferFailed = true
         }
 
-        let ms = millisSince(start)
-        var r = ResultJSON(
-            stdout: stdoutBuf,
-            stderr: stderrBuf,
-            exit_code: Int(exitCode ?? 0),
-            duration_ms: ms
-        )
-        if sawBinaryStdout {
-            r.stdout_bytes = Data(stdoutBytes).base64EncodedString()
-        }
-        if sawBinaryStderr {
-            r.stderr_bytes = Data(stderrBytes).base64EncodedString()
-        }
-        encodeAndPrint(r)
-        if let code = exitCode, code != 0 {
-            throw ExitCode(code)
-        }
+        try emitResult(RunResult(
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self),
+            exitCode: exitCode ?? 0,
+            wallTime: ContinuousClock.now - start,
+            stdoutBytes: sawBinaryStdout ? stdoutData : nil,
+            stderrBytes: sawBinaryStderr ? stderrData : nil
+        ))
+        if transferFailed { throw ExitCode.failure }
     }
 
-    private func emitDaemonResult(_ result: RunResult) throws {
+    private func emitResult(_ result: RunResult) throws {
         if resolveOutputFormat() == .json {
             encodeAndPrint(ResultJSON(
                 stdout: result.stdout,
@@ -384,95 +330,29 @@ struct Run: AsyncParsableCommand {
         }
     }
 
-    // MARK: - Buffered (non-streaming)
-
-    private func runBuffered(options: RunOptions, format: OutputFormat) async throws {
-        let start = ContinuousClock.now
-        do {
-            let result = try await Lumina.run(command, options: options)
-            let ms = millisSince(start)
-            switch format {
-            case .json:
-                printResultJSON(result, durationMs: ms)
-            case .text:
-                // Prefer raw bytes when available (binary output); fall back to lossy UTF-8 string
-                if let bytes = result.stdoutBytes {
-                    FileHandle.standardOutput.write(bytes)
-                } else {
-                    print(result.stdout, terminator: "")
-                }
-                if let bytes = result.stderrBytes {
-                    FileHandle.standardError.write(bytes)
-                } else if !result.stderr.isEmpty {
-                    FileHandle.standardError.write(Data(result.stderr.utf8))
-                }
-            }
-            if !result.success {
-                throw ExitCode(result.exitCode)
-            }
-        } catch let exitCode as ExitCode {
-            throw exitCode
-        } catch {
-            let ms = millisSince(start)
-            switch format {
-            case .json:
-                printErrorJSON(error, durationMs: ms, friendly: true)
-            case .text:
-                try handleTextError(error, timeout: timeout)
-            }
-            throw ExitCode.failure
-        }
-    }
-
     // MARK: - Streaming
 
-    private func runStreaming(options: RunOptions, format: OutputFormat) async throws {
-        let start = ContinuousClock.now
+    private func runStreaming(options: RunOptions) async throws {
         do {
             let chunks = Lumina.stream(command, options: options)
             for try await chunk in chunks {
-                switch format {
-                case .json:
-                    // NDJSON: one JSON object per line
-                    switch chunk {
-                    case .stdout(let data):
-                        printNDJSONLine(StreamChunk(stream: "stdout", data: data))
-                    case .stderr(let data):
-                        printNDJSONLine(StreamChunk(stream: "stderr", data: data))
-                    case .stdoutBytes(let bytes):
-                        // Binary stdout: write raw bytes to stdout fd directly (bypasses print buffering)
-                        FileHandle.standardOutput.write(bytes)
-                    case .stderrBytes(let bytes):
-                        FileHandle.standardError.write(bytes)
-                    case .exit(let code):
-                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: millisSince(start)))
-                        if code != 0 { throw ExitCode(code) }
-                    }
-                case .text:
-                    switch chunk {
-                    case .stdout(let data):
-                        print(data, terminator: "")
-                    case .stderr(let data):
-                        FileHandle.standardError.write(Data(data.utf8))
-                    case .stdoutBytes(let bytes):
-                        FileHandle.standardOutput.write(bytes)
-                    case .stderrBytes(let bytes):
-                        FileHandle.standardError.write(bytes)
-                    case .exit(let code):
-                        if code != 0 { throw ExitCode(code) }
-                    }
+                switch chunk {
+                case .stdout(let data):
+                    FileHandle.standardOutput.write(Data(data.utf8))
+                case .stderr(let data):
+                    FileHandle.standardError.write(Data(data.utf8))
+                case .stdoutBytes(let bytes):
+                    FileHandle.standardOutput.write(bytes)
+                case .stderrBytes(let bytes):
+                    FileHandle.standardError.write(bytes)
+                case .exit(let code):
+                    if code != 0 { throw ExitCode(code) }
                 }
             }
         } catch let exitCode as ExitCode {
             throw exitCode
         } catch {
-            switch format {
-            case .json:
-                printNDJSONLine(ErrorChunk(error: friendlyError(error), duration_ms: millisSince(start)))
-            case .text:
-                try handleTextError(error, timeout: timeout)
-            }
-            throw ExitCode.failure
+            try handleTextError(error, timeout: timeout)
         }
     }
 }
@@ -528,19 +408,6 @@ private struct ResultJSON: Encodable {
     var network_metrics: NetworkMetricsSummary?
 }
 
-private func printResultJSON(_ result: RunResult, durationMs: Int) {
-    let r = ResultJSON(
-        stdout: result.stdout,
-        stderr: result.stderr,
-        stdout_bytes: result.stdoutBytes.map { $0.base64EncodedString() },
-        stderr_bytes: result.stderrBytes.map { $0.base64EncodedString() },
-        exit_code: Int(result.exitCode),
-        duration_ms: durationMs,
-        network_metrics: result.networkMetrics
-    )
-    encodeAndPrint(r)
-}
-
 /// Map a session server's `.error(message:)` payload to a v0.6.0 error state.
 /// The message is produced by `String(describing: error)` on the server side,
 /// so we match the canonical LuminaError case descriptions.
@@ -573,15 +440,6 @@ private func printErrorJSON(
     if let ps = partialStdout { r.partial_stdout = ps }
     if let pe = partialStderr { r.partial_stderr = pe }
     encodeAndPrint(r)
-}
-
-private func encodeAndPrint<T: Encodable>(_ value: T) {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = .sortedKeys
-    if let data = try? encoder.encode(value),
-       let str = String(data: data, encoding: .utf8) {
-        print(str)
-    }
 }
 
 private func millisSince(_ start: ContinuousClock.Instant) -> Int {
@@ -625,8 +483,7 @@ struct Pull: AsyncParsableCommand {
 struct Images: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Manage cached images",
-        subcommands: [ImageList.self, ImageCreate.self, ImageRemove.self,
-                      ImageInspect.self, ImageCatalog.self, ImagePull.self],
+        subcommands: [ImageList.self, ImageCreate.self, ImageRemove.self, ImageInspect.self],
         defaultSubcommand: ImageList.self
     )
 }
@@ -640,12 +497,7 @@ struct ImageList: ParsableCommand {
         let format = resolveOutputFormat()
         switch format {
         case .json:
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            if let data = try? encoder.encode(names),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
+            encodeAndPrint(names)
         case .text:
             if names.isEmpty {
                 print("No images found. Run 'lumina pull' first.")
@@ -675,10 +527,7 @@ struct ImageCreate: AsyncParsableCommand {
     var rosetta = false
 
     func run() async throws {
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 60s, 5m\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedTimeout = try parseTimeoutOrExit(timeout)
 
         guard !buildCommands.isEmpty else {
             FileHandle.standardError.write(Data("lumina: at least one --run command is required\n".utf8))
@@ -746,143 +595,7 @@ struct ImageInspect: ParsableCommand {
             size_bytes: info.sizeBytes,
             created: ISO8601DateFormatter().string(from: info.created)
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        if let data = try? encoder.encode(output),
-           let str = String(data: data, encoding: .utf8) {
-            print(str)
-        }
-    }
-}
-
-// MARK: - Images catalog (v0.7.1: curated agent-path images)
-
-struct ImageCatalog: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "catalog",
-        abstract: "List curated agent-path images publishable via GitHub Releases. See AgentImageCatalog for the canonical list."
-    )
-
-    @Option(name: .long, help: "Filter by tag (e.g. ml, security, baseline).")
-    var tag: String?
-
-    func run() throws {
-        let entries = tag.map { AgentImageCatalog.entries(withTag: $0) }
-            ?? AgentImageCatalog.all
-        let format = resolveOutputFormat()
-        switch format {
-        case .json:
-            struct Row: Encodable {
-                let id, displayName, summary: String
-                let url: String
-                let sha256: String
-                let approximateSize: Int64
-                let tags: [String]
-            }
-            let rows = entries.map { e in
-                Row(id: e.id, displayName: e.displayName, summary: e.summary,
-                    url: e.url.absoluteString, sha256: e.sha256,
-                    approximateSize: e.approximateSize, tags: e.tags)
-            }
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? enc.encode(rows),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
-        case .text:
-            if entries.isEmpty {
-                print("No catalog entries match.")
-                return
-            }
-            for e in entries {
-                print("\(e.id)")
-                print("  \(e.displayName) · ~\(formatMB(e.approximateSize))")
-                print("  \(e.summary)")
-                if !e.tags.isEmpty {
-                    print("  tags: \(e.tags.joined(separator: ", "))")
-                }
-                print("")
-            }
-        }
-    }
-
-    private func formatMB(_ bytes: Int64) -> String {
-        let mb = Double(bytes) / (1024 * 1024)
-        return String(format: "%.0f MB", mb)
-    }
-}
-
-struct ImagePull: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "pull",
-        abstract: "Pull a curated image from the catalog by id (e.g. `lumina images pull default-baked`). Verifies SHA-256 against the catalog before extracting."
-    )
-
-    @Argument(help: "Catalog id (see `lumina images catalog`).")
-    var id: String
-
-    @Flag(name: .long, help: "Re-download even if the image already exists locally.")
-    var force = false
-
-    func run() async throws {
-        guard let entry = AgentImageCatalog.entry(id: id) else {
-            let ids = AgentImageCatalog.all.map { $0.id }.joined(separator: ", ")
-            FileHandle.standardError.write(Data(
-                "lumina: no catalog entry with id '\(id)'. Known: \(ids)\n".utf8
-            ))
-            throw ExitCode(2)
-        }
-
-        // Refuse to pull entries whose sha256 is still a placeholder —
-        // the catalog reserves identity before an artifact is
-        // published; pulling one before it exists would silently
-        // install a tarball whose integrity we can't verify.
-        let placeholder = String(repeating: "0", count: 64)
-        if entry.sha256.lowercased() == placeholder {
-            FileHandle.standardError.write(Data("""
-                lumina: catalog entry '\(id)' has a placeholder sha256 —
-                the artifact hasn't been published yet. The build-baked-
-                image.yml workflow will attach it to the next tag; until
-                then this pull would install an unverified tarball and
-                is refused.
-
-                """.utf8))
-            throw ExitCode(2)
-        }
-
-        let store = ImageStore()
-        if store.list().contains(id) && !force {
-            print("Image '\(id)' already installed. Use --force to re-pull.")
-            return
-        }
-        if force {
-            store.clean(name: id)
-        }
-
-        // Stream the entry URL through a one-off ImagePuller
-        // configured for THIS entry. Reuses the default puller's
-        // download + tar-hardening path (v0.7.1 flags
-        // --no-same-owner / --no-xattrs / --no-mac-metadata + the
-        // pre-scan for path-traversal members).
-        let puller = ImagePuller(
-            repo: "abdul-abdi/lumina",  // informational; URL is authoritative
-            tag: "catalog-\(entry.id)",
-            assetName: entry.url.lastPathComponent,
-            directURL: entry.url,
-            expectedSHA256: entry.sha256,
-            imageName: entry.id
-        )
-        do {
-            try await puller.pull { msg in
-                FileHandle.standardError.write(Data("\(msg)\n".utf8))
-            }
-            print("Installed '\(entry.id)' at ~/.lumina/images/\(entry.id)/")
-            print("Try: lumina run --image \(entry.id) 'uname -a'")
-        } catch {
-            FileHandle.standardError.write(Data("lumina pull: \(error)\n".utf8))
-            throw ExitCode.failure
-        }
+        encodeAndPrint(output, pretty: true)
     }
 }
 
@@ -936,64 +649,16 @@ struct SessionStart: AsyncParsableCommand {
 
     func run() async throws {
         // Check if requested image exists before spawning background process
-        let puller = ImagePuller()
-        if !puller.imageExists(name: image) {
-            if image == "default" {
-                FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
-                do {
-                    try await puller.pull { msg in
-                        FileHandle.standardError.write(Data("\(msg)\n".utf8))
-                    }
-                } catch {
-                    FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
-                    throw ExitCode.failure
-                }
-            } else {
-                FileHandle.standardError.write(Data("lumina: image '\(image)' not found. Use 'lumina images list' to see available images.\n".utf8))
-                throw ExitCode.failure
-            }
-        }
+        try await ensureImage(image)
 
         let resolvedMemory = resolveMemory(flag: memory)
         let resolvedCpus = resolveCpus(flag: cpus)
 
-        guard let parsedMemory = parseMemory(resolvedMemory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory '\(resolvedMemory)'\n".utf8))
-            throw ExitCode.failure
-        }
+        let parsedMemory = try parseMemoryOrExit(resolvedMemory)
 
         let bootTimeoutSecs = 60 // Hardcoded — if boot takes >60s, something is broken
 
-        // Parse --volume: host path (starts with / or .) forwarded as mount,
-        // otherwise resolved as named volume
-        var sessionVolumes: [(String, String)] = [] // (left, guestPath) pairs for subprocess
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else {
-                FileHandle.standardError.write(Data("lumina: invalid --volume '\(spec)'. Use path_or_name:guest_path\n".utf8))
-                throw ExitCode.failure
-            }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                // Validate host directory exists
-                let hostURL = URL(fileURLWithPath: left)
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir), isDir.boolValue else {
-                    FileHandle.standardError.write(Data("lumina: not a directory: \(left)\n".utf8))
-                    throw ExitCode.failure
-                }
-                sessionVolumes.append((left, guestPath))
-            } else {
-                // Validate named volume exists
-                let volumeStore = VolumeStore()
-                guard volumeStore.resolve(name: left) != nil else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                sessionVolumes.append((left, guestPath))
-            }
-        }
+        _ = try parseVolumeSpecs(volume, volumeStore: VolumeStore())
 
         // Parse --forward early so invalid specs fail before spawning the child.
         // Forwarded specs are passed verbatim to _session-serve, which re-parses
@@ -1018,8 +683,8 @@ struct SessionStart: AsyncParsableCommand {
             "--cpus", String(resolvedCpus),
             "--memory", String(parsedMemory),
         ]
-        for (left, guestPath) in sessionVolumes {
-            process.arguments! += ["--volume", "\(left):\(guestPath)"]
+        for spec in volume {
+            process.arguments! += ["--volume", spec]
         }
         if let ds = resolveDiskSize(flag: diskSize) {
             process.arguments! += ["--disk-size", ds]
@@ -1125,43 +790,35 @@ struct SessionStop: AsyncParsableCommand {
 
     func run() async throws {
         let sid = parseSID(self.sid)
-        let client = SessionClient()
+        let client = try connectSession(sid)
         do {
-            try client.connect(sid: sid)
             try client.send(.shutdown)
-            // Verify the server acknowledged the shutdown
-            let response = try? client.receive()
-            client.disconnect()
-
-            let confirmed: Bool
-            if let response = response {
-                switch response {
-                case .exit: confirmed = true
-                default: confirmed = false
-                }
-            } else {
-                // Connection closed — server shut down (success)
-                confirmed = true
-            }
-
-            let format = resolveOutputFormat()
-            switch format {
-            case .json:
-                struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
-                encodeAndPrint(StopResult(stopped: sid, confirmed: confirmed))
-            case .text:
-                print("Session '\(sid)' stopped.")
-            }
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
+        } catch {
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
             throw ExitCode.failure
+        }
+        // Verify the server acknowledged the shutdown
+        let response = try? client.receive()
+        client.disconnect()
+
+        let confirmed: Bool
+        if let response = response {
+            switch response {
+            case .exit: confirmed = true
+            default: confirmed = false
+            }
+        } else {
+            // Connection closed — server shut down (success)
+            confirmed = true
+        }
+
+        let format = resolveOutputFormat()
+        switch format {
+        case .json:
+            struct StopResult: Encodable { var stopped: String; var confirmed: Bool }
+            encodeAndPrint(StopResult(stopped: sid, confirmed: confirmed))
+        case .text:
+            print("Session '\(sid)' stopped.")
         }
     }
 }
@@ -1429,28 +1086,11 @@ struct Exec: AsyncParsableCommand {
     func run() async throws {
         let sid = parseSID(self.sid)
         let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
-        guard let parsedTimeout = parseDuration(resolvedTimeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout '\(resolvedTimeout)'\n".utf8))
-            throw ExitCode.failure
-        }
-        let timeoutSecs = Int(parsedTimeout.components.seconds)
+        let timeoutSecs = Int(try parseTimeoutOrExit(resolvedTimeout).components.seconds)
 
         let parsedEnv = try parseEnvSpecs(env)
 
-        let client = SessionClient()
-        do {
-            try client.connect(sid: sid)
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
-            throw ExitCode.failure
-        }
+        let client = try connectSession(sid)
         defer { client.disconnect() }
 
         // PTY mode: interactive, raw-byte bidirectional streaming.
@@ -1477,32 +1117,25 @@ struct Exec: AsyncParsableCommand {
         // If stdin is piped, forward it to the session server concurrently.
         // The server routes each stdin chunk to the in-flight exec via StdinChannel.
         // `stdinClose` signals EOF so the guest command sees its stdin close cleanly.
-        let stdinTask: Task<Void, Never>?
         if isatty(fileno(stdin)) == 0 {
             let handle = FileHandle.standardInput
-            stdinTask = Task.detached {
-                while !Task.isCancelled {
+            spawnBlockingThread("lumina.exec-stdin") {
+                while true {
                     let chunk = handle.availableData
                     if chunk.isEmpty {
                         // EOF — tell the server stdin is done
                         try? client.send(.stdinClose)
-                        break
+                        return
                     }
                     let text = String(decoding: chunk, as: UTF8.self)
                     try? client.send(.stdin(data: text))
                 }
             }
-        } else {
-            stdinTask = nil
         }
-        defer { stdinTask?.cancel() }
 
-        // Output routing: v0.6.0 unifies JSON output for exec with run (single envelope).
-        // Legacy NDJSON streaming is preserved behind LUMINA_OUTPUT=ndjson.
-        let legacyNDJSON = useLegacyExecOutput()
         let start = ContinuousClock.now
 
-        if format == .json && !legacyNDJSON {
+        if format == .json {
             // Unified envelope: buffer output, emit single JSON object (matches `run`)
             var stdoutBuf = ""
             var stderrBuf = ""
@@ -1512,7 +1145,6 @@ struct Exec: AsyncParsableCommand {
                 do {
                     response = try client.receive()
                 } catch {
-                    stdinTask?.cancel()
                     let ms = millisSince(start)
                     printErrorJSON(
                         error,
@@ -1536,7 +1168,6 @@ struct Exec: AsyncParsableCommand {
                     let text = String(decoding: rawBytes, as: UTF8.self)
                     if outputStream == .stdout { stdoutBuf += text } else { stderrBuf += text }
                 case .exit(let code, let durationMs):
-                    stdinTask?.cancel()
                     let r = ResultJSON(
                         stdout: stdoutBuf,
                         stderr: stderrBuf,
@@ -1547,7 +1178,6 @@ struct Exec: AsyncParsableCommand {
                     if code != 0 { throw ExitCode(code) }
                     return
                 case .error(let message):
-                    stdinTask?.cancel()
                     let ms = millisSince(start)
                     let state = errorStateForExecMessage(message)
                     printErrorJSON(
@@ -1564,29 +1194,13 @@ struct Exec: AsyncParsableCommand {
                 }
             }
         } else {
-            // Legacy NDJSON (LUMINA_OUTPUT=ndjson) or text mode: existing streaming behavior.
             while true {
                 let response = try client.receive()
                 switch response {
                 case .output(let outputStream, let data):
-                    switch format {
-                    case .json:
-                        printNDJSONLine(StreamChunk(stream: outputStream.rawValue, data: data))
-                    case .text:
-                        if outputStream == .stdout {
-                            print(data, terminator: "")
-                        } else {
-                            FileHandle.standardError.write(Data(data.utf8))
-                        }
-                    }
-                case .exit(let code, let durationMs):
-                    stdinTask?.cancel()
-                    switch format {
-                    case .json:
-                        printNDJSONLine(ExitChunk(exit_code: Int(code), duration_ms: durationMs))
-                    case .text:
-                        break
-                    }
+                    let fd = outputStream == .stdout ? FileHandle.standardOutput : FileHandle.standardError
+                    fd.write(Data(data.utf8))
+                case .exit(let code, _):
                     if code != 0 { throw ExitCode(code) }
                     return
                 case .outputBytes(let outputStream, let base64):
@@ -1599,7 +1213,6 @@ struct Exec: AsyncParsableCommand {
                         : FileHandle.standardError
                     fd.write(rawBytes)
                 case .error(let message):
-                    stdinTask?.cancel()
                     FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
                     throw ExitCode.failure
                 default:
@@ -1663,16 +1276,15 @@ struct Exec: AsyncParsableCommand {
 
         // Stdin pump: raw bytes from fd 0 → base64 pty_input frames.
         // `availableData` blocks until data is ready or EOF; on EOF we stop.
-        let stdinPtyTask = Task.detached { [client] in
+        spawnBlockingThread("lumina.pty-stdin") { [client] in
             let handle = FileHandle.standardInput
-            while !Task.isCancelled {
+            while true {
                 let chunk = handle.availableData
-                if chunk.isEmpty { break } // EOF — host-side stdin closed
+                if chunk.isEmpty { return } // EOF — host-side stdin closed
                 let base64 = chunk.base64EncodedString()
                 try? client.send(.ptyInput(data: base64))
             }
         }
-        defer { stdinPtyTask.cancel() }
 
         // Output pump: pty_output → raw bytes to stdout, exit → done.
         while true {
@@ -1681,7 +1293,6 @@ struct Exec: AsyncParsableCommand {
                 response = try client.receive()
             } catch {
                 // Connection dropped mid-session — best effort restore and exit.
-                stdinPtyTask.cancel()
                 FileHandle.standardError.write(Data("\r\nlumina: session disconnected\r\n".utf8))
                 throw ExitCode.failure
             }
@@ -1692,11 +1303,9 @@ struct Exec: AsyncParsableCommand {
                     fflush(stdout)
                 }
             case .exit(let code, _):
-                stdinPtyTask.cancel()
                 if code != 0 { throw ExitCode(code) }
                 return
             case .error(let message):
-                stdinPtyTask.cancel()
                 FileHandle.standardError.write(Data("\r\nlumina: \(message)\r\n".utf8))
                 throw ExitCode.failure
             default:
@@ -1728,20 +1337,7 @@ struct Cp: AsyncParsableCommand {
     func run() async throws {
         let (sid, isUpload, localPath, remotePath) = try parseCpArgs()
 
-        let client = SessionClient()
-        do {
-            try client.connect(sid: sid)
-        } catch let error as LuminaError {
-            switch error {
-            case .sessionNotFound:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
-            case .sessionDead:
-                FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
-            default:
-                FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
-            }
-            throw ExitCode.failure
-        }
+        let client = try connectSession(sid)
         defer { client.disconnect() }
 
         if isUpload {
@@ -1832,12 +1428,7 @@ struct VolumeList: ParsableCommand {
         let format = resolveOutputFormat()
         switch format {
         case .json:
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            if let data = try? encoder.encode(names),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
+            encodeAndPrint(names)
         case .text:
             if names.isEmpty {
                 print("No volumes.")
@@ -1882,12 +1473,7 @@ struct VolumeInspect: ParsableCommand {
             created: ISO8601DateFormatter().string(from: info.created),
             last_used: ISO8601DateFormatter().string(from: info.lastUsed)
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        if let data = try? encoder.encode(output),
-           let str = String(data: data, encoding: .utf8) {
-            print(str)
-        }
+        encodeAndPrint(output, pretty: true)
     }
 }
 
@@ -1965,16 +1551,7 @@ struct NetworkRun: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let timeoutDuration: Duration?
-        if !timeout.isEmpty {
-            guard let parsed = parseDuration(timeout) else {
-                FileHandle.standardError.write(Data("lumina: invalid timeout '\(timeout)'. Use e.g. 30s, 5m\n".utf8))
-                throw ExitCode.failure
-            }
-            timeoutDuration = parsed
-        } else {
-            timeoutDuration = nil
-        }
+        let timeoutDuration = timeout.isEmpty ? nil : try parseTimeoutOrExit(timeout)
 
         FileHandle.standardError.write(Data("Starting \(manifest.sessions.count) sessions on shared network...\n".utf8))
 
@@ -2016,174 +1593,6 @@ struct NetworkSession: Codable {
     let name: String
     let image: String?
     let volumes: [String]?
-}
-
-// MARK: - Pool
-
-struct PoolCmd: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "pool",
-        abstract: "Run commands across a pre-warmed VM pool",
-        subcommands: [PoolRun.self]
-    )
-}
-
-/// `lumina pool run --size N [--count C] [--concurrency K] "cmd"`
-///
-/// Boots N VMs, then runs `cmd` C times (default N) using up to K concurrent
-/// workers (default N). Prints per-run JSON results to stdout and a summary
-/// to stderr. Useful for throughput benchmarking and parallel workloads.
-struct PoolRun: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "run", abstract: "Run a command on a pre-warmed VM pool")
-
-    @Argument(help: "Command to run in pooled VMs")
-    var command: String
-
-    @Option(name: .long, help: "Number of VMs to pre-warm (default 4)")
-    var size: Int = 4
-
-    @Option(name: .long, help: "Total number of runs (default equals pool size)")
-    var count: Int? = nil
-
-    @Option(name: .long, help: "Max concurrent runs (default equals pool size)")
-    var concurrency: Int? = nil
-
-    @Option(name: .long, help: "Image to boot from")
-    var image: String = "default"
-
-    @Option(name: .long, help: "Per-run timeout (e.g. 30s, 2m)")
-    var timeout: String = "60s"
-
-    @Option(name: [.short, .long], help: "Environment variable (KEY=VAL, repeatable)")
-    var env: [String] = []
-
-    @Option(name: .long, help: "Memory per VM (e.g. 512MB, 1GB)")
-    var memory: String = "1GB"
-
-    @Option(name: .long, help: "vCPUs per VM")
-    var cpus: Int = 2
-
-    @Option(name: .long, help: "Copy file or directory into each VM before run (local:remote, repeatable)")
-    var copy: [String] = []
-
-    @Option(name: .long, help: "Download from VM after each run (remote:local, repeatable). Per-run: each run produces its own download.")
-    var download: [String] = []
-
-    @Option(name: .long, help: "Mount host dir or named volume into every VM (path_or_name:guest, repeatable). Applied at pool boot time.")
-    var volume: [String] = []
-
-    func run() async throws {
-        installSignalHandlers()
-        atexit { DiskClone.cleanOrphans() }
-
-        let totalRuns = count ?? size
-        let maxConcurrent = concurrency ?? size
-
-        guard let parsedTimeout = parseDuration(timeout) else {
-            FileHandle.standardError.write(Data("lumina: invalid timeout: \(timeout)\n".utf8))
-            throw ExitCode.failure
-        }
-        guard let parsedMemory = parseMemory(memory) else {
-            FileHandle.standardError.write(Data("lumina: invalid memory: \(memory)\n".utf8))
-            throw ExitCode.failure
-        }
-        let parsedEnv = try parseEnvSpecs(env)
-        let (parsedUploads, parsedDirUploads) = try parseCopySpecs(copy)
-        let parsedDownloads = try parseDownloadSpecs(download)
-        let volumeStore = VolumeStore()
-        let parsedMounts = try parseVolumeSpecs(volume, volumeStore: volumeStore)
-
-        let opts = VMOptions(memory: parsedMemory, cpuCount: cpus, image: image, mounts: parsedMounts)
-
-        let format = resolveOutputFormat()
-
-        FileHandle.standardError.write(Data("Booting \(size) VMs (image: \(image))...\n".utf8))
-        let bootStart = ContinuousClock.now
-
-        let pool = Pool(size: size, options: opts)
-        try await pool.boot()
-
-        let bootMs = (ContinuousClock.now - bootStart).totalMilliseconds
-        FileHandle.standardError.write(Data("Pool ready in \(bootMs)ms. Running \(totalRuns)×\"\(command)\" (concurrency \(maxConcurrent))...\n".utf8))
-
-        let runStart = ContinuousClock.now
-
-        // Collect (index, result) pairs; print each one as it arrives.
-        let cmdCopy = command
-        let envCopy = parsedEnv
-        let timeoutCopy = parsedTimeout
-        let uploadsCopy = parsedUploads
-        let dirUploadsCopy = parsedDirUploads
-        let downloadsCopy = parsedDownloads
-        var collectedResults: [(Int, RunResult)] = []
-
-        await withTaskGroup(of: (Int, RunResult).self) { group in
-            var inFlight = 0
-            var nextIdx = 0
-            // Throttle to maxConcurrent in-flight runs
-            while nextIdx < totalRuns || inFlight > 0 {
-                while inFlight < maxConcurrent && nextIdx < totalRuns {
-                    let idx = nextIdx
-                    nextIdx += 1
-                    inFlight += 1
-                    group.addTask { [pool] in
-                        do {
-                            let r = try await pool.run(
-                                cmdCopy,
-                                timeout: timeoutCopy,
-                                env: envCopy,
-                                uploads: uploadsCopy,
-                                directoryUploads: dirUploadsCopy,
-                                downloads: downloadsCopy
-                            )
-                            return (idx, r)
-                        } catch {
-                            return (idx, RunResult(stdout: "", stderr: String(describing: error), exitCode: 1, wallTime: .zero))
-                        }
-                    }
-                }
-                if let (idx, result) = await group.next() {
-                    collectedResults.append((idx, result))
-                    inFlight -= 1
-                    // Print result immediately as it arrives
-                    if format == .json {
-                        printNDJSONLine(PoolResultJSON(
-                            run: idx + 1,
-                            exit_code: Int(result.exitCode),
-                            stdout: result.stdout,
-                            stderr: result.stderr,
-                            duration_ms: result.wallTime.totalMilliseconds
-                        ))
-                    } else {
-                        let prefix = "[\(idx + 1)/\(totalRuns)] exit=\(result.exitCode) "
-                        FileHandle.standardOutput.write(Data(prefix.utf8))
-                        FileHandle.standardOutput.write(Data(result.stdout.utf8))
-                    }
-                }
-            }
-        }
-        let results = collectedResults.map { $0.1 }
-
-        await pool.shutdown()
-
-        let totalMs = (ContinuousClock.now - runStart).totalMilliseconds
-        let successes = results.filter { $0.success }.count
-        let avgMs = totalRuns > 0 ? results.map { $0.wallTime.totalMilliseconds }.reduce(0, +) / totalRuns : 0
-
-        FileHandle.standardError.write(Data(
-            "Done: \(successes)/\(totalRuns) succeeded, total \(totalMs)ms, avg \(avgMs)ms/run\n".utf8
-        ))
-
-        if successes < totalRuns { throw ExitCode.failure }
-    }
-}
-
-private struct PoolResultJSON: Encodable {
-    var run: Int
-    var exit_code: Int
-    var stdout: String
-    var stderr: String
-    var duration_ms: Int
 }
 
 // Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift

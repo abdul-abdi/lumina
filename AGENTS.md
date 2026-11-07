@@ -6,9 +6,27 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.7.3.
+here reflects what ships in v0.8.0.
 
-## v0.7.3 deltas (current — read these first)
+## v0.8.0 deltas (current — read these first)
+
+The CLI dropped surfaces that were deprecated or could not work:
+`LUMINA_OUTPUT=ndjson` (piped `run` and `exec` always emit the unified
+envelope), `LUMINA_STREAM` (text output always streams), `pool run`
+(run `lumina daemon serve`; parallel `lumina run` calls route through
+it), `images catalog` and `images pull` (every catalog digest was a
+placeholder, so pulls were refused), `doctor --iso` (use `lumina iso
+inspect`) and the no-op `run --wait-network`.
+
+`stdout_bytes` / `stderr_bytes` now hold the whole stream whenever any
+chunk was binary. The cold `run` path used to include only the binary
+chunks.
+
+`run --image <name>` fails at once with "image not found" when the
+image is missing; a piped caller still gets
+`{"error": "connection_failed", "error_detail": "image '<name>' not found"}`.
+
+## v0.7.3 deltas
 
 ### Guest networking actually works now
 
@@ -396,12 +414,6 @@ it as opt-in diagnostic, not a contract — missing field ≠ error.
    not an error envelope. The command ran to completion, just returned
    non-zero. Parse `exit_code` second.
 
-### Legacy NDJSON
-
-If a consumer cannot migrate immediately, set `LUMINA_OUTPUT=ndjson` to get the
-pre-v0.6.0 streaming NDJSON format for `exec`. This opt-in is scheduled for
-removal in v0.8.0. New code should not use it.
-
 ## Error States — How to Handle Each
 
 | State                   | What happened                               | Retry?                                     |
@@ -443,8 +455,6 @@ of a command that returned non-zero. `make: *** [build] Error 1` is a
   binds `127.0.0.1`. This is intentional.
 - **Do not parse `lumina ps` TTY output.** Pipe it so you get JSON, or it will
   break on the next column tweak.
-- **Do not assume `LUMINA_OUTPUT=ndjson` will exist forever.** It is removed in
-  v0.8.0. Treat the unified envelope as the stable format.
 
 ## Example Agent Workflow
 

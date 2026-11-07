@@ -99,11 +99,7 @@ struct IsoInspect: AsyncParsableCommand {
                     disk_size: recDiskSize
                 )
             )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(report)
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data("\n".utf8))
+            encodeAndPrint(report, pretty: true)
             return
         }
 
@@ -449,11 +445,7 @@ struct IsoList: AsyncParsableCommand {
                     recommended_disk: formatBytes(entry.recommendedDiskBytes)
                 )
             }
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(entries)
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data("\n".utf8))
+            encodeAndPrint(entries, pretty: true)
             return
         }
 

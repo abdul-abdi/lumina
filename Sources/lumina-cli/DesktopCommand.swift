@@ -28,20 +28,6 @@ enum DesktopHelpers {
         return home.appendingPathComponent(".lumina/desktop-vms")
     }
 
-    /// Parse a memory string like "4GB" or "512MB" into bytes.
-    static func parseMemoryOrExit(_ raw: String) -> UInt64 {
-        guard let bytes = parseMemory(raw) else {
-            FileHandle.standardError.write(Data("error: invalid memory value '\(raw)' (expected e.g. 4GB / 512MB)\n".utf8))
-            exit(2)
-        }
-        return bytes
-    }
-
-    /// Parse a disk-size string like "32GB" into bytes.
-    static func parseDiskOrExit(_ raw: String) -> UInt64 {
-        parseMemoryOrExit(raw)  // same grammar
-    }
-
     static func createBundle(
         at root: URL,
         name: String,
@@ -62,11 +48,13 @@ enum DesktopHelpers {
             FileHandle.standardError.write(Data("error: --network must be 'nat' or 'bridged' (got '\(network)')\n".utf8))
             throw ExitCode(2)
         }
+        let memoryBytes = try parseMemoryOrExit(memory)
+        let diskBytes = try parseMemoryOrExit(diskSize, what: "disk-size")
         do {
             let bundle = try VMBundle.create(
                 at: root, name: name, osFamily: osFamily, osVariant: osVariant,
-                memoryBytes: parseMemoryOrExit(memory), cpuCount: cpus,
-                diskBytes: parseDiskOrExit(diskSize), networkMode: networkMode, id: id
+                memoryBytes: memoryBytes, cpuCount: cpus,
+                diskBytes: diskBytes, networkMode: networkMode, id: id
             )
             try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: bundle.manifest.diskBytes)
             return bundle
@@ -565,7 +553,7 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
         )
         let vm = MacOSVM(
             bootConfig: cfg,
-            memoryBytes: DesktopHelpers.parseMemoryOrExit(memory),
+            memoryBytes: try parseMemoryOrExit(memory),
             cpuCount: cpus,
             macAddress: stableMAC
         )

@@ -32,8 +32,7 @@ public struct ImagePuller: Sendable {
     private let assetName: String
     private let imageStore: ImageStore
     /// When set, download this URL directly instead of constructing
-    /// one from repo/tag/assetName. Used by `lumina images pull <id>`
-    /// against the catalog.
+    /// one from repo/tag/assetName.
     private let directURL: URL?
     /// When set, verify the downloaded tarball matches this digest
     /// before extraction. Refuses to install a mismatched tarball

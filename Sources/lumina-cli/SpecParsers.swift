@@ -7,8 +7,7 @@
 // Each helper writes a friendly error to stderr and throws
 // `ExitCode.failure` on bad input — same shape as the inline parsers
 // they replace, so subcommand callers don't need their own error
-// formatting. Audit follow-up: the duplication between `Run` and
-// `pool run` was ~80 LOC of identical loops.
+// formatting.
 import ArgumentParser
 import Foundation
 import Lumina
@@ -110,4 +109,20 @@ func parseVolumeSpecs(_ specs: [String], volumeStore: VolumeStore) throws -> [Mo
         }
     }
     return parsed
+}
+
+func parseTimeoutOrExit(_ raw: String) throws -> Duration {
+    guard let duration = parseDuration(raw) else {
+        FileHandle.standardError.write(Data("lumina: invalid timeout '\(raw)'. Use e.g. 30s, 5m\n".utf8))
+        throw ExitCode.failure
+    }
+    return duration
+}
+
+func parseMemoryOrExit(_ raw: String, what: String = "memory") throws -> UInt64 {
+    guard let bytes = parseMemory(raw) else {
+        FileHandle.standardError.write(Data("lumina: invalid \(what) '\(raw)'. Use e.g. 512MB, 1GB\n".utf8))
+        throw ExitCode.failure
+    }
+    return bytes
 }

@@ -1,4 +1,5 @@
 // Sources/lumina-cli/Helpers.swift
+import ArgumentParser
 import Foundation
 import Lumina
 
@@ -147,21 +148,6 @@ func resolveDiskSize(flag: String?) -> String? {
     return ProcessInfo.processInfo.environment["LUMINA_DISK_SIZE"]
 }
 
-// MARK: - Streaming Mode (text format only)
-//
-// Default: TTY = stream (humans want real-time), pipe = buffer.
-// Override: LUMINA_STREAM=0|1 env var.
-// JSON format uses the unified envelope (buffered) by default; set
-// LUMINA_OUTPUT=ndjson for legacy per-chunk NDJSON streaming.
-
-/// Resolve streaming mode for text output: LUMINA_STREAM env > isatty auto-detect.
-func resolveStreaming() -> Bool {
-    if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
-        return envVal == "1" || envVal == "true"
-    }
-    return isatty(STDOUT_FILENO) != 0
-}
-
 // MARK: - Session ID Parsing
 
 /// Parse a session ID from either a bare UUID string or a JSON {"sid":"UUID"} object.
@@ -178,6 +164,43 @@ func parseSID(_ input: String) -> String {
     return trimmed
 }
 
+func connectSession(_ sid: String) throws -> SessionClient {
+    let client = SessionClient()
+    do {
+        try client.connect(sid: sid)
+    } catch let error as LuminaError {
+        switch error {
+        case .sessionNotFound:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+        case .sessionDead:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+        default:
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+        }
+        throw ExitCode.failure
+    }
+    return client
+}
+
+func ensureImage(_ name: String) async throws {
+    let puller = ImagePuller()
+    guard !puller.imageExists(name: name) else { return }
+    guard name == "default" else {
+        FileHandle.standardError.write(Data("lumina: image '\(name)' not found. Use 'lumina images list' to see available images.\n".utf8))
+        throw ExitCode.failure
+    }
+    FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+    do {
+        try await puller.pull { msg in
+            FileHandle.standardError.write(Data("\(msg)\n".utf8))
+        }
+    } catch {
+        FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+        FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
+        throw ExitCode.failure
+    }
+}
+
 // MARK: - Stdin Auto-Detect
 //
 // Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),
@@ -192,51 +215,23 @@ func resolveStdin() -> Stdin {
     }
     let handle = FileHandle.standardInput
     return .source { @Sendable in
-        // availableData blocks until data is ready or EOF. Returns empty
-        // Data on EOF, which we signal to the pump as nil.
-        let chunk = handle.availableData
-        return chunk.isEmpty ? nil : chunk
+        await withCheckedContinuation { continuation in
+            spawnBlockingThread("lumina.run-stdin") {
+                // availableData blocks until data is ready or EOF. Returns empty
+                // Data on EOF, which we signal to the pump as nil.
+                let chunk = handle.availableData
+                continuation.resume(returning: chunk.isEmpty ? nil : chunk)
+            }
+        }
     }
 }
 
-// MARK: - Legacy Output Mode
-
-/// Check if legacy NDJSON output is requested for exec.
-/// `LUMINA_OUTPUT=ndjson` preserves pre-v0.6.0 streaming behavior for exec when piped.
-/// Default (absent or any other value) = unified envelope. Removed in v0.8.0.
-func useLegacyExecOutput() -> Bool {
-    ProcessInfo.processInfo.environment["LUMINA_OUTPUT"]?.lowercased() == "ndjson"
-}
-
-// MARK: - NDJSON Output Types (streaming / session exec)
-
-/// Stream chunk: stdout or stderr data.
-struct StreamChunk: Encodable {
-    var stream: String
-    var data: String
-}
-
-/// Exit status for streaming / session exec.
-struct ExitChunk: Encodable {
-    var exit_code: Int
-    var duration_ms: Int
-}
-
-/// Error for streaming / session exec.
-struct ErrorChunk: Encodable {
-    var error: String
-    var duration_ms: Int
-}
-
-/// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.
-/// Uses JSONEncoder which always properly escapes control characters (\n, \r, \t, etc.).
-func printNDJSONLine<T: Encodable>(_ value: T) {
+func encodeAndPrint<T: Encodable>(_ value: T, pretty: Bool = false) {
     let encoder = JSONEncoder()
-    encoder.outputFormatting = .sortedKeys
+    encoder.outputFormatting = pretty ? [.sortedKeys, .prettyPrinted] : .sortedKeys
     if let data = try? encoder.encode(value),
        let str = String(data: data, encoding: .utf8) {
         print(str)
-        fflush(stdout)
     }
 }
 
