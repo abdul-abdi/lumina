@@ -7,8 +7,7 @@
 // Each helper writes a friendly error to stderr and throws
 // `ExitCode.failure` on bad input — same shape as the inline parsers
 // they replace, so subcommand callers don't need their own error
-// formatting. Audit follow-up: the duplication between `Run` and
-// `pool run` was ~80 LOC of identical loops.
+// formatting.
 import ArgumentParser
 import Foundation
 import Lumina

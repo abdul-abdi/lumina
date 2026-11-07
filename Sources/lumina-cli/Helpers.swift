@@ -212,18 +212,6 @@ func encodeAndPrint<T: Encodable>(_ value: T, pretty: Bool = false) {
     }
 }
 
-/// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.
-/// Uses JSONEncoder which always properly escapes control characters (\n, \r, \t, etc.).
-func printNDJSONLine<T: Encodable>(_ value: T) {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = .sortedKeys
-    if let data = try? encoder.encode(value),
-       let str = String(data: data, encoding: .utf8) {
-        print(str)
-        fflush(stdout)
-    }
-}
-
 // MARK: - Raw Terminal Mode (PTY support)
 
 #if canImport(Darwin)
