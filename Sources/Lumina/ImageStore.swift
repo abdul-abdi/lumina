@@ -156,13 +156,4 @@ public struct ImageStore: Sendable {
 
         return ImageInfo(name: name, base: base, command: command, rosetta: rosetta, created: created, sizeBytes: size)
     }
-
-    /// Clean up staging directories left by crashed image creation attempts.
-    public func cleanStagingDirs() {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: baseDir, includingPropertiesForKeys: nil) else { return }
-        for entry in entries where entry.lastPathComponent.hasPrefix(".tmp-") {
-            try? fm.removeItem(at: entry)
-        }
-    }
 }

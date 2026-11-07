@@ -264,22 +264,3 @@ import Testing
     let info = try store.inspect(name: "alpine")
     #expect(info.rosetta == false)
 }
-
-@Test func imageStoreCleanStagingDirs() throws {
-    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-imgtest-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: tmpDir) }
-
-    let store = ImageStore(baseDir: tmpDir)
-
-    // Create staging dirs
-    let staging1 = tmpDir.appendingPathComponent(".tmp-aaa")
-    let staging2 = tmpDir.appendingPathComponent(".tmp-bbb")
-    try FileManager.default.createDirectory(at: staging1, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: staging2, withIntermediateDirectories: true)
-
-    #expect(FileManager.default.fileExists(atPath: staging1.path))
-    store.cleanStagingDirs()
-    #expect(!FileManager.default.fileExists(atPath: staging1.path))
-    #expect(!FileManager.default.fileExists(atPath: staging2.path))
-}

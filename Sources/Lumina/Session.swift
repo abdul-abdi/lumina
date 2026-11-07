@@ -6,7 +6,6 @@ public struct SessionPaths: Sendable {
     public let directory: URL
     public let socket: URL
     public let metaFile: URL
-    public let runDir: URL
 
     public static let defaultSessionsDir: URL = {
         FileManager.default.homeDirectoryForCurrentUser
@@ -18,7 +17,6 @@ public struct SessionPaths: Sendable {
         self.directory = sessionsDir.appendingPathComponent(sid)
         self.socket = self.directory.appendingPathComponent("control.sock")
         self.metaFile = self.directory.appendingPathComponent("meta.json")
-        self.runDir = self.directory.appendingPathComponent("run")
     }
 
     /// Write session metadata to disk.
