@@ -120,14 +120,13 @@ struct Run: AsyncParsableCommand {
         let autoDaemon = ProcessInfo.processInfo.environment["LUMINA_DAEMON"] != "0"
             && volume.isEmpty && resolveDiskSize(flag: nil) == nil
             && FileManager.default.fileExists(atPath: Daemon.socketPath().path)
-        if viaDaemon || autoDaemon {
+        if (viaDaemon || autoDaemon) && stdinIsSettled() {
             if !volume.isEmpty {
                 FileHandle.standardError.write(Data(
                     "warning: --via-daemon ignores --volume (mounts are pool-level config — set at `lumina daemon serve` time instead)\n".utf8
                 ))
             }
-            let timeoutSecs = parseDuration(resolveTimeout(flag: timeout, defaultValue: "60s"))
-                .map { Int($0.components.seconds) } ?? 60
+            let timeoutSecs = Int(try parseTimeoutOrExit(resolveTimeout(flag: timeout, defaultValue: "60s")).components.seconds)
             let (daemonUploads, daemonDirUploads) = try parseCopySpecs(copy)
             // The daemon needs the whole blob in one request; the cold
             // fallback below replays it because stdin is already at EOF.

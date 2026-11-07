@@ -201,6 +201,16 @@ func ensureImage(_ name: String) async throws {
     }
 }
 
+func stdinIsSettled() -> Bool {
+    if isatty(STDIN_FILENO) != 0 { return true }
+    var info = stat()
+    guard fstat(STDIN_FILENO, &info) == 0 else { return true }
+    let kind = info.st_mode & S_IFMT
+    if kind == S_IFREG || kind == S_IFCHR { return true }
+    var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    return poll(&pfd, 1, 50) > 0
+}
+
 // MARK: - Stdin Auto-Detect
 //
 // Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),
