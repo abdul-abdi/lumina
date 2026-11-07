@@ -40,13 +40,15 @@ final class ClipboardBridge: NSObject, VZVirtioSocketListenerDelegate, @unchecke
         shouldAcceptNewConnection connection: VZVirtioSocketConnection,
         from socketDevice: VZVirtioSocketDevice
     ) -> Bool {
-        queue.async { self.attach(connection) }
+        let box = UncheckedSendable(connection)
+        queue.async { self.attach(box.value) }
         return true
     }
 
     private func attach(_ newConnection: VZVirtioSocketConnection) {
         detach()
         connection = newConnection
+        disableSigpipe(fd: newConnection.fileDescriptor)
         let source = DispatchSource.makeReadSource(fileDescriptor: newConnection.fileDescriptor, queue: queue)
         source.setEventHandler { [weak self] in self?.receive() }
         source.resume()
@@ -74,18 +76,7 @@ final class ClipboardBridge: NSObject, VZVirtioSocketListenerDelegate, @unchecke
               text.utf8.count <= Self.maxBytes,
               let fd = connection?.fileDescriptor else { return }
         last = text
-        var line = Data(text.utf8).base64EncodedData()
-        line.append(0x0A)
-        let sent = line.withUnsafeBytes { bytes -> Bool in
-            var offset = 0
-            while offset < bytes.count {
-                let n = Darwin.write(fd, bytes.baseAddress! + offset, bytes.count - offset)
-                if n <= 0 { return false }
-                offset += n
-            }
-            return true
-        }
-        if !sent { detach() }
+        if !writeAll(fd: fd, data: Data(text.utf8).base64EncodedData() + [0x0A]) { detach() }
     }
 
     private func receive() {
