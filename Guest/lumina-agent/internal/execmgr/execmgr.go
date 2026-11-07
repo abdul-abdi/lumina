@@ -21,8 +21,6 @@ import (
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/wire"
 )
 
-// Manager tracks in-flight commands so stdin/cancel/teardown can find
-// them by ID.
 type Manager struct {
 	w *wire.Writer
 
@@ -30,16 +28,10 @@ type Manager struct {
 	running map[string]*runningCmd
 }
 
-// New creates an empty Manager.
 func New(w *wire.Writer) *Manager {
 	return &Manager{w: w, running: make(map[string]*runningCmd)}
 }
 
-// runningCmd tracks a single in-flight command. stdinPipe is seeded
-// by Register before the goroutine that will run the command starts,
-// so stdin / stdin_close messages arriving immediately after exec
-// cannot race the goroutine's registration and get silently dropped.
-// See `Register` for the full rationale.
 type runningCmd struct {
 	cmd       *exec.Cmd
 	stdinPipe io.WriteCloser
@@ -64,8 +56,6 @@ func (m *Manager) Register(id string) (stdinR, stdinW *os.File, err error) {
 	return stdinR, stdinW, nil
 }
 
-// Unregister removes an entry; used when a command failed to start
-// (after Register was called).
 func (m *Manager) Unregister(id string) {
 	m.mu.Lock()
 	delete(m.running, id)
@@ -76,7 +66,6 @@ func (m *Manager) Unregister(id string) {
 // from Register — this function takes ownership of them.
 func (m *Manager) Execute(req protocol.ExecRequest, stdinR, stdinW *os.File) {
 	cmd := exec.Command("/bin/sh", "-c", req.Cmd)
-	// Process group so the whole descendant tree can be killed together.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	cmd.Env = os.Environ()
@@ -119,7 +108,6 @@ func (m *Manager) Execute(req protocol.ExecRequest, stdinR, stdinW *os.File) {
 	_ = stderrW.Close()
 	_ = stdinR.Close()
 
-	// Upgrade the pre-registered entry with cmd + cancel + done.
 	cmdCtx, cmdCancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 	m.mu.Lock()
@@ -128,7 +116,6 @@ func (m *Manager) Execute(req protocol.ExecRequest, stdinR, stdinW *os.File) {
 		rc.cancel = cmdCancel
 		rc.done = doneCh
 	} else {
-		// Defensive — Register should always insert first.
 		m.running[req.ID] = &runningCmd{
 			cmd: cmd, stdinPipe: stdinW, cancel: cmdCancel, done: doneCh,
 		}
@@ -154,7 +141,6 @@ func (m *Manager) Execute(req protocol.ExecRequest, stdinR, stdinW *os.File) {
 	go func() { defer wg.Done(); streamPipe(m.w, req.ID, protocol.StreamStdout, stdoutR) }()
 	go func() { defer wg.Done(); streamPipe(m.w, req.ID, protocol.StreamStderr, stderrR) }()
 
-	// Exit handling: timeout → SIGTERM → 5s grace → SIGKILL.
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
@@ -191,8 +177,6 @@ func (m *Manager) Execute(req protocol.ExecRequest, stdinR, stdinW *os.File) {
 	_ = m.w.Send(protocol.NewExit(req.ID, exitCode))
 }
 
-// Stdin forwards data to a running command's stdin pipe. Silently
-// drops if the command has already exited.
 func (m *Manager) Stdin(msg protocol.StdinMsg) {
 	m.mu.Lock()
 	rc := m.running[msg.ID]
@@ -202,7 +186,6 @@ func (m *Manager) Stdin(msg protocol.StdinMsg) {
 	}
 }
 
-// StdinClose closes the stdin pipe for a running command.
 func (m *Manager) StdinClose(msg protocol.StdinCloseMsg) {
 	m.mu.Lock()
 	rc := m.running[msg.ID]
@@ -233,8 +216,6 @@ func (m *Manager) Cancel(msg protocol.CancelMsg) {
 	}
 }
 
-// KillAll SIGKILLs every running command. Used when the connection to
-// the host drops — we want to release resources fast.
 func (m *Manager) KillAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -245,7 +226,6 @@ func (m *Manager) KillAll() {
 	}
 }
 
-// WaitAll blocks until every running command's done channel is closed.
 func (m *Manager) WaitAll() {
 	m.mu.Lock()
 	cmds := make([]*runningCmd, 0, len(m.running))
@@ -260,9 +240,6 @@ func (m *Manager) WaitAll() {
 	}
 }
 
-// ── private ─────────────────────────────────────────────────────────
-
-// killLocked assumes m.mu is held.
 func (m *Manager) killLocked(rc *runningCmd, sig syscall.Signal, gracePeriod int) {
 	if rc.cmd == nil || rc.cmd.Process == nil {
 		return
@@ -286,9 +263,6 @@ func (m *Manager) killLocked(rc *runningCmd, sig syscall.Signal, gracePeriod int
 	}
 }
 
-// failStart reports a start-path failure and releases any fds the
-// caller created. The variadic-looking arg list keeps the happy path
-// free of branch-on-nil noise.
 func (m *Manager) failStart(
 	id string,
 	stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW *os.File,
@@ -310,7 +284,6 @@ func (m *Manager) failStart(
 	_ = m.w.Send(protocol.NewExit(id, 127))
 }
 
-// gracefulKill sends SIGTERM, waits, then SIGKILL.
 func gracefulKill(cmd *exec.Cmd, waitCh <-chan error, grace time.Duration) error {
 	if cmd.Process == nil {
 		return <-waitCh
@@ -329,7 +302,6 @@ func gracefulKill(cmd *exec.Cmd, waitCh <-chan error, grace time.Duration) error
 	}
 }
 
-// streamPipe reads from pipe, auto-detecting text vs binary per chunk.
 func streamPipe(w *wire.Writer, id string, stream string, pipe io.ReadCloser) {
 	buf := make([]byte, protocol.MaxChunkSize)
 	for {
@@ -348,7 +320,6 @@ func streamPipe(w *wire.Writer, id string, stream string, pipe io.ReadCloser) {
 	}
 }
 
-// sendText chunks long strings under the frame cap.
 func sendText(w *wire.Writer, id string, stream string, data string) {
 	for len(data) > 0 {
 		cut := len(data)

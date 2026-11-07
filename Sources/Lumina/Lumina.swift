@@ -1,10 +1,6 @@
-// Sources/Lumina/Lumina.swift
 import Foundation
 
 public struct Lumina {
-    /// Run a command in a disposable VM, return result when complete.
-    /// The VM is created, booted, used, and destroyed automatically.
-    /// Throws `LuminaError` on failure.
     public static func run(
         _ command: String,
         options: RunOptions = .default
@@ -28,7 +24,6 @@ public struct Lumina {
         }
     }
 
-    /// Stream output from a command in a disposable VM.
     /// Output chunks are yielded in real time as the guest agent sends them.
     public static func stream(
         _ command: String,
@@ -59,7 +54,6 @@ public struct Lumina {
     /// Unlike `run`, this manages the VM lifecycle manually: after the build
     /// command completes, the clone is detached, the VM is shut down cleanly
     /// (flushing the ext4 journal), and then the rootfs is copied to the image store.
-    /// Delegates to the multi-command overload with a single-element array.
     public static func createImage(
         name: String,
         from base: String = "default",
@@ -130,7 +124,6 @@ public struct Lumina {
         try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "), rosetta: rosetta)
     }
 
-    /// Run a closure with a private network of VMs.
     /// All VMs share a virtual switch for VM-to-VM communication.
     public static func withNetwork<T: Sendable>(
         _ name: String = "default",
@@ -157,9 +150,6 @@ public struct Lumina {
         try await vm.boot()
         let bootDone = ContinuousClock.now
 
-        // Host-driven network config, awaited by default since
-        // v0.7.3 — see the RunOptions.awaitNetworkReady docstring
-        // for why the v0.7.2 fire-and-forget default was wrong.
         if options.awaitNetworkReady {
             try await vm.configureNetwork()
         } else {

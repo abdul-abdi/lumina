@@ -1,8 +1,3 @@
-// Sources/LuminaDesktopKit/VMStore.swift
-//
-// v0.7.0 M6 — enumerates `.luminaVM` bundles for the Desktop app.
-// Watches `~/.lumina/desktop-vms/` for additions/removals.
-
 import Foundation
 import LuminaBootable
 
@@ -43,7 +38,6 @@ public struct VMStore: Sendable {
         return bundles.sorted { $0.manifest.createdAt < $1.manifest.createdAt }
     }
 
-    /// Soft-delete a bundle to the user's Trash. Returns true on success.
     public func moveToTrash(_ bundle: VMBundle) -> Bool {
         var resultingURL: NSURL?
         do {

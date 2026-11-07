@@ -1,11 +1,3 @@
-// Sources/LuminaDesktopKit/OSBrand.swift
-//
-// v0.7.0 M6 — visual identity per guest OS. Each card in the library
-// speaks its guest's brand: Ubuntu gets orange warmth, Kali gets the
-// dark-blue + dragon feel, macOS gets silver, Windows gets the fluent
-// blue. The goal is at-a-glance recognition — you look at 10 cards
-// and know which is which without reading a label.
-
 import SwiftUI
 import LuminaBootable
 
@@ -36,9 +28,6 @@ public struct OSBrand: Sendable {
 }
 
 public enum OSBranding {
-    /// Resolve a brand from a catalog variant ID or a freeform OS string
-    /// (manifest.osVariant). Falls back to the family default when the
-    /// variant is unrecognised.
     public static func brand(for variant: String, family: OSFamily) -> OSBrand {
         let v = variant.lowercased()
 
@@ -113,7 +102,6 @@ public enum OSBranding {
             )
         }
 
-        // Family fallback.
         switch family {
         case .linux:
             return OSBrand(

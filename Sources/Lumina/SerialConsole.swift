@@ -1,4 +1,3 @@
-// Sources/Lumina/SerialConsole.swift
 import Foundation
 
 public final class SerialConsole: @unchecked Sendable {
@@ -28,7 +27,6 @@ public final class SerialConsole: @unchecked Sendable {
         buffer.append(data)
         _version &+= 1
 
-        // Keep tail if over max size (per Carmack review)
         if buffer.count > maxSize {
             buffer.removeFirst(buffer.count - maxSize)
         }
@@ -40,8 +38,6 @@ public final class SerialConsole: @unchecked Sendable {
         return String(data: buffer, encoding: .utf8) ?? ""
     }
 
-    /// Monotonic version counter — increments once per successful
-    /// `append`. Starts at 0 for a freshly-constructed console.
     /// Overflow wraps via `&+=` (expected to never happen in practice;
     /// 2^64 appends at 4 Hz is ~146 billion years).
     public var version: UInt64 {

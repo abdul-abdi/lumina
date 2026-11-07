@@ -1,5 +1,3 @@
-// Sources/Lumina/EFIBootable.swift
-//
 // Configures a VZVirtualMachineConfiguration for EFI boot — the v0.7.0 M3
 // pipeline shared by Linux desktop installs (Ubuntu / Kali / Fedora /
 // Debian) and Windows 11 on ARM (M4).
@@ -9,25 +7,6 @@
 // on `Lumina`, so putting EFIBootable the other way around would cycle.
 // `LuminaBootable` keeps the higher-level surfaces (VMBundle, catalog,
 // disk allocator) which `VM` does NOT need at boot.
-//
-// Disk + CD-ROM strategy (hardened v0.7.1):
-//
-// - Primary disk uses `cachingMode:.automatic`. Synchronization is
-//   `.fsync` when `EFIBootConfig.installPhase == true` (halves the
-//   partman/mkfs install time on APFS by coalescing guest flushes into
-//   `fsync(2)` instead of barrier-fsync) and `.full` afterwards (real
-//   crash safety for the user's installed system).
-//
-// - Installer ISO uses `cachingMode:.cached`, `synchronizationMode:.none`.
-//   The ISO is read-only, so sync mode is meaningless, and `cached` keeps
-//   the hot blocks in the unified buffer cache so the second pass through
-//   the installer does not re-read from APFS.
-//
-// - When `preferUSBCDROM == true` the ISO is attached via
-//   `VZUSBMassStorageDeviceConfiguration`. Windows 11 ARM setup refuses
-//   virtio-block-as-CD-ROM; USB mass-storage presents as a genuine
-//   removable drive and works. Linux installers accept either. The
-//   virtio-block fallback remains for `preferUSBCDROM == false`.
 
 import Foundation
 import Virtualization
@@ -45,12 +24,10 @@ public struct EFIBootable: Sendable {
     }
 
     public func apply(to vzConfig: VZVirtualMachineConfiguration) throws {
-        // Platform: generic for both Linux and Windows guests.
         if !(vzConfig.platform is VZGenericPlatformConfiguration) {
             vzConfig.platform = VZGenericPlatformConfiguration()
         }
 
-        // Variable store: reuse an existing file or create a fresh one.
         let variableStore: VZEFIVariableStore
         if FileManager.default.fileExists(atPath: config.variableStoreURL.path) {
             variableStore = VZEFIVariableStore(url: config.variableStoreURL)
@@ -89,8 +66,6 @@ public struct EFIBootable: Sendable {
             vzConfig.bootLoader = loader
         }
 
-        // Storage devices: primary read-write disk, optional CD-ROM
-        // (USB mass-storage when preferred, else virtio block).
         var storage: [VZStorageDeviceConfiguration] = []
         do {
             let primary = try Self.makePrimaryDiskAttachment(
@@ -114,7 +89,6 @@ public struct EFIBootable: Sendable {
             }
         }
 
-        // Additional CD-ROMs (Windows autounattend.xml sidecar, etc.).
         // Always attached as USB mass-storage so Windows Setup sees them
         // as removable drives and scans for autounattend.xml.
         for extraISO in config.extraCDROMs {
@@ -164,7 +138,6 @@ public struct EFIBootable: Sendable {
         )
     }
 
-    /// Wrap an ISO attachment in the appropriate `VZStorageDeviceConfiguration`.
     /// With `preferUSB == true` (typically Windows guests),
     /// use `VZUSBMassStorageDeviceConfiguration` so EFI + guest setup see
     /// a genuine CD-ROM/removable drive. Otherwise fall back to virtio

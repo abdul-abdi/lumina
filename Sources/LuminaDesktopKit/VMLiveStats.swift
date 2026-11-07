@@ -1,15 +1,3 @@
-// Sources/LuminaDesktopKit/VMLiveStats.swift
-//
-// v0.7.0 M6 — cards display live stats (disk growth, running heartbeat)
-// instead of static configuration labels. Per Victor's critique:
-// representations should show behavior, not labels for behavior.
-//
-// We poll VMBundle.actualDiskBytes every 2s into a 60-sample ring buffer,
-// then draw a path through the samples. The sparkline shows whether the
-// guest is writing — a flat line means "asleep," a rising line means
-// "actively installing or working," a spike means "snapshot just landed."
-// This is information the static text can't convey.
-
 import SwiftUI
 import LuminaBootable
 
@@ -29,10 +17,8 @@ public final class VMLiveStats {
         start()
     }
 
-    /// Start sampling. Idempotent.
     public func start() {
         guard timer == nil else { return }
-        // Prime with a single sample so the view has something to draw.
         pushSample()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pushSample() }
@@ -56,7 +42,6 @@ public final class VMLiveStats {
         samples.append(bytes)
         if samples.count > windowSize { samples.removeFirst() }
 
-        // Rolling 10-sample growth rate = (last - earliest in window) / elapsed.
         if samples.count >= 2 {
             let span = Double(min(5, samples.count - 1)) * 2.0  // samples are 2s apart
             let delta = Double(bytes) - Double(samples[max(0, samples.count - 1 - 5)])
@@ -76,11 +61,6 @@ public final class VMLiveStats {
     }
 }
 
-// ── SPARKLINE VIEW ────────────────────────────────────────────────
-
-/// Tiny line chart of the VM's disk usage over time. When the VM is
-/// running and writing, the line rises — you SEE the guest working.
-/// When idle, the line is flat. The representation carries the state.
 @MainActor
 public struct DiskSparkline: View {
     @Bindable var stats: VMLiveStats
@@ -105,17 +85,14 @@ public struct DiskSparkline: View {
                 if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
                 else { path.addLine(to: CGPoint(x: x, y: y)) }
             }
-            // Line
             context.stroke(path, with: .color(tint), lineWidth: 1.2)
 
-            // Area fill under the line
             var fillPath = path
             fillPath.addLine(to: CGPoint(x: size.width, y: size.height))
             fillPath.addLine(to: CGPoint(x: 0, y: size.height))
             fillPath.closeSubpath()
             context.fill(fillPath, with: .color(tint.opacity(0.12)))
 
-            // Terminal cursor at the latest point
             if let last = samples.last {
                 let x = size.width
                 let y = size.height - CGFloat(last) * size.height
@@ -126,7 +103,6 @@ public struct DiskSparkline: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            // Growth rate indicator — breathes when writing, still when idle.
             if running && abs(stats.growthRate) > 1024 {
                 HStack(spacing: 3) {
                     Image(systemName: "arrow.up.right")
@@ -153,9 +129,6 @@ public struct DiskSparkline: View {
     }
 }
 
-// ── HEARTBEAT INDICATOR ───────────────────────────────────────────
-/// Tiny amber dot that pulses when the VM is running. Visual proof
-/// the machine is alive — no text label needed.
 @MainActor
 public struct Heartbeat: View {
     let color: Color

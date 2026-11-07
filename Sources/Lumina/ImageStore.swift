@@ -1,4 +1,3 @@
-// Sources/Lumina/ImageStore.swift
 import Foundation
 
 public struct ImagePaths: Sendable {
@@ -49,7 +48,6 @@ public struct ImageStore: Sendable {
             .sorted()
     }
 
-    /// Read image metadata. Returns nil if the image has no meta.json.
     public func readMeta(name: String) -> ImageMeta? {
         let metaFile = baseDir.appendingPathComponent(name).appendingPathComponent("meta.json")
         guard let data = try? Data(contentsOf: metaFile),
@@ -75,20 +73,17 @@ public struct ImageStore: Sendable {
     ) throws {
         let fm = FileManager.default
 
-        // Validate base exists
         let baseImageDir = baseDir.appendingPathComponent(base)
         guard fm.fileExists(atPath: baseImageDir.appendingPathComponent("rootfs.img").path) else {
             throw LuminaError.imageNotFound(base)
         }
 
-        // Staging dir for atomic creation
         let stagingId = UUID().uuidString
         let stagingDir = baseDir.appendingPathComponent(".tmp-\(stagingId)")
 
         do {
             try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-            // Copy modified rootfs
             try fm.copyItem(at: rootfsSource, to: stagingDir.appendingPathComponent("rootfs.img"))
 
             try fm.createSymbolicLink(
@@ -96,12 +91,10 @@ public struct ImageStore: Sendable {
                 withDestinationURL: baseImageDir.appendingPathComponent("vmlinuz")
             )
 
-            // Write meta.json
             let meta = ImageMeta(base: base, command: command, created: Date(), rosetta: rosetta)
             let metaData = try JSONEncoder().encode(meta)
             try metaData.write(to: stagingDir.appendingPathComponent("meta.json"))
 
-            // Atomic rename to final location
             let finalDir = self.baseDir.appendingPathComponent(name)
             try fm.moveItem(at: stagingDir, to: finalDir)
         } catch let error as LuminaError {
@@ -122,7 +115,6 @@ public struct ImageStore: Sendable {
         try FileManager.default.removeItem(at: dir)
     }
 
-    /// Inspect an image -- returns metadata and size.
     public func inspect(name: String) throws -> ImageInfo {
         let rootfs = baseDir.appendingPathComponent(name).appendingPathComponent("rootfs.img")
 

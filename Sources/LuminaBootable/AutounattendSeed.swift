@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/AutounattendSeed.swift
-//
 // Generates a sidecar autounattend.xml ISO that lets stock Microsoft
 // Windows 11 ARM64 installers complete OOBE on Apple Virtualization.framework,
 // which exposes no TPM device.
@@ -41,15 +39,6 @@ public struct AutounattendSeed: Sendable {
         self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname)
     }
 
-    /// Standard autounattend covering:
-    ///   1. WindowsPE pass — registry bypass for TPM, SecureBoot, RAM, CPU,
-    ///      storage. These are the five compatibility checks the Win11
-    ///      installer enforces; setting `LabConfig\Bypass*Check=1` skips
-    ///      the matching check.
-    ///   2. specialize pass — disable telemetry, set computer name.
-    ///   3. oobeSystem pass — accept EULA, skip Microsoft Account, create
-    ///      a local user, suppress every "set up your PC" screen.
-    ///
     /// `BypassNRO` is the magic OOBE step that lets us skip the
     /// "you must connect to internet and sign in to Microsoft" gate.
     /// Without it, recent Win11 ARM ISOs (post-23H2) brick OOBE in a VM
@@ -60,7 +49,6 @@ public struct AutounattendSeed: Sendable {
         // their Volume Activation guide; functionally a "deferred
         // activation" placeholder, not a license.
         let proVLKey = "W269N-WFGWX-YVC9B-4J6C9-T83GX"
-        // Escape XML reserved chars conservatively.
         let xName = xmlEscape(username)
         let xHost = xmlEscape(hostname)
         return #"""
@@ -226,7 +214,6 @@ public struct AutounattendSeed: Sendable {
         """#
     }
 
-    /// Generate `<bundle>/autounattend.iso`. Returns the URL.
     public func generate() throws -> URL {
         let data = Data(xml.utf8)
         return try SeedISO.make(

@@ -1,4 +1,3 @@
-// Sources/Lumina/Types.swift
 import Foundation
 
 // MARK: - File Transfer
@@ -77,7 +76,6 @@ public struct RunOptions: Sendable {
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
     /// is resized before boot. Nil means use the image's original size.
     public var diskSize: UInt64?
-    /// Stdin source. Default `.closed` sends EOF immediately.
     public var stdin: Stdin
     /// When true, `Lumina.run`/`Lumina.stream` block on
     /// `network_ready` before invoking exec — guarantees commands
@@ -134,9 +132,6 @@ public struct RunOptions: Sendable {
 /// Display + input configuration for a VM. Presence triggers the desktop
 /// code path in `VM.boot()`; absence (the default) leaves the agent path
 /// untouched.
-///
-/// For agent workloads, leave `VMOptions.graphics` as `nil`. For desktop
-/// workloads, pass a `GraphicsConfig`.
 public struct GraphicsConfig: Sendable {
     public var widthInPixels: Int
     public var heightInPixels: Int
@@ -153,8 +148,6 @@ public struct GraphicsConfig: Sendable {
 ///
 /// The caller supplies URLs for the EFI variable store, primary read-write disk,
 /// and optional CD-ROM ISO for installer boots.
-/// `LuminaBootable.EFIBootable` (M3) consumes this to configure a
-/// `VZVirtualMachineConfiguration`.
 public struct EFIBootConfig: Sendable, Equatable {
     public var variableStoreURL: URL
     public var primaryDisk: URL
@@ -284,12 +277,9 @@ public struct VMOptions: Sendable {
     /// `guestCrashed(serialOutput:)` still fires — this just adds a
     /// durable log on top).
     public var serialLogURL: URL?
-    /// v0.7.0: optional display + input for the desktop use case.
     /// `nil` is the agent path — zero overhead. Non-nil wires
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
     public var graphics: GraphicsConfig?
-    /// v0.7.0 M4: optional virtio sound device for desktop guests.
-    /// false = no sound device (agent-path-safe).
     public var sound: Bool
 
     /// v0.7.0 M3: optional EFI boot. `nil` means "use the headless agent
@@ -342,16 +332,12 @@ public struct VMOptions: Sendable {
         self.networkHosts = nil
         self.networkIP = nil
         self.diskSize = runOptions.diskSize
-        // Auto-detect rosetta from image metadata
         self.rosetta = ImageStore().readMeta(name: runOptions.image)?.rosetta ?? false
-        // Disposable `run` is never a desktop workload.
         self.graphics = nil
         // Disposable `run` always takes the agent path — the CLI has no way
         // to build a .luminaVM bundle in one shot today.
         self.efi = nil
-        // Disposable `run` is headless; no audio.
         self.sound = false
-        // Disposable `run` is one-shot; no benefit from a stable MAC.
         self.macAddress = nil
         // Disposable `run` has no bundle; caller can set a specific log
         // path via the library API if they want the serial dump.
@@ -432,7 +418,6 @@ public enum OutputChunk: Sendable, Equatable {
 public enum PtyChunk: Sendable, Equatable {
     /// Raw bytes from PTY master fd (base64-decoded).
     case output(Data)
-    /// Process exited with this code.
     case exit(Int32)
 }
 

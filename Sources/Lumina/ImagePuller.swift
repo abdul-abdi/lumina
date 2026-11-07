@@ -1,4 +1,3 @@
-// Sources/Lumina/ImagePuller.swift
 import Foundation
 import CryptoKit
 import os
@@ -44,13 +43,10 @@ public struct ImagePuller: Sendable {
         self.imageStore = imageStore
     }
 
-    /// Check if the default image is already available.
     public func imageExists(name: String = "default") -> Bool {
         (try? imageStore.resolve(name: name)) != nil
     }
 
-    /// Pull the default image from GitHub Releases.
-    /// Downloads the tarball, verifies integrity, extracts vmlinuz + rootfs.img.
     public func pull(
         name: String = "default",
         progress: @Sendable (_ message: String) -> Void = { _ in }
@@ -59,7 +55,6 @@ public struct ImagePuller: Sendable {
         let releaseURL = "https://github.com/\(repo)/releases/download/\(resolvedTag)/\(assetName)"
         progress("Downloading \(assetName) from \(repo) (\(resolvedTag))...")
 
-        // 1. Download the tarball
         let downloadedFile: URL
         do {
             downloadedFile = try await download(from: releaseURL)
@@ -69,7 +64,6 @@ public struct ImagePuller: Sendable {
             throw .imageNotFound("Network error: \(error.localizedDescription)")
         }
 
-        // 2. Verify download is not empty / corrupted
         let fileSize: Int
         do {
             let attrs = try FileManager.default.attributesOfItem(atPath: downloadedFile.path)
@@ -164,7 +158,6 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 6. Verify required files exist
         let requiredFiles = ["vmlinuz", "rootfs.img"]
         var missingFiles: [String] = []
         for file in requiredFiles {
@@ -181,7 +174,6 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 7. Verify rootfs.img is non-trivial (at least 1MB)
         let rootfsPath = stagingDir.appendingPathComponent("rootfs.img")
         let rootfsSize = (try? FileManager.default.attributesOfItem(
             atPath: rootfsPath.path
@@ -266,15 +258,6 @@ public struct ImagePuller: Sendable {
         }
     }
 
-    /// Resolve which GitHub release tag to pull from. Order:
-    ///   1. explicit `self.tag` set at init (pin mode — no network)
-    ///   2. `LUMINA_IMAGE_TAG` env var (easy override for testing)
-    ///   3. GitHub API latest release containing `assetName` (normal path)
-    ///   4. `Self.fallbackTag` (offline / rate-limited / unexpected error)
-    ///
-    /// The API call is bounded to 3 seconds. If it fails for any
-    /// reason, we log once and fall through to the hardcoded fallback
-    /// — never block the boot on a transient GitHub issue.
     private func resolveTag(
         progress: @Sendable (_ message: String) -> Void
     ) async -> String {
@@ -293,10 +276,6 @@ public struct ImagePuller: Sendable {
         return Self.fallbackTag
     }
 
-    /// Query GitHub's releases endpoint and return the most recent
-    /// release tag whose asset list includes `assetName`. Nil on any
-    /// failure — caller falls back to the pinned tag.
-    ///
     /// We list `per_page=10` rather than hit `/latest` because a
     /// release that doesn't ship the image asset (e.g. a CLI-only
     /// patch release) would mislead `/latest` into 404-ing the image
@@ -326,7 +305,6 @@ public struct ImagePuller: Sendable {
             return nil
         }
 
-        // Minimal decode: only the two fields we need off each release.
         struct Asset: Decodable { let name: String }
         struct Release: Decodable {
             let tag_name: String

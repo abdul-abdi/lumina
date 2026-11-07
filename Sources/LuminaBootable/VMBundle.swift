@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/VMBundle.swift
-//
 // Filesystem-backed model for a `.luminaVM` bundle.
 //
 // Layout:

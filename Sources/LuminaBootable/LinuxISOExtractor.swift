@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/LinuxISOExtractor.swift
-//
 // Extracts the kernel + initramfs out of a Linux installer ISO so the
 // host can boot them via VZLinuxBootLoader with a caller-controlled
 // kernel cmdline. The only reason we do this is to inject
@@ -115,14 +113,6 @@ public struct LinuxISOExtractor: Sendable {
             "boot/vmlinuz-lts",
             "boot/initramfs-lts",
             "Alpine standard (LTS)",
-            // Alpine's init script's `myopts` allowlist (parsed from
-            // /proc/cmdline) does NOT include `alpine_dev` or
-            // `modloop` keys — verified empirically on 3.23 — so
-            // those silently drop. What it DOES honour is `modules=`,
-            // which forces an early `modprobe -a` of the listed
-            // modules. We list iso9660 + virtio-blk so nlplug-findfs
-            // (Alpine's actual block-device-and-boot-media scanner)
-            // can see and mount the attached ISO.
             "modules=iso9660,virtio_blk,loop,squashfs,sd-mod,usb-storage,ext4"
         ),
         (
@@ -151,7 +141,6 @@ public struct LinuxISOExtractor: Sendable {
         iso: URL,
         destination: URL
     ) throws -> Extracted {
-        // 1. List archive contents.
         let list = runProcess("/usr/bin/bsdtar", arguments: ["-tf", iso.path])
         guard list.exitCode == 0 else {
             throw Error.listFailed(
@@ -160,7 +149,6 @@ public struct LinuxISOExtractor: Sendable {
         }
         let members = Set(list.stdout.split(separator: "\n").map(String.init))
 
-        // 2. Find a matching layout.
         var tried: [String] = []
         var matched: (layout: (kernel: String, initramfs: String, name: String, cmdlineExtra: String), kernel: String, initramfs: String)? = nil
         for layout in knownLayouts {
@@ -179,7 +167,6 @@ public struct LinuxISOExtractor: Sendable {
             throw Error.unknownLayout(triedPaths: Array(Set(tried)).sorted())
         }
 
-        // 3. Extract exactly those two files into destination.
         // `-C destination` sets the output dir; trailing positional args
         // restrict extraction to specific members.
         let extractArgs = [
@@ -255,7 +242,6 @@ public struct LinuxISOExtractor: Sendable {
         let header = handle.readData(ofLength: 32)
         guard header.count >= 16 else { return kernel }
 
-        // Detect "zimg" at offset 4.
         let zimgMagic: [UInt8] = [0x7a, 0x69, 0x6d, 0x67] // "zimg"
         let headerBytes = [UInt8](header)
         guard Array(headerBytes[4..<8]) == zimgMagic else {
@@ -289,7 +275,6 @@ public struct LinuxISOExtractor: Sendable {
             )
         }
 
-        // Write compressed payload to tmp, gunzip it to the final path.
         let gzTmp = destination.appendingPathComponent("vmlinuz-raw.gz")
         let rawOut = destination.appendingPathComponent("vmlinuz-raw")
         try? FileManager.default.removeItem(at: gzTmp)

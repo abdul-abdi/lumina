@@ -1,13 +1,3 @@
-// Sources/LuminaDesktopKit/LuminaDesktopSession.swift
-//
-// v0.7.0 M6 — the MainActor bridge from `Lumina.VM` (an actor) to
-// SwiftUI views (which observe `@Observable @MainActor` state).
-//
-// The bridge owns a `Lumina.VM` and a snapshot of its observable state
-// (status, last error, serial output digest). SwiftUI views read these
-// `@Observable` properties; the actor mirrors changes into them via
-// `Task { @MainActor in ... }` after each mutation.
-//
 // Why not pass the actor directly into views: SwiftUI re-evaluates view
 // bodies on every state change. Calling `await session.vm.state` from
 // inside a body would suspend rendering and force every observer to
@@ -42,7 +32,6 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        /// True when `boot()` should actually start a new VZ machine.
         /// Used as the re-entry guard at the top of `boot()` to make
         /// concurrent boot calls idempotent from every UI path (card
         /// ▶ BOOT, ⌘K launcher, VM-window `.task`, menu bar). Two paths
@@ -57,7 +46,6 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        /// True when a terminal-state guard should early-return in
         /// `handleExternalStop`. `.shuttingDown` means the explicit
         /// `shutdown()` path owns the transition; `.stopped` means we
         /// already landed there. Without this guard the VZ delegate
@@ -76,17 +64,8 @@ public final class LuminaDesktopSession: Identifiable {
     public var lastError: String?
     public var bootDuration: Duration?
     public var serialDigest: String = ""
-    /// Per-phase breakdown of the most recent boot — populated from
-    /// `VM.bootPhases` in `boot()` at the success/crash transition.
-    /// `BootPhases()` when no boot has run yet. UI gates on
-    /// `.isValid` to avoid rendering empty rows.
     public var bootPhases: BootPhases = BootPhases()
 
-    /// Atomic read of every observable session field as a single
-    /// `Sendable`, `Equatable` value. v0.7.1 #21: callers that want a
-    /// consistent view of session state (tests, debug dumps, future
-    /// `lumina ps --verbose`) read this instead of stitching together
-    /// four individual properties at different observation ticks.
     public var snapshot: SessionSnapshot {
         SessionSnapshot(
             status: status,
@@ -105,7 +84,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// Each field is only written when it actually differs from the
     /// current value, so idempotent applies (applyAtomic of the
     /// current snapshot) don't fire spurious observation ticks.
-    /// v0.7.1 #21.
     public func applyAtomic(_ next: SessionSnapshot) {
         if status != next.status { status = next.status }
         if lastError != next.lastError { lastError = next.lastError }
@@ -122,9 +100,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// completes its actor hop.
     public var vzMachine: VZVirtualMachine?
 
-    /// The underlying VM actor. MainActor-isolated (inherits from the
-    /// enclosing `@MainActor` class). `VM` is an actor, so `VM?` is
-    /// `Sendable` and can be awaited from any isolation without friction.
     private var vm: VM?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
@@ -132,10 +107,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// session is torn down.
     private var vmDelegate: VMStopForwarder?
 
-    /// Polling task that mirrors `VM.serialTail(...)` into
-    /// `serialDigest` for the booting / crashed tail UI. Lives for as
-    /// long as the VM actor is attached; cancelled in `shutdown()` /
-    /// `handleExternalStop()`.
     private var serialMirrorTask: Task<Void, Never>?
 
     /// Polling task that mirrors `VM.bootPhases` into `bootPhases` so
@@ -144,7 +115,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// up at boot() entry, cancelled the moment boot() returns (success
     /// or failure), because after boot completes the phases are frozen
     /// and the final `applyAtomic` is the authoritative write.
-    /// v0.7.1 feature 3.2.
     private var bootPhasesMirrorTask: Task<Void, Never>?
 
     public init(bundle: VMBundle) {
@@ -153,7 +123,6 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     public func boot() async {
-        // Re-entry guard — see `Status.canBoot` for the full rationale.
         guard status.canBoot else { return }
 
         // Enter .booting with a clean error slate in a single tick.
@@ -225,9 +194,6 @@ public final class LuminaDesktopSession: Identifiable {
             ))
             return
         }
-        // Persist event log alongside the bundle so the user can post-
-        // mortem what happened on first boot from the framebuffer alone.
-        // Best-effort; failures are non-fatal.
         appendFirstBootLog(events: firstBootPlan.events, to: mutableBundle.logsDirectory)
 
         var opts = mutableBundle.vmOptions(cdrom: cdromURL, plan: firstBootPlan)
@@ -266,8 +232,6 @@ public final class LuminaDesktopSession: Identifiable {
         startBootPhasesMirror(for: newVM)
         do {
             try await newVM.boot()
-            // Final authoritative phase snapshot; stop the poll task
-            // so the post-boot `applyAtomic` below is the last writer.
             bootPhasesMirrorTask?.cancel()
             bootPhasesMirrorTask = nil
             // Grab the VZ handle and publish it BEFORE flipping status
@@ -279,10 +243,6 @@ public final class LuminaDesktopSession: Identifiable {
             // land in the same observation tick.
             let handle = await newVM.vzMachine()
             self.vzMachine = handle.machine
-            // Snapshot the per-phase boot timings so the waterfall UI
-            // has the full breakdown in the same tick status flips to
-            // `.running`. Agent path populates every phase; EFI path
-            // fills configMs/vzStartMs/totalMs and leaves the rest 0.
             let phases = await newVM.bootPhases
             // Land status + bootDuration + phases in a single observation
             // tick so the UI never renders `.running` with a nil duration
@@ -298,15 +258,10 @@ public final class LuminaDesktopSession: Identifiable {
         } catch {
             bootPhasesMirrorTask?.cancel()
             bootPhasesMirrorTask = nil
-            // Best-effort phase snapshot before tearing down — useful
-            // diagnostic even on a crash. Zero-value on early failures.
             let partialPhases = await self.vm?.bootPhases ?? BootPhases()
             self.vm = nil
             self.vmDelegate = nil
             self.vzMachine = nil
-            // `error` is already `LuminaError` — `VM.boot()` is typed
-            // `throws(LuminaError)`, so Swift knows the concrete type in
-            // this catch. `isCancellation` is a LuminaError extension.
             if error.isCancellation {
                 // User clicked Stop mid-boot. The VM actor's cancellation
                 // path has already torn down the VZ machine, released the
@@ -391,9 +346,6 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     private func handleExternalStop(reason: String?) {
-        // Terminal-state guard — see `Status.isTerminal`. Covers both
-        // the "shutdown() already owns the transition" and "already
-        // stopped" cases in one name.
         if status.isTerminal { return }
 
         // Grab one final serial tail from the VM before we drop the
@@ -439,14 +391,6 @@ public final class LuminaDesktopSession: Identifiable {
         }
     }
 
-    /// Poll the VM's serial console tail into `serialDigest` on a
-    /// ~250ms cadence. During `.booting` this feeds the bottom-docked
-    /// tail view — the only diagnostic available while the framebuffer
-    /// is blank (EFI → kernel handoff, early kernel messages before
-    /// the graphics driver claims the display). After the framebuffer
-    /// lights up the tail collapses in the UI but stays live so a
-    /// later crash preserves the last-known-good diagnostic lines.
-    ///
     /// **Back-pressure:** the loop captures `VM.serialVersion` each tick
     /// and short-circuits the tail+strip+publish pipeline when it hasn't
     /// changed since the previous iteration. An idle VM (no new serial

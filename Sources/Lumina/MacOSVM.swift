@@ -1,5 +1,3 @@
-// Sources/Lumina/MacOSVM.swift
-//
 // v0.7.0 M5 — actor wrapping VZVirtualMachine for macOS guests.
 // Parallel to `VM` (which handles Linux + Windows). VZ exposes
 // VZMacOSVirtualMachine in framework documentation as a "type" but the
@@ -124,11 +122,6 @@ public actor MacOSVM {
             throw Error.installFailed("config validation: \(error)")
         }
 
-        // Cooperative cancellation gates matching VM.boot: a cancel
-        // that lands between config-build and VZ machine construction
-        // should exit here rather than allocate the VZ instance and
-        // immediately tear it down. UX symmetry with `⌘.` on boot
-        // (issue #23).
         try Task.checkCancellation()
 
         let queue = executor.queue
@@ -223,14 +216,6 @@ public actor MacOSVM {
         _state = .idle
     }
 
-    /// Boot a macOS guest that's already installed.
-    ///
-    /// A mid-boot Task cancel (user clicks Stop in the desktop app before
-    /// the guest reaches userspace) triggers `onCancel` on the start
-    /// continuation, which invokes `vm.stop(…)` on the executor queue.
-    /// That resumes `start`'s completion with an error; the `catch` funnels
-    /// through `stopVZMachineIfRunning` to release `flock()` on the
-    /// primary disk, so a subsequent `boot()` succeeds cold.
     public func boot() async throws {
         guard _state == .idle else {
             throw Error.invalidState("boot requires .idle state, was \(_state)")

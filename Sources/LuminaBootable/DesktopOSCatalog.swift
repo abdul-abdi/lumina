@@ -1,9 +1,3 @@
-// Sources/LuminaBootable/DesktopOSCatalog.swift
-//
-// Static registry of supported desktop guests. Consumed by the New VM wizard
-// (M6). Entries point at vendor-canonical ARM64 ISO URLs with published
-// SHA-256 checksums.
-//
 // PRE-SHIP VERIFICATION:
 //   URL + checksum values were last verified against each vendor's signed
 //   SHA256SUMS / CHECKSUM file on 2026-04-20. ARM64 release paths and
@@ -70,12 +64,6 @@ public enum DesktopOSCatalog {
     public static let placeholderSHA256 = String(repeating: "0", count: 64)
 
     public static let all: [DesktopOSEntry] = [
-        // URLs + SHA-256 digests verified against each vendor's signed
-        // SHA256SUMS / CHECKSUM file on 2026-04-20 (Ubuntu 24.04.3, Kali
-        // 2026.1, Fedora 42, Debian 12.12.0). The digests are load-bearing
-        // — NewVMWizard.createAndDismiss hashes any user-picked file and
-        // refuses to create the VM unless the digest matches an entry
-        // below, rejecting tampered or partially-downloaded files.
         DesktopOSEntry(
             id: "ubuntu-24.04",
             displayName: "Ubuntu 24.04 LTS (Server, ARM64)",

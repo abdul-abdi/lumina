@@ -1,13 +1,6 @@
-// Sources/lumina-cli/SpecParsers.swift
-//
 // Shared parsers for CLI flag specs that more than one subcommand
 // accepts: `--env KEY=VAL`, `--copy local:remote`,
 // `--download remote:local`, `--volume name_or_path:guest`.
-//
-// Each helper writes a friendly error to stderr and throws
-// `ExitCode.failure` on bad input — same shape as the inline parsers
-// they replace, so subcommand callers don't need their own error
-// formatting.
 import ArgumentParser
 import Foundation
 import Lumina

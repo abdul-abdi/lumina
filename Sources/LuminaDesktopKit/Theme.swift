@@ -1,9 +1,3 @@
-// Sources/LuminaDesktopKit/Theme.swift
-//
-// v0.7.0 M6 — phosphor-amber palette aligned to lumina.run.
-// Two themes (dark/light), system-following by default, user-overridable.
-// Tokens resolve dynamically to the active color scheme.
-
 import SwiftUI
 import AppKit
 
@@ -93,28 +87,23 @@ public enum AppearancePreference: String, CaseIterable, Sendable {
 }
 
 public enum LuminaTheme {
-    // ── Surfaces (auto-resolve to dark/light) ──────────────────────
     public static let bg      = dynamic(dark: "#0A0A0A", light: "#FAF8F2")
     public static let bg1     = dynamic(dark: "#0F0F0F", light: "#F4F1EA")
     public static let bg2     = dynamic(dark: "#141414", light: "#EDE9E0")
     public static let bgInset = dynamic(dark: "#050505", light: "#FFFFFF")
 
-    // ── Ink (text) ─────────────────────────────────────────────────
     public static let ink     = dynamic(dark: "#E8E4D8", light: "#1A1814")
     public static let inkDim  = dynamic(dark: "#9A9384", light: "#5A554A")
     public static let inkMute = dynamic(dark: "#6B6558", light: "#8C8678")
 
-    // ── Rules / dividers ───────────────────────────────────────────
     public static let rule    = dynamic(dark: "#1F1D18", light: "#E0DCD2")
     public static let rule2   = dynamic(dark: "#2A2620", light: "#D2CDC0")
 
-    // ── Accent + status (same in both modes — brand) ───────────────
     public static let accent  = hex("#FFB347")  // phosphor amber
     public static let ok      = dynamic(dark: "#8FC97A", light: "#3F9B22")
     public static let warn    = dynamic(dark: "#E5C96A", light: "#A07700")
     public static let err     = dynamic(dark: "#E87272", light: "#B02A2A")
 
-    // ── Type ───────────────────────────────────────────────────────
     public static let monoSmall = Font.system(size: 11, design: .monospaced)
 
     public static let title = Font.system(size: 24, weight: .medium, design: .monospaced)
@@ -123,7 +112,6 @@ public enum LuminaTheme {
     public static let label = Font.system(size: 10, weight: .medium, design: .monospaced)
 }
 
-// ── Color helpers ──────────────────────────────────────────────────
 func hex(_ s: String) -> Color {
     var trimmed = s
     if trimmed.hasPrefix("#") { trimmed.removeFirst() }
@@ -143,19 +131,15 @@ private func dynamic(dark: String, light: String) -> Color {
     }))
 }
 
-// ── Translucent material helpers ───────────────────────────────────
 // Earlier drafts referenced macOS 26 Liquid Glass APIs (`Glass`,
 // `.glassEffect`). Dropped because `#available` is a runtime check;
 // the compiler still needs the symbols in the SDK. CI runs on
 // macos-15 (SDK 15.x) which doesn't have those types, so the build
 // failed. System materials render indistinguishably for our use.
-// ── Live state readers for the VM card ────────────────────────────
 
 import LuminaBootable
 
 public extension VMBundle {
-    /// Actual on-disk size of the primary disk image (sparse-aware).
-    /// Returns 0 if the disk file doesn't exist yet.
     var actualDiskBytes: UInt64 {
         let url = primaryDiskURL
         guard let rsrc = try? url.resourceValues(forKeys: [.fileAllocatedSizeKey]) else {
@@ -164,7 +148,6 @@ public extension VMBundle {
         return UInt64(rsrc.fileAllocatedSize ?? 0)
     }
 
-    /// Count of snapshot subdirectories under snapshots/.
     var snapshotCount: Int {
         let url = snapshotsDirectory
         guard let entries = try? FileManager.default.contentsOfDirectory(
@@ -175,7 +158,6 @@ public extension VMBundle {
         }.count
     }
 
-    /// "never" / "2h ago" / "3d ago" — human-readable last boot.
     var lastBootedRelative: String {
         guard let d = manifest.lastBootedAt else { return "never booted" }
         let secs = Int(Date().timeIntervalSince(d))
@@ -185,7 +167,6 @@ public extension VMBundle {
         return "\(secs / 86400)d ago"
     }
 
-    /// "1.2 GB" / "480 MB" — sparse disk usage, human.
     var diskUsedFormatted: String {
         formatBytesHuman(actualDiskBytes)
     }

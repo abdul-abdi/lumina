@@ -1,6 +1,3 @@
-// Sources/LuminaDesktopKit/MaterialBackground.swift
-//
-// v0.7.0 M6 — NSVisualEffectView wrapper for proper Mac-native translucency.
 // SwiftUI's `.background(.ultraThinMaterial)` is fine for sheets but doesn't
 // behave correctly as a window background — falls back to opaque on hidden
 // title bars. We use the AppKit primitive directly.
@@ -35,7 +32,6 @@ public struct MaterialBackground: NSViewRepresentable {
     }
 }
 
-/// Window controller config for hiding the title bar + unified toolbar.
 public struct WindowAccessor: NSViewRepresentable {
     public let configure: (NSWindow) -> Void
 
@@ -56,8 +52,6 @@ public struct WindowAccessor: NSViewRepresentable {
 }
 
 public extension View {
-    /// Configure the window this view is hosted in. Hides the title text,
-    /// makes the toolbar transparent so our material background shows.
     func luminaWindowChrome() -> some View {
         self.background(WindowAccessor { window in
             window.titlebarAppearsTransparent = true

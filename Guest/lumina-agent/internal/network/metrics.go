@@ -23,7 +23,6 @@ const metricsInterval = 2 * time.Second
 // configure_network (counters start at zero and are safe to read).
 const metricsFirstSampleDelay = 500 * time.Millisecond
 
-// Test injection — production always reads the real procfs file.
 var readProcNetDev = defaultReadProcNetDev
 
 // StartMetricsTicker runs in its own goroutine, emitting
@@ -33,8 +32,6 @@ var readProcNetDev = defaultReadProcNetDev
 // skips the sample and tries again next cycle rather than tearing
 // itself down.
 func StartMetricsTicker(ctx context.Context, w *wire.Writer) {
-	// Initial delay so the first sample lands before a 1s run exits,
-	// but after enough boot noise settles that counters aren't zero.
 	select {
 	case <-ctx.Done():
 		return

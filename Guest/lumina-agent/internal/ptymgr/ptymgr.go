@@ -25,8 +25,6 @@ import (
 // avoiding per-character JSON overhead.
 const drainWindow = 5 * time.Millisecond
 
-// readBufSize — per-read chunk; a burst aggregates up to 8 KiB before
-// flushing mid-window.
 const readBufSize = 4096
 
 // pendingResizeTTL — a window_resize that arrives for a PTY id whose
@@ -41,7 +39,6 @@ const readBufSize = 4096
 // still correct.
 const pendingResizeTTL = 60 * time.Second
 
-// Manager tracks in-flight PTY sessions.
 type Manager struct {
 	w *wire.Writer
 
@@ -56,7 +53,6 @@ type Manager struct {
 	now func() time.Time
 }
 
-// New creates an empty Manager.
 func New(w *wire.Writer) *Manager {
 	return &Manager{
 		w:              w,
@@ -81,7 +77,6 @@ type winsize struct {
 	enqueuedAt time.Time
 }
 
-// HasActive reports whether a PTY with the given id is running.
 func (m *Manager) HasActive(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -140,7 +135,6 @@ func writeAll(fd int, b []byte) error {
 		switch err {
 		case nil:
 		case unix.EAGAIN, unix.EINTR:
-			// Wait for writability instead of busy-spinning the retry.
 			pfd[0].Revents = 0
 			_, _ = unix.Poll(pfd, 50)
 		default:
@@ -181,8 +175,6 @@ func (m *Manager) Resize(msg protocol.WindowResizeMsg) {
 	m.pendingMu.Unlock()
 }
 
-// Execute runs req under a freshly allocated PTY. It owns the PTY
-// master/slave lifecycle and sends exit when the process terminates.
 func (m *Manager) Execute(req protocol.PtyExecRequest) {
 	id := req.ID
 
@@ -199,7 +191,6 @@ func (m *Manager) Execute(req protocol.PtyExecRequest) {
 		return
 	}
 
-	// Initial size: from request, unless a pending resize beat us here.
 	ws := unix.Winsize{Row: uint16(req.Rows), Col: uint16(req.Cols)}
 	m.pendingMu.Lock()
 	if pending, ok := m.pendingResizes[id]; ok {
@@ -212,7 +203,6 @@ func (m *Manager) Execute(req protocol.PtyExecRequest) {
 		_, _ = fmt.Fprintf(os.Stderr, "pty initial winsize (id=%s): %v\n", id, err)
 	}
 
-	// Build child command with slave as tty.
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", req.Cmd)
 	cmd.Env = append(os.Environ(),
@@ -250,7 +240,6 @@ func (m *Manager) Execute(req protocol.PtyExecRequest) {
 	}
 	_ = slaveFile.Close() // child has its own dup'd fd
 
-	// Reader goroutine: chunk + drain-window coalesce.
 	readDone := make(chan struct{})
 	go m.readMaster(id, masterFd, readDone)
 
@@ -267,8 +256,6 @@ func (m *Manager) Execute(req protocol.PtyExecRequest) {
 	_ = m.w.Send(protocol.NewExit(id, exitCode))
 }
 
-// ── private ─────────────────────────────────────────────────────────
-
 func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 	defer close(done)
 	buf := make([]byte, readBufSize)
@@ -283,8 +270,6 @@ func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 		if n > 0 {
 			accum := make([]byte, 0, 8192)
 			accum = append(accum, buf[:n]...)
-			// Coalesce a drain window of additional bytes without
-			// holding up the master for long.
 			deadline := time.Now().Add(drainWindow)
 			for {
 				remaining := time.Until(deadline)
@@ -324,7 +309,6 @@ func (m *Manager) readMaster(id string, masterFd int, done chan<- struct{}) {
 	}
 }
 
-// sendErrorAndExit writes a pty_output text frame then exit 127.
 func (m *Manager) sendErrorAndExit(id, text string) {
 	_ = m.w.Send(protocol.PtyOutputMsg{
 		Type: protocol.TypePtyOutput,
@@ -334,7 +318,6 @@ func (m *Manager) sendErrorAndExit(id, text string) {
 	_ = m.w.Send(protocol.NewExit(id, 127))
 }
 
-// openPty allocates a /dev/ptmx master + slave pair.
 func openPty() (masterFd int, slavePath string, err error) {
 	masterFd, err = unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
@@ -353,7 +336,6 @@ func openPty() (masterFd int, slavePath string, err error) {
 	return masterFd, fmt.Sprintf("/dev/pts/%d", ptsNum), nil
 }
 
-// envPairs converts the request env map to "k=v" strings.
 func envPairs(env map[string]string) []string {
 	pairs := make([]string, 0, len(env))
 	for k, v := range env {

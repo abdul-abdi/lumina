@@ -1,4 +1,3 @@
-// Sources/Lumina/Daemon.swift
 //
 // Unix-socket daemon wrapping Pool. `lumina daemon serve` pre-boots N VMs and
 // listens on ~/.lumina/lumind.sock. `lumina run --via-daemon` dials the socket
@@ -27,10 +26,6 @@
 // Blocking I/O: Darwin read(2) wrapped in DispatchQueue.global().async +
 // withCheckedContinuation. FileHandle.availableData is FORBIDDEN
 // (cooperative-pool starvation — see swift-cooperative-pool-starvation learning).
-//
-// Accepted client fds get SO_RCVTIMEO so a client that connects and sends no
-// newline can't hold the (deliberately serial — see #33) accept loop open
-// forever.
 
 import Foundation
 import Darwin
@@ -93,8 +88,6 @@ public enum Daemon {
         guard let fd = unixConnect(path: sockURL.path) else { return nil }
         defer { Darwin.close(fd) }
 
-        // Build NDJSON request. Uploads/downloads carry host paths only —
-        // the daemon reads/writes them directly since it's on the same host.
         let request = DaemonRequest(
             op: "run", image: image, memory: memory, cpus: cpuCount, cmd: command, timeout: timeout,
             env: env, cwd: cwd,
@@ -167,7 +160,6 @@ public enum Daemon {
 
     // MARK: - Client: stop
 
-    /// Send shutdown op to daemon. Returns `true` if daemon was running, `false` otherwise.
     public static func stop(socketPath: URL? = nil) async -> Bool {
         let sockURL = socketPath ?? Daemon.socketPath()
         guard FileManager.default.fileExists(atPath: sockURL.path) else { return false }
@@ -192,13 +184,11 @@ public enum Daemon {
     ) async throws -> Never {
         let sockURL = socketPath ?? Daemon.socketPath()
 
-        // Mkdir ~/.lumina defensively
         let luminaDir = sockURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(
             at: luminaDir, withIntermediateDirectories: true
         )
 
-        // Remove stale socket
         try? FileManager.default.removeItem(at: sockURL)
 
         guard let listenerFd = unixListen(path: sockURL.path) else {
@@ -220,7 +210,6 @@ public enum Daemon {
             Darwin.exit(0)
         }
 
-        // Boot pool
         let pool = Pool(size: size, image: image)
         FileHandle.standardError.write(Data(
             "lumina daemon: booting \(size) VM(s) (image: \(image))...\n".utf8
@@ -268,9 +257,6 @@ public enum Daemon {
             }
             consecutiveAcceptFailures = 0
 
-            // A client that connects and never sends a newline would otherwise
-            // block asyncReadLine's read(2) forever, wedging this serial loop
-            // for every subsequent --via-daemon caller.
             setReceiveTimeout(fd: clientFd, seconds: Self.clientReceiveTimeoutSeconds)
             disableSigpipe(fd: clientFd)
 
@@ -288,7 +274,6 @@ public enum Daemon {
 private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath: URL) async {
     defer { Darwin.close(fd) }
 
-    // Read one NDJSON line
     guard let line = await asyncReadLine(fd: fd),
           let request = try? JSONDecoder().decode(DaemonRequest.self, from: line)
     else { return }
@@ -423,7 +408,6 @@ struct RunResultEnvelope: Codable, Sendable {
     var partial_stderr: String?
     var network_metrics: NetworkMetricsSummary?
 
-    /// Build from a successful `RunResult`.
     init(from result: RunResult, durationMs: Int) {
         self.stdout = result.stdout
         self.stderr = result.stderr
@@ -434,13 +418,11 @@ struct RunResultEnvelope: Codable, Sendable {
         self.network_metrics = result.networkMetrics
     }
 
-    /// Build for an error response.
     init(error: String, duration_ms: Int) {
         self.duration_ms = duration_ms
         self.error = error
     }
 
-    /// Decode back to `RunResult` on the client side.
     func toRunResult() -> RunResult {
         let stdoutData = stdout_bytes.flatMap { Data(base64Encoded: $0) }
         let stderrData = stderr_bytes.flatMap { Data(base64Encoded: $0) }
@@ -469,7 +451,6 @@ private func asyncReadLine(fd: Int32) async -> Data? {
             while true {
                 let n = Darwin.read(fd, &chunk, chunk.count)
                 if n <= 0 {
-                    // EOF or error
                     cont.resume(returning: buffer.isEmpty ? nil : buffer)
                     return
                 }
@@ -538,7 +519,6 @@ func acceptBackoffDelay(consecutiveFailures: Int) -> Duration {
 
 // MARK: - POSIX Unix socket helpers (mirrored from lumi/Pool.swift; internal for testability)
 
-/// Bind and listen on a Unix domain socket. Returns listener fd or nil on failure.
 func unixListen(path: String, backlog: Int32 = 64) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 { return nil }
@@ -561,7 +541,6 @@ func unixListen(path: String, backlog: Int32 = 64) -> Int32? {
     return fd
 }
 
-/// Accept one incoming connection. Returns client fd (≥0) or -1 on failure.
 /// Designed to be called from a DispatchQueue.global() context.
 func unixAcceptFd(listener: Int32) -> Int32 {
     var caddr = sockaddr_un()
@@ -571,7 +550,6 @@ func unixAcceptFd(listener: Int32) -> Int32 {
     }
 }
 
-/// Connect to a Unix domain socket. Returns connected fd or nil on failure.
 func unixConnect(path: String) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 { return nil }

@@ -1,4 +1,3 @@
-// Sources/lumina-cli/Helpers.swift
 import ArgumentParser
 import Foundation
 import Lumina
@@ -61,7 +60,6 @@ func installSignalHandlers() {
 /// Install signal forwarding that sends a cancel message to the session client
 /// on SIGINT/SIGTERM. Returns a cleanup closure that removes the signal sources.
 func installSignalForwarding(client: SessionClient) -> () -> Void {
-    // Ignore default signal handling — we'll handle it ourselves
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
 
@@ -69,7 +67,6 @@ func installSignalForwarding(client: SessionClient) -> () -> Void {
     let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
         let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
         source.setEventHandler {
-            // Send cancel to guest via session IPC
             try? client.send(.cancel(signal: Int32(sig), gracePeriod: 5))
 
             // After sending cancel, restore default handler and re-raise
@@ -100,7 +97,6 @@ enum OutputFormat {
 /// Determine output format: JSON (for agents/pipes) or text (for humans/TTYs).
 /// Priority: LUMINA_FORMAT env > isatty() auto-detection.
 func resolveOutputFormat() -> OutputFormat {
-    // 1. LUMINA_FORMAT env var takes highest priority
     if let envFormat = ProcessInfo.processInfo.environment["LUMINA_FORMAT"]?.lowercased() {
         switch envFormat {
         case "json": return .json
@@ -109,14 +105,10 @@ func resolveOutputFormat() -> OutputFormat {
         }
     }
 
-    // 2. Auto-detect: TTY -> text, pipe -> JSON
     return isatty(STDOUT_FILENO) != 0 ? .text : .json
 }
 
 // MARK: - Env Var Defaults
-//
-// Priority: CLI flag > env var > built-in default.
-// Env vars: LUMINA_MEMORY, LUMINA_CPUS, LUMINA_TIMEOUT, LUMINA_DISK_SIZE
 
 import Lumina
 
@@ -212,9 +204,6 @@ func stdinIsSettled() -> Bool {
 }
 
 // MARK: - Stdin Auto-Detect
-//
-// Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),
-// pipe = streamed (agents pipe data in, matches shell conventions).
 
 /// Resolve stdin source: if host stdin is a TTY, return `.closed` so the guest
 /// sees EOF immediately. Otherwise, return a `.source` that reads from
@@ -279,15 +268,12 @@ func enableRawMode() -> termios? {
     return original
 }
 
-/// Restore the terminal (stdin) to the original termios captured by `enableRawMode`.
 func restoreTerminal(_ original: termios) {
     var t = original
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)
     savedTermios = nil
 }
 
-/// Return the current terminal window size (cols, rows) from stdout, or nil if
-/// stdout is not attached to a TTY.
 func getTerminalSize() -> (cols: Int, rows: Int)? {
     var ws = winsize()
     // `TIOCGWINSZ` type varies by SDK (UInt on some, UInt32 on others); force to UInt.
@@ -308,7 +294,6 @@ func installPtySignalHandlers(
 ) -> () -> Void {
     let queue = DispatchQueue(label: "com.lumina.pty-signals")
 
-    // SIGINT/SIGTERM: restore terminal, then re-raise with default disposition
     let termSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
         Foundation.signal(sig, SIG_IGN) // Let the dispatch source deliver it
         let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
@@ -324,7 +309,6 @@ func installPtySignalHandlers(
         return source
     }
 
-    // SIGWINCH: report new size to caller
     Foundation.signal(SIGWINCH, SIG_IGN)
     let winchSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: queue)
     winchSource.setEventHandler {

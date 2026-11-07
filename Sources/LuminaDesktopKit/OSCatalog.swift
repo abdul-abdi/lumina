@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/OSCatalog.swift
-//
-// v0.7.0 M6 — unified catalog of OS tiles for the New VM wizard.
-// Wraps `LuminaBootable.DesktopOSCatalog` (Linux distros) and adds
-// Windows 11 ARM (BYO ISO only — Microsoft can't be redistributed) and
-// macOS.
-
 import Foundation
 import LuminaBootable
 
@@ -26,7 +19,6 @@ public struct OSWizardTile: Sendable, Identifiable {
 
 public enum OSCatalog {
     public static let allTiles: [OSWizardTile] = [
-        // Linux from DesktopOSCatalog
         tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill",
              desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
              constraint: "Server ISO · GUI is a one-liner post-install"),
@@ -37,7 +29,6 @@ public enum OSCatalog {
         tile(for: "debian-12", glyph: "leaf.fill",
              desc: "Conservative, dependable; the foundation many other distros build on. Netinst lets you pick GNOME/KDE/XFCE during setup."),
 
-        // Windows
         OSWizardTile(
             id: "windows-11-arm",
             displayName: "Windows 11 (ARM64)",
@@ -48,7 +39,6 @@ public enum OSCatalog {
             acquisition: .microsoftAccountDownload
         ),
 
-        // BYO
         OSWizardTile(
             id: "byo-file",
             displayName: "Use my own ISO",

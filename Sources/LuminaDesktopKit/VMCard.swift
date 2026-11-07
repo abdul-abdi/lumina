@@ -1,14 +1,5 @@
-// Sources/LuminaDesktopKit/VMCard.swift
-//
-// The library's unit of attention: a single VM surfaced as a card in
-// grid view, with the chip/preview/action primitives shared across
-// grid + list layouts. Extracted from LibraryView.swift so the card
-// has an obvious home — it's the most-read surface in the app.
-
 import SwiftUI
 import LuminaBootable
-
-// ── STATE CHIP ─────────────────────────────────────────────────────
 
 /// Active (colored) state chip. Returns nil for `.stopped` — per Victor's
 /// rule, idle gets no chip. The eye should be drawn to states that
@@ -50,12 +41,6 @@ struct StateChip: View {
     }
 }
 
-// ── STATE PREVIEW ──────────────────────────────────────────────────
-
-/// Terminal-style preview of a VM's current state — the card's primary
-/// content. Replaces the decorative centered glyph. Shows what's
-/// actually going on: last-boot time, disk usage, snapshot count,
-/// install state if the VM hasn't been booted yet.
 @MainActor
 struct VMStatePreview: View {
     let bundle: VMBundle
@@ -66,7 +51,6 @@ struct VMStatePreview: View {
     enum Density { case card, row }
 
     private var isInstalling: Bool {
-        // No lastBootedAt + a pending ISO sidecar present = first boot incoming.
         if bundle.manifest.lastBootedAt != nil { return false }
         let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
         return FileManager.default.fileExists(atPath: sidecar.path)
@@ -137,11 +121,6 @@ struct VMStatePreview: View {
     }
 }
 
-// ── ACTION BUTTON ──────────────────────────────────────────────────
-
-/// Explicit action on the card/row: ▶ Boot / ■ Stop. Appears always in
-/// list view; hover-only in grid view. Direct manipulation — the verb
-/// is visible, not hidden behind a navigation step.
 @MainActor
 struct VMActionButton: View {
     @Bindable var session: LuminaDesktopSession
@@ -262,11 +241,6 @@ struct VMActionButton: View {
     }
 }
 
-// ── DISTRO CHIP ────────────────────────────────────────────────────
-
-/// Distro badge — small pill with the OS's glyph + its own brand name
-/// in its own typographic style. Ubuntu's lowercase serif, Kali's bold
-/// caps, macOS's sans-semibold. At-a-glance recognition.
 @MainActor
 struct DistroChip: View {
     let brand: OSBrand
@@ -287,8 +261,6 @@ struct DistroChip: View {
         )
     }
 }
-
-// ── GRID CONTAINER ─────────────────────────────────────────────────
 
 @MainActor
 public struct VMGridView: View {
@@ -318,8 +290,6 @@ public struct VMGridView: View {
     }
 }
 
-// ── CARD ───────────────────────────────────────────────────────────
-
 @MainActor
 public struct VMCard: View {
     @Bindable var model: AppModel
@@ -333,9 +303,6 @@ public struct VMCard: View {
         self.openWindow = openWindow
     }
 
-    // Stats are model-owned (issue #11). Grid and list rows of the
-    // same bundle now share a single `VMLiveStats` instance and its
-    // timer, instead of each view spinning its own.
     private var stats: VMLiveStats { model.liveStats(for: bundle) }
 
     private var session: LuminaDesktopSession {
@@ -346,7 +313,6 @@ public struct VMCard: View {
         let brand = OSBranding.brand(for: bundle.manifest.osVariant,
                                      family: bundle.manifest.osFamily)
         HStack(spacing: 0) {
-            // Per-OS brand stripe (thicker than the default 3pt for impact)
             Rectangle()
                 .fill(brand.accent)
                 .frame(width: 4)
@@ -356,10 +322,8 @@ public struct VMCard: View {
         }
         .background(
             ZStack {
-                // Base plate
                 RoundedRectangle(cornerRadius: 8)
                     .fill(LuminaTheme.bg1.opacity(isHovering ? 0.82 : 0.62))
-                // Per-OS subtle tint gradient top→bottom
                 RoundedRectangle(cornerRadius: 8)
                     .fill(
                         LinearGradient(
@@ -407,7 +371,6 @@ public struct VMCard: View {
 
     private func content(brand: OSBrand) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Header: heartbeat + VM name + state pill
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 if session.status == .running {
                     Heartbeat(color: LuminaTheme.ok)
@@ -420,7 +383,6 @@ public struct VMCard: View {
                 StateChip(status: session.status)
             }
 
-            // Distro chip — distinctive brand badge
             DistroChip(brand: brand)
 
             VMStatePreview(bundle: bundle, status: session.status,

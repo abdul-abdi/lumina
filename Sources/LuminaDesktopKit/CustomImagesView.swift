@@ -1,15 +1,8 @@
-// Sources/LuminaDesktopKit/CustomImagesView.swift
-//
 // Agent-path image library. Custom images are built via `lumina images
 // create <name> --from default --run "apk add python3"` and live at
 // ~/.lumina/images/<name>/. The Desktop library wasn't surfacing them
 // before v0.7.1 because they don't boot through the EFI path — they run
 // under the headless agent runtime (`lumina run`, `lumina session start`).
-//
-// This view makes them visible and provides one-click ergonomics for
-// launching an interactive session in Terminal.app. Booting in-window
-// (i.e. a SwiftUI terminal emulator pane) is a larger feature deferred
-// to v0.7.1+.
 
 import SwiftUI
 import Lumina
@@ -58,9 +51,6 @@ public struct CustomImagesView: View {
         }
     }
 
-    /// Alert payload surfaced after a launch attempt. `.info` is a
-    /// success-ish case (pasteboard fallback used); `.error` is a hard
-    /// failure the user must fix.
     struct LaunchNotice: Equatable {
         let title: String
         let message: String
@@ -140,17 +130,10 @@ public struct CustomImagesView: View {
         }
     }
 
-    /// Same column spec as VMGridView for visual parity with the main
-    /// library. Adaptive so agent images tile symmetrically with VMs
-    /// when the window is resized.
     private var gridColumns: [GridItem] {
         [GridItem(.adaptive(minimum: 300, maximum: 380), spacing: 14)]
     }
 
-    /// Translate a launch outcome into a user-facing alert payload.
-    /// Silent on `.executed` (the terminal window itself is the
-    /// feedback); surfaces a helpful hint on the pasteboard-fallback
-    /// path; surfaces an error on hard failure.
     private func noticeFor(outcome: TerminalLaunchOutcome) -> LaunchNotice? {
         switch outcome {
         case .executed:
@@ -189,8 +172,6 @@ public struct CustomImagesView: View {
     }
 }
 
-/// Value type for a single image row. Derived from ImageStore + meta.json;
-/// safe to hold on the MainActor.
 struct CustomImageEntry: Sendable {
     let name: String
     let meta: ImageMeta?
@@ -211,15 +192,12 @@ struct CustomImageEntry: Sendable {
 
 // MARK: - Shared row/card helpers
 
-/// Bytes-on-disk display for installed images. Shared by ImageRow and ImageCard.
 private func formatBytes(_ bytes: Int64) -> String {
     let formatter = ByteCountFormatter()
     formatter.countStyle = .file
     return formatter.string(fromByteCount: bytes)
 }
 
-/// Copies the disposable-run command to the pasteboard and flashes
-/// `copiedFlash` true then false. Shared by ImageRow and ImageCard.
 private func copyRunCommand(imageName: String, copiedFlash: Binding<Bool>) {
     let cmd = "lumina run --image \(imageName) 'uname -a'"
     NSPasteboard.general.clearContents()
@@ -230,9 +208,6 @@ private func copyRunCommand(imageName: String, copiedFlash: Binding<Bool>) {
     }
 }
 
-/// Opens `lumina session start --image <name>` via TerminalLauncher and
-/// surfaces the outcome through the caller's alert callback. Shared by
-/// ImageRow and ImageCard.
 private func openInTerminal(imageName: String, onLaunchOutcome: (TerminalLaunchOutcome) -> Void) {
     let cmd = "lumina session start --image \(imageName)"
     let outcome = TerminalLauncher().launch(command: cmd)
@@ -358,11 +333,6 @@ private struct ImageRow: View {
 
 // MARK: - Grid cards (parity with VMCard/VMGridView)
 
-/// Grid-layout card for an installed agent image. Visual weight
-/// matches VMCard so the agent-images grid reads as a peer of the
-/// VM library grid, not a second-class list. Primary action = open
-/// in terminal; hover reveals the action button alongside the
-/// always-visible badge + size footer.
 @MainActor
 private struct ImageCard: View {
     let entry: CustomImageEntry
@@ -374,14 +344,12 @@ private struct ImageCard: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Accent stripe — parity with VMCard's OS brand stripe.
             Rectangle()
                 .fill(LuminaTheme.accent)
                 .frame(width: 4)
                 .shadow(color: hovering ? LuminaTheme.accent.opacity(0.4) : .clear,
                         radius: hovering ? 4 : 0)
             VStack(alignment: .leading, spacing: 10) {
-                // Header: name + badge
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(entry.name)
                         .font(.system(size: 14, weight: .semibold))
@@ -390,10 +358,6 @@ private struct ImageCard: View {
                     Spacer()
                     badge
                 }
-                // Kind chip — distinguishes installed agent image from
-                // the VM library's OS brand. Not distro-specific (agent
-                // images are all Alpine-derived today) so a generic
-                // "AGENT IMAGE" pill with the shippingbox glyph.
                 HStack(spacing: 6) {
                     Image(systemName: entry.isBaseline ? "cube" : "shippingbox.fill")
                         .font(.system(size: 12, weight: .semibold))
@@ -406,8 +370,6 @@ private struct ImageCard: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(Capsule().fill(LuminaTheme.accent))
-                // Metadata block — same density as VMStatePreview so
-                // the grid rows align vertically across sections.
                 VStack(alignment: .leading, spacing: 4) {
                     if let meta = entry.meta {
                         Text("› from   \(meta.base ?? "unknown")")

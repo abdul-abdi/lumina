@@ -35,7 +35,6 @@ struct IsoInspect: AsyncParsableCommand {
             throw ExitCode(2)
         }
 
-        // Architecture
         let arch: ISOInspector.Architecture
         do {
             arch = try ISOInspector.detectArchitecture(at: url)
@@ -44,7 +43,6 @@ struct IsoInspect: AsyncParsableCommand {
             throw ExitCode(1)
         }
 
-        // Size
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path))
             .flatMap { ($0[.size] as? NSNumber)?.uint64Value } ?? 0
 
@@ -54,10 +52,8 @@ struct IsoInspect: AsyncParsableCommand {
         // need to know if a match exists.
         let layout = detectKnownLayout(iso: url)
 
-        // Catalog match — filename-based.
         let catalogMatch = ISOVerifier.catalogEntry(matching: url)
 
-        // Recommended specs come from catalog when available, else defaults.
         let recMemory: String
         let recCPUs: Int
         let recDiskSize: String
@@ -103,7 +99,6 @@ struct IsoInspect: AsyncParsableCommand {
             return
         }
 
-        // Text output
         print("ISO:           \(url.path)")
         print("size:          \(formatBytes(size))")
         print("architecture:  \(archString(arch))")
@@ -277,7 +272,6 @@ struct IsoBoot: AsyncParsableCommand {
             throw ExitCode(2)
         }
 
-        // Resolve target guest OS.
         let resolvedOS: IsoTargetOS
         switch osHint.lowercased() {
         case "auto":
@@ -449,7 +443,6 @@ struct IsoList: AsyncParsableCommand {
             return
         }
 
-        // Text output: aligned columns.
         let nameWidth = (DesktopOSCatalog.all.map { $0.displayName.count }.max() ?? 30) + 2
         print("ID            \("NAME".padding(toLength: nameWidth, withPad: " ", startingAt: 0))SIZE       URL")
         for entry in DesktopOSCatalog.all {

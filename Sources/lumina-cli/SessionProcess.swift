@@ -1,4 +1,3 @@
-// Sources/lumina-cli/SessionProcess.swift
 import ArgumentParser
 import Darwin
 import Foundation
@@ -58,16 +57,13 @@ struct SessionServe: AsyncParsableCommand {
             forwardSpecs.append(parsed)
         }
 
-        // Auto-detect rosetta from image metadata
         let imageRosetta = ImageStore().readMeta(name: image)?.rosetta ?? false
 
-        // Parse disk size if provided
         var parsedDiskSize: UInt64? = nil
         if let ds = diskSize, let size = parseMemory(ds) {
             parsedDiskSize = size
         }
 
-        // Boot VM
         let vmOptions = VMOptions(
             memory: memory,
             cpuCount: cpus,
@@ -107,7 +103,6 @@ struct SessionServe: AsyncParsableCommand {
             }
         }
 
-        // Write session metadata
         let info = SessionInfo(
             sid: sid,
             pid: ProcessInfo.processInfo.processIdentifier,
@@ -157,7 +152,6 @@ struct SessionServe: AsyncParsableCommand {
             await forwarder.teardownAll()
         }
 
-        // Cleanup
         paths.cleanup()
     }
 }
@@ -232,7 +226,6 @@ actor PortForwarder {
         // Ask the guest to listen; it replies with a reverse-channel vsock port.
         let vsockPort = try await vm.requestPortForward(guestPort: guestPort)
 
-        // Bind host TCP listener on loopback.
         let listenerFd: Int32
         do {
             listenerFd = try Self.bindLoopbackListener(port: hostPort)
@@ -253,8 +246,6 @@ actor PortForwarder {
         PortForwarder.startAcceptLoop(forward: fwd, vm: vm)
     }
 
-    /// Tear down every active forward: close listeners, shut down proxy
-    /// connections, and notify the guest. Must be called before vm.shutdown().
     func teardownAll() async {
         let active = Array(forwards.values)
         forwards.removeAll()
@@ -273,8 +264,6 @@ actor PortForwarder {
 
     // MARK: - Private helpers
 
-    /// Bind a TCP socket on 127.0.0.1:port and start listening.
-    /// Returns the listener fd on success. Throws on bind/listen failure.
     private static func bindLoopbackListener(port: Int) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else {
@@ -358,8 +347,6 @@ actor PortForwarder {
         pump(from: vsockFd, to: tcpFd)
     }
 
-    /// Blocking copy loop. Reads from `src` and writes everything to `dst`
-    /// until EOF or error. Nonisolated-safe.
     private static func pumpBytes(from src: Int32, to dst: Int32) {
         let bufferSize = 32 * 1024
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)

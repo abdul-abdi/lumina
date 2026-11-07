@@ -1,9 +1,3 @@
-// Apps/LuminaDesktop/LuminaDesktop/LuminaDesktopApp.swift
-//
-// v0.7.0 M6 — @main entry for the Lumina Desktop app.
-// All UI lives in the LuminaDesktopKit SPM target; this file is just the
-// scene + window orchestration.
-
 import SwiftUI
 import LuminaDesktopKit
 import LuminaBootable
@@ -49,11 +43,6 @@ struct LuminaDesktopApp: App {
             PreferencesView(model: model)
         }
 
-        // ── MENU BAR EXTRA ──────────────────────────────────────
-        // Always-visible status item in the system menu bar. Shows the
-        // number of running VMs next to a Lumina glyph; click to reveal
-        // a dropdown with quick actions. Works even when the main
-        // window is hidden or the app is in fullscreen.
         MenuBarExtra {
             MenuBarContent(model: model, coordinator: coordinator)
         } label: {
@@ -64,7 +53,6 @@ struct LuminaDesktopApp: App {
 
 }
 
-// ── MENU BAR GLYPH + COUNT ────────────────────────────────────────
 @MainActor
 struct MenuBarLabel: View {
     @Bindable var model: AppModel
@@ -161,12 +149,6 @@ struct MenuBarContent: View {
     }
 }
 
-// ── MENU BAR ──────────────────────────────────────────────────────
-/// Full macOS menu bar. The native place for every verb. Fullscreen
-/// users get a menu at the top of the screen via the OS's automatic
-/// menu-reveal-on-hover. First-time discovery happens here, not in a
-/// floating toast.
-// ── APP-LEVEL UI STATE ────────────────────────────────────────────
 /// Tracks cross-window UI state the menu bar needs to observe:
 /// whether any Lumina window is currently in fullscreen. The VM menu
 /// uses this to switch the label between "Enter Full Screen" and
@@ -207,7 +189,6 @@ struct LuminaCommands: Commands {
     @Bindable var coordinator: LauncherCoordinator
 
     var body: some Commands {
-        // ── Lumina menu (app menu) ──
         CommandGroup(replacing: .appInfo) {
             Button("About Lumina") {
                 NSApplication.shared.orderFrontStandardAboutPanel(options: [
@@ -221,7 +202,6 @@ struct LuminaCommands: Commands {
             }
         }
 
-        // ── File menu ──
         CommandGroup(replacing: .newItem) {
             Button("New VM…") {
                 coordinator.openWizard(preselecting: "ubuntu-24.04")
@@ -244,7 +224,6 @@ struct LuminaCommands: Commands {
 
         }
 
-        // ── VM menu ──
         CommandMenu("VM") {
             // Standard macOS pattern: label flips based on whether any
             // window is already fullscreen. No floating chrome — the
@@ -256,7 +235,6 @@ struct LuminaCommands: Commands {
             .keyboardShortcut("f", modifiers: [.command, .control])
         }
 
-        // ── View menu ──
         CommandGroup(after: .toolbar) {
             Button("Open Command Launcher") {
                 coordinator.showLauncher()
@@ -279,7 +257,6 @@ struct LuminaCommands: Commands {
             }
         }
 
-        // ── Help menu ──
         CommandGroup(replacing: .help) {
             Button("Lumina Documentation") {
                 NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki")!)
@@ -298,7 +275,6 @@ struct LuminaCommands: Commands {
         }
     }
 
-    // ── Helpers ──
 
     private func openWizard(tile: String) {
         coordinator.openWizard(preselecting: tile)

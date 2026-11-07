@@ -29,7 +29,6 @@ import (
 // a hung connection is detected quickly; long enough not to churn.
 const HeartbeatInterval = 2 * time.Second
 
-// Agent owns all per-connection state.
 type Agent struct {
 	conn    net.Conn
 	w       *wire.Writer
@@ -38,7 +37,6 @@ type Agent struct {
 	portFwd *portfwd.Manager
 }
 
-// New builds an Agent around conn. One Agent per accepted connection.
 func New(conn net.Conn) *Agent {
 	w := wire.NewWriter(conn)
 	return &Agent{
@@ -50,9 +48,6 @@ func New(conn net.Conn) *Agent {
 	}
 }
 
-// Serve runs the per-connection lifecycle: ready → heartbeat → dispatch.
-// Returns when the scanner errors or EOFs; all running commands get a
-// chance to finish before we return.
 func (a *Agent) Serve() {
 	_ = a.w.Send(protocol.NewReady())
 	bootmark.Mark("ready_sent")
@@ -76,11 +71,8 @@ func (a *Agent) Serve() {
 		_, _ = fmt.Fprintf(os.Stderr, "connection error: %v\n", err)
 	}
 
-	// Drain in-flight commands before returning to the accept loop.
 	a.exec.WaitAll()
 }
-
-// ── private ─────────────────────────────────────────────────────────
 
 // dispatch routes a single scanned frame to the matching handler. Any
 // decode error is logged but non-fatal — one malformed frame does not
@@ -215,9 +207,6 @@ func (a *Agent) handleConfigureNetwork(line []byte) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid configure_network request: %v\n", err)
 		return
 	}
-	// Network config is synchronous-ish (polls carrier for up to 2 s)
-	// so hand it off to a goroutine — we don't want to block the
-	// message loop on link readiness.
 	go network.Configure(a.w, msg)
 }
 

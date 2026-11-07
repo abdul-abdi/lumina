@@ -1,4 +1,3 @@
-// Sources/lumina-cli/CLI.swift
 import ArgumentParser
 import Foundation
 import Lumina
@@ -181,7 +180,6 @@ struct Run: AsyncParsableCommand {
             throw error
         }
 
-        // Resolve from env vars with built-in defaults
         let resolvedTimeout = resolveTimeout(flag: timeout, defaultValue: "60s")
         let resolvedMemory = resolveMemory(flag: "1GB")
         let resolvedCpus = resolveCpus(flag: 2)
@@ -398,7 +396,6 @@ private struct ResultJSON: Encodable {
     /// --image". Present only alongside `error`; free text, do not match on it.
     var error_detail: String?
     var duration_ms: Int
-    // v0.6.0: partial data on error
     var partial_stdout: String?
     var partial_stderr: String?
     // v0.7.1: per-NIC counter snapshot from the guest. Absent when the
@@ -647,7 +644,6 @@ struct SessionStart: AsyncParsableCommand {
     var ttl: String = "0"
 
     func run() async throws {
-        // Check if requested image exists before spawning background process
         try await ensureImage(image)
 
         let resolvedMemory = resolveMemory(flag: memory)
@@ -672,7 +668,6 @@ struct SessionStart: AsyncParsableCommand {
         let sid = UUID().uuidString
         let execPath = ProcessInfo.processInfo.arguments[0]
 
-        // Spawn background session process
         let process = Process()
         process.executableURL = URL(fileURLWithPath: execPath)
         process.arguments = [
@@ -709,14 +704,12 @@ struct SessionStart: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // Wait for the socket to appear (session process boots VM)
         let paths = SessionPaths(sid: sid)
         let deadline = ContinuousClock.now + .seconds(bootTimeoutSecs)
         while ContinuousClock.now < deadline {
             if FileManager.default.fileExists(atPath: paths.socket.path) {
                 break
             }
-            // Check if child exited early (boot failure)
             if !process.isRunning {
                 break
             }
@@ -724,7 +717,6 @@ struct SessionStart: AsyncParsableCommand {
         }
 
         guard FileManager.default.fileExists(atPath: paths.socket.path) else {
-            // Read child stderr to surface the real error
             let stderrData = stderrPipe.fileHandleForReading.availableData
             let stderrStr = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !process.isRunning && !stderrStr.isEmpty {
@@ -735,7 +727,6 @@ struct SessionStart: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // Output session ID
         let format = resolveOutputFormat()
         switch format {
         case .json:
@@ -796,7 +787,6 @@ struct SessionStop: AsyncParsableCommand {
             FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
             throw ExitCode.failure
         }
-        // Verify the server acknowledged the shutdown
         let response = try? client.receive()
         client.disconnect()
 
@@ -941,7 +931,6 @@ struct Ps: AsyncParsableCommand {
         if rows.isEmpty {
             return "No active sessions.\n"
         }
-        // Fixed-width columns. Kept inline — formatting is pure and small.
         var out = "SID                                  IMAGE           UPTIME     EXECS\n"
         for row in rows {
             out += String(
@@ -1034,8 +1023,6 @@ enum PsRowBuilder {
         }
     }
 
-    /// Format seconds as a compact human-readable uptime ("42s", "3m 7s", "2h 15m").
-    /// Pure function — safe to unit-test.
     static func formatUptime(_ seconds: TimeInterval) -> String {
         let total = max(0, Int(seconds))
         let hours = total / 3600
@@ -1105,11 +1092,9 @@ struct Exec: AsyncParsableCommand {
             return
         }
 
-        // Forward SIGINT/SIGTERM to the guest command via cancel message
         let cleanupSignals = installSignalForwarding(client: client)
         defer { cleanupSignals() }
 
-        // Execute
         let format = resolveOutputFormat()
         try client.send(.exec(cmd: command, timeout: timeoutSecs, env: parsedEnv, cwd: workdir))
 
@@ -1122,7 +1107,6 @@ struct Exec: AsyncParsableCommand {
                 while true {
                     let chunk = handle.availableData
                     if chunk.isEmpty {
-                        // EOF — tell the server stdin is done
                         try? client.send(.stdinClose)
                         return
                     }
@@ -1135,7 +1119,6 @@ struct Exec: AsyncParsableCommand {
         let start = ContinuousClock.now
 
         if format == .json {
-            // Unified envelope: buffer output, emit single JSON object (matches `run`)
             var stdoutBuf = ""
             var stderrBuf = ""
 
@@ -1264,7 +1247,6 @@ struct Exec: AsyncParsableCommand {
         }
         defer { cleanupPtySignals() }
 
-        // Send pty_exec request
         try client.send(.ptyExec(
             cmd: command,
             timeout: timeoutSecs,
@@ -1273,7 +1255,6 @@ struct Exec: AsyncParsableCommand {
             rows: termSize.rows
         ))
 
-        // Stdin pump: raw bytes from fd 0 → base64 pty_input frames.
         // `availableData` blocks until data is ready or EOF; on EOF we stop.
         spawnBlockingThread("lumina.pty-stdin") { [client] in
             let handle = FileHandle.standardInput
@@ -1374,10 +1355,8 @@ struct Cp: AsyncParsableCommand {
     /// Format: one arg is `<sid>:/path`, the other is a local path.
     private func parseCpArgs() throws -> (sid: String, isUpload: Bool, localPath: String, remotePath: String) {
         if let (sid, remote) = parseSessionRef(source) {
-            // Source is session ref → download
             return (sid: sid, isUpload: false, localPath: destination, remotePath: remote)
         } else if let (sid, remote) = parseSessionRef(destination) {
-            // Destination is session ref → upload
             return (sid: sid, isUpload: true, localPath: source, remotePath: remote)
         } else {
             FileHandle.standardError.write(Data("lumina: one argument must be <sid>:/path (e.g. lumina cp ./file ABC123:/remote)\n".utf8))
@@ -1390,7 +1369,6 @@ struct Cp: AsyncParsableCommand {
         guard let colonIndex = arg.firstIndex(of: ":") else { return nil }
         let candidate = String(arg[arg.startIndex..<colonIndex])
         let path = String(arg[arg.index(after: colonIndex)...])
-        // Session IDs are full UUIDs — validate the format exactly
         guard UUID(uuidString: candidate) != nil, path.hasPrefix("/") else { return nil }
         return (sid: candidate, path: path)
     }
@@ -1593,8 +1571,6 @@ struct NetworkSession: Codable {
     let image: String?
     let volumes: [String]?
 }
-
-// Parsing helpers (parseDuration, parseMemory) are in Lumina/Types.swift
 
 // MARK: - Daemon
 

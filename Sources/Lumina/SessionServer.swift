@@ -1,4 +1,3 @@
-// Sources/Lumina/SessionServer.swift
 import Foundation
 
 /// Listens on a Unix domain socket and dispatches SessionRequest messages
@@ -8,10 +7,6 @@ import Foundation
 /// CommandRunner enforces mutual exclusion of file transfers. Per-connection
 /// state is local to handleConnection; there is no shared state beyond the
 /// VM actor itself, which is already thread-safe.
-///
-/// On shutdown (one client sends `.shutdown`, or bind/accept fails), the
-/// serve() task group awaits all in-flight connection tasks before returning
-/// so each client gets a clean response before the process exits.
 public final class SessionServer: @unchecked Sendable {
     private let socketPath: URL
     private var serverFd: Int32 = -1
@@ -91,7 +86,6 @@ public final class SessionServer: @unchecked Sendable {
 
             if Date().timeIntervalSince(lastSeen) >= ttl {
                 NSLog("[Lumina.Session] Idle TTL reached (%.0fs), auto-shutting down", ttl)
-                // Close the listening fd so accept() returns and serve() exits.
                 lock.withLock {
                     if serverFd >= 0 {
                         Darwin.close(serverFd)
@@ -105,7 +99,6 @@ public final class SessionServer: @unchecked Sendable {
 
     /// Bind and listen on the Unix domain socket.
     public func bind() throws {
-        // Remove stale socket file
         try? FileManager.default.removeItem(at: socketPath)
 
         let path = socketPath.path
@@ -142,8 +135,6 @@ public final class SessionServer: @unchecked Sendable {
         }
     }
 
-    /// Accept a client connection. Blocks until a client connects.
-    /// Returns file handles for reading and writing.
     public func accept() throws -> (read: FileHandle, write: FileHandle) {
         let clientFd = Darwin.accept(serverFd, nil, nil)
         guard clientFd >= 0 else {
@@ -232,7 +223,6 @@ public final class SessionServer: @unchecked Sendable {
         }
     }
 
-    /// Close the server socket.
     public func close() {
         if serverFd >= 0 {
             Darwin.close(serverFd)
@@ -285,7 +275,6 @@ public final class SessionServer: @unchecked Sendable {
                     await self?.handleConnection(handles: handles, vm: vm, onShutdown: onShutdown)
                 }
             }
-            // TaskGroup auto-awaits remaining children on scope exit.
         }
     }
 
@@ -303,9 +292,6 @@ public final class SessionServer: @unchecked Sendable {
         let clientFd = handles.read.fileDescriptor
         defer { Darwin.close(clientFd) }
 
-        // Read and dispatch messages until client disconnects.
-        // The buffer persists across reads for this connection to
-        // handle coalesced NDJSON frames.
         var readBuf = Data()
         while true {
             let msgData: Data
@@ -366,9 +352,6 @@ public final class SessionServer: @unchecked Sendable {
                 return
 
             case .ptyExec(let cmd, let timeout, let env, let cols, let rows):
-                // Pass current read buffer so any pty_input/window_resize bytes
-                // already buffered (coalesced NDJSON) are not dropped — same
-                // pattern as the exec handler.
                 let bufSnapshot = readBuf
                 readBuf = Data()
                 await handlePtyExec(
@@ -378,10 +361,6 @@ public final class SessionServer: @unchecked Sendable {
                 )
 
             case .ptyInput, .windowResize:
-                // PTY frames outside of a pty_exec context are no-ops. During
-                // a PTY session, handlePtyExec reads them inline from the
-                // socket. Guard defensively in case a buggy client sends them
-                // outside that window.
                 break
 
             case .save(let image):
@@ -451,7 +430,6 @@ public final class SessionServer: @unchecked Sendable {
             } catch {
                 try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
             }
-            // Signal EOF to the stdin pump so the pump task exits cleanly.
             channel.close()
         } onRequest: { request in
             switch request {
@@ -601,7 +579,6 @@ final class StdinChannel: @unchecked Sendable {
     private var closed = false
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    /// Enqueue a chunk of stdin data.
     /// If `next()` is currently suspended waiting for data, resumes it immediately.
     func send(_ data: Data) {
         lock.withLock {
@@ -614,7 +591,6 @@ final class StdinChannel: @unchecked Sendable {
         }
     }
 
-    /// Signal EOF. Subsequent calls to `next()` return nil.
     /// Safe to call multiple times (idempotent).
     func close() {
         lock.withLock {
@@ -626,7 +602,6 @@ final class StdinChannel: @unchecked Sendable {
         }
     }
 
-    /// Return the next stdin chunk, suspending until one is available.
     /// Returns nil when the channel is closed (EOF).
     func next() async -> Data? {
         await withCheckedContinuation { cont in

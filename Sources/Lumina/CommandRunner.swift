@@ -1,4 +1,3 @@
-// Sources/Lumina/CommandRunner.swift
 import Foundation
 import os
 @preconcurrency import Virtualization
@@ -22,7 +21,6 @@ final class CommandRunner: @unchecked Sendable {
     private var _outputHandle: FileHandle?
     private var _state: ConnectionState = .disconnected
 
-    // ── Exec handlers: one AsyncStream per in-flight command, keyed by ID ──
     private var execHandlers: [String: AsyncStream<GuestMessage>.Continuation] = [:]
 
     // ── PTY handlers: separate lock + map (PTY and exec are distinct I/O models) ──
@@ -38,7 +36,6 @@ final class CommandRunner: @unchecked Sendable {
     // instead of sharing the exec map. Concurrent transfers are rejected.
     private var transferContinuation: AsyncStream<GuestMessage>.Continuation?
 
-    // ── Network readiness: one-shot continuation for configure_network flow ──
     private var networkContinuation: CheckedContinuation<GuestMessage, Error>?
 
     // ── Network metrics: latest snapshot from guest ticker ──
@@ -48,7 +45,6 @@ final class CommandRunner: @unchecked Sendable {
     // command beat the ticker's 500ms initial delay, or legacy agent).
     private var _latestNetworkMetrics: NetworkMetricsSummary?
 
-    // ── Late-exit grace window (v0.7.2) ──
     // Audit-flagged correctness fix: a slow command finishing a
     // hair after the timeout watchdog fired could lose its exit
     // code — host returned `timeout`, guest had already returned 0.
@@ -76,7 +72,6 @@ final class CommandRunner: @unchecked Sendable {
         code < 0 || code == 128 + SIGTERM || code == 128 + SIGKILL
     }
 
-    // ── Port forward continuations: one per in-flight port_forward_start ──
     // Keyed by guestPort. Throwing so teardown (reset/dispatcher error) can
     // surface `.connectionFailed` to the caller instead of silently succeeding
     // with a bogus vsock port.
@@ -88,9 +83,6 @@ final class CommandRunner: @unchecked Sendable {
     private static let maxRetries = 2000     // 2000 * 10ms = 20s max
     private static let retryInterval: UInt64 = 10_000_000  // 10ms — shaves ~10-15ms off cold boot (prev 20ms)
 
-    /// Latest network metrics snapshot seen on this connection. nil when no
-    /// metrics have arrived yet (short command + 500ms ticker delay, or
-    /// pre-v0.7.1 agent with no ticker). Thread-safe read.
     var latestNetworkMetrics: NetworkMetricsSummary? {
         lock.withLock { _latestNetworkMetrics }
     }
@@ -99,7 +91,6 @@ final class CommandRunner: @unchecked Sendable {
         lock.withLock { _state }
     }
 
-    /// Number of exec commands currently in flight.
     var activeExecCount: Int {
         lock.withLock { execHandlers.count }
     }
@@ -141,7 +132,6 @@ final class CommandRunner: @unchecked Sendable {
             throw .connectionFailed
         }
 
-        // Wait for the guest agent's "ready" message.
         // This is the only synchronous read — after this, the dispatcher takes over.
         var readBuffer = Data()
         let readyData = try readLine(from: input, buffer: &readBuffer)
@@ -252,9 +242,6 @@ final class CommandRunner: @unchecked Sendable {
         let execId = id
 
         return AsyncThrowingStream { continuation in
-            // Soft deadline fires the cancel; hard deadline + grace
-            // window is when we actually throw timeout. Lets a natural
-            // exit racing the watchdog still report its real code.
             let softDeadline = ContinuousClock.now + .seconds(timeout)
             let hardDeadline = softDeadline + Self.lateExitGraceWindow
 
@@ -320,7 +307,6 @@ final class CommandRunner: @unchecked Sendable {
         try send(.stdin(id: id, data: data))
     }
 
-    /// Close the stdin pipe for a running command.
     func closeStdin(id: String) throws(LuminaError) {
         try send(.stdinClose(id: id))
     }
@@ -350,7 +336,6 @@ final class CommandRunner: @unchecked Sendable {
             throw error
         }
 
-        // Transform GuestMessage stream into PtyChunk stream
         let runner = self
         let ptyId = id
         return AsyncThrowingStream { cont in
@@ -369,7 +354,6 @@ final class CommandRunner: @unchecked Sendable {
                         continue
                     }
                 }
-                // Stream ended without exit (connection lost)
                 cont.finish(throwing: LuminaError.connectionFailed)
                 runner.unregisterPtyHandler(ptyId)
             }
@@ -381,17 +365,14 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
-    /// Unregister a PTY handler and finish its stream.
     private func unregisterPtyHandler(_ id: String) {
         ptyLock.withLock { ptyHandlers.removeValue(forKey: id) }?.finish()
     }
 
-    /// Send raw input bytes to a running PTY session.
     func sendPtyInput(id: String, data: Data) throws(LuminaError) {
         try send(.ptyInput(id: id, data: data.base64EncodedString()))
     }
 
-    /// Send a window resize event to a running PTY session.
     func sendWindowResize(id: String, cols: Int, rows: Int) throws(LuminaError) {
         try send(.windowResize(id: id, cols: cols, rows: rows))
     }
@@ -472,7 +453,6 @@ final class CommandRunner: @unchecked Sendable {
         do {
             reply = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GuestMessage, Error>) in
                 lock.withLock { networkContinuation = cont }
-                // Now safe to send — reply routes to cont via the dispatcher.
                 do {
                     try send(.configureNetwork(ip: ip, gateway: gateway, dns: dns))
                 } catch {
@@ -510,9 +490,6 @@ final class CommandRunner: @unchecked Sendable {
     /// tears down (in which case the continuation is resumed with
     /// `.connectionFailed`).
     func requestPortForward(guestPort: Int) async throws(LuminaError) -> Int {
-        // Register continuation BEFORE sending so a fast guest reply cannot
-        // arrive before the map entry exists. All lock operations happen inside
-        // this synchronous closure — NSLock is async-unavailable in Swift 6.
         do {
             return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, any Error>) in
                 let failure: LuminaError? = lock.withLock {
@@ -531,8 +508,6 @@ final class CommandRunner: @unchecked Sendable {
                 do {
                     try send(.portForwardStart(guestPort: guestPort))
                 } catch {
-                    // The send failed — remove entry and resume before
-                    // the dispatcher has any chance of finding it.
                     lock.withLock { portForwardContinuations.removeValue(forKey: guestPort) }?
                         .resume(throwing: LuminaError.connectionFailed)
                 }
@@ -544,14 +519,12 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
-    /// Tell the guest to stop forwarding `guestPort`. Idempotent on the guest.
     func stopPortForward(guestPort: Int) throws(LuminaError) {
         try send(.portForwardStop(guestPort: guestPort))
     }
 
     // MARK: - File Upload (async, through dispatcher)
 
-    /// Upload a file to the guest via the vsock protocol.
     /// Only one transfer (upload or download) can be active at a time.
     /// Sends base64-encoded chunks with ACK backpressure.
     func upload(_ file: FileUpload) async throws(LuminaError) {
@@ -578,7 +551,6 @@ final class CommandRunner: @unchecked Sendable {
 
             try send(.upload(path: file.remotePath, data: b64, mode: file.mode, seq: seq, eof: isEof))
 
-            // Wait for ACK (skip heartbeats)
             var gotAck = false
             for await response in stream {
                 switch response {
@@ -606,7 +578,6 @@ final class CommandRunner: @unchecked Sendable {
             }
         }
 
-        // Wait for upload_done confirmation
         var done = false
         for await response in stream {
             switch response {
@@ -632,14 +603,12 @@ final class CommandRunner: @unchecked Sendable {
     // MARK: - File Download (async, through dispatcher)
 
     /// Download a file from the guest via the vsock protocol.
-    /// Only one transfer (upload or download) can be active at a time.
     func download(_ file: FileDownload) async throws(LuminaError) {
         let stream = try acquireTransferHandler()
         defer { releaseTransferHandler() }
 
         try send(.downloadReq(path: file.remotePath))
 
-        // Receive chunks until eof
         var fileData = Data()
         var expectedSeq = 0
         var receivedEof = false
@@ -677,7 +646,6 @@ final class CommandRunner: @unchecked Sendable {
             )
         }
 
-        // Write to local path
         do {
             try fileData.write(to: file.localPath)
         } catch {
@@ -687,8 +655,6 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Private: Dispatcher
 
-    /// Start the background message dispatcher that routes all incoming guest
-    /// messages to the appropriate handler.
     private func startDispatcher(initialBuffer: Data = Data()) {
         guard let input = getInputHandle() else { return }
         let generation = lock.withLock {
@@ -719,7 +685,6 @@ final class CommandRunner: @unchecked Sendable {
         if let fd { Darwin.shutdown(fd, SHUT_RDWR) }
     }
 
-    /// Route a guest message to the appropriate handler.
     /// Exec messages go to execHandlers by ID.
     /// Transfer messages go to the single transferContinuation.
     /// Heartbeats broadcast to all exec handlers.
@@ -730,7 +695,6 @@ final class CommandRunner: @unchecked Sendable {
         case .ptyOutput(let id, _):
             ptyLock.withLock { ptyHandlers[id] }?.yield(msg)
         case .exit(let id, _):
-            // Check exec handlers first (common case)
             if let h = lock.withLock({ execHandlers[id] }) {
                 h.yield(msg)
                 break
@@ -741,11 +705,6 @@ final class CommandRunner: @unchecked Sendable {
                 break
             }
             // Orphan exit: handler already unregistered. Drop.
-            // For `exec()` / `execStream()`: the soft/hard deadline
-            // grace window keeps the handler registered through the
-            // natural-exit window, so by the time we land here the
-            // command genuinely overshot the window and the synthetic
-            // .timeout error is correct.
             // For `ptyExec()`: there is no host-side soft/hard
             // deadline pattern — PTY timeout is enforced solely by
             // the guest's gracefulKill (SIGTERM, then SIGKILL after
@@ -757,10 +716,8 @@ final class CommandRunner: @unchecked Sendable {
             // the soft/hard deadline change.
             break
         case .heartbeat:
-            // Broadcast to all exec handlers so timeout checks can run
             for h in lock.withLock({ Array(execHandlers.values) }) { h.yield(msg) }
         case .uploadAck, .uploadDone, .uploadError, .downloadData, .downloadError:
-            // Route to the dedicated transfer handler
             lock.withLock { transferContinuation }?.yield(msg)
         case .networkReady:
             takeNetworkContinuation()?.resume(returning: msg)
@@ -795,8 +752,6 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
-    /// Handle a dispatcher error (connection drop, protocol error).
-    /// Fails all in-flight operations.
     private func handleDispatcherError(_ error: any Error) {
         NSLog("[Lumina.CommandRunner] Dispatcher error: %@", String(describing: error))
         _ = failAll(.failed, dropConnection: false)
@@ -811,27 +766,23 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Private: Exec Handler Registration
 
-    /// Register an exec handler and return the stream to read from.
     private func registerExecHandler(_ id: String) -> AsyncStream<GuestMessage> {
         let (stream, continuation) = AsyncStream.makeStream(of: GuestMessage.self)
         lock.withLock { execHandlers[id] = continuation }
         return stream
     }
 
-    /// Inject a synthetic heartbeat into an exec handler's stream.
     /// Used by the timeout watchdog to unblock the for-await loop in exec().
     private func yieldSyntheticHeartbeat(to id: String) {
         lock.withLock { execHandlers[id] }?.yield(.heartbeat)
     }
 
-    /// Unregister an exec handler and finish its stream.
     private func unregisterExecHandler(_ id: String) {
         lock.withLock { execHandlers.removeValue(forKey: id) }?.finish()
     }
 
     // MARK: - Private: Transfer Handler (singleton, guarded)
 
-    /// Acquire the transfer handler slot. Throws if another transfer is active.
     private func acquireTransferHandler() throws(LuminaError) -> AsyncStream<GuestMessage> {
         let (stream, continuation) = AsyncStream.makeStream(of: GuestMessage.self)
         let failure: LuminaError? = lock.withLock {
@@ -846,7 +797,6 @@ final class CommandRunner: @unchecked Sendable {
         return stream
     }
 
-    /// Release the transfer handler slot.
     private func releaseTransferHandler() {
         lock.withLock {
             defer { transferContinuation = nil }
@@ -873,15 +823,10 @@ final class CommandRunner: @unchecked Sendable {
     /// where the dispatcher (which also acquires the lock per message) is blocked
     /// waiting for the lock while a write stalls on vsock backpressure.
     ///
-    /// Uses POSIX `write()` instead of `FileHandle.write()` — same reason as
-    /// `SessionServer.writeResponse`: NSFileHandle raises an Obj-C exception on
-    /// EPIPE that Swift's `try` cannot catch.
-    ///
     /// The dup'd fd remains valid even if `resetForReconnect` closes the original
     /// between lock release and write. A failed write surfaces as `.connectionFailed`
     /// rather than a crash or deadlock.
     private func writeToOutput(_ data: Data) throws(LuminaError) {
-        // Dup under lock, write after lock is released.
         let rawFd = lock.withLock { _outputHandle.map { dup($0.fileDescriptor) } ?? -1 }
         guard rawFd >= 0 else { throw .connectionFailed }
         defer { Darwin.close(rawFd) }
@@ -894,7 +839,6 @@ final class CommandRunner: @unchecked Sendable {
         lock.withLock { _state = newState }
     }
 
-    /// Store a new vsock connection and create file handles for I/O.
     private func setConnection(_ conn: VZVirtioSocketConnection) {
         let fd = conn.fileDescriptor
         lock.withLock {
@@ -904,7 +848,6 @@ final class CommandRunner: @unchecked Sendable {
         }
     }
 
-    /// Read connection state under lock (safe to call from async contexts).
     private func getConnectionInfo() -> (connected: Bool, input: FileHandle?) {
         lock.withLock { (_connection != nil, _inputHandle) }
     }
@@ -915,7 +858,6 @@ final class CommandRunner: @unchecked Sendable {
 
     // MARK: - Private: Buffered Line Reader
 
-    /// Read one newline-delimited message and decode it.
     private func readGuestMessage(from handle: FileHandle, buffer: inout Data) throws(LuminaError) -> GuestMessage {
         let lineData = try readLine(from: handle, buffer: &buffer)
         do {

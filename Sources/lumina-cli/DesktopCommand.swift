@@ -1,8 +1,3 @@
-// Sources/lumina-cli/DesktopCommand.swift
-//
-// `lumina desktop` subcommand tree — v0.7.0 M3.
-// Create, boot, and list `.luminaVM` bundles under ~/.lumina/desktop-vms/.
-
 import ArgumentParser
 import Foundation
 import Lumina
@@ -101,8 +96,6 @@ enum DesktopHelpers {
         }
     }
 
-    /// Resolve a bundle path to a VMBundle, exiting on failure with a
-    /// helpful message.
     static func loadBundleOrExit(_ pathArg: String) -> VMBundle {
         let url = URL(fileURLWithPath: (pathArg as NSString).expandingTildeInPath)
         do {
@@ -561,7 +554,6 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
         print("Restoring macOS from \(ipswPath) into \(bundle.rootURL.path)")
         print("This may take 30+ minutes; progress prints in 5% increments.")
 
-        // Print progress when it crosses 5% buckets.
         let lastBucket = ProgressBucket()
         do {
             try await vm.install { fraction in
@@ -580,7 +572,6 @@ struct DesktopInstallMacOS: AsyncParsableCommand {
 
         // Persist the resolved hardware model + machine identifier into the
         // bundle manifest so future boots know which IPSW lineage to use.
-        // (For v0.7.0 we stash them in a sidecar; M6 grows the manifest schema.)
         let resolved = await vm.bootConfig
         if let hw = resolved.hardwareModel {
             try? hw.write(to: bundle.rootURL.appendingPathComponent("macos.hwmodel"), options: .atomic)

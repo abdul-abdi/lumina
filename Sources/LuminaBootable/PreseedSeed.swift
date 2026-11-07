@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/PreseedSeed.swift
-//
 // Cures the Debian-installer "netcfg first-probe DHCP race" by injecting a
 // preseed.cfg into the installer's initrd. The kernel's initramfs format
 // supports concatenated cpio.gz archives where later entries override

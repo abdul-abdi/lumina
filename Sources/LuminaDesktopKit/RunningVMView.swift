@@ -1,15 +1,3 @@
-// Sources/LuminaDesktopKit/RunningVMView.swift
-//
-// v0.7.0 M6 — per-VM running window. Embeds LuminaVirtualMachineView
-// edge-to-edge with a centered VM name and right-aligned toolbar
-// buttons (STOP / RESTART / SNAPSHOT). Fullscreen is handled by
-// macOS — toggled via ⌘⌃F or the VM menu's `Enter / Exit Full
-// Screen` item. In fullscreen the entire toolbar auto-hides and
-// reveals on hover-to-top: on macOS 15+ via the Scene-level
-// `.windowToolbarFullScreenVisibility(.onHover)` modifier; on macOS
-// 14 via `LegacyFullscreenConfigurator` below, which flips
-// `NSApp.presentationOptions` on the enter/exit notifications.
-
 import SwiftUI
 @preconcurrency import Virtualization
 import LuminaBootable
@@ -58,7 +46,6 @@ public struct RunningVMView: View {
                 }
 
                 toolbarButton("⌘ SNAPSHOT") {
-                    // wired in M8
                 }
                 .keyboardShortcut("t", modifiers: .command)
                 .disabled(!session.status.isLive)
@@ -128,7 +115,6 @@ public struct RunningVMView: View {
     private var bootingScreen: some View {
         VStack(spacing: 16) {
             Spacer()
-            // ASCII brand mark, big
             VStack(alignment: .leading, spacing: 0) {
                 Text("[ BOOTING ]")
                     .font(LuminaTheme.label)
@@ -313,13 +299,6 @@ public struct RunningVMView: View {
 
 }
 
-// ── FULLSCREEN TOOLBAR AUTO-HIDE ─────────────────────────────────
-/// Applies `.windowToolbarFullScreenVisibility(.onHover)` on macOS
-/// 15+, a no-op on earlier versions. The modifier tells the SwiftUI
-/// runtime to treat the window's toolbar the same way as the system
-/// menu bar in fullscreen: hide it while the guest has focus, and
-/// reveal it briefly when the cursor crosses the top-edge reveal
-/// threshold.
 struct FullscreenToolbarAutoHide: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 15.0, *) {
@@ -330,7 +309,6 @@ struct FullscreenToolbarAutoHide: ViewModifier {
     }
 }
 
-// ── LEGACY FULLSCREEN CONFIG (macOS 14 fallback) ─────────────────
 /// macOS 14 fallback for toolbar auto-hide in fullscreen. On macOS
 /// 15+ the SwiftUI-native `.windowToolbarFullScreenVisibility(.onHover)`
 /// Scene modifier handles this declaratively — this type is only
@@ -352,11 +330,9 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
         DispatchQueue.main.async {
             guard let window = v.window else { return }
 
-            // (1) Allow true fullscreen primary mode.
             window.collectionBehavior.insert(.fullScreenPrimary)
             window.collectionBehavior.remove(.fullScreenNone)
 
-            // (2) Hide NSWindow's own title rendering in the title bar.
             // `.navigationTitle(...)` sets the window title for system
             // services (Window menu, Dock, Expose, accessibility) — we
             // want those to work, but NOT see a duplicate left-aligned
@@ -364,7 +340,6 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
             // VM name centered.
             window.titleVisibility = .hidden
 
-            // (3) Enter-fullscreen: apply immersive presentation options.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didEnterFullScreenNotification,
                 object: window, queue: .main
@@ -379,7 +354,6 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
                 }
             }
 
-            // (4) Exit-fullscreen: restore default.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didExitFullScreenNotification,
                 object: window, queue: .main

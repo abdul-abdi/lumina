@@ -1,4 +1,3 @@
-// Sources/Lumina/SessionProtocol.swift
 import Foundation
 
 // MARK: - Session Request (host → session server)

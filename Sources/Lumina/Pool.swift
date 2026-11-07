@@ -1,5 +1,3 @@
-// Sources/Lumina/Pool.swift
-//
 // Pre-warmed VM pool. Boot N VMs once, serve run() calls from warm
 // inventory, automatically refill after each use.
 //
@@ -34,16 +32,13 @@ public actor Pool {
     /// Ready-to-use VMs. May contain fewer than `size` while slots refill.
     private var available: [VM] = []
 
-    /// Callers blocked waiting for a VM.
     private var waiters: [CheckedContinuation<VM, any Error>] = []
 
     /// Count of slots currently booting (prevents over-spawning).
     private var booting: Int = 0
 
-    /// True after shutdown() is called — rejects new runs.
     private var isShutdown = false
 
-    /// Exposed for testing only. Count of VMs currently in inventory.
     internal var availableCount: Int { available.count }
 
     // MARK: - Init
@@ -116,15 +111,12 @@ public actor Pool {
 
     // MARK: - Shutdown
 
-    /// Shut down all pooled VMs and reject future run() calls.
     public func shutdown() async {
         isShutdown = true
-        // Fail all waiting callers
         for waiter in waiters {
             waiter.resume(throwing: LuminaError.sessionFailed("Pool shut down"))
         }
         waiters.removeAll()
-        // Shut down ready VMs
         let vms = available
         available.removeAll()
         for vm in vms {
@@ -161,7 +153,6 @@ public actor Pool {
     /// Return a used VM, boot a replacement, hand off to the next waiter or inventory.
     private func releaseAndRefill(_ used: VM) async {
         await used.shutdown()
-        // Boot a fresh replacement slot asynchronously
         Task.detached { [self] in
             let fresh = await self.bootSingleVM()
             await self.depositVM(fresh)
@@ -186,8 +177,6 @@ public actor Pool {
             return
         }
         booting = max(0, booting - 1)
-        // If shutdown() was called while this VM was booting, shut it down
-        // immediately rather than adding it to inventory — prevents leaked VMs.
         if isShutdown {
             await vm.shutdown()
             return
@@ -202,7 +191,6 @@ public actor Pool {
 
     // MARK: - Private: Boot Helpers
 
-    /// Boot one slot concurrently (for initial boot).
     private func bootOneSlot() async {
         let vm = await bootSingleVM()
         await depositVM(vm)

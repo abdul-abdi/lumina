@@ -1,4 +1,3 @@
-// Sources/Lumina/SessionClient.swift
 import Foundation
 
 /// Connects to a session's Unix domain socket and sends/receives
@@ -18,19 +17,16 @@ public final class SessionClient: @unchecked Sendable {
     public func connect(sid: String) throws {
         let paths = SessionPaths(sid: sid, sessionsDir: sessionsDir)
 
-        // Check if session directory exists
         guard FileManager.default.fileExists(atPath: paths.directory.path) else {
             throw LuminaError.sessionNotFound(sid)
         }
 
-        // Check if session process is alive
         if let info = paths.readMeta(), kill(info.pid, 0) != 0 {
             paths.cleanup()
             throw LuminaError.sessionDead(sid)
         }
 
         guard let fd = unixConnect(path: paths.socket.path) else {
-            // Socket exists but can't connect -- session may be dead
             if !paths.isAlive() {
                 paths.cleanup()
                 throw LuminaError.sessionDead(sid)
@@ -40,10 +36,6 @@ public final class SessionClient: @unchecked Sendable {
         clientFd = fd
     }
 
-    /// Send a request to the session server.
-    ///
-    /// Uses POSIX `write()` instead of `FileHandle.write()` — NSFileHandle raises
-    /// an Obj-C NSFileHandleOperationException on EPIPE that Swift's `try` cannot catch.
     public func send(_ request: SessionRequest) throws {
         guard clientFd >= 0 else {
             throw LuminaError.connectionFailed
@@ -53,7 +45,6 @@ public final class SessionClient: @unchecked Sendable {
         }
     }
 
-    /// Read one response from the session server.
     /// Uses a persistent buffer to handle coalesced NDJSON frames — if a
     /// single read returns multiple newline-delimited messages, the leftover
     /// bytes are retained for the next call.
@@ -96,7 +87,6 @@ public final class SessionClient: @unchecked Sendable {
         readBuffer = Data()
     }
 
-    /// Disconnect from the session.
     public func disconnect() {
         if clientFd >= 0 {
             Darwin.close(clientFd)

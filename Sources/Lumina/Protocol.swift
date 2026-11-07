@@ -1,4 +1,3 @@
-// Sources/Lumina/Protocol.swift
 import Foundation
 
 // MARK: - Host Messages (sent to guest)
@@ -10,18 +9,14 @@ public enum HostMessage: Sendable {
     /// Send a signal to a running command (by id) or all commands (id nil).
     /// The guest sends `signal` to the process group, waits `gracePeriod` seconds, then SIGKILL.
     case cancel(id: String?, signal: Int32, gracePeriod: Int)
-    /// Send stdin data to a running command identified by id.
     case stdin(id: String, data: String)
-    /// Close the stdin pipe for a running command.
     case stdinClose(id: String)
-    /// Configure guest network (host-driven, Apple-style).
     case configureNetwork(ip: String, gateway: String, dns: String)
     /// Start a PTY-backed interactive command. Output flows back as `.ptyOutput`
     /// and the process exits via the shared `.exit(id:code:)` message.
     case ptyExec(id: String, cmd: String, timeout: Int, env: [String: String], cols: Int, rows: Int)
     /// Write base64-encoded bytes to a running PTY's master side (keyboard input).
     case ptyInput(id: String, data: String)
-    /// Resize the window of a running PTY (sends TIOCSWINSZ on the guest).
     case windowResize(id: String, cols: Int, rows: Int)
     /// Tell the guest agent to start forwarding a TCP port. The guest listens on
     /// `guestPort`, picks an available vsock port for the reverse channel, and
@@ -304,7 +299,6 @@ enum LuminaProtocol {
 
 // MARK: - Public alias using backtick-escaped name
 
-/// Namespace alias to allow `Protocol.encode` / `Protocol.decodeGuest` call sites.
 typealias Protocol = LuminaProtocol
 
 // MARK: - Stale guest image detection

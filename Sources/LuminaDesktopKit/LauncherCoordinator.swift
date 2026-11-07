@@ -1,11 +1,3 @@
-// Sources/LuminaDesktopKit/LauncherCoordinator.swift
-//
-// Intra-process UI-event bus for the Desktop app. Replaces what used
-// to be posted through `NotificationCenter` (LuminaLauncherOpenWizard,
-// LuminaShowLauncher). `@Observable` state with explicit request
-// stamps — SwiftUI observes mutations, and we stay off the dynamic
-// Notification bus for events that only ever travel inside this app.
-//
 // System notifications (NSWindow fullscreen, DistributedNotificationCenter
 // appearance changes) keep using `NotificationCenter` because that is
 // the API AppKit publishes them on.

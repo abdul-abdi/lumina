@@ -1,10 +1,7 @@
-// Sources/LuminaBootable/FirstBootPlan.swift
-//
 // Pure orchestration of the install-time seeds we apply on the first boot
 // of a desktop VM bundle. Both the CLI (`lumina desktop boot`) and the
 // GUI (`LuminaDesktopSession.boot()`) call this — without a single
 // shared entry point, the GUI silently bypassed the fixes the CLI was
-// applying. See [[wiki/projects/lumina]] for the v0.7.2 incident.
 //
 // Shape:
 //   - `prepareFirstBoot(...)` returns a `FirstBootPlan` value (artifacts
@@ -30,8 +27,6 @@ public struct FirstBootPlan: Sendable, Equatable {
     public var events: [Event]
 
     public enum Event: Sendable, Equatable {
-        /// `LinuxISOExtractor` matched a known layout. `layoutName` is
-        /// the human-readable distro string (e.g. "Debian arm64 netinst").
         case linuxDirectMatched(layoutName: String)
         /// Extractor returned `unknownLayout` and the caller is NOT in
         /// `--capture-serial` mode, so we fell back to standard EFI boot
@@ -106,8 +101,6 @@ public struct FirstBootDependencies: Sendable {
         self.generateAutounattend = generateAutounattend
     }
 
-    /// Production wiring: real `LinuxISOExtractor`, `PreseedSeed`,
-    /// `AutounattendSeed`.
     public static let live = FirstBootDependencies(
         extract: { iso, destination in
             try LinuxISOExtractor.extract(iso: iso, destination: destination)
@@ -220,8 +213,6 @@ public func prepareFirstBoot(
         plan.events.append(.linuxDirectMatched(layoutName: extracted.layoutName))
         plan.linuxDirectKernel = extracted.kernel
 
-        // Default to the extracted initrd; the preseed step (if it runs)
-        // overwrites this with the patched copy.
         var initrdURL = extracted.initramfs
 
         // Linux uses the LAST `console=` flag as /dev/console — that's

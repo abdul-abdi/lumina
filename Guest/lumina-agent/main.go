@@ -1,9 +1,3 @@
-// Guest/lumina-agent/main.go
-//
-// Linux guest agent: accepts a vsock connection from the host and
-// dispatches exec / pty / transfer / network / port-forward requests
-// via the packages under ./internal. Everything interesting lives in
-// those packages; this file is only process setup and the accept loop.
 package main
 
 import (
@@ -16,8 +10,6 @@ import (
 	"github.com/abdullahiabdi/lumina/guest/lumina-agent/internal/vsock"
 )
 
-// vsockPort is the fixed port the host dials to reach us. Pinned so
-// the host never has to discover it.
 const vsockPort = 1024
 
 // Installed when we inherit none. The kernel hands PID 1 only HOME and
@@ -28,7 +20,6 @@ const vsockPort = 1024
 const defaultPATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 func main() {
-	// stderr → serial console on most VZ setups.
 	_, _ = fmt.Fprintln(os.Stderr, "lumina-agent starting")
 	bootmark.Mark("agent_start")
 

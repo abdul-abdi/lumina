@@ -1,5 +1,3 @@
-// Sources/lumina-cli/DoctorCommand.swift
-//
 // `lumina doctor` — host health check. One-shot diagnostic that
 // inspects everything Lumina needs to work well, then reports in
 // human-readable text (TTY) or structured JSON (pipe).
@@ -43,7 +41,6 @@ struct Doctor: AsyncParsableCommand {
             printHumanReport(report)
         }
 
-        // Exit code mirrors severity.
         if report.checks.contains(where: { $0.severity == .error }) {
             throw ExitCode(2)
         } else if report.checks.contains(where: { $0.severity == .warning }) {
@@ -377,7 +374,6 @@ struct Doctor: AsyncParsableCommand {
         }
         if let name = current { bridges.append((name, currentIP)) }
 
-        // Filter to vmnet range: bridgeN where N ≥ 100.
         let vmnetBridges = bridges.filter { b in
             guard b.name.hasPrefix("bridge") else { return false }
             let suffix = String(b.name.dropFirst("bridge".count))

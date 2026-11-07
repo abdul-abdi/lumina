@@ -1,7 +1,3 @@
-// Sources/LuminaDesktopKit/NewVMWizard.swift
-//
-// v0.7.0 M6 — 4-step wizard: choose OS → variant → resources → review.
-
 import SwiftUI
 import Lumina
 import LuminaBootable
@@ -62,7 +58,6 @@ public struct NewVMWizard: View {
         }
         .frame(width: 760, height: 560)
         .background(LuminaTheme.bg)
-        // Inherit from parent — respects AppearancePreference toggle.
         .animation(.easeInOut(duration: 0.18), value: step)
         .onAppear {
             if let id = initialTileID, let tile = OSCatalog.tile(id: id) {
@@ -252,7 +247,6 @@ public struct NewVMWizard: View {
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                // Host chip bar — numbers that constrain the choices below.
                 HostChipBar(host: host, freeDisk: freeDisk)
 
                 sliderRow(label: "Memory", value: $memoryGB,
@@ -522,8 +516,6 @@ public struct NewVMWizard: View {
             if isVerifying { return false }
             switch tile.acquisition {
             case .userProvided, .microsoftAccountDownload, .catalogISO:
-                // User must attach the ISO before we can proceed — we don't
-                // run a background downloader in v0.7.0.
                 return byoFile != nil
             }
         case .resources: return true
@@ -663,7 +655,6 @@ public struct NewVMWizard: View {
                 id: id
             )
             try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: diskBytes)
-            // Stage BYO file if provided.
             if let f = byoFile {
                 let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
                 try? Data(f.path.utf8).write(to: sidecar, options: .atomic)
@@ -689,10 +680,6 @@ public struct NewVMWizard: View {
     }
 
 
-    /// Collapse the UI choice + selected bridge interface into the
-    /// persisted `NetworkMode` shape. Returns nil for NAT so older
-    /// bundle readers (pre-networkMode schema) still load cleanly —
-    /// `LuminaDesktopSession.networkProvider(for:)` maps nil → .nat.
     private func resolvedNetworkMode() -> NetworkMode? {
         switch networkMode {
         case .nat:
@@ -709,16 +696,11 @@ public struct NewVMWizard: View {
     }
 }
 
-/// UI-local representation of the network attachment choice. Maps to
-/// `LuminaBootable.NetworkMode` at persist time via `resolvedNetworkMode()`.
 enum NetworkModeChoice: Equatable {
     case nat
     case bridged
 }
 
-/// Thin bar showing host constraints above the resource sliders.
-/// Host RAM / core count / free disk — the numbers that should shape
-/// the user's choices are made visible.
 @MainActor
 struct HostChipBar: View {
     let host: HostInfo

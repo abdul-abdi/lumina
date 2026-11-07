@@ -1,4 +1,3 @@
-// Sources/Lumina/MacOSSupport.swift
 //
 // v0.7.0 M5 — VZMacOSVirtualMachine glue. Lives in `Lumina` (not
 // `LuminaBootable`) for the same reason as `EFIBootable`: `MacOSVM`
@@ -118,7 +117,6 @@ public struct MacOSBootable: Sendable {
 
         vzConfig.bootLoader = VZMacOSBootLoader()
 
-        // Primary disk — read-write virtio block.
         do {
             let primaryAttachment = try VZDiskImageStorageDeviceAttachment(
                 url: config.primaryDisk,

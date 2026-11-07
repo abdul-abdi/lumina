@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/HostInfo.swift
-//
-// v0.7.0 M6 — inspect the host Mac's memory, CPU, and free disk so the
-// wizard can suggest sane VM resources and warn before the user configures
-// a VM that won't fit. The constraint is invisible otherwise — Victor's
-// principle: make it visible.
-
 import Foundation
 import Darwin
 

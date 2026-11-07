@@ -1,11 +1,3 @@
-// Sources/LuminaDesktopKit/TerminalLauncher.swift
-//
-// v0.7.1: agent engineers don't use Terminal.app. The previous
-// `try? osascript` pattern either opened the wrong terminal or
-// failed silently. TerminalLauncher detects the installed terminal,
-// falls back in a known order, and surfaces a visible error on
-// failure instead of swallowing it.
-//
 // Launch strategy per terminal — chosen to work with an ad-hoc-signed
 // desktop build where we don't have application-specific entitlements:
 //   - Ghostty / Warp / generic: copy the command to the pasteboard,
@@ -23,17 +15,9 @@
 import AppKit
 import Foundation
 
-/// Result of a launch attempt — used by the caller to decide whether
-/// to show an auto-executed or "paste the copied command" message.
 public enum TerminalLaunchOutcome: Equatable, Sendable {
-    /// Terminal opened and the command started executing (AppleScript
-    /// `do script` path).
     case executed(terminal: TerminalKind)
-    /// Terminal opened but the user must paste (⌘V) — the command was
-    /// copied to the pasteboard as a fallback.
     case copiedAndOpened(terminal: TerminalKind)
-    /// Launch failed. `reason` is a human-readable diagnostic suitable
-    /// for a user-visible alert.
     case failed(reason: String)
 }
 
@@ -66,23 +50,13 @@ public enum TerminalKind: String, CaseIterable, Sendable, Equatable {
 
 }
 
-/// Pluggable surface so tests can swap the AppKit / Process calls.
-/// Production uses `DefaultTerminalEnvironment`; tests inject fakes
-/// so detection / launch flows are exercisable without actually
-/// launching a terminal app.
 public protocol TerminalEnvironment: Sendable {
-    /// Returns true if the terminal is installed (has a resolvable
-    /// application URL for its bundle identifier).
     func isInstalled(_ kind: TerminalKind) -> Bool
 
-    /// Copy a command to the user's general pasteboard.
     func copyToPasteboard(_ command: String)
 
-    /// Open a terminal app without executing anything (pasteboard
-    /// fallback). Returns true on success.
     func openApp(bundleIdentifier: String) -> Bool
 
-    /// Run an AppleScript and return true when the process exited 0.
     func runAppleScript(_ script: String) -> Bool
 }
 
@@ -154,10 +128,7 @@ public struct DefaultTerminalEnvironment: TerminalEnvironment {
     }
 }
 
-/// Launches an agent-image session in the user's preferred terminal.
 public struct TerminalLauncher: Sendable {
-    /// UserDefaults key for the stored preference. Value is a
-    /// `TerminalKind.rawValue` or "auto".
     public static let preferenceKey = "lumina.desktop.preferredTerminal"
 
     private let env: any TerminalEnvironment
@@ -166,14 +137,11 @@ public struct TerminalLauncher: Sendable {
         self.env = env
     }
 
-    /// Resolve the configured or auto-detected terminal. "auto" walks
-    /// the preference order until a terminal is installed.
     public func resolveTerminal(
         preferenceRaw: String? = UserDefaults.standard.string(
             forKey: TerminalLauncher.preferenceKey
         )
     ) -> TerminalKind {
-        // Explicit preference wins if the app is installed.
         if let raw = preferenceRaw,
            raw != "auto",
            let kind = TerminalKind(rawValue: raw),
@@ -191,8 +159,6 @@ public struct TerminalLauncher: Sendable {
         return .terminal
     }
 
-    /// Launch `command` in the resolved terminal. Returns an outcome
-    /// the caller can surface in the UI (toast / alert).
     public func launch(
         command: String,
         preferenceRaw: String? = UserDefaults.standard.string(
@@ -224,7 +190,6 @@ public struct TerminalLauncher: Sendable {
         if env.runAppleScript(script) {
             return .executed(terminal: .terminal)
         }
-        // Fallback: pasteboard + plain open.
         env.copyToPasteboard(command)
         if env.openApp(bundleIdentifier: TerminalKind.terminal.bundleIdentifier) {
             return .copiedAndOpened(terminal: .terminal)

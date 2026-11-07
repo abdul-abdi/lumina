@@ -1,17 +1,3 @@
-// Sources/LuminaDesktopKit/LibraryView.swift
-//
-// v0.7.0 M6 — Mac-native rewrite. NavigationSplitView + materials +
-// proper sidebar + detail pane. Phosphor-amber accent on a translucent
-// dark surface that picks up the desktop wallpaper through the window.
-//
-// Split across files for locatability:
-//   - `HostStatusRibbon.swift`     — top-of-detail metric strip
-//   - `LibraryEmptyStates.swift`   — empty-library hero + filter empties
-//   - `VMCard.swift`               — grid card + state chip + preview + action + distro chip
-//   - `VMListView.swift`           — dense-row list layout
-//   - `Heartbeat.swift`            — pulse indicator used by card and row
-//   - this file: top-level library composition + toolbar chrome
-
 import SwiftUI
 import LuminaBootable
 
@@ -65,9 +51,6 @@ public struct LibraryView: View {
     public init(model: AppModel, coordinator: LauncherCoordinator) {
         self.model = model
         self.coordinator = coordinator
-        // Seed local @State from whatever AppStorage held last session so
-        // the initial render matches the persisted choice without an
-        // extra propagation cycle.
         let raw = UserDefaults.standard.string(forKey: "lumina.appearance") ?? "system"
         self._appearanceState = State(initialValue: AppearancePreference(rawValue: raw) ?? .system)
     }
@@ -118,7 +101,6 @@ public struct LibraryView: View {
             CommandLauncher(model: model, coordinator: coordinator, isPresented: $showingLauncher)
         }
         .background(
-            // Global ⌘K / ⌘P shortcut even when focus is on sidebar
             Button("") { showingLauncher = true }
                 .keyboardShortcut("k", modifiers: .command)
                 .opacity(0)
@@ -175,7 +157,6 @@ public struct LibraryView: View {
         showingWizard = true
     }
 
-    // ── SIDEBAR ──────────────────────────────────────────────────
     private var sidebar: some View {
         List(selection: $section) {
             sectionHeader("LIBRARY")
@@ -251,7 +232,6 @@ public struct LibraryView: View {
         .tag(s)
     }
 
-    // ── DETAIL ───────────────────────────────────────────────────
     @ViewBuilder
     private var detail: some View {
         ZStack {
@@ -297,7 +277,6 @@ public struct LibraryView: View {
     }
 }
 
-// ── LAYOUT PICKER ─────────────────────────────────────────────────
 @MainActor
 public struct LayoutPicker: View {
     @Binding var layoutRaw: String
@@ -321,7 +300,6 @@ public struct LayoutPicker: View {
     }
 }
 
-// ── APPEARANCE TOGGLE ─────────────────────────────────────────────
 @MainActor
 public struct AppearanceMenu: View {
     @Binding var current: AppearancePreference
@@ -379,7 +357,6 @@ public struct AppearanceMenu: View {
     }
 }
 
-// ── SEARCH ────────────────────────────────────────────────────────
 @MainActor
 public struct LuminaSearchField: View {
     @Binding var text: String

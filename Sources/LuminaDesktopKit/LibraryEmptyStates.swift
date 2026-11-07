@@ -1,9 +1,3 @@
-// Sources/LuminaDesktopKit/LibraryEmptyStates.swift
-//
-// Empty-library hero and filter-empty placeholder. Extracted from
-// LibraryView.swift so the library entry-point stays focused on the
-// NavigationSplitView composition.
-
 import SwiftUI
 
 @MainActor
@@ -98,12 +92,10 @@ public struct BrandMarkLarge: View {
     public init() {}
     public var body: some View {
         ZStack {
-            // back square (cream)
             RoundedRectangle(cornerRadius: 8)
                 .stroke(LuminaTheme.ink.opacity(0.4), lineWidth: 2)
                 .frame(width: 56, height: 56)
                 .offset(x: 12, y: 12)
-            // front square (amber, with subtle glow)
             RoundedRectangle(cornerRadius: 8)
                 .stroke(LuminaTheme.accent, lineWidth: 2)
                 .frame(width: 56, height: 56)

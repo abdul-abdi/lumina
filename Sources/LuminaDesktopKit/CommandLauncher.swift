@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/CommandLauncher.swift
-//
-// v0.7.0 M6 — ⌘K fuzzy launcher. Type a VM name or a command, hit Enter,
-// it runs. This is what makes Lumina feel faster than anything else in
-// the VM space: no clicks, no navigation, no wizard for existing VMs.
-// You think "ubuntu", you press Enter, the VM boots.
-
 import SwiftUI
 import AppKit
 import LuminaBootable
@@ -59,8 +52,6 @@ public struct CommandLauncher: View {
             return .handled
         }
     }
-
-    // ── ROWS ──────────────────────────────────────────────────────
 
     private var queryField: some View {
         HStack(spacing: 10) {
@@ -128,9 +119,6 @@ public struct CommandLauncher: View {
         }
     }
 
-    // ── MATCH / ACTION ────────────────────────────────────────────
-
-    /// Canonical match — either a known VM, a verb action, or a tile.
     enum Match: Identifiable, Equatable {
         case vm(VMBundle, VMVerb)
         case newVM(tileID: String, label: String)
@@ -192,10 +180,8 @@ public struct CommandLauncher: View {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
         let verbHit = q.split(separator: " ").first.map(String.init) ?? ""
 
-        // Base match set
         var out: [Match] = []
 
-        // VM matches (always show if query matches name/variant)
         for bundle in model.bundles {
             if q.isEmpty || bundle.manifest.name.lowercased().contains(q)
                 || bundle.manifest.osVariant.lowercased().contains(q) {
@@ -210,7 +196,6 @@ public struct CommandLauncher: View {
             }
         }
 
-        // "new" / "create" → wizard entries
         if q.isEmpty || "new".hasPrefix(verbHit) || "create".hasPrefix(verbHit)
             || q.contains("ubuntu") || q.contains("kali") || q.contains("fedora")
             || q.contains("debian") || q.contains("windows") {
@@ -222,7 +207,6 @@ public struct CommandLauncher: View {
             out.append(.newVM(tileID: "byo-file", label: "From ISO file…"))
         }
 
-        // Admin actions — show if user types "reveal" / "delete"
         if q.hasPrefix("reveal") || q.hasPrefix("show") {
             for b in model.bundles { out.append(.reveal(b)) }
         }
@@ -230,7 +214,6 @@ public struct CommandLauncher: View {
             for b in model.bundles { out.append(.delete(b)) }
         }
 
-        // Dedupe + cap
         var seen = Set<String>()
         return out.filter { seen.insert($0.id).inserted }.prefix(12).map { $0 }
     }
