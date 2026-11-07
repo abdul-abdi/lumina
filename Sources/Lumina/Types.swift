@@ -160,8 +160,8 @@ public struct EFIBootConfig: Sendable, Equatable {
     public var primaryDisk: URL
     public var cdromISO: URL?
     public var extraDisks: [URL]
-    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration` on
-    /// macOS 13+ instead of the default virtio-block device. Windows 11
+    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration`
+    /// instead of the default virtio-block device. Windows 11
     /// ARM setup is picky about media type and refuses to boot from a
     /// virtio-block-labeled CD-ROM with "Windows cannot find the media";
     /// USB mass-storage presents as a real removable drive and works.
@@ -196,10 +196,8 @@ public struct EFIBootConfig: Sendable, Equatable {
     /// Additional CD-ROM ISOs attached alongside the primary `cdromISO`.
     /// Used to deliver a Windows autounattend.xml sidecar (TPM-bypass
     /// pass) without having to repack the user's installer ISO. Each
-    /// entry is attached as a separate `VZUSBMassStorageDeviceConfiguration`
-    /// (macOS 13+); on macOS 12 the primary ISO falls back to virtio-block
-    /// and `extraCDROMs` are silently skipped (older OS users get a clear
-    /// stderr warning from the caller). Order is preserved — Windows
+    /// entry is attached as a separate `VZUSBMassStorageDeviceConfiguration`.
+    /// Order is preserved — Windows
     /// Setup scans drives in attachment order and applies the first
     /// `autounattend.xml` it finds, which is normally the sidecar
     /// because the installer ISO doesn't ship one.

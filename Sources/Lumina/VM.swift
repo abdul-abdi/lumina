@@ -372,40 +372,34 @@ public actor VM {
 
         // Rosetta for x86_64 binary translation in Linux guests
         if options.rosetta {
-            if #available(macOS 13.0, *) {
-                let availability = VZLinuxRosettaDirectoryShare.availability
-                switch availability {
-                case .installed:
-                    do {
-                        let rosettaShare = try VZLinuxRosettaDirectoryShare()
-                        let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
-                        rosettaDevice.share = rosettaShare
-                        var sharingDevices = config.directorySharingDevices
-                        sharingDevices.append(rosettaDevice)
-                        config.directorySharingDevices = sharingDevices
-                        cmdLine += " lumina_rosetta=1"
-                    } catch {
-                        clone?.remove()
-                        _state = .idle
-                        throw .bootFailed(underlying: error)
-                    }
-                case .notSupported:
+            let availability = VZLinuxRosettaDirectoryShare.availability
+            switch availability {
+            case .installed:
+                do {
+                    let rosettaShare = try VZLinuxRosettaDirectoryShare()
+                    let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                    rosettaDevice.share = rosettaShare
+                    var sharingDevices = config.directorySharingDevices
+                    sharingDevices.append(rosettaDevice)
+                    config.directorySharingDevices = sharingDevices
+                    cmdLine += " lumina_rosetta=1"
+                } catch {
                     clone?.remove()
                     _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not supported on this Mac"))
-                case .notInstalled:
-                    clone?.remove()
-                    _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not installed. Run: softwareupdate --install-rosetta"))
-                @unknown default:
-                    clone?.remove()
-                    _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Unknown Rosetta availability status"))
+                    throw .bootFailed(underlying: error)
                 }
-            } else {
+            case .notSupported:
                 clone?.remove()
                 _state = .idle
-                throw .bootFailed(underlying: VMError.invalidState("Rosetta requires macOS 13.0 or later"))
+                throw .bootFailed(underlying: VMError.invalidState("Rosetta is not supported on this Mac"))
+            case .notInstalled:
+                clone?.remove()
+                _state = .idle
+                throw .bootFailed(underlying: VMError.invalidState("Rosetta is not installed. Run: softwareupdate --install-rosetta"))
+            @unknown default:
+                clone?.remove()
+                _state = .idle
+                throw .bootFailed(underlying: VMError.invalidState("Unknown Rosetta availability status"))
             }
         }
 
@@ -662,7 +656,7 @@ public actor VM {
             // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
             // as the agent path; gated behind options.rosetta.
             if options.rosetta {
-                if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
+                if VZLinuxRosettaDirectoryShare.availability == .installed {
                     if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
                         let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
                         device.share = rosettaShare

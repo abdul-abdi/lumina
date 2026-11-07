@@ -116,10 +116,6 @@ import Virtualization
     }
 
     @Test func configure_usesUSBMassStorageCDROMWhenPreferred() throws {
-        // macOS 13+ only — older hosts always get virtio block and this
-        // test degrades gracefully to pass-through.
-        guard #available(macOS 13.0, *) else { return }
-
         let vars = tmp.appendingPathComponent("efi.vars")
         let disk = tmp.appendingPathComponent("disk.img")
         let iso = tmp.appendingPathComponent("windows.iso")
