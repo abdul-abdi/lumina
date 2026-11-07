@@ -1,0 +1,12 @@
+[Unit]
+Description=Resize the desktop to fit the Lumina window
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/lumina-display
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
