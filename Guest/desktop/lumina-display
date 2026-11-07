@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+apply() {
+  local connector output mode scale
+  for connector in /sys/class/drm/card*-*; do
+    [[ $(<"$connector/status") == connected ]] || continue
+    mode=$(head -1 "$connector/modes")
+    [[ -n $mode ]] || continue
+    output=${connector##*/}
+    output=${output#*-}
+    scale=$(hyprctl monitors -j | jq -r --arg o "$output" '.[] | select(.name == $o) | .scale')
+    [[ -n $scale ]] || continue
+    hyprctl eval "hl.monitor({ output = \"$output\", mode = \"$mode@60\", position = \"auto\", scale = $scale })" >/dev/null
+  done
+}
+apply
+udevadm monitor --udev --subsystem-match=drm | while IFS= read -r line; do
+  [[ $line == *change* ]] || continue
+  while IFS= read -r -t 0.3 _; do :; done
+  apply
+done
