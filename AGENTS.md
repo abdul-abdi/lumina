@@ -47,10 +47,14 @@ host sleep no longer reports stale times.
 runtime failures in commands without an envelope emit
 `{"error": "failed", "message": ...}`.
 
-**Desktop.** The app no longer offers a macOS tile or IPSW drop target, and
-the agent image catalog is gone: neither could produce a working result
-(a restored macOS bundle cannot be booted yet, and no catalog image was
-ever published). `lumina desktop install-macos` remains for experiments.
+**macOS guests boot.** Before, a restored macOS bundle could not be
+booted at all. Now the app's macOS tile downloads the newest IPSW this Mac
+supports (cached in `~/.lumina/cache/ipsw`), installs it on first boot with
+progress, and later boots go straight to the desktop. From the CLI:
+`lumina desktop create --os-variant macos …`, then `lumina desktop
+install-macos <bundle> [--ipsw FILE]`, then `lumina desktop boot <bundle>`
+(headless). The agent image catalog is gone; no catalog image was ever
+published.
 
 ## v0.7.3 deltas
 

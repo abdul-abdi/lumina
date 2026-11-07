@@ -31,6 +31,7 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 - 🐧 **Linux desktop guests** — Ubuntu, Kali, Fedora, Debian ARM64 ISOs boot through `VZEFIBootLoader`
 - 🪟 **Windows 11 on ARM** — retail ISO install flow
+- 🍎 **macOS guests** — the newest IPSW your Mac supports, downloaded, installed and booted from one tile
 - 🖥 **Lumina Desktop.app** — a SwiftUI library + wizard + per-VM windows, with ⌘K fuzzy launcher, live per-card disk sparklines, drag-drop ISOs, native fullscreen, and a brand-aware look per guest OS (Ubuntu orange, Kali cyber blue, Windows MS blue, macOS silver, …)
 - 🔒 **Catalog ISO integrity** — the wizard streams user-picked catalog ISOs through SHA-256 before creating the VM and refuses partial or tampered downloads
 - 🎨 **Ad-hoc signed build** — no Apple Developer Program account required. Notarization scaffolding is in place (per-cert-class entitlement selection in `scripts/build-app.sh`); the hosted CI switch from ad-hoc to notarized Developer ID waits on Apple Developer Program enrollment and is tracked as a v0.7.2 follow-up.
@@ -221,7 +222,7 @@ While a daemon is running, `lumina run` uses it whenever the pool shape
 anything else boots cold. Set `LUMINA_DAEMON=0` to always boot cold. Each
 warm VM holds its memory (1 GB by default) while idle.
 
-### Desktop VMs — install Ubuntu, Kali, Fedora, Debian, Windows 11 ARM, Omarchy
+### Desktop VMs — install Ubuntu, Kali, Fedora, Debian, Windows 11 ARM, Omarchy, macOS
 
 ```bash
 # Create a bundle + stage an installer ISO
@@ -235,6 +236,11 @@ lumina desktop boot ~/.lumina/desktop-vms/<uuid> --headless --serial out.log
 # Unattended installs: --seed DIR is packed into a `cidata` ISO on first boot
 # (cloud-init NoCloud). scripts/omarchy-vm.sh uses it to install Omarchy.
 scripts/omarchy-vm.sh omarchy        # then boot "omarchy" in Lumina.app
+
+# macOS guests: install once (downloads the newest supported IPSW, ~18 GB, cached)
+lumina desktop create --name mac --os-variant macos --memory 8GB --cpus 4 --disk-size 64GB
+lumina desktop install-macos ~/.lumina/desktop-vms/<uuid>     # or --ipsw ./UniversalMac.ipsw
+lumina desktop boot ~/.lumina/desktop-vms/<uuid>              # headless; open it in Lumina.app to see it
 
 # List everything (shares state with the app)
 lumina desktop ls
@@ -254,7 +260,7 @@ Open `/Applications/Lumina.app` — or press **⌘K** once it's running to fuzzy
 | ⌘,         | Preferences                                             |
 | ⌘/         | Keyboard shortcuts                                      |
 
-Drag any `.iso` or `.img` onto the window → wizard opens pre-filled.
+Drag any `.iso`, `.img` or `.ipsw` onto the window → wizard opens pre-filled.
 
 Full CLI reference lives in the [wiki](https://github.com/abdul-abdi/lumina/wiki/CLI-Reference).
 
