@@ -35,17 +35,9 @@ public enum HostMessage: Sendable {
 // MARK: - Guest Messages (received from guest)
 
 public enum GuestMessage: Sendable, Equatable {
-    /// Initial handshake from the guest agent. Optional fields:
-    ///   - `protocolVersion`: wire-format version the agent speaks. 0
-    ///     means absent (pre-v0.7.2 agent). Hosts can branch on this
-    ///     for forward/backward-compat decisions when a future bump
-    ///     ships breaking changes — without resorting to message-
-    ///     shape probing.
-    ///   - `capabilities`: list of feature strings the agent
-    ///     implements (e.g. `"pty"`, `"port_forward"`,
-    ///     `"network_metrics"`). Empty when absent. Hosts may consult
-    ///     it before issuing capability-gated requests.
-    case ready(protocolVersion: Int, capabilities: [String])
+    /// Initial handshake from the guest agent. `protocolVersion` is 0 when
+    /// absent (pre-v0.7.2 agent).
+    case ready(protocolVersion: Int)
     /// Text output (UTF-8). `data` carries the text verbatim.
     case output(id: String, stream: OutputStream, data: String)
     /// Binary output. `bytes` carries the raw bytes that were base64-encoded
@@ -136,184 +128,176 @@ public struct InterfaceCounters: Sendable, Equatable, Codable {
         case rxPackets = "rx_packets"
         case txPackets = "tx_packets"
     }
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func field(_ key: CodingKeys) throws -> UInt64 { try c.decodeIfPresent(UInt64.self, forKey: key) ?? 0 }
+        self.init(
+            rxBytes: try field(.rxBytes), txBytes: try field(.txBytes),
+            rxErrors: try field(.rxErrors), txErrors: try field(.txErrors),
+            rxPackets: try field(.rxPackets), txPackets: try field(.txPackets)
+        )
+    }
 }
 
 // MARK: - Wire Format
+
+private struct HostFrame: Encodable {
+    var type: String
+    var id: String?
+    var cmd: String?
+    var timeout: Int?
+    var env: [String: String]?
+    var cwd: String?
+    var path: String?
+    var data: String?
+    var mode: String?
+    var seq: Int?
+    var eof: Bool?
+    var signal: Int?
+    var grace_period: Int?
+    var ip: String?
+    var gateway: String?
+    var dns: String?
+    var cols: Int?
+    var rows: Int?
+    var guest_port: Int?
+}
+
+private struct GuestFrame: Decodable {
+    var type: String
+    var protocol_version: Int?
+    var id: String?
+    var stream: OutputStream?
+    var data: String?
+    var encoding: String?
+    var code: Int?
+    var seq: Int?
+    var eof: Bool?
+    var path: String?
+    var error: String?
+    var ip: String?
+    var config_ms: Int?
+    var stage: String?
+    var dns_ok: Bool?
+    var reason: String?
+    var attempts: Int?
+    var interfaces: [String: InterfaceCounters]?
+    var guest_port: Int?
+    var vsock_port: Int?
+
+    func need<T>(_ value: T?) throws -> T {
+        guard let value else { throw LuminaError.protocolError("Malformed \(type) message") }
+        return value
+    }
+}
+
+private struct FrameType: Decodable {
+    var type: String
+}
 
 enum LuminaProtocol {
     // 128KB — must accommodate 48KB raw chunks from guest agent (48*4/3 ≈ 64KB base64 + JSON envelope).
     static let maxMessageSize = 131_072
 
+    private static let knownGuestTypes: Set<String> = [
+        "ready", "output", "exit", "heartbeat", "upload_ack", "upload_done", "upload_error",
+        "download_data", "download_error", "network_ready", "network_error", "network_metrics",
+        "pty_output", "port_forward_ready", "port_forward_error",
+    ]
+
     static func encode(_ message: HostMessage) throws -> Data {
-        let dict: [String: Any]
+        let frame: HostFrame
         switch message {
         case .exec(let id, let cmd, let timeout, let env, let cwd):
-            var d: [String: Any] = ["type": "exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env]
-            if let cwd = cwd { d["cwd"] = cwd }
-            dict = d
-        case .upload(let path, let dataStr, let mode, let seq, let eof):
-            dict = ["type": "upload", "path": path, "data": dataStr, "mode": mode, "seq": seq, "eof": eof]
+            frame = HostFrame(type: "exec", id: id, cmd: cmd, timeout: timeout, env: env, cwd: cwd)
+        case .upload(let path, let data, let mode, let seq, let eof):
+            frame = HostFrame(type: "upload", path: path, data: data, mode: mode, seq: seq, eof: eof)
         case .downloadReq(let path):
-            dict = ["type": "download_req", "path": path]
+            frame = HostFrame(type: "download_req", path: path)
         case .cancel(let id, let signal, let gracePeriod):
-            var d: [String: Any] = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
-            if let id = id { d["id"] = id }
-            dict = d
+            frame = HostFrame(type: "cancel", id: id, signal: Int(signal), grace_period: gracePeriod)
         case .stdin(let id, let data):
-            dict = ["type": "stdin", "id": id, "data": data]
+            frame = HostFrame(type: "stdin", id: id, data: data)
         case .stdinClose(let id):
-            dict = ["type": "stdin_close", "id": id]
+            frame = HostFrame(type: "stdin_close", id: id)
         case .configureNetwork(let ip, let gateway, let dns):
-            dict = ["type": "configure_network", "ip": ip, "gateway": gateway, "dns": dns]
+            frame = HostFrame(type: "configure_network", ip: ip, gateway: gateway, dns: dns)
         case .ptyExec(let id, let cmd, let timeout, let env, let cols, let rows):
-            dict = ["type": "pty_exec", "id": id, "cmd": cmd, "timeout": timeout, "env": env, "cols": cols, "rows": rows]
+            frame = HostFrame(type: "pty_exec", id: id, cmd: cmd, timeout: timeout, env: env, cols: cols, rows: rows)
         case .ptyInput(let id, let data):
-            dict = ["type": "pty_input", "id": id, "data": data]
+            frame = HostFrame(type: "pty_input", id: id, data: data)
         case .windowResize(let id, let cols, let rows):
-            dict = ["type": "window_resize", "id": id, "cols": cols, "rows": rows]
+            frame = HostFrame(type: "window_resize", id: id, cols: cols, rows: rows)
         case .portForwardStart(let guestPort):
-            dict = ["type": "port_forward_start", "guest_port": guestPort]
+            frame = HostFrame(type: "port_forward_start", guest_port: guestPort)
         case .portForwardStop(let guestPort):
-            dict = ["type": "port_forward_stop", "guest_port": guestPort]
+            frame = HostFrame(type: "port_forward_stop", guest_port: guestPort)
         }
-        var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        data.append(contentsOf: [UInt8(ascii: "\n")])
-        return data
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(frame) + [UInt8(ascii: "\n")]
     }
 
     static func decodeGuest(_ data: Data) throws -> GuestMessage {
-        let trimmed = data.prefix(while: { $0 != UInt8(ascii: "\n") })
-        guard let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any],
-              let type = json["type"] as? String
-        else {
-            throw LuminaError.protocolError("Invalid JSON in guest message")
-        }
-
-        switch type {
-        case "ready":
-            // protocol_version / capabilities are optional. Pre-v0.7.2
-            // agents omit both and decode as (0, []) — host treats
-            // version=0 as "old agent, no capability negotiation".
-            let protocolVersion = json["protocol_version"] as? Int ?? 0
-            let capabilities = (json["capabilities"] as? [String]) ?? []
-            return .ready(protocolVersion: protocolVersion, capabilities: capabilities)
-        case "output":
-            guard let id = json["id"] as? String,
-                  let streamStr = json["stream"] as? String,
-                  let stream = OutputStream(rawValue: streamStr),
-                  let outputData = json["data"] as? String
-            else {
-                throw LuminaError.protocolError("Malformed output message")
-            }
-            // Backward-compatible binary-output envelope. Old guests never set
-            // "encoding" → treated as UTF-8 text. New guests emitting non-UTF-8
-            // chunks set "encoding":"base64" and base64-encode the bytes in the
-            // "data" string.
-            if let encoding = json["encoding"] as? String, encoding == "base64" {
-                guard let bytes = Data(base64Encoded: outputData) else {
-                    throw LuminaError.protocolError("Malformed base64 output data")
-                }
-                return .outputBinary(id: id, stream: stream, bytes: bytes)
-            }
-            return .output(id: id, stream: stream, data: outputData)
-        case "exit":
-            guard let id = json["id"] as? String,
-                  let code = json["code"] as? Int else {
-                throw LuminaError.protocolError("Malformed exit message: missing id or code")
-            }
-            return .exit(id: id, code: Int32(code))
-        case "heartbeat":
-            return .heartbeat
-        case "upload_ack":
-            guard let seq = json["seq"] as? Int else {
-                throw LuminaError.protocolError("Malformed upload_ack: missing seq")
-            }
-            return .uploadAck(seq: seq)
-        case "upload_done":
-            guard let path = json["path"] as? String else {
-                throw LuminaError.protocolError("Malformed upload_done: missing path")
-            }
-            return .uploadDone(path: path)
-        case "upload_error":
-            guard let path = json["path"] as? String,
-                  let errorStr = json["error"] as? String else {
-                throw LuminaError.protocolError("Malformed upload_error: missing path/error")
-            }
-            return .uploadError(path: path, error: errorStr)
-        case "download_data":
-            guard let path = json["path"] as? String,
-                  let dataStr = json["data"] as? String,
-                  let seq = json["seq"] as? Int,
-                  let eof = json["eof"] as? Bool else {
-                throw LuminaError.protocolError("Malformed download_data: missing fields")
-            }
-            return .downloadData(path: path, data: dataStr, seq: seq, eof: eof)
-        case "download_error":
-            guard let path = json["path"] as? String,
-                  let errorStr = json["error"] as? String else {
-                throw LuminaError.protocolError("Malformed download_error: missing path/error")
-            }
-            return .downloadError(path: path, error: errorStr)
-        case "network_ready":
-            let ip = json["ip"] as? String ?? ""
-            let configMs = json["config_ms"] as? Int ?? 0
-            let stage = json["stage"] as? String ?? ""
-            // Absent on pre-v0.7.3 agents, which wrote resolv.conf without
-            // checking. Defaulting to true keeps them quiet rather than
-            // warning about a condition we cannot observe.
-            let dnsOk = json["dns_ok"] as? Bool ?? true
-            return .networkReady(ip: ip, configMs: configMs, stage: stage, dnsOk: dnsOk)
-        case "network_error":
-            let reason = json["reason"] as? String ?? "unspecified"
-            let attempts = json["attempts"] as? Int ?? 0
-            return .networkError(reason: reason, attempts: attempts)
-        case "network_metrics":
-            let raw = json["interfaces"] as? [String: [String: Any]] ?? [:]
-            var ifaces: [String: InterfaceCounters] = [:]
-            for (name, fields) in raw {
-                func u64(_ key: String) -> UInt64 {
-                    if let v = fields[key] as? UInt64 { return v }
-                    if let v = fields[key] as? Int, v >= 0 { return UInt64(v) }
-                    if let v = fields[key] as? NSNumber { return v.uint64Value }
-                    return 0
-                }
-                ifaces[name] = InterfaceCounters(
-                    rxBytes: u64("rx_bytes"),
-                    txBytes: u64("tx_bytes"),
-                    rxErrors: u64("rx_errors"),
-                    txErrors: u64("tx_errors"),
-                    rxPackets: u64("rx_packets"),
-                    txPackets: u64("tx_packets")
-                )
-            }
-            return .networkMetrics(interfaces: ifaces)
-        case "pty_output":
-            guard let id = json["id"] as? String,
-                  let outputData = json["data"] as? String else {
-                throw LuminaError.protocolError("Malformed pty_output: missing id or data")
-            }
-            return .ptyOutput(id: id, data: outputData)
-        case "port_forward_ready":
-            guard let guestPort = json["guest_port"] as? Int,
-                  let vsockPort = json["vsock_port"] as? Int else {
-                throw LuminaError.protocolError("port_forward_ready missing fields")
-            }
-            return .portForwardReady(guestPort: guestPort, vsockPort: vsockPort)
-        case "port_forward_error":
-            guard let guestPort = json["guest_port"] as? Int else {
-                throw LuminaError.protocolError("port_forward_error missing guest_port")
-            }
-            let reason = json["reason"] as? String ?? "unspecified"
-            return .portForwardError(guestPort: guestPort, reason: reason)
-        default:
+        let line = data.prefix(while: { $0 != UInt8(ascii: "\n") })
+        let f: GuestFrame
+        do {
+            f = try JSONDecoder().decode(GuestFrame.self, from: line)
+        } catch {
             // Forward compatibility: a frame this host has never heard of must
             // not be fatal. Throwing here reached handleDispatcherError, which
             // tears down the dispatcher for the whole VM and fails every
             // in-flight exec, PTY and transfer on it — so one new frame from a
-            // newer guest bricked a running VM. The `ready` handshake already
-            // carries protocol_version and capabilities for real negotiation.
-            // Malformed *known* types still throw, above.
-            return .unknown(type: type)
+            // newer guest bricked a running VM. Malformed *known* types still throw.
+            if let type = try? JSONDecoder().decode(FrameType.self, from: line).type, !knownGuestTypes.contains(type) {
+                return .unknown(type: type)
+            }
+            throw LuminaError.protocolError("Invalid JSON in guest message")
+        }
+
+        switch f.type {
+        case "ready":
+            return .ready(protocolVersion: f.protocol_version ?? 0)
+        case "output":
+            let (id, stream, text) = (try f.need(f.id), try f.need(f.stream), try f.need(f.data))
+            // Old guests never set "encoding" → UTF-8 text. New guests emitting
+            // non-UTF-8 chunks set "encoding":"base64".
+            guard f.encoding == "base64" else { return .output(id: id, stream: stream, data: text) }
+            guard let bytes = Data(base64Encoded: text) else {
+                throw LuminaError.protocolError("Malformed base64 output data")
+            }
+            return .outputBinary(id: id, stream: stream, bytes: bytes)
+        case "exit":
+            return .exit(id: try f.need(f.id), code: Int32(try f.need(f.code)))
+        case "heartbeat":
+            return .heartbeat
+        case "upload_ack":
+            return .uploadAck(seq: try f.need(f.seq))
+        case "upload_done":
+            return .uploadDone(path: try f.need(f.path))
+        case "upload_error":
+            return .uploadError(path: try f.need(f.path), error: try f.need(f.error))
+        case "download_data":
+            return .downloadData(path: try f.need(f.path), data: try f.need(f.data), seq: try f.need(f.seq), eof: try f.need(f.eof))
+        case "download_error":
+            return .downloadError(path: try f.need(f.path), error: try f.need(f.error))
+        case "network_ready":
+            // dns_ok is absent on pre-v0.7.3 agents, which wrote resolv.conf
+            // without checking. Defaulting to true keeps them quiet rather than
+            // warning about a condition we cannot observe.
+            return .networkReady(ip: f.ip ?? "", configMs: f.config_ms ?? 0, stage: f.stage ?? "", dnsOk: f.dns_ok ?? true)
+        case "network_error":
+            return .networkError(reason: f.reason ?? "unspecified", attempts: f.attempts ?? 0)
+        case "network_metrics":
+            return .networkMetrics(interfaces: f.interfaces ?? [:])
+        case "pty_output":
+            return .ptyOutput(id: try f.need(f.id), data: try f.need(f.data))
+        case "port_forward_ready":
+            return .portForwardReady(guestPort: try f.need(f.guest_port), vsockPort: try f.need(f.vsock_port))
+        case "port_forward_error":
+            return .portForwardError(guestPort: try f.need(f.guest_port), reason: f.reason ?? "unspecified")
+        default:
+            return .unknown(type: f.type)
         }
     }
 }

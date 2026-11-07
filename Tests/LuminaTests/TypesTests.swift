@@ -75,8 +75,8 @@ import Testing
 
 @Test func guestMessageHeartbeatEquality() {
     #expect(GuestMessage.heartbeat == GuestMessage.heartbeat)
-    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 0, capabilities: []))
-    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 1, capabilities: ["pty"]))
+    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 0))
+    #expect(GuestMessage.heartbeat != GuestMessage.ready(protocolVersion: 1))
 }
 
 @Test func runOptionsWorkingDirectoryDefaultNil() {

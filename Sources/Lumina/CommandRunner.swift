@@ -155,7 +155,7 @@ final class CommandRunner: @unchecked Sendable {
             setState(.disconnected)
             throw .protocolError("Failed to decode guest message: \(error)")
         }
-        guard case .ready(let protocolVersion, _) = msg else {
+        guard case .ready(let protocolVersion) = msg else {
             setState(.disconnected)
             throw .protocolError("Expected ready message, got: \(msg)")
         }
