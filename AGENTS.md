@@ -26,6 +26,32 @@ chunks.
 image is missing; a piped caller still gets
 `{"error": "connection_failed", "error_detail": "image '<name>' not found"}`.
 
+**Warm daemon by default.** When `lumina daemon serve` (or the LaunchAgent
+from `lumina daemon install`) is running, `lumina run` routes through it in
+~20 ms instead of booting cold, as long as the pool's image, memory and CPU
+count match and no `--volume` or disk size is requested. `LUMINA_DAEMON=0`
+forces the cold path. The daemon needs stdin read to EOF up front, so a
+run whose stdin is a pipe with no data and no EOF within 50 ms boots cold
+and streams stdin instead of waiting. A request that reached the daemon
+is never re-run cold: a daemon-side failure comes back as an error
+envelope.
+
+**`lumina session save <sid> <image>`** flushes the session's disk and
+saves it as a new image.
+
+**Guest clock.** The guest resyncs its clock from the RTC before each exec
+when it has drifted by 2 s or more, so a session that sat idle across a
+host sleep no longer reports stale times.
+
+**CLI errors.** Parse errors emit `{"error": "usage_error"}` and exit 64;
+runtime failures in commands without an envelope emit
+`{"error": "failed", "message": ...}`.
+
+**Desktop.** The app no longer offers a macOS tile or IPSW drop target, and
+the agent image catalog is gone: neither could produce a working result
+(a restored macOS bundle cannot be booted yet, and no catalog image was
+ever published). `lumina desktop install-macos` remains for experiments.
+
 ## v0.7.3 deltas
 
 ### Guest networking actually works now
@@ -117,7 +143,7 @@ The integration gate that runs, in CI and locally, is `make test-integration` �
 - **Windows 11 ARM** uses USB mass-storage for the installer ISO (`EFIBootConfig.preferUSBCDROM = true` for `osFamily == .windows`) instead of virtio-block; fixes "Windows cannot find media." `EFIBootConfig.installPhase` flips the primary disk sync mode to `.fsync` during first install for ~2× faster partman; reverts to `.full` on subsequent boots.
 - **Guest agent split** — `main.go` is now 48 lines (accept loop only); state lives in `*Manager` structs under `Guest/lumina-agent/internal/`. Heartbeat failure now also kills active PTY process groups (previously leaked).
 - **Idle-TTL sessions** — `lumina session start --ttl 30m` auto-shuts-down when idle (no client activity + zero active execs) for the TTL window. Default `0` disables.
-- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each card/row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove". v0.7.1 also: tap anywhere on the row/card to launch in Terminal (no button-hunt); the section now respects the global LayoutPicker and offers full grid/list parity with the VM library (`ImageCard` + `CatalogCard` match `VMCard`'s dimensions). Catalog entries support tap-to-pull, with dimmed state while another pull is in flight.
+- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each card/row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove". v0.7.1 also: tap anywhere on the row/card to launch in Terminal (no button-hunt); the section now respects the global LayoutPicker and offers full grid/list parity with the VM library (`ImageCard` matches `VMCard`'s dimensions).
 - **Desktop tap-to-boot + auto-boot on create.** Clicking a stopped/crashed VM's card or row now opens the VM window AND kicks off `session.boot()` in one gesture — no intermediate "click BOOT" screen. The New-VM wizard does the same on completion: finish the wizard, the VM window is already open and booting. Re-entry guard (`Status.canBoot`) keeps concurrent taps idempotent.
 - **Boot-phase UI waterfall (new).** During the Desktop booting screen, a live SwiftUI waterfall renders each phase (`image resolve → disk clone → config build → vz start → vsock connect → guest agent ready`) as a proportional bar, filling in as phases complete (polled at 150ms from `await vm.bootPhases`). Same waterfall appears post-mortem on the crashed screen so you can see which phase was running when the VM fell over. EFI-path guests render a 3-bar subset (only `configMs`, `vzStartMs`, `totalMs` populate); the view self-gates on `BootPhases.isValid`.
 - **NetworkMode** — `manifest.json` can carry `"networkMode": {"mode": "nat"}` (default) or `"networkMode": {"mode": "bridged", "interfaceIdentifier": "en0"}`. Bridged requires `com.apple.vm.networking` entitlement (paid Apple Developer Program); ad-hoc builds reject the config at `validate()`.
@@ -328,8 +354,7 @@ user-picked catalog ISO through SHA-256 before creating the VM and refuses
 mismatches. `lumina desktop create --iso` (CLI path) does not yet verify —
 if you're scripting and integrity matters, `shasum -a 256` the file
 yourself before passing it to `--iso`, or drive creation through the app.
-BYO / Windows-MSA / Apple-IPSW paths have no catalog digest to check
-against — Apple IPSWs are signed and verified by `VZMacOSRestoreImage`.
+BYO and Windows-MSA paths have no catalog digest to check against.
 
 #### Windows 11 ARM caveats
 

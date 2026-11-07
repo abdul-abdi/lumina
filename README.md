@@ -31,7 +31,6 @@ v0.6.0 shipped a headless agent runtime: boot a Linux VM, run a command, get str
 
 - 🐧 **Linux desktop guests** — Ubuntu, Kali, Fedora, Debian ARM64 ISOs boot through `VZEFIBootLoader`
 - 🪟 **Windows 11 on ARM** — retail ISO install flow
-- 🍎 **macOS guests** — IPSW-restored `VZMacOSVirtualMachine` (needs Apple Silicon host)
 - 🖥 **Lumina Desktop.app** — a SwiftUI library + wizard + per-VM windows, with ⌘K fuzzy launcher, live per-card disk sparklines, drag-drop ISOs, native fullscreen, and a brand-aware look per guest OS (Ubuntu orange, Kali cyber blue, Windows MS blue, macOS silver, …)
 - 🔒 **Catalog ISO integrity** — the wizard streams user-picked catalog ISOs through SHA-256 before creating the VM and refuses partial or tampered downloads
 - 🎨 **Ad-hoc signed build** — no Apple Developer Program account required. Notarization scaffolding is in place (per-cert-class entitlement selection in `scripts/build-app.sh`); the hosted CI switch from ad-hoc to notarized Developer ID waits on Apple Developer Program enrollment and is tracked as a v0.7.2 follow-up.
@@ -66,7 +65,7 @@ Hardening changes that make "every ARM64 OS boots cleanly, every time" closer to
 
 - **Tap a VM card → it boots.** Clicking a stopped or crashed VM in the library opens its window and kicks off `boot()` in one gesture — no intermediate "click BOOT" screen. Same behavior on grid cards and list rows. The "Create VM" wizard auto-boots on completion — finish the wizard, the VM window is already open and booting.
 - **Live boot-phase waterfall.** During `.booting`, a SwiftUI waterfall renders each boot phase as a proportional colored bar, filling in live as phases complete (polled at 150ms). Post-mortem version on the crashed screen shows which phase was running when the VM fell over. EFI guests render a 3-bar subset; the view auto-elides zero-ms phases.
-- **Agent Images parity.** The Agent Images section now follows the same grid/list toggle as the VM library. Click any installed image → opens `lumina session start --image <name>` in your preferred terminal. Click a catalog entry → pulls with SHA-256 verification. Hover reveals the action button; cards match `VMCard` visual weight.
+- **Agent Images parity.** The Agent Images section now follows the same grid/list toggle as the VM library. Click any installed image → opens `lumina session start --image <name>` in your preferred terminal. Hover reveals the action button; cards match `VMCard` visual weight.
 
 **Operations (new):**
 
@@ -205,7 +204,24 @@ lumina session list && lumina session stop $SID
 there has been no client activity **and** no active execs for the interval.
 Default is `0` (never auto-stop). Live execs and PTYs prevent shutdown.
 
-### Desktop VMs — install Ubuntu, Kali, Windows 11 ARM, macOS
+`lumina session save <sid> <image>` flushes the session's disk and saves it
+as a new image, so the next `run --image <image>` starts from that state.
+
+### Warm daemon — ~20 ms runs
+
+```bash
+lumina daemon install             # LaunchAgent: keeps 2 VMs warm, restarts on crash
+lumina daemon serve --size 4      # or run it in the foreground
+lumina run "echo hi"              # routes through the daemon automatically
+lumina daemon status && lumina daemon uninstall
+```
+
+While a daemon is running, `lumina run` uses it whenever the pool shape
+(image, memory, CPUs) matches and no `--volume` or disk size is asked for;
+anything else boots cold. Set `LUMINA_DAEMON=0` to always boot cold. Each
+warm VM holds its memory (1 GB by default) while idle.
+
+### Desktop VMs — install Ubuntu, Kali, Fedora, Debian, Windows 11 ARM, Omarchy
 
 ```bash
 # Create a bundle + stage an installer ISO
@@ -220,9 +236,6 @@ lumina desktop boot ~/.lumina/desktop-vms/<uuid> --headless --serial out.log
 # (cloud-init NoCloud). scripts/omarchy-vm.sh uses it to install Omarchy.
 scripts/omarchy-vm.sh omarchy        # then boot "omarchy" in Lumina.app
 
-# macOS guests — restore from IPSW (needs ~15GB)
-lumina desktop install-macos ~/.lumina/desktop-vms/<uuid> --ipsw ./UniversalMac.ipsw
-
 # List everything (shares state with the app)
 lumina desktop ls
 ```
@@ -236,15 +249,12 @@ Open `/Applications/Lumina.app` — or press **⌘K** once it's running to fuzzy
 | ⌘K         | Command launcher — type a VM name, hit Enter, it boots  |
 | ⌘N         | New VM wizard (v0.7.1: auto-boots the VM on completion) |
 | Click card | Open VM window + boot it in one action (v0.7.1)         |
-| ⌘B / ⌘.    | Boot / Stop selected VM                                 |
-| ⌘R         | Restart selected VM                                     |
-| ⌘T         | Take snapshot                                           |
 | ⌘⌃F        | Fullscreen the running VM                               |
 | ⌘1 / ⌘2    | Grid / List layout                                      |
 | ⌘,         | Preferences                                             |
 | ⌘/         | Keyboard shortcuts                                      |
 
-Drag any `.iso`, `.img`, or `.ipsw` onto the window → wizard opens pre-filled.
+Drag any `.iso` or `.img` onto the window → wizard opens pre-filled.
 
 Full CLI reference lives in the [wiki](https://github.com/abdul-abdi/lumina/wiki/CLI-Reference).
 
@@ -316,6 +326,7 @@ When stdout or stderr contained bytes that are not valid UTF-8, `stdout_bytes` /
 | `LUMINA_TIMEOUT`   | Command timeout               | `60s`                       |
 | `LUMINA_DISK_SIZE` | Rootfs size                   | image default               |
 | `LUMINA_FORMAT`    | `json` / `text`               | auto (JSON piped, text TTY) |
+| `LUMINA_DAEMON`    | `0` disables daemon routing   | route when a daemon runs    |
 
 For `lumina run`, resources come from env vars only. For `lumina session start` and `lumina desktop create`, flags (`--memory`, `--cpus`, `--disk-size`, `--forward`) override env vars.
 
@@ -396,7 +407,7 @@ swift scripts/generate-icon.swift  # regenerate AppIcon.icns
 ```
 Sources/
 ├── Lumina/                 — headless agent runtime (zero external deps)
-├── LuminaBootable/         — EFI + IPSW boot pipelines, DesktopOSCatalog
+├── LuminaBootable/         — EFI boot pipeline, unattended-install seeds, DesktopOSCatalog
 ├── LuminaDesktopKit/       — SwiftUI primitives: AppModel, LibraryView, VMCard, ⌘K launcher, OSBrand
 ├── LuminaDesktopApp/       — @main entry for Lumina.app (SPM-buildable)
 └── lumina-cli/             — unified CLI (agent + desktop)
