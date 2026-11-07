@@ -344,7 +344,7 @@ struct PreferencesView: View {
                 ))
             Text("Lumina Desktop")
                 .font(.title3.weight(.semibold))
-            Text("v0.7.1")
+            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
                 .foregroundStyle(.secondary)
             Text("Native Apple Workload Runtime for Agents")
                 .font(.caption)
