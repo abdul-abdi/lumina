@@ -1,16 +1,17 @@
 #!/bin/bash
 set -euo pipefail
+scale=${LUMINA_RENDER_SCALE:-2}
 apply() {
-  local connector output mode scale
+  local connector output preferred width height
   for connector in /sys/class/drm/card*-*; do
     [[ $(<"$connector/status") == connected ]] || continue
-    mode=$(head -1 "$connector/modes")
-    [[ -n $mode ]] || continue
+    preferred=$(head -1 "$connector/modes")
+    [[ -n $preferred ]] || continue
     output=${connector##*/}
     output=${output#*-}
-    scale=$(hyprctl monitors -j | jq -r --arg o "$output" '.[] | select(.name == $o) | .scale')
-    [[ -n $scale ]] || continue
-    hyprctl eval "hl.monitor({ output = \"$output\", mode = \"$mode@60\", position = \"auto\", scale = $scale })" >/dev/null
+    width=$(awk -v n="${preferred%x*}" -v s="$scale" 'BEGIN { printf "%d", n * s / 2 + 0.5 }')
+    height=$(awk -v n="${preferred#*x}" -v s="$scale" 'BEGIN { printf "%d", n * s / 2 + 0.5 }')
+    hyprctl eval "hl.monitor({ output = \"$output\", mode = \"${width}x${height}@60\", position = \"auto\", scale = $scale })" >/dev/null
   done
 }
 apply
