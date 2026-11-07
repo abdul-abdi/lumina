@@ -108,58 +108,16 @@ public final class SessionServer: @unchecked Sendable {
         // Remove stale socket file
         try? FileManager.default.removeItem(at: socketPath)
 
-        serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard serverFd >= 0 else {
-            throw LuminaError.sessionFailed("Failed to create socket: \(errno)")
-        }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
         let path = socketPath.path
-        let pathBytes = path.utf8CString
-        // sockaddr_un.sun_path is 104 bytes on macOS (including null terminator).
-        // A path longer than 103 bytes would be silently truncated — fail early.
-        guard path.utf8.count <= 103 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed(
-                "Socket path too long (\(path.utf8.count) bytes, max 103): \(path)"
-            )
-        }
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
-                pathBytes.withUnsafeBufferPointer { src in
-                    // src.baseAddress is nil only for an empty buffer; the guard
-                    // above requires a non-empty path (count <= 103) so this is
-                    // defensive, not expected.
-                    guard let base = src.baseAddress else { return }
-                    let count = min(src.count, 104)
-                    dest.update(from: base, count: count)
-                }
-            }
-        }
-
-        let bindResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                Darwin.bind(serverFd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed("Failed to bind socket: \(errno)")
-        }
-
         // Use SOMAXCONN (128 on macOS). A larger backlog has no cost on a
         // Unix domain socket and prevents parallel CLI clients from hanging
         // when their connect() is deferred past the accept queue. The
         // previous value of 5 was observed to hang at ~8 concurrent
         // `lumina exec` invocations against a single session.
-        guard listen(serverFd, Int32(SOMAXCONN)) == 0 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed("Failed to listen on socket: \(errno)")
+        guard let fd = unixListen(path: path, backlog: SOMAXCONN) else {
+            throw LuminaError.sessionFailed("Failed to bind and listen on \(path)")
         }
+        serverFd = fd
 
         // v0.7.1 isolation probe finding: the socket file inherits the
         // process umask (0022 on macOS default), landing as 0755. Any
@@ -211,13 +169,7 @@ public final class SessionServer: @unchecked Sendable {
     /// frees cooperative threads for dispatch.
     public func readMessage(from handle: FileHandle, buffer: inout Data) async throws -> Data {
         while true {
-            // Check if buffer already has a complete line
-            if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let lineEnd = buffer.index(after: newlineIndex)
-                let line = Data(buffer[buffer.startIndex..<lineEnd])
-                buffer.removeSubrange(buffer.startIndex..<lineEnd)
-                return line
-            }
+            if let line = takeLine(from: &buffer) { return line }
 
             let chunk = await Self.asyncReadChunk(fd: handle.fileDescriptor)
             if chunk.isEmpty {
@@ -275,21 +227,8 @@ public final class SessionServer: @unchecked Sendable {
     /// write. With NSFileHandle this crashes the server; with POSIX write()
     /// the error is returned as a Swift error that `try?` can suppress.
     public func writeResponse(_ response: SessionResponse, to handle: FileHandle) throws {
-        let data = try SessionProtocol.encode(response)
-        let fd = handle.fileDescriptor
-        try data.withUnsafeBytes { buffer in
-            guard let base = buffer.baseAddress else { return }
-            var remaining = buffer.count
-            var offset = 0
-            while remaining > 0 {
-                var written: Int
-                repeat { written = Darwin.write(fd, base + offset, remaining) } while written < 0 && errno == EINTR
-                if written <= 0 {
-                    throw LuminaError.sessionFailed("Write failed: \(errno)")
-                }
-                offset += written
-                remaining -= written
-            }
+        guard writeAll(fd: handle.fileDescriptor, data: try SessionProtocol.encode(response)) else {
+            throw LuminaError.sessionFailed("Write failed: \(errno)")
         }
     }
 

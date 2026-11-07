@@ -68,7 +68,6 @@ import Testing
 @Test func connectionStateEquality() {
     #expect(ConnectionState.disconnected == ConnectionState.disconnected)
     #expect(ConnectionState.ready != ConnectionState.failed)
-    #expect(ConnectionState.connecting != ConnectionState.waitingForReady)
     #expect(ConnectionState.failed != ConnectionState.ready)
     #expect(ConnectionState.failed != ConnectionState.disconnected)
     #expect(ConnectionState.failed == ConnectionState.failed)

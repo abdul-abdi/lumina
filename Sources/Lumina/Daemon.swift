@@ -131,7 +131,7 @@ public enum Daemon {
         // "daemon unreachable" and the caller would re-run it cold — an
         // `apt install` or a migration executed twice, silently. Anything that
         // fails after the send must throw.
-        guard let respLine = try await asyncReadLine(fd: fd) else {
+        guard let respLine = await asyncReadLine(fd: fd) else {
             throw LuminaError.sessionFailed(
                 "daemon closed the connection after the request was sent; the command may have run — not retrying"
             )
@@ -178,7 +178,7 @@ public enum Daemon {
             return .unreachable(reason: "write to daemon socket failed")
         }
 
-        guard let respLine = try? await asyncReadLine(fd: fd) else {
+        guard let respLine = await asyncReadLine(fd: fd) else {
             return .unreachable(reason: "no response from daemon (timed out or disconnected)")
         }
         guard let json = try? JSONSerialization.jsonObject(with: respLine) as? [String: Any] else {
@@ -321,7 +321,7 @@ private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath
     defer { Darwin.close(fd) }
 
     // Read one NDJSON line
-    guard let line = try? await asyncReadLine(fd: fd),
+    guard let line = await asyncReadLine(fd: fd),
           let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
           let op = json["op"] as? String
     else { return }
@@ -507,23 +507,24 @@ struct RunResultEnvelope: Codable, Sendable {
 /// Read bytes from `fd` until `\n`, returning the data (without the newline).
 /// Uses `read(2)` on a global DispatchQueue so the cooperative pool is not blocked.
 /// Returns `nil` on EOF or connection close.
-private func asyncReadLine(fd: Int32) async throws -> Data? {
-    return try await withCheckedThrowingContinuation { cont in
+private func asyncReadLine(fd: Int32) async -> Data? {
+    await withCheckedContinuation { cont in
         DispatchQueue.global().async {
             var buffer = Data()
-            var byte = UInt8(0)
+            var chunk = [UInt8](repeating: 0, count: 65_536)
             while true {
-                let n = Darwin.read(fd, &byte, 1)
+                let n = Darwin.read(fd, &chunk, chunk.count)
                 if n <= 0 {
                     // EOF or error
                     cont.resume(returning: buffer.isEmpty ? nil : buffer)
                     return
                 }
-                if byte == 0x0a { // newline
+                if let newline = chunk[0..<n].firstIndex(of: 0x0a) {
+                    buffer.append(contentsOf: chunk[0..<newline])
                     cont.resume(returning: buffer.isEmpty ? nil : buffer)
                     return
                 }
-                buffer.append(byte)
+                buffer.append(contentsOf: chunk[0..<n])
             }
         }
     }
@@ -584,7 +585,7 @@ func acceptBackoffDelay(consecutiveFailures: Int) -> Duration {
 // MARK: - POSIX Unix socket helpers (mirrored from lumi/Pool.swift; internal for testability)
 
 /// Bind and listen on a Unix domain socket. Returns listener fd or nil on failure.
-func unixListen(path: String) -> Int32? {
+func unixListen(path: String, backlog: Int32 = 64) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 { return nil }
     var addr = sockaddr_un()
@@ -602,7 +603,7 @@ func unixListen(path: String) -> Int32? {
         ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, len) }
     }
     if bindRc != 0 { Darwin.close(fd); return nil }
-    if Darwin.listen(fd, 64) != 0 { Darwin.close(fd); return nil }
+    if Darwin.listen(fd, backlog) != 0 { Darwin.close(fd); return nil }
     return fd
 }
 

@@ -1085,7 +1085,7 @@ func integrationSessionExecStdinViaIPC() async throws {
     setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
     let client = SessionClient()
-    client.injectTestSocket(readFd: clientFd, writeFd: clientFd)
+    client.injectTestSocket(fd: clientFd)
     defer { client.disconnect() }
 
     // Send exec for `cat` (echoes stdin until EOF).

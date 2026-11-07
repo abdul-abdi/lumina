@@ -47,7 +47,7 @@ import Testing
 
     // Build a SessionClient with our test socket
     let client = SessionClient()
-    client.injectTestSocket(readFd: fds[0], writeFd: fds[0])
+    client.injectTestSocket(fd: fds[0])
 
     // Write two coalesced NDJSON responses in one write
     let msg1 = try SessionProtocol.encode(SessionResponse.output(stream: .stdout, data: "hello"))
@@ -79,7 +79,7 @@ import Testing
     }
 
     let client = SessionClient()
-    client.injectTestSocket(readFd: fds[0], writeFd: fds[0])
+    client.injectTestSocket(fd: fds[0])
 
     let msg1 = try SessionProtocol.encode(SessionResponse.output(stream: .stdout, data: "line1"))
     let msg2 = try SessionProtocol.encode(SessionResponse.output(stream: .stderr, data: "err"))
