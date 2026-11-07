@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+trap 'kill 0' EXIT
+coproc HOST { exec socat - VSOCK-CONNECT:2:1025; }
+exec 3>&"${HOST[1]}"
+wl-paste -n --watch sh -c 'base64 -w0; echo' >&3 &
+while IFS= read -r line; do
+  printf '%s' "$line" | base64 -d | wl-copy
+done <&"${HOST[0]}"

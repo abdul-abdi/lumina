@@ -134,6 +134,7 @@ final class StdinPumpGate: @unchecked Sendable {
 public actor VM {
     private var virtualMachine: VZVirtualMachine?
     private var commandRunner: CommandRunner?
+    private var clipboard: ClipboardBridge?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
     private let imageStore: ImageStore
@@ -571,6 +572,9 @@ public actor VM {
             if options.sound {
                 attachSoundDevice(to: config)
             }
+            if options.graphics != nil {
+                config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+            }
 
             // v0.7.0 M8: optional Rosetta directory share — Linux guests can
             // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
@@ -623,6 +627,9 @@ public actor VM {
             _bootPhases.totalMs = msSince(phaseStart)
 
             _state = .ready
+            if let socket = vm.socketDevices.first as? VZVirtioSocketDevice {
+                clipboard = ClipboardBridge(socket: socket)
+            }
 
             if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
                 FileHandle.standardError.write(Data((_bootPhases.formatTrace() + "\n").utf8))
@@ -1243,6 +1250,8 @@ public actor VM {
 
     private func shutdownVM() async {
         commandRunner?.close()
+        clipboard?.stop()
+        clipboard = nil
         if let vm = virtualMachine {
             let queue = executor.queue
             let vmBox = UncheckedSendable(vm)

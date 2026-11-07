@@ -1,0 +1,12 @@
+[Unit]
+Description=Share the clipboard with the Mac host
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/lumina-clipboard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
