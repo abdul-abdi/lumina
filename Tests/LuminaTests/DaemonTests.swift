@@ -285,6 +285,7 @@ private final class FakeDaemonServer: @unchecked Sendable {
             }
             guard clientFd >= 0 else { return }
             defer { Darwin.close(clientFd) }
+            disableSigpipe(fd: clientFd)
             guard let line = Self.blockingReadLine(fd: clientFd) else { return }
             if let resp = respond(line) {
                 writeAll(fd: clientFd, data: resp)
