@@ -1117,25 +1117,21 @@ struct Exec: AsyncParsableCommand {
         // If stdin is piped, forward it to the session server concurrently.
         // The server routes each stdin chunk to the in-flight exec via StdinChannel.
         // `stdinClose` signals EOF so the guest command sees its stdin close cleanly.
-        let stdinTask: Task<Void, Never>?
         if isatty(fileno(stdin)) == 0 {
             let handle = FileHandle.standardInput
-            stdinTask = Task.detached {
-                while !Task.isCancelled {
+            spawnBlockingThread("lumina.exec-stdin") {
+                while true {
                     let chunk = handle.availableData
                     if chunk.isEmpty {
                         // EOF — tell the server stdin is done
                         try? client.send(.stdinClose)
-                        break
+                        return
                     }
                     let text = String(decoding: chunk, as: UTF8.self)
                     try? client.send(.stdin(data: text))
                 }
             }
-        } else {
-            stdinTask = nil
         }
-        defer { stdinTask?.cancel() }
 
         let start = ContinuousClock.now
 
@@ -1149,7 +1145,6 @@ struct Exec: AsyncParsableCommand {
                 do {
                     response = try client.receive()
                 } catch {
-                    stdinTask?.cancel()
                     let ms = millisSince(start)
                     printErrorJSON(
                         error,
@@ -1173,7 +1168,6 @@ struct Exec: AsyncParsableCommand {
                     let text = String(decoding: rawBytes, as: UTF8.self)
                     if outputStream == .stdout { stdoutBuf += text } else { stderrBuf += text }
                 case .exit(let code, let durationMs):
-                    stdinTask?.cancel()
                     let r = ResultJSON(
                         stdout: stdoutBuf,
                         stderr: stderrBuf,
@@ -1184,7 +1178,6 @@ struct Exec: AsyncParsableCommand {
                     if code != 0 { throw ExitCode(code) }
                     return
                 case .error(let message):
-                    stdinTask?.cancel()
                     let ms = millisSince(start)
                     let state = errorStateForExecMessage(message)
                     printErrorJSON(
@@ -1208,7 +1201,6 @@ struct Exec: AsyncParsableCommand {
                     let fd = outputStream == .stdout ? FileHandle.standardOutput : FileHandle.standardError
                     fd.write(Data(data.utf8))
                 case .exit(let code, _):
-                    stdinTask?.cancel()
                     if code != 0 { throw ExitCode(code) }
                     return
                 case .outputBytes(let outputStream, let base64):
@@ -1221,7 +1213,6 @@ struct Exec: AsyncParsableCommand {
                         : FileHandle.standardError
                     fd.write(rawBytes)
                 case .error(let message):
-                    stdinTask?.cancel()
                     FileHandle.standardError.write(Data("lumina: \(message)\n".utf8))
                     throw ExitCode.failure
                 default:
@@ -1285,16 +1276,15 @@ struct Exec: AsyncParsableCommand {
 
         // Stdin pump: raw bytes from fd 0 → base64 pty_input frames.
         // `availableData` blocks until data is ready or EOF; on EOF we stop.
-        let stdinPtyTask = Task.detached { [client] in
+        spawnBlockingThread("lumina.pty-stdin") { [client] in
             let handle = FileHandle.standardInput
-            while !Task.isCancelled {
+            while true {
                 let chunk = handle.availableData
-                if chunk.isEmpty { break } // EOF — host-side stdin closed
+                if chunk.isEmpty { return } // EOF — host-side stdin closed
                 let base64 = chunk.base64EncodedString()
                 try? client.send(.ptyInput(data: base64))
             }
         }
-        defer { stdinPtyTask.cancel() }
 
         // Output pump: pty_output → raw bytes to stdout, exit → done.
         while true {
@@ -1303,7 +1293,6 @@ struct Exec: AsyncParsableCommand {
                 response = try client.receive()
             } catch {
                 // Connection dropped mid-session — best effort restore and exit.
-                stdinPtyTask.cancel()
                 FileHandle.standardError.write(Data("\r\nlumina: session disconnected\r\n".utf8))
                 throw ExitCode.failure
             }
@@ -1314,11 +1303,9 @@ struct Exec: AsyncParsableCommand {
                     fflush(stdout)
                 }
             case .exit(let code, _):
-                stdinPtyTask.cancel()
                 if code != 0 { throw ExitCode(code) }
                 return
             case .error(let message):
-                stdinPtyTask.cancel()
                 FileHandle.standardError.write(Data("\r\nlumina: \(message)\r\n".utf8))
                 throw ExitCode.failure
             default:

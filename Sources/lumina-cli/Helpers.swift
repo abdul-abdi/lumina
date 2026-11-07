@@ -215,10 +215,14 @@ func resolveStdin() -> Stdin {
     }
     let handle = FileHandle.standardInput
     return .source { @Sendable in
-        // availableData blocks until data is ready or EOF. Returns empty
-        // Data on EOF, which we signal to the pump as nil.
-        let chunk = handle.availableData
-        return chunk.isEmpty ? nil : chunk
+        await withCheckedContinuation { continuation in
+            spawnBlockingThread("lumina.run-stdin") {
+                // availableData blocks until data is ready or EOF. Returns empty
+                // Data on EOF, which we signal to the pump as nil.
+                let chunk = handle.availableData
+                continuation.resume(returning: chunk.isEmpty ? nil : chunk)
+            }
+        }
     }
 }
 
