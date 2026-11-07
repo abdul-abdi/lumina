@@ -203,6 +203,15 @@ func resolveStdin() -> Stdin {
     }
 }
 
+func encodeAndPrint<T: Encodable>(_ value: T, pretty: Bool = false) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = pretty ? [.sortedKeys, .prettyPrinted] : .sortedKeys
+    if let data = try? encoder.encode(value),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+}
+
 /// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.
 /// Uses JSONEncoder which always properly escapes control characters (\n, \r, \t, etc.).
 func printNDJSONLine<T: Encodable>(_ value: T) {

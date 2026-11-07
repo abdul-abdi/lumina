@@ -444,15 +444,6 @@ private func printErrorJSON(
     encodeAndPrint(r)
 }
 
-private func encodeAndPrint<T: Encodable>(_ value: T) {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = .sortedKeys
-    if let data = try? encoder.encode(value),
-       let str = String(data: data, encoding: .utf8) {
-        print(str)
-    }
-}
-
 private func millisSince(_ start: ContinuousClock.Instant) -> Int {
     (ContinuousClock.now - start).totalMilliseconds
 }
@@ -509,12 +500,7 @@ struct ImageList: ParsableCommand {
         let format = resolveOutputFormat()
         switch format {
         case .json:
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            if let data = try? encoder.encode(names),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
+            encodeAndPrint(names)
         case .text:
             if names.isEmpty {
                 print("No images found. Run 'lumina pull' first.")
@@ -612,12 +598,7 @@ struct ImageInspect: ParsableCommand {
             size_bytes: info.sizeBytes,
             created: ISO8601DateFormatter().string(from: info.created)
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        if let data = try? encoder.encode(output),
-           let str = String(data: data, encoding: .utf8) {
-            print(str)
-        }
+        encodeAndPrint(output, pretty: true)
     }
 }
 
@@ -650,12 +631,7 @@ struct ImageCatalog: ParsableCommand {
                     url: e.url.absoluteString, sha256: e.sha256,
                     approximateSize: e.approximateSize, tags: e.tags)
             }
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? enc.encode(rows),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
+            encodeAndPrint(rows, pretty: true)
         case .text:
             if entries.isEmpty {
                 print("No catalog entries match.")
@@ -1610,12 +1586,7 @@ struct VolumeList: ParsableCommand {
         let format = resolveOutputFormat()
         switch format {
         case .json:
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            if let data = try? encoder.encode(names),
-               let str = String(data: data, encoding: .utf8) {
-                print(str)
-            }
+            encodeAndPrint(names)
         case .text:
             if names.isEmpty {
                 print("No volumes.")
@@ -1660,12 +1631,7 @@ struct VolumeInspect: ParsableCommand {
             created: ISO8601DateFormatter().string(from: info.created),
             last_used: ISO8601DateFormatter().string(from: info.lastUsed)
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        if let data = try? encoder.encode(output),
-           let str = String(data: data, encoding: .utf8) {
-            print(str)
-        }
+        encodeAndPrint(output, pretty: true)
     }
 }
 

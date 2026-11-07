@@ -47,12 +47,7 @@ struct Doctor: AsyncParsableCommand {
 
         let wantJSON = json || isatty(fileno(stdout)) == 0
         if wantJSON {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? encoder.encode(report) {
-                FileHandle.standardOutput.write(data)
-                FileHandle.standardOutput.write(Data("\n".utf8))
-            }
+            encodeAndPrint(report, pretty: true)
         } else {
             printHumanReport(report)
         }
