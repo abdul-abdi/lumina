@@ -1151,10 +1151,10 @@ func bootWithEFIProfile_createsVariableStore() async throws {
     close(fd)
 
     var opts = VMOptions.default
-    opts.bootable = .efi(EFIBootConfig(
+    opts.efi = EFIBootConfig(
         variableStoreURL: varsURL,
         primaryDisk: diskURL
-    ))
+    )
     opts.memory = 1024 * 1024 * 1024
     opts.cpuCount = 2
 

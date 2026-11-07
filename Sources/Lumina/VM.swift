@@ -233,25 +233,9 @@ public actor VM {
         }
         _state = .booting
 
-        // v0.7.0 M3: route non-agent profiles off the hot agent path.
-        // The .agent case is a single-cmp-and-branch before falling through
-        // to the v0.6.0 code below — the CI agent-boot P50 gate is the
-        // source of truth on timing.
-        switch options.effectiveBootable {
-        case .agent:
-            break  // fall through to the v0.6.0 agent boot path
-        case .efi(let cfg):
+        if let cfg = options.efi {
             try await bootEFIPath(cfg: cfg)
             return
-        case .macOS:
-            // Library callers with `VMOptions.bootable = .macOS(...)` must
-            // go through `MacOSVM` directly; `VM` drives VZVirtualMachine
-            // and cannot configure a VZMacOSVirtualMachine. The CLI wires
-            // this correctly at DesktopCommand.bootMacOS().
-            _state = .idle
-            throw .bootFailed(underlying: VMError.invalidState(
-                "VM.boot() does not support macOS guests — use MacOSVM directly"
-            ))
         }
 
         // Phase instrumentation — each recordPhase() resets the phase

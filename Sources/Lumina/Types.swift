@@ -160,20 +160,7 @@ public struct GraphicsConfig: Sendable {
     }
 }
 
-// MARK: - v0.7.0 M3: Bootable profiles
-
-/// Identifier for a headless agent image in `~/.lumina/images/<name>/`.
-///
-/// Thin wrapper so callers can round-trip the name through `BootableProfile`
-/// without plucking it out of `VMOptions.image` (which survives for backwards
-/// compatibility but is derived from this value going forward).
-public struct AgentImageRef: Sendable, Equatable {
-    public let image: String
-
-    public init(image: String) {
-        self.image = image
-    }
-}
+// MARK: - v0.7.0 M3: Boot configs
 
 /// Configuration for a VZEFIBootLoader-based guest (Linux ISO boot, Windows 11 ARM).
 ///
@@ -285,19 +272,6 @@ public struct MacOSBootConfig: Sendable, Equatable {
     }
 }
 
-/// Describes how a VM should boot.
-///
-/// `.agent` preserves the v0.6.0 headless contract (Linux kernel + initrd +
-/// lumina-agent + vsock). `.efi` and `.macOS` are the v0.7.0 full-OS paths.
-/// When `VMOptions.bootable` is nil, `effectiveBootable` derives
-/// `.agent(AgentImageRef(image: options.image))` so agent callers never have
-/// to populate this field.
-public enum BootableProfile: Sendable, Equatable {
-    case agent(AgentImageRef)
-    case efi(EFIBootConfig)
-    case macOS(MacOSBootConfig)
-}
-
 // MARK: - v0.7.0 M4: Audio
 
 /// Optional virtio sound device for desktop guests. nil = no sound device.
@@ -352,24 +326,9 @@ public struct VMOptions: Sendable {
     /// nil = no sound device (agent-path-safe).
     public var sound: SoundConfig?
 
-    /// v0.7.0 M3: optional override for how this VM boots. `nil` means "use
-    /// the headless agent path with `image`." Non-nil wins over `image`.
-    ///
-    /// Regression-gate invariant: the agent cold-boot path cannot read any
-    /// `.efi` / `.macOS` code. The VM actor consults this property only when
-    /// building the VZ configuration — never on the agent fast path.
-    public var bootable: BootableProfile?
-
-    /// Resolves `bootable` to a concrete profile.
-    ///
-    /// Returns `bootable` if set; otherwise falls back to
-    /// `.agent(AgentImageRef(image: self.image))`. Call sites that dispatch
-    /// on the profile (e.g. `VM.boot()`) use this to keep the agent path
-    /// implicit.
-    public var effectiveBootable: BootableProfile {
-        if let b = bootable { return b }
-        return .agent(AgentImageRef(image: image))
-    }
+    /// v0.7.0 M3: optional EFI boot. `nil` means "use the headless agent
+    /// path with `image`." Non-nil wins over `image`.
+    public var efi: EFIBootConfig?
 
     public static let `default` = VMOptions()
 
@@ -385,7 +344,7 @@ public struct VMOptions: Sendable {
         rosetta: Bool = false,
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
-        bootable: BootableProfile? = nil,
+        efi: EFIBootConfig? = nil,
         sound: SoundConfig? = nil,
         macAddress: String? = nil,
         serialLogURL: URL? = nil
@@ -401,7 +360,7 @@ public struct VMOptions: Sendable {
         self.rosetta = rosetta
         self.diskSize = diskSize
         self.graphics = graphics
-        self.bootable = bootable
+        self.efi = efi
         self.sound = sound
         self.macAddress = macAddress
         self.serialLogURL = serialLogURL
@@ -423,7 +382,7 @@ public struct VMOptions: Sendable {
         self.graphics = nil
         // Disposable `run` always takes the agent path — the CLI has no way
         // to build a .luminaVM bundle in one shot today.
-        self.bootable = nil
+        self.efi = nil
         // Disposable `run` is headless; no audio.
         self.sound = nil
         // Disposable `run` is one-shot; no benefit from a stable MAC.
