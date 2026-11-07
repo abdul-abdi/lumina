@@ -112,13 +112,11 @@ import Testing
     let cfg = EFIBootConfig(
         variableStoreURL: tmp.appendingPathComponent("efi.vars"),
         primaryDisk: tmp.appendingPathComponent("disk.img"),
-        cdromISO: tmp.appendingPathComponent("cd.iso"),
-        extraDisks: [tmp.appendingPathComponent("data.img")]
+        cdromISO: tmp.appendingPathComponent("cd.iso")
     )
     #expect(cfg.variableStoreURL.lastPathComponent == "efi.vars")
     #expect(cfg.primaryDisk.lastPathComponent == "disk.img")
     #expect(cfg.cdromISO?.lastPathComponent == "cd.iso")
-    #expect(cfg.extraDisks.count == 1)
 }
 
 @Test func efiBootConfig_optionalCdromNil() {
@@ -128,7 +126,6 @@ import Testing
         primaryDisk: tmp.appendingPathComponent("d")
     )
     #expect(cfg.cdromISO == nil)
-    #expect(cfg.extraDisks.isEmpty)
 }
 
 @Test func macOSBootConfig_storesPaths() {
@@ -150,33 +147,11 @@ import Testing
     #expect(opts.efi == nil)
 }
 
-// MARK: - v0.7.0 M4 — SoundConfig
+// MARK: - v0.7.0 M4 — sound
 
-@Test func soundConfig_defaultStreamCount() {
-    let s = SoundConfig(enabled: true)
-    #expect(s.enabled)
-    #expect(s.streamCount == 1)
-}
-
-@Test func soundConfig_disabledIsValid() {
-    let s = SoundConfig(enabled: false)
-    #expect(!s.enabled)
-}
-
-@Test func soundConfig_explicitStreamCount() {
-    let s = SoundConfig(enabled: true, streamCount: 2)
-    #expect(s.streamCount == 2)
-}
-
-@Test func vmOptions_defaultSoundIsNil() {
+@Test func vmOptions_defaultSoundIsOff() {
     let o = VMOptions.default
-    #expect(o.sound == nil)
-}
-
-@Test func vmOptions_canSetSound() {
-    var o = VMOptions.default
-    o.sound = SoundConfig(enabled: true)
-    #expect(o.sound?.enabled == true)
+    #expect(o.sound == false)
 }
 
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {

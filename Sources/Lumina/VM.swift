@@ -41,16 +41,9 @@ actor VmnetBridgeRegistry {
     ///
     /// Precondition: `candidates` is non-empty.
     func claim(
-        mac: UInt8?,
+        mac: UInt8,
         candidates: [(gateway: String, subnetPrefix: String, name: String)]
     ) -> (gateway: String, subnetPrefix: String, name: String) {
-        guard let mac else {
-            // No MAC hint — caller is pre-v0.7.1 agent path. Legacy
-            // behaviour: first candidate. Don't record a claim; we
-            // have no stable identity to key on.
-            return candidates[0]
-        }
-
         // If this MAC already claimed a bridge, return it (idempotent
         // for the polling loop, re-connects, etc.). Drop the claim
         // transparently if the bridge has gone away between calls.
@@ -427,8 +420,8 @@ public actor VM {
         if let graphics = options.graphics {
             attachGraphicsDevices(to: config, graphics: graphics)
         }
-        if let sound = options.sound, sound.enabled {
-            attachSoundDevice(to: config, sound: sound)
+        if options.sound {
+            attachSoundDevice(to: config)
         }
 
         do {
@@ -648,8 +641,8 @@ public actor VM {
             if let graphics = options.graphics {
                 attachGraphicsDevices(to: config, graphics: graphics)
             }
-            if let sound = options.sound, sound.enabled {
-                attachSoundDevice(to: config, sound: sound)
+            if options.sound {
+                attachSoundDevice(to: config)
             }
 
             // v0.7.0 M8: optional Rosetta directory share — Linux guests can
@@ -1128,7 +1121,7 @@ public actor VM {
         // VM already holds .64. Falling back silently was the worst case: the
         // guest installs a .64 address and route, verifies its own handiwork,
         // and reports ready — a plausible address that routes nothing.
-        let discovered = await Self.discoverVmnetGateway(macLastByte: self.macLastByte)
+        let discovered = await Self.discoverVmnetGateway(macLastByte: lastByte)
         if discovered == nil {
             FileHandle.standardError.write(Data(
                 "[lumina] warning: could not read a vmnet bridge address; assuming 192.168.64.1. If vmnet chose another subnet this VM will not reach the network — `lumina doctor` lists the bridges.\n".utf8
@@ -1174,7 +1167,7 @@ public actor VM {
     /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
     /// be needed for a fully correct multi-VM implementation.
     private static func discoverVmnetGateway(
-        macLastByte: UInt8? = nil
+        macLastByte: UInt8
     ) async -> (gateway: String, subnetPrefix: String)? {
         // Poll up to 300ms in 25ms increments. The bridge IPv4 typically appears
         // within 50ms of boot; 300ms gives comfortable headroom.
@@ -1196,9 +1189,7 @@ public actor VM {
     /// Single-bridge case: return the one bridge, no ambiguity.
     /// Multi-bridge case: consult `VmnetBridgeRegistry`, which records
     /// first-come claims by MAC last byte so concurrent VM boots in the
-    /// same process don't double-assign. If the registry is short-
-    /// circuited (nil MAC), falls back to the first candidate — the
-    /// legacy behaviour that pre-v0.7.1 callers relied on.
+    /// same process don't double-assign.
     ///
     /// Sorted by bridge name so the candidate order is stable across
     /// discovery polls; the registry's first-come claim then becomes
@@ -1209,7 +1200,7 @@ public actor VM {
     /// legacy heuristic — that needs a host-level lock (or vmnet's
     /// private MAC→bridge mapping API) and is out of scope.
     static func discoverVmnetGatewayOnce(
-        preferringMAC macLastByte: UInt8? = nil
+        preferringMAC macLastByte: UInt8
     ) async -> (gateway: String, subnetPrefix: String)? {
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0, let head = ifap else { return nil }
@@ -1595,22 +1586,14 @@ struct UncheckedSendable<T>: @unchecked Sendable {
 
 // MARK: - Sound (v0.7.0 M4, agent-path-neutral)
 
-/// Attach a `VZVirtioSoundDeviceConfiguration` with `sound.streamCount`
-/// output streams. Free function so it doesn't pull anything into the
-/// agent path until `options.sound` is non-nil. `internal` so MacOSVM
-/// (same target) can reuse it.
-internal func attachSoundDevice(
-    to config: VZVirtualMachineConfiguration,
-    sound: SoundConfig
-) {
+/// Attach a `VZVirtioSoundDeviceConfiguration` with one output stream.
+/// Free function so it doesn't pull anything into the agent path until
+/// `options.sound` is set. `internal` so MacOSVM (same target) can reuse it.
+internal func attachSoundDevice(to config: VZVirtualMachineConfiguration) {
     let device = VZVirtioSoundDeviceConfiguration()
-    var streams: [VZVirtioSoundDeviceStreamConfiguration] = []
-    for _ in 0..<max(1, sound.streamCount) {
-        let output = VZVirtioSoundDeviceOutputStreamConfiguration()
-        output.sink = VZHostAudioOutputStreamSink()
-        streams.append(output)
-    }
-    device.streams = streams
+    let output = VZVirtioSoundDeviceOutputStreamConfiguration()
+    output.sink = VZHostAudioOutputStreamSink()
+    device.streams = [output]
     var existing = config.audioDevices
     existing.append(device)
     config.audioDevices = existing

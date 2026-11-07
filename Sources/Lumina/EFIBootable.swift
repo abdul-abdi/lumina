@@ -90,8 +90,7 @@ public struct EFIBootable: Sendable {
         }
 
         // Storage devices: primary read-write disk, optional CD-ROM
-        // (USB mass-storage when preferred, else virtio block), then any
-        // extra disks.
+        // (USB mass-storage when preferred, else virtio block).
         var storage: [VZStorageDeviceConfiguration] = []
         do {
             let primary = try Self.makePrimaryDiskAttachment(
@@ -127,15 +126,6 @@ public struct EFIBootable: Sendable {
                 ))
             } catch {
                 throw Error.diskAttachmentFailed(extraISO, "\(error)")
-            }
-        }
-
-        for extra in config.extraDisks {
-            do {
-                let att = try VZDiskImageStorageDeviceAttachment(url: extra, readOnly: false)
-                storage.append(VZVirtioBlockDeviceConfiguration(attachment: att))
-            } catch {
-                throw Error.diskAttachmentFailed(extra, "\(error)")
             }
         }
 

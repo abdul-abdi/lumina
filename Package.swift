@@ -5,8 +5,8 @@ import PackageDescription
 // functionally equivalent to
 // v0.6.0 within the CI agent-boot P50 budget — the new v0.7.0 additions
 // (`efi` check, optional `graphics`/`sound` attachments)
-// are guarded single-branch no-ops when `VMOptions.efi`,
-// `VMOptions.graphics`, and `VMOptions.sound` are nil. Nothing in
+// are guarded single-branch no-ops when `VMOptions.efi` and
+// `VMOptions.graphics` are nil and `VMOptions.sound` is false. Nothing in
 // LuminaBootable / LuminaDesktopKit is reachable from
 // `lumina run` or `lumina session start` unless the caller opts in.
 // The agent-boot P50 gate in .github/workflows/ci.yml enforces the

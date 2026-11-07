@@ -232,7 +232,7 @@ public final class LuminaDesktopSession: Identifiable {
 
         var opts = mutableBundle.vmOptions(cdrom: cdromURL, plan: firstBootPlan)
         opts.graphics = GraphicsConfig()
-        opts.sound = SoundConfig(enabled: true)
+        opts.sound = true
 
         // Migrate existing bundles to the Spotlight opt-out applied at
         // VMBundle.create() time. Old bundles pre-dating that change

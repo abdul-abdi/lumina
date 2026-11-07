@@ -152,14 +152,13 @@ public struct GraphicsConfig: Sendable {
 /// Configuration for a VZEFIBootLoader-based guest (Linux ISO boot, Windows 11 ARM).
 ///
 /// The caller supplies URLs for the EFI variable store, primary read-write disk,
-/// optional CD-ROM ISO for installer boots, and any extra virtio block devices.
+/// and optional CD-ROM ISO for installer boots.
 /// `LuminaBootable.EFIBootable` (M3) consumes this to configure a
 /// `VZVirtualMachineConfiguration`.
 public struct EFIBootConfig: Sendable, Equatable {
     public var variableStoreURL: URL
     public var primaryDisk: URL
     public var cdromISO: URL?
-    public var extraDisks: [URL]
     /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration`
     /// instead of the default virtio-block device. Windows 11
     /// ARM setup is picky about media type and refuses to boot from a
@@ -207,7 +206,6 @@ public struct EFIBootConfig: Sendable, Equatable {
         variableStoreURL: URL,
         primaryDisk: URL,
         cdromISO: URL? = nil,
-        extraDisks: [URL] = [],
         preferUSBCDROM: Bool = false,
         installPhase: Bool = false,
         linuxDirectKernel: URL? = nil,
@@ -218,7 +216,6 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
         self.cdromISO = cdromISO
-        self.extraDisks = extraDisks
         self.preferUSBCDROM = preferUSBCDROM
         self.installPhase = installPhase
         self.linuxDirectKernel = linuxDirectKernel
@@ -257,22 +254,6 @@ public struct MacOSBootConfig: Sendable, Equatable {
     }
 }
 
-// MARK: - v0.7.0 M4: Audio
-
-/// Optional virtio sound device for desktop guests. nil = no sound device.
-///
-/// Linux desktop and Windows 11 ARM guests both benefit; agent path leaves
-/// this nil and incurs zero cost.
-public struct SoundConfig: Sendable, Equatable {
-    public var enabled: Bool
-    public var streamCount: Int
-
-    public init(enabled: Bool, streamCount: Int = 1) {
-        self.enabled = enabled
-        self.streamCount = streamCount
-    }
-}
-
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {
@@ -308,8 +289,8 @@ public struct VMOptions: Sendable {
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
     public var graphics: GraphicsConfig?
     /// v0.7.0 M4: optional virtio sound device for desktop guests.
-    /// nil = no sound device (agent-path-safe).
-    public var sound: SoundConfig?
+    /// false = no sound device (agent-path-safe).
+    public var sound: Bool
 
     /// v0.7.0 M3: optional EFI boot. `nil` means "use the headless agent
     /// path with `image`." Non-nil wins over `image`.
@@ -330,7 +311,7 @@ public struct VMOptions: Sendable {
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
         efi: EFIBootConfig? = nil,
-        sound: SoundConfig? = nil,
+        sound: Bool = false,
         macAddress: String? = nil,
         serialLogURL: URL? = nil
     ) {
@@ -369,7 +350,7 @@ public struct VMOptions: Sendable {
         // to build a .luminaVM bundle in one shot today.
         self.efi = nil
         // Disposable `run` is headless; no audio.
-        self.sound = nil
+        self.sound = false
         // Disposable `run` is one-shot; no benefit from a stable MAC.
         self.macAddress = nil
         // Disposable `run` has no bundle; caller can set a specific log
