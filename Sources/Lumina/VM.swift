@@ -1063,10 +1063,6 @@ public actor VM {
         return fd
     }
 
-    /// Configure guest network via host-driven protocol.
-    /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
-    /// and waits for network_ready before returning — ensuring DNS is live for all
-    /// subsequent exec commands.
     /// Confirm every requested share is mounted before the caller's first
     /// command runs. The guest mounts these from init with stderr discarded
     /// and no report back, so a failure produced the worst kind of answer:
@@ -1147,11 +1143,6 @@ public actor VM {
     ///
     /// Returns (gatewayIP, subnetPrefix) e.g. ("192.168.65.1", "192.168.65"), or nil
     /// if no suitable bridge is found within the timeout.
-    ///
-    /// Note: with multiple concurrent VMs each VM gets its own bridge. This heuristic
-    /// picks the first one found, which is correct for sequential boots but may pick
-    /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
-    /// be needed for a fully correct multi-VM implementation.
     private static func discoverVmnetGateway(
         macLastByte: UInt8
     ) async -> (gateway: String, subnetPrefix: String)? {

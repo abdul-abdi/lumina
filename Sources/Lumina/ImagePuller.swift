@@ -67,7 +67,7 @@ public struct ImagePuller: Sendable {
     }
 
     /// Pull the default image from GitHub Releases.
-    /// Downloads the tarball, verifies integrity, extracts vmlinuz + initrd + rootfs.img.
+    /// Downloads the tarball, verifies integrity, extracts vmlinuz + rootfs.img.
     public func pull(
         name requestedName: String = "default",
         progress: @Sendable (_ message: String) -> Void = { _ in }
@@ -203,7 +203,7 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 6. Verify required files exist (initrd is optional for baked images)
+        // 6. Verify required files exist
         let requiredFiles = ["vmlinuz", "rootfs.img"]
         var missingFiles: [String] = []
         for file in requiredFiles {
