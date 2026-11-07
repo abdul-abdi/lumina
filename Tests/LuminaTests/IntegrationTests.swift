@@ -369,7 +369,7 @@ func integrationDirectoryDownload() async throws {
         "mkdir -p /tmp/dl-test/nested && echo aaa > /tmp/dl-test/x.txt && echo bbb > /tmp/dl-test/nested/y.txt && echo ok",
         options: RunOptions(
             timeout: .seconds(30),
-            directoryDownloads: [DirectoryDownload(remotePath: "/tmp/dl-test", localPath: downloadDir)]
+            downloads: [FileDownload(remotePath: "/tmp/dl-test", localPath: downloadDir)]
         )
     )
 

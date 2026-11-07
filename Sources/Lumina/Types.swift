@@ -35,16 +35,6 @@ public struct DirectoryUpload: Sendable {
     }
 }
 
-public struct DirectoryDownload: Sendable {
-    public let remotePath: String
-    public let localPath: URL
-
-    public init(remotePath: String, localPath: URL) {
-        self.remotePath = remotePath
-        self.localPath = localPath
-    }
-}
-
 public struct MountPoint: Sendable {
     public let hostPath: URL
     public let guestPath: String
@@ -82,7 +72,6 @@ public struct RunOptions: Sendable {
     public var uploads: [FileUpload]
     public var downloads: [FileDownload]
     public var directoryUploads: [DirectoryUpload]
-    public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
     public var workingDirectory: String?
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
@@ -118,7 +107,6 @@ public struct RunOptions: Sendable {
         uploads: [FileUpload] = [],
         downloads: [FileDownload] = [],
         directoryUploads: [DirectoryUpload] = [],
-        directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
         diskSize: UInt64? = nil,
@@ -133,7 +121,6 @@ public struct RunOptions: Sendable {
         self.uploads = uploads
         self.downloads = downloads
         self.directoryUploads = directoryUploads
-        self.directoryDownloads = directoryDownloads
         self.mounts = mounts
         self.workingDirectory = workingDirectory
         self.diskSize = diskSize

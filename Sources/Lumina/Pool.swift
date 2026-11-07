@@ -99,7 +99,6 @@ public actor Pool {
         uploads: [FileUpload] = [],
         directoryUploads: [DirectoryUpload] = [],
         downloads: [FileDownload] = [],
-        directoryDownloads: [DirectoryDownload] = [],
         stdin: Stdin = .closed
     ) async throws -> RunResult {
         guard !isShutdown else { throw LuminaError.sessionFailed("Pool is shut down") }
@@ -132,9 +131,6 @@ public actor Pool {
             } else {
                 try await vm.downloadFiles([dl])
             }
-        }
-        for dir in directoryDownloads {
-            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
         }
 
         return result

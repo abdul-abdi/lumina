@@ -53,10 +53,6 @@ public struct Lumina {
                     try await vm.downloadFiles([dl])
                 }
             }
-            // Explicit directory downloads (library API)
-            for dir in options.directoryDownloads {
-                try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
-            }
 
             let totalWallTime = ContinuousClock.now - start
             return RunResult(
@@ -132,9 +128,6 @@ public struct Lumina {
                             } else {
                                 try await vm.downloadFiles([dl])
                             }
-                        }
-                        for dir in options.directoryDownloads {
-                            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
                         }
 
                         continuation.finish()

@@ -10,7 +10,6 @@ import Testing
     #expect(opts.cpuCount == 2)
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
-    #expect(opts.directoryDownloads.isEmpty)
     // v0.7.3: block exec on network_ready by default. The wait costs ~4ms
     // now that the host drives config directly, and opting out fails DNS
     // outright. Regression guard against another flip to false.
@@ -34,12 +33,6 @@ import Testing
     let upload = DirectoryUpload(localPath: URL(fileURLWithPath: "/tmp/mydir"), remotePath: "/data")
     #expect(upload.localPath.path == "/tmp/mydir")
     #expect(upload.remotePath == "/data")
-}
-
-@Test func directoryDownloadInit() {
-    let download = DirectoryDownload(remotePath: "/app/dist", localPath: URL(fileURLWithPath: "/tmp/output"))
-    #expect(download.remotePath == "/app/dist")
-    #expect(download.localPath.path == "/tmp/output")
 }
 
 @Test func vmOptionsFromRunOptions() {
@@ -95,9 +88,8 @@ import Testing
     let opts = RunOptions()
     #expect(opts.image == "default")
     #expect(opts.diskSize == nil)
-    // Verify no directoryUploads/Downloads by default
+    // Verify no directoryUploads by default
     #expect(opts.directoryUploads.isEmpty)
-    #expect(opts.directoryDownloads.isEmpty)
 }
 
 @Test func luminaErrorDescriptions() {
