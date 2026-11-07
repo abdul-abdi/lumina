@@ -37,7 +37,7 @@ public actor MacOSVM {
     private let memoryBytes: UInt64
     private let cpuCount: Int
     private let graphics: GraphicsConfig?
-    private let sound: SoundConfig?
+    private let sound: Bool
     private let macAddressString: String?
 
     public var state: State { _state }
@@ -49,11 +49,9 @@ public actor MacOSVM {
         cpuCount: Int = 4,
         graphics: GraphicsConfig? = GraphicsConfig(
             widthInPixels: 2560,
-            heightInPixels: 1440,
-            keyboardKind: .mac,
-            pointingDeviceKind: .trackpad
+            heightInPixels: 1440
         ),
-        sound: SoundConfig? = SoundConfig(enabled: true),
+        sound: Bool = true,
         macAddress: String? = nil
     ) {
         self._bootConfig = bootConfig
@@ -116,8 +114,8 @@ public actor MacOSVM {
         if let graphics {
             attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
         }
-        if let sound, sound.enabled {
-            attachSoundDevice(to: vzConfig, sound: sound)
+        if sound {
+            attachSoundDevice(to: vzConfig)
         }
 
         do {
@@ -257,8 +255,8 @@ public actor MacOSVM {
             if let graphics {
                 attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
             }
-            if let sound, sound.enabled {
-                attachSoundDevice(to: vzConfig, sound: sound)
+            if sound {
+                attachSoundDevice(to: vzConfig)
             }
 
             try vzConfig.validate()
@@ -330,20 +328,13 @@ private func attachMacGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    var displays: [VZMacGraphicsDisplayConfiguration] = [
+    let displays: [VZMacGraphicsDisplayConfiguration] = [
         VZMacGraphicsDisplayConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels,
             pixelsPerInch: 220
         )
     ]
-    for extra in graphics.additionalDisplays {
-        displays.append(VZMacGraphicsDisplayConfiguration(
-            widthInPixels: extra.widthInPixels,
-            heightInPixels: extra.heightInPixels,
-            pixelsPerInch: 220
-        ))
-    }
     let gpu = VZMacGraphicsDeviceConfiguration()
     gpu.displays = displays
     config.graphicsDevices = [gpu]

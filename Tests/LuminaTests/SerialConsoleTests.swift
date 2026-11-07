@@ -25,15 +25,6 @@ import Testing
     #expect(output.contains("CCCC"))
 }
 
-@Test func serialConsoleDetectsAgentReady() async {
-    let console = SerialConsole()
-    #expect(!console.agentStarted)
-    console.append(Data("kernel booting...\n".utf8))
-    #expect(!console.agentStarted)
-    console.append(Data("lumina-agent starting\n".utf8))
-    #expect(console.agentStarted)
-}
-
 @Test func serialConsoleVersionMonotonic() async {
     let console = SerialConsole()
     // Fresh console: version starts at 0.

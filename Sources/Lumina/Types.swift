@@ -35,16 +35,6 @@ public struct DirectoryUpload: Sendable {
     }
 }
 
-public struct DirectoryDownload: Sendable {
-    public let remotePath: String
-    public let localPath: URL
-
-    public init(remotePath: String, localPath: URL) {
-        self.remotePath = remotePath
-        self.localPath = localPath
-    }
-}
-
 public struct MountPoint: Sendable {
     public let hostPath: URL
     public let guestPath: String
@@ -82,7 +72,6 @@ public struct RunOptions: Sendable {
     public var uploads: [FileUpload]
     public var downloads: [FileDownload]
     public var directoryUploads: [DirectoryUpload]
-    public var directoryDownloads: [DirectoryDownload]
     public var mounts: [MountPoint]
     public var workingDirectory: String?
     /// Disk size in bytes. When larger than the image rootfs, the COW clone
@@ -118,7 +107,6 @@ public struct RunOptions: Sendable {
         uploads: [FileUpload] = [],
         downloads: [FileDownload] = [],
         directoryUploads: [DirectoryUpload] = [],
-        directoryDownloads: [DirectoryDownload] = [],
         mounts: [MountPoint] = [],
         workingDirectory: String? = nil,
         diskSize: UInt64? = nil,
@@ -133,7 +121,6 @@ public struct RunOptions: Sendable {
         self.uploads = uploads
         self.downloads = downloads
         self.directoryUploads = directoryUploads
-        self.directoryDownloads = directoryDownloads
         self.mounts = mounts
         self.workingDirectory = workingDirectory
         self.diskSize = diskSize
@@ -144,24 +131,6 @@ public struct RunOptions: Sendable {
 
 // MARK: - Graphics (v0.7.0 desktop stack, opt-in)
 
-/// Keyboard device kind attached to a VM with a display.
-///
-/// `.usb` is the right default for Linux and Windows guests. `.mac` requires
-/// a macOS guest (VZMacOSVirtualMachine) and is ignored otherwise.
-public enum KeyboardKind: Sendable {
-    case usb
-    case mac
-}
-
-/// Pointing device kind attached to a VM with a display.
-///
-/// `.usbScreenCoordinate` is a standard USB mouse — works with every guest OS.
-/// `.trackpad` requires a macOS guest and falls back to USB mouse otherwise.
-public enum PointingDeviceKind: Sendable {
-    case usbScreenCoordinate
-    case trackpad
-}
-
 /// Display + input configuration for a VM. Presence triggers the desktop
 /// code path in `VM.boot()`; absence (the default) leaves the agent path
 /// untouched.
@@ -171,71 +140,27 @@ public enum PointingDeviceKind: Sendable {
 public struct GraphicsConfig: Sendable {
     public var widthInPixels: Int
     public var heightInPixels: Int
-    public var keyboardKind: KeyboardKind
-    public var pointingDeviceKind: PointingDeviceKind
-    /// Additional displays beyond the primary. Empty by default, which
-    /// preserves single-display v0.7.0 behavior. Each entry becomes a
-    /// second `VZVirtioGraphicsScanoutConfiguration` on the same
-    /// virtio-GPU device, or a second `VZMacGraphicsDisplayConfiguration`
-    /// on the macOS graphics device. The running-VM window still shows
-    /// the primary only; a multi-display UI is follow-up work.
-    public var additionalDisplays: [Display]
 
-    public init(
-        widthInPixels: Int = 1920,
-        heightInPixels: Int = 1080,
-        keyboardKind: KeyboardKind = .usb,
-        pointingDeviceKind: PointingDeviceKind = .usbScreenCoordinate,
-        additionalDisplays: [Display] = []
-    ) {
+    public init(widthInPixels: Int = 1920, heightInPixels: Int = 1080) {
         self.widthInPixels = widthInPixels
         self.heightInPixels = heightInPixels
-        self.keyboardKind = keyboardKind
-        self.pointingDeviceKind = pointingDeviceKind
-        self.additionalDisplays = additionalDisplays
-    }
-
-    /// A display spec. Resolution-only; future fields (ppi, position,
-    /// colorspace) go here without breaking callers.
-    public struct Display: Sendable, Equatable {
-        public var widthInPixels: Int
-        public var heightInPixels: Int
-
-        public init(widthInPixels: Int, heightInPixels: Int) {
-            self.widthInPixels = widthInPixels
-            self.heightInPixels = heightInPixels
-        }
     }
 }
 
-// MARK: - v0.7.0 M3: Bootable profiles
-
-/// Identifier for a headless agent image in `~/.lumina/images/<name>/`.
-///
-/// Thin wrapper so callers can round-trip the name through `BootableProfile`
-/// without plucking it out of `VMOptions.image` (which survives for backwards
-/// compatibility but is derived from this value going forward).
-public struct AgentImageRef: Sendable, Equatable {
-    public let image: String
-
-    public init(image: String) {
-        self.image = image
-    }
-}
+// MARK: - v0.7.0 M3: Boot configs
 
 /// Configuration for a VZEFIBootLoader-based guest (Linux ISO boot, Windows 11 ARM).
 ///
 /// The caller supplies URLs for the EFI variable store, primary read-write disk,
-/// optional CD-ROM ISO for installer boots, and any extra virtio block devices.
+/// and optional CD-ROM ISO for installer boots.
 /// `LuminaBootable.EFIBootable` (M3) consumes this to configure a
 /// `VZVirtualMachineConfiguration`.
 public struct EFIBootConfig: Sendable, Equatable {
     public var variableStoreURL: URL
     public var primaryDisk: URL
     public var cdromISO: URL?
-    public var extraDisks: [URL]
-    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration` on
-    /// macOS 13+ instead of the default virtio-block device. Windows 11
+    /// Attach the CD-ROM via `VZUSBMassStorageDeviceConfiguration`
+    /// instead of the default virtio-block device. Windows 11
     /// ARM setup is picky about media type and refuses to boot from a
     /// virtio-block-labeled CD-ROM with "Windows cannot find the media";
     /// USB mass-storage presents as a real removable drive and works.
@@ -270,10 +195,8 @@ public struct EFIBootConfig: Sendable, Equatable {
     /// Additional CD-ROM ISOs attached alongside the primary `cdromISO`.
     /// Used to deliver a Windows autounattend.xml sidecar (TPM-bypass
     /// pass) without having to repack the user's installer ISO. Each
-    /// entry is attached as a separate `VZUSBMassStorageDeviceConfiguration`
-    /// (macOS 13+); on macOS 12 the primary ISO falls back to virtio-block
-    /// and `extraCDROMs` are silently skipped (older OS users get a clear
-    /// stderr warning from the caller). Order is preserved — Windows
+    /// entry is attached as a separate `VZUSBMassStorageDeviceConfiguration`.
+    /// Order is preserved — Windows
     /// Setup scans drives in attachment order and applies the first
     /// `autounattend.xml` it finds, which is normally the sidecar
     /// because the installer ISO doesn't ship one.
@@ -283,7 +206,6 @@ public struct EFIBootConfig: Sendable, Equatable {
         variableStoreURL: URL,
         primaryDisk: URL,
         cdromISO: URL? = nil,
-        extraDisks: [URL] = [],
         preferUSBCDROM: Bool = false,
         installPhase: Bool = false,
         linuxDirectKernel: URL? = nil,
@@ -294,7 +216,6 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
         self.cdromISO = cdromISO
-        self.extraDisks = extraDisks
         self.preferUSBCDROM = preferUSBCDROM
         self.installPhase = installPhase
         self.linuxDirectKernel = linuxDirectKernel
@@ -333,35 +254,6 @@ public struct MacOSBootConfig: Sendable, Equatable {
     }
 }
 
-/// Describes how a VM should boot.
-///
-/// `.agent` preserves the v0.6.0 headless contract (Linux kernel + initrd +
-/// lumina-agent + vsock). `.efi` and `.macOS` are the v0.7.0 full-OS paths.
-/// When `VMOptions.bootable` is nil, `effectiveBootable` derives
-/// `.agent(AgentImageRef(image: options.image))` so agent callers never have
-/// to populate this field.
-public enum BootableProfile: Sendable, Equatable {
-    case agent(AgentImageRef)
-    case efi(EFIBootConfig)
-    case macOS(MacOSBootConfig)
-}
-
-// MARK: - v0.7.0 M4: Audio
-
-/// Optional virtio sound device for desktop guests. nil = no sound device.
-///
-/// Linux desktop and Windows 11 ARM guests both benefit; agent path leaves
-/// this nil and incurs zero cost.
-public struct SoundConfig: Sendable, Equatable {
-    public var enabled: Bool
-    public var streamCount: Int
-
-    public init(enabled: Bool, streamCount: Int = 1) {
-        self.enabled = enabled
-        self.streamCount = streamCount
-    }
-}
-
 // MARK: - VM Options
 
 public struct VMOptions: Sendable {
@@ -397,27 +289,12 @@ public struct VMOptions: Sendable {
     /// `VZVirtioGraphicsDeviceConfiguration` + keyboard + pointing device.
     public var graphics: GraphicsConfig?
     /// v0.7.0 M4: optional virtio sound device for desktop guests.
-    /// nil = no sound device (agent-path-safe).
-    public var sound: SoundConfig?
+    /// false = no sound device (agent-path-safe).
+    public var sound: Bool
 
-    /// v0.7.0 M3: optional override for how this VM boots. `nil` means "use
-    /// the headless agent path with `image`." Non-nil wins over `image`.
-    ///
-    /// Regression-gate invariant: the agent cold-boot path cannot read any
-    /// `.efi` / `.macOS` code. The VM actor consults this property only when
-    /// building the VZ configuration — never on the agent fast path.
-    public var bootable: BootableProfile?
-
-    /// Resolves `bootable` to a concrete profile.
-    ///
-    /// Returns `bootable` if set; otherwise falls back to
-    /// `.agent(AgentImageRef(image: self.image))`. Call sites that dispatch
-    /// on the profile (e.g. `VM.boot()`) use this to keep the agent path
-    /// implicit.
-    public var effectiveBootable: BootableProfile {
-        if let b = bootable { return b }
-        return .agent(AgentImageRef(image: image))
-    }
+    /// v0.7.0 M3: optional EFI boot. `nil` means "use the headless agent
+    /// path with `image`." Non-nil wins over `image`.
+    public var efi: EFIBootConfig?
 
     public static let `default` = VMOptions()
 
@@ -433,8 +310,8 @@ public struct VMOptions: Sendable {
         rosetta: Bool = false,
         diskSize: UInt64? = nil,
         graphics: GraphicsConfig? = nil,
-        bootable: BootableProfile? = nil,
-        sound: SoundConfig? = nil,
+        efi: EFIBootConfig? = nil,
+        sound: Bool = false,
         macAddress: String? = nil,
         serialLogURL: URL? = nil
     ) {
@@ -449,7 +326,7 @@ public struct VMOptions: Sendable {
         self.rosetta = rosetta
         self.diskSize = diskSize
         self.graphics = graphics
-        self.bootable = bootable
+        self.efi = efi
         self.sound = sound
         self.macAddress = macAddress
         self.serialLogURL = serialLogURL
@@ -471,9 +348,9 @@ public struct VMOptions: Sendable {
         self.graphics = nil
         // Disposable `run` always takes the agent path — the CLI has no way
         // to build a .luminaVM bundle in one shot today.
-        self.bootable = nil
+        self.efi = nil
         // Disposable `run` is headless; no audio.
-        self.sound = nil
+        self.sound = false
         // Disposable `run` is one-shot; no benefit from a stable MAC.
         self.macAddress = nil
         // Disposable `run` has no bundle; caller can set a specific log

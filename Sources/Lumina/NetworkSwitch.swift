@@ -15,7 +15,6 @@ public struct SwitchPort: Sendable {
 public final class NetworkSwitch: @unchecked Sendable {
     private let lock = NSLock()
     private var ports: [SwitchPort] = []
-    private var relayThread: Thread?
     private var running = false
 
     public init() {}
@@ -47,7 +46,6 @@ public final class NetworkSwitch: @unchecked Sendable {
         }
         thread.qualityOfService = .userInitiated
         thread.start()
-        relayThread = thread
     }
 
     /// Stop the relay and close all fds.

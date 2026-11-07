@@ -1,12 +1,12 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// Agent protection invariant: the agent path through `VM.boot()` (the
-// `.agent` case of `BootableProfile`) is functionally equivalent to
+// Agent protection invariant: the agent path through `VM.boot()` is
+// functionally equivalent to
 // v0.6.0 within the CI agent-boot P50 budget — the new v0.7.0 additions
-// (`effectiveBootable` switch, optional `graphics`/`sound` attachments)
-// are guarded single-branch no-ops when `VMOptions.bootable`,
-// `VMOptions.graphics`, and `VMOptions.sound` are nil. Nothing in
+// (`efi` check, optional `graphics`/`sound` attachments)
+// are guarded single-branch no-ops when `VMOptions.efi` and
+// `VMOptions.graphics` are nil and `VMOptions.sound` is false. Nothing in
 // LuminaBootable / LuminaDesktopKit is reachable from
 // `lumina run` or `lumina session start` unless the caller opts in.
 // The agent-boot P50 gate in .github/workflows/ci.yml enforces the

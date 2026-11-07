@@ -307,7 +307,7 @@ extension VMBundle {
         case .bridged(let iface): opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
         }
         opts.serialLogURL = logsDirectory.appendingPathComponent("serial.log")
-        opts.bootable = .efi(EFIBootConfig(
+        opts.efi = EFIBootConfig(
             variableStoreURL: efiVarsURL,
             primaryDisk: primaryDiskURL,
             cdromISO: cdrom,
@@ -317,7 +317,7 @@ extension VMBundle {
             linuxDirectInitramfs: plan.linuxDirectInitramfs,
             linuxDirectCmdline: plan.linuxDirectCmdline,
             extraCDROMs: plan.seedISOs
-        ))
+        )
         return opts
     }
 }

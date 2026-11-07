@@ -10,7 +10,6 @@ import Testing
     #expect(opts.cpuCount == 2)
     #expect(opts.image == "default")
     #expect(opts.directoryUploads.isEmpty)
-    #expect(opts.directoryDownloads.isEmpty)
     // v0.7.3: block exec on network_ready by default. The wait costs ~4ms
     // now that the host drives config directly, and opting out fails DNS
     // outright. Regression guard against another flip to false.
@@ -34,12 +33,6 @@ import Testing
     let upload = DirectoryUpload(localPath: URL(fileURLWithPath: "/tmp/mydir"), remotePath: "/data")
     #expect(upload.localPath.path == "/tmp/mydir")
     #expect(upload.remotePath == "/data")
-}
-
-@Test func directoryDownloadInit() {
-    let download = DirectoryDownload(remotePath: "/app/dist", localPath: URL(fileURLWithPath: "/tmp/output"))
-    #expect(download.remotePath == "/app/dist")
-    #expect(download.localPath.path == "/tmp/output")
 }
 
 @Test func vmOptionsFromRunOptions() {
@@ -94,9 +87,8 @@ import Testing
     let opts = RunOptions()
     #expect(opts.image == "default")
     #expect(opts.diskSize == nil)
-    // Verify no directoryUploads/Downloads by default
+    // Verify no directoryUploads by default
     #expect(opts.directoryUploads.isEmpty)
-    #expect(opts.directoryDownloads.isEmpty)
 }
 
 @Test func luminaErrorDescriptions() {
@@ -112,35 +104,18 @@ import Testing
 }
 
 
-// MARK: - v0.7.0 M3 — BootableProfile types
-
-@Test func agentImageRef_initWithImageName_storesName() {
-    let ref = AgentImageRef(image: "default")
-    #expect(ref.image == "default")
-}
-
-@Test func agentImageRef_initWithCustomName_storesName() {
-    let ref = AgentImageRef(image: "my-image")
-    #expect(ref.image == "my-image")
-}
-
-@Test func agentImageRef_isSendable() {
-    func takeSendable<T: Sendable>(_: T) {}
-    takeSendable(AgentImageRef(image: "x"))
-}
+// MARK: - v0.7.0 M3 — boot configs
 
 @Test func efiBootConfig_allFieldsRoundTrip() {
     let tmp = FileManager.default.temporaryDirectory
     let cfg = EFIBootConfig(
         variableStoreURL: tmp.appendingPathComponent("efi.vars"),
         primaryDisk: tmp.appendingPathComponent("disk.img"),
-        cdromISO: tmp.appendingPathComponent("cd.iso"),
-        extraDisks: [tmp.appendingPathComponent("data.img")]
+        cdromISO: tmp.appendingPathComponent("cd.iso")
     )
     #expect(cfg.variableStoreURL.lastPathComponent == "efi.vars")
     #expect(cfg.primaryDisk.lastPathComponent == "disk.img")
     #expect(cfg.cdromISO?.lastPathComponent == "cd.iso")
-    #expect(cfg.extraDisks.count == 1)
 }
 
 @Test func efiBootConfig_optionalCdromNil() {
@@ -150,7 +125,6 @@ import Testing
         primaryDisk: tmp.appendingPathComponent("d")
     )
     #expect(cfg.cdromISO == nil)
-    #expect(cfg.extraDisks.isEmpty)
 }
 
 @Test func macOSBootConfig_storesPaths() {
@@ -167,89 +141,16 @@ import Testing
     #expect(cfg.machineIdentifier == nil)
 }
 
-@Test func bootableProfile_agentCase() {
-    let p = BootableProfile.agent(AgentImageRef(image: "default"))
-    if case .agent(let ref) = p {
-        #expect(ref.image == "default")
-    } else {
-        Issue.record("expected .agent case")
-    }
-}
-
-@Test func bootableProfile_efiCase() {
-    let tmp = FileManager.default.temporaryDirectory
-    let p = BootableProfile.efi(EFIBootConfig(
-        variableStoreURL: tmp.appendingPathComponent("v"),
-        primaryDisk: tmp.appendingPathComponent("d")
-    ))
-    if case .efi = p {} else { Issue.record("expected .efi case") }
-}
-
-@Test func bootableProfile_macOSCase() {
-    let tmp = FileManager.default.temporaryDirectory
-    let p = BootableProfile.macOS(MacOSBootConfig(
-        ipsw: tmp.appendingPathComponent("i"),
-        auxiliaryStorage: tmp.appendingPathComponent("a"),
-        primaryDisk: tmp.appendingPathComponent("d")
-    ))
-    if case .macOS = p {} else { Issue.record("expected .macOS case") }
-}
-
-@Test func vmOptions_defaultBootableIsNil() {
+@Test func vmOptions_defaultEFIIsNil() {
     let opts = VMOptions.default
-    #expect(opts.bootable == nil)
+    #expect(opts.efi == nil)
 }
 
-@Test func vmOptions_effectiveBootable_derivesAgentFromImage() {
-    var opts = VMOptions.default
-    opts.image = "my-custom"
-    let effective = opts.effectiveBootable
-    if case .agent(let ref) = effective {
-        #expect(ref.image == "my-custom")
-    } else {
-        Issue.record("expected derived .agent profile")
-    }
-}
+// MARK: - v0.7.0 M4 — sound
 
-// MARK: - v0.7.0 M4 — SoundConfig
-
-@Test func soundConfig_defaultStreamCount() {
-    let s = SoundConfig(enabled: true)
-    #expect(s.enabled)
-    #expect(s.streamCount == 1)
-}
-
-@Test func soundConfig_disabledIsValid() {
-    let s = SoundConfig(enabled: false)
-    #expect(!s.enabled)
-}
-
-@Test func soundConfig_explicitStreamCount() {
-    let s = SoundConfig(enabled: true, streamCount: 2)
-    #expect(s.streamCount == 2)
-}
-
-@Test func vmOptions_defaultSoundIsNil() {
+@Test func vmOptions_defaultSoundIsOff() {
     let o = VMOptions.default
-    #expect(o.sound == nil)
-}
-
-@Test func vmOptions_canSetSound() {
-    var o = VMOptions.default
-    o.sound = SoundConfig(enabled: true)
-    #expect(o.sound?.enabled == true)
-}
-
-@Test func vmOptions_effectiveBootable_preservesExplicitEFI() {
-    let tmp = FileManager.default.temporaryDirectory
-    var opts = VMOptions.default
-    opts.bootable = .efi(EFIBootConfig(
-        variableStoreURL: tmp.appendingPathComponent("v"),
-        primaryDisk: tmp.appendingPathComponent("d")
-    ))
-    if case .efi = opts.effectiveBootable {} else {
-        Issue.record("explicit .efi should survive")
-    }
+    #expect(o.sound == false)
 }
 
 @Test func vmOptionsAutoDetectsRosettaFromImageMeta() throws {
