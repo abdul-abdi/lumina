@@ -1,6 +1,7 @@
 // Sources/Lumina/ImagePuller.swift
 import Foundation
 import CryptoKit
+import os
 
 /// Downloads pre-built VM images from GitHub Releases.
 ///
@@ -138,6 +139,7 @@ public struct ImagePuller: Sendable {
         } catch {
             throw .imageNotFound("Cannot create image directory: \(error.localizedDescription)")
         }
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
 
         // 5. Pre-scan tarball for path-traversal attempts before extraction.
         //    BSD tar on macOS rejects `..` members by default, but relying on
@@ -150,7 +152,6 @@ public struct ImagePuller: Sendable {
             "/usr/bin/tar", arguments: ["-tzf", downloadedFile.path]
         )
         guard listResult.exitCode == 0 else {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Tarball listing failed (exit \(listResult.exitCode)): \(listResult.stderr)"
             )
@@ -160,7 +161,6 @@ public struct ImagePuller: Sendable {
             let path = String(member).trimmingCharacters(in: .whitespaces)
             if path.isEmpty { continue }
             if path.hasPrefix("/") {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains absolute path: \(path). Refusing to extract."
                 )
@@ -168,7 +168,6 @@ public struct ImagePuller: Sendable {
             // Split on `/` and reject any `..` component after normalisation.
             let parts = path.split(separator: "/")
             if parts.contains(where: { $0 == ".." }) {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains path-traversal member: \(path). Refusing to extract."
                 )
@@ -199,7 +198,6 @@ public struct ImagePuller: Sendable {
         )
 
         guard tarResult.exitCode == 0 else {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Extraction failed (exit \(tarResult.exitCode)): \(tarResult.stderr)"
             )
@@ -216,7 +214,6 @@ public struct ImagePuller: Sendable {
         }
 
         if !missingFiles.isEmpty {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Image tarball is missing required files: \(missingFiles.joined(separator: ", ")). "
                 + "The release may be malformed."
@@ -230,7 +227,6 @@ public struct ImagePuller: Sendable {
         )[.size] as? Int) ?? 0
 
         if rootfsSize < 1_048_576 {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "rootfs.img is suspiciously small (\(formatBytes(rootfsSize))). "
                 + "The image may be corrupted."
@@ -246,7 +242,6 @@ public struct ImagePuller: Sendable {
             do {
                 try FileManager.default.moveItem(at: imageDir, to: retiredDir)
             } catch {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound("Cannot replace existing image: \(error.localizedDescription)")
             }
         }
@@ -254,7 +249,6 @@ public struct ImagePuller: Sendable {
             try FileManager.default.moveItem(at: stagingDir, to: imageDir)
         } catch {
             if hadExisting { try? FileManager.default.moveItem(at: retiredDir, to: imageDir) }
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound("Cannot install image: \(error.localizedDescription)")
         }
         if hadExisting { try? FileManager.default.removeItem(at: retiredDir) }
@@ -399,29 +393,6 @@ public struct ImagePuller: Sendable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func runProcess(
-        _ path: String, arguments: [String]
-    ) -> (exitCode: Int32, stderr: String, stdout: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        let stderrPipe = Pipe()
-        let stdoutPipe = Pipe()
-        process.standardError = stderrPipe
-        process.standardOutput = stdoutPipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return (-1, error.localizedDescription, "")
-        }
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
-        return (process.terminationStatus, stderr, stdout)
-    }
-
     private func formatBytes(_ bytes: Int) -> String {
         if bytes >= 1_073_741_824 {
             return String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
@@ -436,4 +407,35 @@ public struct ImagePuller: Sendable {
 
 private struct PullError: Error {
     let message: String
+}
+
+func runProcess(
+    _ path: String, arguments: [String]
+) -> (exitCode: Int32, stderr: String, stdout: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = arguments
+    let stderrPipe = Pipe()
+    let stdoutPipe = Pipe()
+    process.standardError = stderrPipe
+    process.standardOutput = stdoutPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, error.localizedDescription, "")
+    }
+    let stderrHandle = stderrPipe.fileHandleForReading
+    let stderrData = OSAllocatedUnfairLock(initialState: Data())
+    let stderrDrained = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        let data = stderrHandle.readDataToEndOfFile()
+        stderrData.withLock { $0 = data }
+        stderrDrained.signal()
+    }
+    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    stderrDrained.wait()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData.withLock { $0 }, encoding: .utf8) ?? ""
+    let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+    return (process.terminationStatus, stderr, stdout)
 }

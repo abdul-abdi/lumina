@@ -115,14 +115,8 @@ public struct ImageStore: Sendable {
 
     /// Remove a named image. Refuses if other images depend on it.
     public func removeImage(name: String) throws {
-        let allNames = list()
-        for other in allNames where other != name {
-            let metaFile = baseDir.appendingPathComponent(other).appendingPathComponent("meta.json")
-            if let data = try? Data(contentsOf: metaFile),
-               let meta = try? JSONDecoder().decode(ImageMeta.self, from: data),
-               meta.base == name {
-                throw LuminaError.sessionFailed("Cannot remove '\(name)': image '\(other)' depends on it")
-            }
+        for other in list() where other != name && readMeta(name: other)?.base == name {
+            throw LuminaError.sessionFailed("Cannot remove '\(name)': image '\(other)' depends on it")
         }
         let dir = baseDir.appendingPathComponent(name)
         try FileManager.default.removeItem(at: dir)
@@ -130,30 +124,23 @@ public struct ImageStore: Sendable {
 
     /// Inspect an image -- returns metadata and size.
     public func inspect(name: String) throws -> ImageInfo {
-        let dir = baseDir.appendingPathComponent(name)
-        let metaFile = dir.appendingPathComponent("meta.json")
-        let rootfs = dir.appendingPathComponent("rootfs.img")
+        let rootfs = baseDir.appendingPathComponent(name).appendingPathComponent("rootfs.img")
 
         guard FileManager.default.fileExists(atPath: rootfs.path) else {
             throw LuminaError.imageNotFound(name)
         }
 
-        var base: String? = nil
-        var command: String? = nil
-        var rosetta = false
-        var created = Date()
-
-        if let data = try? Data(contentsOf: metaFile),
-           let meta = try? JSONDecoder().decode(ImageMeta.self, from: data) {
-            base = meta.base
-            command = meta.command
-            rosetta = meta.rosetta
-            created = meta.created
-        }
-
+        let meta = readMeta(name: name)
         let attrs = try? FileManager.default.attributesOfItem(atPath: rootfs.path)
         let size = attrs?[.size] as? UInt64 ?? 0
 
-        return ImageInfo(name: name, base: base, command: command, rosetta: rosetta, created: created, sizeBytes: size)
+        return ImageInfo(
+            name: name,
+            base: meta?.base,
+            command: meta?.command,
+            rosetta: meta?.rosetta ?? false,
+            created: meta?.created ?? Date(),
+            sizeBytes: size
+        )
     }
 }

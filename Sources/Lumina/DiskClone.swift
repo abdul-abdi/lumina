@@ -77,21 +77,9 @@ public struct DiskClone: Sendable {
         }
 
         // Grow the ext4 filesystem to fill the new space
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: resize2fs)
-        process.arguments = [rootfs.path]
-        let stderrPipe = Pipe()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = stderrPipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            throw .cloneFailed(underlying: error)
-        }
-        guard process.terminationStatus == 0 else {
-            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw .cloneFailed(underlying: ResizeError.resize2fsFailed(stderr))
+        let result = runProcess(resize2fs, arguments: [rootfs.path])
+        guard result.exitCode == 0 else {
+            throw .cloneFailed(underlying: ResizeError.resize2fsFailed(result.stderr))
         }
     }
 
@@ -102,20 +90,9 @@ public struct DiskClone: Sendable {
     /// Find an e2fsprogs tool by name (checks PATH then Homebrew locations).
     private static func findE2fsTool(_ name: String) -> String? {
         // Check PATH first
-        let whichProcess = Process()
-        whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        whichProcess.arguments = [name]
-        let pipe = Pipe()
-        whichProcess.standardOutput = pipe
-        whichProcess.standardError = FileHandle.nullDevice
-        if (try? whichProcess.run()) != nil {
-            whichProcess.waitUntilExit()
-            if whichProcess.terminationStatus == 0 {
-                let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let path, !path.isEmpty { return path }
-            }
-        }
+        let which = runProcess("/usr/bin/which", arguments: [name])
+        let path = which.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if which.exitCode == 0, !path.isEmpty { return path }
         // Check Homebrew locations
         for prefix in ["/opt/homebrew", "/usr/local"] {
             let path = "\(prefix)/opt/e2fsprogs/sbin/\(name)"

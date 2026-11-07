@@ -785,19 +785,9 @@ public actor VM {
         let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
         defer { try? FileManager.default.removeItem(at: tarLocal) }
 
-        let tarProcess = Process()
-        tarProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tarProcess.arguments = ["czf", tarLocal.path, "-C", localPath.path, "."]
-        tarProcess.standardOutput = FileHandle.nullDevice
-        tarProcess.standardError = FileHandle.nullDevice
-        do {
-            try tarProcess.run()
-            tarProcess.waitUntilExit()
-        } catch {
-            throw .uploadFailed(path: localPath.path, reason: "Failed to create tarball: \(error)")
-        }
-        guard tarProcess.terminationStatus == 0 else {
-            throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tarProcess.terminationStatus)")
+        let tar = runProcess("/usr/bin/tar", arguments: ["czf", tarLocal.path, "-C", localPath.path, "."])
+        guard tar.exitCode == 0 else {
+            throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tar.exitCode): \(tar.stderr)")
         }
 
         let guestTar = "/tmp/\(tarName)"
@@ -840,19 +830,9 @@ public actor VM {
             throw .downloadFailed(path: remotePath, reason: "Failed to create local directory: \(error)")
         }
 
-        let extractProcess = Process()
-        extractProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        extractProcess.arguments = ["xzf", tarLocal.path, "-C", localPath.path]
-        extractProcess.standardOutput = FileHandle.nullDevice
-        extractProcess.standardError = FileHandle.nullDevice
-        do {
-            try extractProcess.run()
-            extractProcess.waitUntilExit()
-        } catch {
-            throw .downloadFailed(path: remotePath, reason: "Failed to extract tarball: \(error)")
-        }
-        guard extractProcess.terminationStatus == 0 else {
-            throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(extractProcess.terminationStatus)")
+        let tar = runProcess("/usr/bin/tar", arguments: ["xzf", tarLocal.path, "-C", localPath.path])
+        guard tar.exitCode == 0 else {
+            throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(tar.exitCode): \(tar.stderr)")
         }
     }
 
