@@ -133,11 +133,6 @@ final class StdinPumpGate: @unchecked Sendable {
 }
 
 public actor VM {
-    // TODO: Remove once all deployed images include the pre-register fix
-    // (Guest/lumina-agent >v0.5.0). The fixed agent inserts the runningCmd entry
-    // synchronously before spawning the goroutine, so stdin/stdin_close cannot race.
-    private static let stdinPumpWarmupMs: Int = 5
-
     private var virtualMachine: VZVirtualMachine?
     private var commandRunner: CommandRunner?
     private let serialConsole = SerialConsole()
@@ -940,20 +935,11 @@ public actor VM {
         case .closed:
             return Task.detached {
                 await gate.wait()
-                // Defensive delay for agents predating the pre-register fix
-                // (see Guest/lumina-agent/main.go serveConnection exec case).
-                // With the fixed guest, stdin/stdin_close cannot race goroutine
-                // registration because the scanner loop inserts the runningCmd
-                // entry synchronously before spawning. This delay is harmless
-                // on fixed agents (~5ms added to cold boot) and load-bearing
-                // for older images until they are rebuilt in CI.
-                try? await Task.sleep(for: .milliseconds(Self.stdinPumpWarmupMs))
                 try? runner.closeStdin(id: execId)
             }
         case .source(let source):
             return Task.detached {
                 await gate.wait()
-                try? await Task.sleep(for: .milliseconds(Self.stdinPumpWarmupMs))
                 do {
                     while !Task.isCancelled {
                         guard let chunk = try await source() else { break }  // EOF
