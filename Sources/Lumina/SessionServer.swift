@@ -428,72 +428,66 @@ public final class SessionServer: @unchecked Sendable {
         let channel = StdinChannel()
         let stdin = Stdin.source { @Sendable [channel] in await channel.next() }
 
-        await withTaskGroup(of: Void.self) { group in
-            // Task 1: run the exec and forward output chunks to the client.
-            // When the exec finishes (success, error, or timeout), signals
-            // EOF to the stdin channel and shuts down the read side of the
-            // socket to unblock Task 2.
-            group.addTask { [weak self] in
-                guard let self else { return }
-                let start = ContinuousClock.now
-                do {
-                    let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd, stdin: stdin)
-                    for try await chunk in chunks {
-                        switch chunk {
-                        case .stdout(let data):
-                            try? self.writeResponse(.output(stream: .stdout, data: data), to: writeHandle)
-                        case .stderr(let data):
-                            try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
-                        case .stdoutBytes(let bytes):
-                            try? self.writeResponse(.outputBytes(stream: .stdout, base64: bytes.base64EncodedString()), to: writeHandle)
-                        case .stderrBytes(let bytes):
-                            try? self.writeResponse(.outputBytes(stream: .stderr, base64: bytes.base64EncodedString()), to: writeHandle)
-                        case .exit(let code):
-                            let ms = (ContinuousClock.now - start).totalMilliseconds
-                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
-                        }
+        await bridge(readHandle: readHandle, initialBuffer: initialBuffer, onClose: { channel.close() }) { [weak self] in
+            guard let self else { return }
+            let start = ContinuousClock.now
+            do {
+                let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd, stdin: stdin)
+                for try await chunk in chunks {
+                    switch chunk {
+                    case .stdout(let data):
+                        try? self.writeResponse(.output(stream: .stdout, data: data), to: writeHandle)
+                    case .stderr(let data):
+                        try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
+                    case .stdoutBytes(let bytes):
+                        try? self.writeResponse(.outputBytes(stream: .stdout, base64: bytes.base64EncodedString()), to: writeHandle)
+                    case .stderrBytes(let bytes):
+                        try? self.writeResponse(.outputBytes(stream: .stderr, base64: bytes.base64EncodedString()), to: writeHandle)
+                    case .exit(let code):
+                        let ms = (ContinuousClock.now - start).totalMilliseconds
+                        try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
                     }
-                } catch {
-                    try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
                 }
-                // Signal EOF to the stdin pump so the pump task exits cleanly.
+            } catch {
+                try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
+            }
+            // Signal EOF to the stdin pump so the pump task exits cleanly.
+            channel.close()
+        } onRequest: { request in
+            switch request {
+            case .stdin(let data):
+                channel.send(Data(data.utf8))
+            case .stdinClose:
                 channel.close()
-                // Unblock Task 2's blocking availableData call by shutting
-                // down the read direction of the socket. The write direction
-                // remains open for subsequent responses after exec.
+            case .cancel(let signal, let gracePeriod):
+                try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+            default:
+                break
+            }
+        }
+    }
+
+    private func bridge(
+        readHandle: FileHandle,
+        initialBuffer: Data,
+        onClose: @escaping @Sendable () -> Void = {},
+        drive: @escaping @Sendable () async -> Void,
+        onRequest: @escaping @Sendable (SessionRequest) async -> Void
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await drive()
                 Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
             }
-
-            // Task 2: read stdin/stdinClose/cancel messages from the client
-            // socket and route them to the appropriate handler during exec.
-            // Exits when the socket read side is shut down (by Task 1 on
-            // exec completion) or when the client disconnects.
             group.addTask { [weak self] in
                 guard let self else { return }
                 var buf = initialBuffer
-                while !Task.isCancelled {
-                    let msgData: Data
-                    do {
-                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
-                    } catch {
-                        break // socket closed or shut down
-                    }
-                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
-                    switch request {
-                    case .stdin(let data):
-                        channel.send(Data(data.utf8))
-                    case .stdinClose:
-                        channel.close()
-                    case .cancel(let signal, let gracePeriod):
-                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
-                    default:
-                        // Other message types are not expected during exec;
-                        // ignore to avoid protocol confusion.
-                        break
-                    }
+                while !Task.isCancelled,
+                      let data = try? await self.readMessage(from: readHandle, buffer: &buf),
+                      let request = try? SessionProtocol.decodeRequest(data) {
+                    await onRequest(request)
                 }
-                // Ensure channel is closed even if socket closed unexpectedly.
-                channel.close()
+                onClose()
             }
         }
     }
@@ -536,63 +530,34 @@ public final class SessionServer: @unchecked Sendable {
             return
         }
 
-        await withTaskGroup(of: Void.self) { group in
-            // Task 1: drive the PTY stream, forward output + exit to client.
-            // On completion, shuts down the read side of the socket to unblock
-            // Task 2 (blocked in availableData).
-            group.addTask { [weak self] in
-                guard let self else { return }
-                let start = ContinuousClock.now
-                do {
-                    for try await chunk in stream {
-                        switch chunk {
-                        case .output(let data):
-                            try? self.writeResponse(
-                                .ptyOutput(data: data.base64EncodedString()),
-                                to: writeHandle
-                            )
-                        case .exit(let code):
-                            let ms = (ContinuousClock.now - start).totalMilliseconds
-                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
-                        }
+        await bridge(readHandle: readHandle, initialBuffer: initialBuffer) { [weak self] in
+            guard let self else { return }
+            let start = ContinuousClock.now
+            do {
+                for try await chunk in stream {
+                    switch chunk {
+                    case .output(let data):
+                        try? self.writeResponse(.ptyOutput(data: data.base64EncodedString()), to: writeHandle)
+                    case .exit(let code):
+                        let ms = (ContinuousClock.now - start).totalMilliseconds
+                        try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
                     }
-                } catch {
-                    try? self.writeResponse(
-                        .error(message: "PTY stream error: \(error)"),
-                        to: writeHandle
-                    )
                 }
-                Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
+            } catch {
+                try? self.writeResponse(.error(message: "PTY stream error: \(error)"), to: writeHandle)
             }
-
-            // Task 2: read pty_input / window_resize / cancel from the client
-            // and forward to the VM. Exits when the read side is shut down
-            // (by Task 1 on stream completion) or the client disconnects.
-            group.addTask { [weak self] in
-                guard let self else { return }
-                var buf = initialBuffer
-                while !Task.isCancelled {
-                    let msgData: Data
-                    do {
-                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
-                    } catch {
-                        break // socket closed or shut down
-                    }
-                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
-                    switch request {
-                    case .ptyInput(let b64):
-                        if let raw = Data(base64Encoded: b64) {
-                            try? await vm.sendPtyInput(id: id, data: raw)
-                        }
-                    case .windowResize(let cols, let rows):
-                        try? await vm.sendWindowResize(id: id, cols: cols, rows: rows)
-                    case .cancel(let signal, let gracePeriod):
-                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
-                    default:
-                        // Other frames are not meaningful during a PTY session.
-                        break
-                    }
+        } onRequest: { request in
+            switch request {
+            case .ptyInput(let b64):
+                if let raw = Data(base64Encoded: b64) {
+                    try? await vm.sendPtyInput(id: id, data: raw)
                 }
+            case .windowResize(let cols, let rows):
+                try? await vm.sendWindowResize(id: id, cols: cols, rows: rows)
+            case .cancel(let signal, let gracePeriod):
+                try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+            default:
+                break
             }
         }
     }
