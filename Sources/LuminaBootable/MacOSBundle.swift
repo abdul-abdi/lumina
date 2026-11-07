@@ -53,7 +53,11 @@ extension VMBundle {
             cpuCount: manifest.cpuCount,
             macAddress: manifest.macAddress
         )
-        try await vm.install { progress(.installing, $0) }
+        do {
+            try await vm.install { progress(.installing, $0) }
+        } catch {
+            throw MacOSRestore.Error(description: "\(error). If the Mac slept during the restore (closed lid or idle sleep on battery), keep it awake and on power and try again.")
+        }
         await vm.shutdown()
         let installed = await vm.bootConfig
         guard let model = installed.hardwareModel, let machineID = installed.machineIdentifier else {
