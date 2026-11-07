@@ -182,6 +182,25 @@ func connectSession(_ sid: String) throws -> SessionClient {
     return client
 }
 
+func ensureImage(_ name: String) async throws {
+    let puller = ImagePuller()
+    guard !puller.imageExists(name: name) else { return }
+    guard name == "default" else {
+        FileHandle.standardError.write(Data("lumina: image '\(name)' not found. Use 'lumina images list' to see available images.\n".utf8))
+        throw ExitCode.failure
+    }
+    FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+    do {
+        try await puller.pull { msg in
+            FileHandle.standardError.write(Data("\(msg)\n".utf8))
+        }
+    } catch {
+        FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+        FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
+        throw ExitCode.failure
+    }
+}
+
 // MARK: - Stdin Auto-Detect
 //
 // Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),

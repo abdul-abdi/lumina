@@ -168,19 +168,18 @@ struct Run: AsyncParsableCommand {
             }
         }
 
-        // Auto-pull image if not present
-        let puller = ImagePuller()
-        if !puller.imageExists() {
-            FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
-            do {
-                try await puller.pull { msg in
-                    FileHandle.standardError.write(Data("\(msg)\n".utf8))
-                }
-            } catch {
-                FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
-                FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
-                throw ExitCode.failure
+        let imageCheckStart = ContinuousClock.now
+        do {
+            try await ensureImage(image)
+        } catch {
+            if resolveOutputFormat() == .json {
+                encodeAndPrint(ResultJSON(
+                    error: "connection_failed",
+                    error_detail: describeFailure(LuminaError.imageNotFound(image)),
+                    duration_ms: millisSince(imageCheckStart)
+                ))
             }
+            throw error
         }
 
         // Resolve from env vars with built-in defaults
@@ -650,23 +649,7 @@ struct SessionStart: AsyncParsableCommand {
 
     func run() async throws {
         // Check if requested image exists before spawning background process
-        let puller = ImagePuller()
-        if !puller.imageExists(name: image) {
-            if image == "default" {
-                FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
-                do {
-                    try await puller.pull { msg in
-                        FileHandle.standardError.write(Data("\(msg)\n".utf8))
-                    }
-                } catch {
-                    FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
-                    throw ExitCode.failure
-                }
-            } else {
-                FileHandle.standardError.write(Data("lumina: image '\(image)' not found. Use 'lumina images list' to see available images.\n".utf8))
-                throw ExitCode.failure
-            }
-        }
+        try await ensureImage(image)
 
         let resolvedMemory = resolveMemory(flag: memory)
         let resolvedCpus = resolveCpus(flag: cpus)
