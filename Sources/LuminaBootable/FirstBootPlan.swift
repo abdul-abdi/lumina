@@ -318,7 +318,8 @@ extension VMBundle {
             variableStoreURL: efiVarsURL,
             primaryDisk: primaryDiskURL,
             cdromISO: cdrom,
-            preferUSBCDROM: manifest.osFamily == .windows,
+            preferUSBCDROM: manifest.osFamily == .windows
+                || ["debian", "kali"].contains { manifest.osVariant.lowercased().hasPrefix($0) },
             installPhase: manifest.lastBootedAt == nil,
             primaryDiskNVMe: manifest.osFamily == .windows,
             linuxDirectKernel: plan.linuxDirectKernel,
