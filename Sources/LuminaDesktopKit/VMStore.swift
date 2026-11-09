@@ -8,10 +8,7 @@ public struct VMStore: Sendable {
         self.rootURL = rootURL
     }
 
-    public static var defaultRoot: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".lumina/desktop-vms")
-    }
+    public static var defaultRoot: URL { VMBundle.libraryRoot }
 
     /// Read all `.luminaVM` bundles under `rootURL`. Bundles whose
     /// manifest fails to parse are silently dropped (they show up as

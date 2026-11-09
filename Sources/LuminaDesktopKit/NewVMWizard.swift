@@ -187,50 +187,30 @@ public struct NewVMWizard: View {
 
                 switch tile.acquisition {
                 case .catalogISO(let entry):
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("INSTALLER ISO")
-                            .font(LuminaTheme.label).tracking(1.5)
-                            .foregroundStyle(LuminaTheme.inkMute)
-                        Text(entry.isoURL.absoluteString)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(LuminaTheme.inkDim)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                        HStack(spacing: 8) {
-                            Button("Open in Browser") {
-                                NSWorkspace.shared.open(entry.isoURL)
-                            }
-                            Button("Copy URL") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(entry.isoURL.absoluteString, forType: .string)
-                            }
+                    automaticDownloadPanel(size: formatBytesHuman(entry.isoSizeBytes), source: entry.isoURL.host ?? "the vendor")
+                case .omarchy:
+                    automaticDownloadPanel(size: "6.7 GB", source: "nightly.omarchy.org")
+                case .microsoftAccountDownload:
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Microsoft only hands out the Windows 11 ARM64 ISO in a browser.")
+                            .font(.headline)
+                        Button("Get Windows 11 from Microsoft") {
+                            NSWorkspace.shared.open(URL(string: "https://www.microsoft.com/software-download/windows11arm64")!)
                         }
-                        Text("≈ \(formatBytesHuman(entry.isoSizeBytes)) download. Once you have the ISO on disk, attach it below.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(LuminaTheme.inkMute)
-                            .padding(.top, 4)
+                        .buttonStyle(.borderedProminent)
+                        .tint(LuminaTheme.accent)
+                        Text(byoFile == nil
+                             ? "Pick \"Windows 11 (multi-edition ISO for Arm64)\". Lumina spots the ISO in Downloads as soon as it finishes."
+                             : "Found \(byoFile!.lastPathComponent). Windows installs unattended and signs in as lumina / lumina.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(byoFile == nil ? LuminaTheme.inkDim : LuminaTheme.ok)
                         isoPicker
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(LuminaTheme.bg1)
                     .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
-                case .microsoftAccountDownload:
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Microsoft requires a Microsoft Account to download the ISO.")
-                                .font(.headline)
-                            Text("Lumina opens the download page in your browser. After downloading, drop the ISO here.")
-                                .foregroundStyle(.secondary)
-                            Button("Open Microsoft Download Page") {
-                                NSWorkspace.shared.open(URL(string: "https://www.microsoft.com/en-us/software-download/windows11arm64")!)
-                            }
-                            .padding(.top, 4)
-                            isoPicker
-                            windowsTPMAdvisory
-                        }
-                        .padding(8)
-                    }
+                    .task(id: tile.id) { await watchDownloadsForWindowsISO() }
                 case .appleIPSW:
                     GroupBox {
                         VStack(alignment: .leading, spacing: 8) {
@@ -474,24 +454,41 @@ public struct NewVMWizard: View {
     /// retail ISOs refuse OOBE without TPM 2.0, which means users download
     /// a 5 GB file that won't boot through Setup. Cheap to warn up-front.
     @ViewBuilder
-    private var windowsTPMAdvisory: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("⚠ KNOWN CONSTRAINT: WINDOWS 11 TPM")
-                .font(LuminaTheme.label).tracking(1.3)
-                .foregroundStyle(LuminaTheme.warn)
-            Text("Apple's Virtualization.framework exposes no TPM. Stock Windows 11 Home/Pro retail ISOs refuse Setup without TPM 2.0. Known workable paths on Apple Silicon:")
-                .font(.system(size: 11))
+    private func automaticDownloadPanel(size: String, source: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Lumina downloads the installer (\(size)) from \(source) on first boot, checks its SHA-256 and keeps it for next time.", systemImage: "arrow.down.circle")
+                .font(.system(size: 12))
                 .foregroundStyle(LuminaTheme.ink)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("  • Tiny11 ARM ISO (pre-bypassed). Not Microsoft-signed.\n  • Windows Insider Preview ISO (TPM bypass during Insider flighting).\n  • Inject LabConfig\\BypassTPMCheck=1 via unattend.xml on a FAT32 sidecar.")
-                .font(.system(size: 10, design: .monospaced))
+            Text("Already have the ISO? Attach it instead.")
+                .font(.system(size: 11))
                 .foregroundStyle(LuminaTheme.inkMute)
-                .fixedSize(horizontal: false, vertical: true)
+            isoPicker
         }
-        .padding(10)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(Rectangle().stroke(LuminaTheme.warn.opacity(0.5), lineWidth: 1))
-        .padding(.top, 6)
+        .background(LuminaTheme.bg1)
+        .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+    }
+
+    private func modified(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+
+    private func watchDownloadsForWindowsISO() async {
+        let downloads = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+        while !Task.isCancelled, byoFile == nil {
+            let candidates = (try? FileManager.default.contentsOfDirectory(
+                at: downloads, includingPropertiesForKeys: [.contentModificationDateKey]
+            )) ?? []
+            let found = candidates
+                .filter { $0.pathExtension.lowercased() == "iso" && $0.lastPathComponent.lowercased().contains("arm64") && $0.lastPathComponent.lowercased().hasPrefix("win") }
+                .max { modified($0) < modified($1) }
+            if let found {
+                byoFile = found
+                return
+            }
+            try? await Task.sleep(for: .seconds(2))
+        }
     }
 
     private var isoPicker: some View {
@@ -547,9 +544,9 @@ public struct NewVMWizard: View {
             guard let tile = selectedTile else { return false }
             if isVerifying { return false }
             switch tile.acquisition {
-            case .userProvided, .microsoftAccountDownload, .catalogISO:
+            case .userProvided, .microsoftAccountDownload:
                 return byoFile != nil
-            case .appleIPSW:
+            case .appleIPSW, .catalogISO, .omarchy:
                 return true
             }
         case .resources: return true
@@ -652,6 +649,8 @@ public struct NewVMWizard: View {
             diskGB = Double(entry.recommendedDiskBytes / (1024 * 1024 * 1024))
         case .microsoftAccountDownload, .appleIPSW:
             memoryGB = 8; cpus = 4; diskGB = 64
+        case .omarchy:
+            memoryGB = 8; cpus = 6; diskGB = 80
         case .userProvided:
             break
         }
@@ -689,6 +688,9 @@ public struct NewVMWizard: View {
                 id: id
             )
             try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: diskBytes)
+            if osVariant == "omarchy" {
+                try OmarchySeed.write(into: bundle)
+            }
             if let f = byoFile {
                 let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
                 try? Data(f.path.utf8).write(to: sidecar, options: .atomic)

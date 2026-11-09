@@ -197,8 +197,9 @@ public struct CommandLauncher: View {
         }
 
         if q.isEmpty || "new".hasPrefix(verbHit) || "create".hasPrefix(verbHit)
-            || q.contains("ubuntu") || q.contains("kali") || q.contains("fedora")
+            || q.contains("ubuntu") || q.contains("omarchy") || q.contains("kali") || q.contains("fedora")
             || q.contains("debian") || q.contains("windows") || q.contains("mac") {
+            out.append(.newVM(tileID: "omarchy", label: "Omarchy"))
             out.append(.newVM(tileID: "ubuntu-24.04", label: "Ubuntu 24.04 LTS"))
             out.append(.newVM(tileID: "kali-rolling", label: "Kali (rolling)"))
             out.append(.newVM(tileID: "fedora-42", label: "Fedora 42"))

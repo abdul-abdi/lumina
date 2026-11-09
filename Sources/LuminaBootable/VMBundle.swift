@@ -136,6 +136,13 @@ public struct VMBundle: Sendable, Equatable {
     public var manifest: VMBundleManifest
 
     public var manifestURL: URL { rootURL.appendingPathComponent("manifest.json") }
+    public static var libraryRoot: URL {
+        if let override = ProcessInfo.processInfo.environment["LUMINA_DESKTOP_VMS"] {
+            return URL(fileURLWithPath: override)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".lumina/desktop-vms")
+    }
+
     public var primaryDiskURL: URL { rootURL.appendingPathComponent("disk.img") }
     public var efiVarsURL: URL { rootURL.appendingPathComponent("efi.vars") }
     public var auxiliaryStorageURL: URL { rootURL.appendingPathComponent("aux.img") }

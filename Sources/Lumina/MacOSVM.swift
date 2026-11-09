@@ -46,6 +46,14 @@ public actor MacOSVM {
         VM.VZMachineHandle(machine: virtualMachine)
     }
 
+    public func setPaused(_ paused: Bool) async throws {
+        guard let vm = virtualMachine else { return }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+            let done: (Result<Void, any Swift.Error>) -> Void = { cont.resume(with: $0) }
+            if paused { vm.pause(completionHandler: done) } else { vm.resume(completionHandler: done) }
+        }
+    }
+
     public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
         pendingDelegate = delegate
         virtualMachine?.delegate = delegate

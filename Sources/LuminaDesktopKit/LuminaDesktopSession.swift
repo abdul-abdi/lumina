@@ -66,6 +66,7 @@ public final class LuminaDesktopSession: Identifiable {
     public var serialDigest: String = ""
     public var bootPhases: BootPhases = BootPhases()
     public var installProgress: (label: String, fraction: Double)?
+    public var notice: String?
 
     public var snapshot: SessionSnapshot {
         SessionSnapshot(
@@ -104,6 +105,7 @@ public final class LuminaDesktopSession: Identifiable {
     private var vm: VM?
     private var macVM: MacOSVM?
     private var installTask: Task<Void, any Error>?
+    private var installActivity: NSObjectProtocol?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
     /// VZ holds the delegate weakly, so we retain it here until the
@@ -171,7 +173,31 @@ public final class LuminaDesktopSession: Identifiable {
         }
 
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
-        let cdromURL = mutableBundle.pendingISO
+        if isInstallPhase, installActivity == nil {
+            installActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.idleSystemSleepDisabled, .userInitiated],
+                reason: "Installing \(mutableBundle.manifest.name)"
+            )
+        }
+        var cdromURL = mutableBundle.pendingISO
+        if cdromURL == nil, isInstallPhase, let name = InstallerSource.displayName(for: mutableBundle.manifest.osVariant) {
+            do {
+                cdromURL = try await mutableBundle.fetchInstaller { [weak self] fraction in
+                    Task { @MainActor in self?.installProgress = ("Downloading \(name)", fraction) }
+                }
+                installProgress = nil
+            } catch {
+                installProgress = nil
+                applyAtomic(SessionSnapshot(
+                    status: .crashed(reason: "installer download: \(error)"),
+                    lastError: "installer download: \(error)",
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest,
+                    bootPhases: BootPhases()
+                ))
+                return
+            }
+        }
         if mutableBundle.manifest.osFamily == .windows, isInstallPhase, WindowsDrivers.cachedISO == nil {
             _ = try? await WindowsDrivers.ensure { [weak self] fraction in
                 Task { @MainActor in self?.installProgress = ("Downloading Windows drivers", fraction) }
@@ -415,6 +441,7 @@ public final class LuminaDesktopSession: Identifiable {
 
     private func handleExternalStop(reason: String?) {
         if status.isTerminal { return }
+        endInstallActivity()
 
         // Grab one final serial tail from the VM before we drop the
         // actor reference. On a kernel panic or EFI→kernel handoff
@@ -513,6 +540,53 @@ public final class LuminaDesktopSession: Identifiable {
         }
     }
 
+    public func takeSnapshot() async {
+        let wasRunning = status == .running
+        do {
+            if wasRunning { try await setPaused(true) }
+            _ = try bundle.takeSnapshot()
+            if wasRunning { try await setPaused(false) }
+            flash("Snapshot saved")
+        } catch {
+            if wasRunning { try? await setPaused(false) }
+            flash("Snapshot failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func togglePause() async {
+        guard status == .running || status == .paused else { return }
+        let pausing = status == .running
+        do {
+            try await setPaused(pausing)
+            status = pausing ? .paused : .running
+        } catch {
+            flash("Couldn't \(pausing ? "pause" : "resume"): \(error.localizedDescription)")
+        }
+    }
+
+    public func restore(_ snapshot: VMSnapshot) throws {
+        guard !status.isLive else { return }
+        try bundle.restore(snapshot)
+    }
+
+    private func setPaused(_ paused: Bool) async throws {
+        if let vm { try await vm.setPaused(paused) }
+        if let macVM { try await macVM.setPaused(paused) }
+    }
+
+    private func endInstallActivity() {
+        if let installActivity { ProcessInfo.processInfo.endActivity(installActivity) }
+        installActivity = nil
+    }
+
+    private func flash(_ message: String) {
+        notice = message
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            if self?.notice == message { self?.notice = nil }
+        }
+    }
+
     public func shutdown() async {
         status = .shuttingDown
         // Clear the handle immediately so the view stops rendering
@@ -525,6 +599,7 @@ public final class LuminaDesktopSession: Identifiable {
         bootPhasesMirrorTask?.cancel()
         bootPhasesMirrorTask = nil
         installTask?.cancel()
+        endInstallActivity()
         if let vm = self.vm {
             await vm.setDelegate(nil)
             await vm.shutdown()

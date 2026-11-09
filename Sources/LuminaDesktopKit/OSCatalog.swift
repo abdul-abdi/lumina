@@ -14,12 +14,22 @@ public struct OSWizardTile: Sendable, Identifiable {
         case catalogISO(DesktopOSEntry)        // Linux — URL + checksum
         case microsoftAccountDownload          // Windows 11 ARM — opens browser
         case appleIPSW
+        case omarchy
         case userProvided                       // BYO file
     }
 }
 
 public enum OSCatalog {
     public static let allTiles: [OSWizardTile] = [
+        OSWizardTile(
+            id: "omarchy",
+            displayName: "Omarchy",
+            family: .linux,
+            glyph: "terminal.fill",
+            description: "Arch Linux with Hyprland, set up by Omarchy. Installs itself unattended; you sign in as yourself.",
+            constraint: "First boot installs Omarchy (10-15 min)",
+            acquisition: .omarchy
+        ),
         tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill",
              desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
              constraint: "Server ISO · GUI is a one-liner post-install"),

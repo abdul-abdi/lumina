@@ -175,8 +175,8 @@ public struct LibraryView: View {
             sidebarRow(.agentImages, count: 0)
 
             sectionHeader("ACTIVITY")
-            sidebarRow(.downloads, count: 0)
-            sidebarRow(.snapshots, count: 0)
+            sidebarRow(.downloads, count: DownloadsView.cachedFiles().count)
+            sidebarRow(.snapshots, count: model.bundles.reduce(0) { $0 + $1.snapshots.count })
         }
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 300)
@@ -238,6 +238,10 @@ public struct LibraryView: View {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
             if section == .agentImages {
                 CustomImagesView(layout: layout)
+            } else if section == .downloads {
+                DownloadsView(model: model)
+            } else if section == .snapshots {
+                SnapshotsView(model: model)
             } else if filteredForSection.isEmpty && model.bundles.isEmpty {
                 EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {

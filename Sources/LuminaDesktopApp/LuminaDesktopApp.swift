@@ -209,6 +209,7 @@ struct LuminaCommands: Commands {
             .keyboardShortcut("n", modifiers: .command)
 
             Menu("New VM from OS") {
+                Button("Omarchy") { openWizard(tile: "omarchy") }
                 Button("Ubuntu 24.04 LTS") { openWizard(tile: "ubuntu-24.04") }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Kali (rolling)") { openWizard(tile: "kali-rolling") }

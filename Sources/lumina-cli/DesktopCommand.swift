@@ -18,10 +18,7 @@ struct Desktop: AsyncParsableCommand {
 enum DesktopHelpers {
     /// Root directory for app-visible desktop VMs. Shared with the
     /// Lumina Desktop.app (M6).
-    static var defaultRoot: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".lumina/desktop-vms")
-    }
+    static var defaultRoot: URL { VMBundle.libraryRoot }
 
     static func createBundle(
         at root: URL,
@@ -228,6 +225,8 @@ struct DesktopCreate: AsyncParsableCommand {
                 FileHandle.standardError.write(Data("error: --seed: \(error.localizedDescription)\n".utf8))
                 throw ExitCode(2)
             }
+        } else if osVariant == "omarchy" {
+            try OmarchySeed.write(into: bundle)
         }
 
         // Stage the installer ISO path into the logs directory's sidecar
@@ -320,6 +319,11 @@ enum DesktopRunner {
     ) async throws -> Stop {
         var bundle = bundle
         bundle.ensureMACAddress()
+        var cdrom = cdrom
+        if cdrom == nil, bundle.manifest.lastBootedAt == nil, let name = InstallerSource.displayName(for: bundle.manifest.osVariant) {
+            FileHandle.standardError.write(Data("Downloading \(name) (cached after the first time)…\n".utf8))
+            cdrom = try await bundle.fetchInstaller()
+        }
         if bundle.manifest.osFamily == .windows, bundle.manifest.lastBootedAt == nil, WindowsDrivers.cachedISO == nil {
             FileHandle.standardError.write(Data("Downloading the virtio drivers Windows needs for networking (~880 MB, cached)…\n".utf8))
             do {
@@ -337,6 +341,10 @@ enum DesktopRunner {
         for event in plan.events {
             FileHandle.standardError.write(Data(formatFirstBootEvent(event).utf8))
         }
+        let installing = bundle.manifest.lastBootedAt == nil
+            ? ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated], reason: "Installing \(bundle.manifest.name)")
+            : nil
+        defer { installing.map(ProcessInfo.processInfo.endActivity) }
         var opts = bundle.vmOptions(cdrom: cdrom, plan: plan)
         if let serialFile {
             opts.serialLogURL = URL(fileURLWithPath: (serialFile as NSString).expandingTildeInPath)

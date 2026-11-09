@@ -16,10 +16,20 @@ public struct RunningVMView: View {
     }
 
     public var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             LuminaTheme.bgInset
             framebuffer
+            if let notice = session.notice {
+                Text(notice)
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.top, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
+        .animation(.easeOut(duration: 0.2), value: session.notice)
         .preferredColorScheme(appearance.colorScheme)
         .toolbar {
             // Centered VM name. `.principal` puts the item in the title
@@ -33,22 +43,58 @@ public struct RunningVMView: View {
                     .foregroundStyle(LuminaTheme.ink)
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                toolbarButton("⏻ STOP", color: LuminaTheme.err) {
-                    Task { await session.shutdown() }
+                if let signIn = session.bundle.signIn {
+                    Menu {
+                        Text("User: \(signIn.user)")
+                        if let password = signIn.password {
+                            Button("Copy Password") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(password, forType: .string)
+                            }
+                        }
+                    } label: {
+                        Label("Sign-in Details", systemImage: "key")
+                    }
+                    .help("How to sign in to this VM")
                 }
-                .disabled(!session.status.isLive)
 
-                toolbarButton("↻ RESTART") {
+                Button {
+                    Task { await session.takeSnapshot() }
+                } label: {
+                    Label("Take Snapshot", systemImage: "camera")
+                }
+                .keyboardShortcut("t", modifiers: .command)
+                .disabled(session.status == .booting || session.status == .shuttingDown)
+                .help("Save the VM's disks so you can return to this point")
+
+                Button {
+                    Task { await session.togglePause() }
+                } label: {
+                    Label(session.status == .paused ? "Resume" : "Pause",
+                          systemImage: session.status == .paused ? "play.fill" : "pause.fill")
+                }
+                .disabled(session.status != .running && session.status != .paused)
+                .help(session.status == .paused ? "Resume the VM" : "Pause the VM")
+
+                Button {
                     Task {
                         await session.shutdown()
                         await session.boot()
                     }
+                } label: {
+                    Label("Restart", systemImage: "arrow.clockwise")
                 }
-
-                toolbarButton("⌘ SNAPSHOT") {
-                }
-                .keyboardShortcut("t", modifiers: .command)
                 .disabled(!session.status.isLive)
+                .help("Stop and start the VM")
+
+                Button {
+                    Task {
+                        if session.status.isLive { await session.shutdown() } else { await session.boot() }
+                    }
+                } label: {
+                    Label(session.status.isLive ? "Stop" : "Start", systemImage: "power")
+                }
+                .help(session.status.isLive ? "Stop the VM" : "Start the VM")
             }
         }
         // Window title for accessibility + Expose / Dock / Window menu.
@@ -77,19 +123,6 @@ public struct RunningVMView: View {
         if #unavailable(macOS 15.0) {
             LegacyFullscreenConfigurator()
         }
-    }
-
-    private func toolbarButton(_ label: String, color: Color = LuminaTheme.ink, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(LuminaTheme.label)
-                .tracking(1.5)
-                .foregroundStyle(color)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
     }
 
     @ViewBuilder
