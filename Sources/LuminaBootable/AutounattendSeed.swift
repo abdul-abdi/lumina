@@ -31,19 +31,29 @@ public struct AutounattendSeed: Sendable {
         bundleRootURL: URL,
         username: String = "lumina",
         hostname: String = "lumina-vm",
+        language: String = "en-US",
         xml: String? = nil
     ) {
         self.bundleRootURL = bundleRootURL
         self.username = username
         self.hostname = hostname
-        self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname)
+        self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname, language: language)
     }
 
     /// `BypassNRO` is the magic OOBE step that lets us skip the
     /// "you must connect to internet and sign in to Microsoft" gate.
     /// Without it, recent Win11 ARM ISOs (post-23H2) brick OOBE in a VM
     /// with no working network/MSA.
-    public static func defaultXML(username: String, hostname: String) -> String {
+    public static func language(ofISO iso: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: iso) else { return nil }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: 16 * 2048 + 40)
+        guard let label = (try? handle.read(upToCount: 32)).map({ String(decoding: $0, as: UTF8.self) }),
+              let match = label.firstMatch(of: /_([A-Z]{2})-([A-Z]{2})_/) else { return nil }
+        return "\(match.1.lowercased())-\(match.2)"
+    }
+
+    public static func defaultXML(username: String, hostname: String, language: String = "en-US") -> String {
         // Use the Pro Volume License key — accepts unattended install
         // and skips product-key prompts. Same key Microsoft documents in
         // their Volume Activation guide; functionally a "deferred
@@ -142,12 +152,12 @@ public struct AutounattendSeed: Sendable {
                        publicKeyToken="31bf3856ad364e35" language="neutral"
                        versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
               <SetupUILanguage>
-                <UILanguage>en-US</UILanguage>
+                <UILanguage>\#(language)</UILanguage>
               </SetupUILanguage>
               <InputLocale>0409:00000409</InputLocale>
-              <SystemLocale>en-US</SystemLocale>
-              <UILanguage>en-US</UILanguage>
-              <UserLocale>en-US</UserLocale>
+              <SystemLocale>\#(language)</SystemLocale>
+              <UILanguage>\#(language)</UILanguage>
+              <UserLocale>\#(language)</UserLocale>
             </component>
           </settings>
 

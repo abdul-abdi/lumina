@@ -116,7 +116,10 @@ public struct FirstBootDependencies: Sendable {
             ).patch()
         },
         generateAutounattend: { bundleRoot in
-            try AutounattendSeed(bundleRootURL: bundleRoot).generate()
+            let iso = (try? String(contentsOf: bundleRoot.appendingPathComponent("pending-iso.path"), encoding: .utf8))
+                .map { URL(fileURLWithPath: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            let language = iso.flatMap(AutounattendSeed.language(ofISO:)) ?? "en-US"
+            return try AutounattendSeed(bundleRootURL: bundleRoot, language: language).generate()
         },
         windowsDrivers: { WindowsDrivers.cachedISO }
     )
