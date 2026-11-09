@@ -72,7 +72,9 @@ public struct EFIBootable: Sendable {
                 url: config.primaryDisk,
                 installPhase: config.installPhase
             )
-            storage.append(VZVirtioBlockDeviceConfiguration(attachment: primary))
+            storage.append(config.primaryDiskNVMe
+                ? VZNVMExpressControllerDeviceConfiguration(attachment: primary)
+                : VZVirtioBlockDeviceConfiguration(attachment: primary))
         } catch {
             throw Error.diskAttachmentFailed(config.primaryDisk, "\(error)")
         }

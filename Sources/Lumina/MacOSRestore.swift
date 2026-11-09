@@ -26,7 +26,7 @@ public enum MacOSRestore {
         return destination
     }
 
-    private static func download(
+    public static func download(
         _ remote: URL, to destination: URL, progress: @escaping @Sendable (Double) -> Void
     ) async throws {
         var head = URLRequest(url: remote)

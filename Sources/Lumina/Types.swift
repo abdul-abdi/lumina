@@ -168,6 +168,7 @@ public struct EFIBootConfig: Sendable, Equatable {
     /// mid-install loses data, and the install is disposable).
     /// Callers populate this from `VMBundleManifest.lastBootedAt == nil`.
     public var installPhase: Bool
+    public var primaryDiskNVMe: Bool
     /// Opt-in Linux-direct boot override. When any of these are set, the
     /// EFIBootable path substitutes `VZLinuxBootLoader` for
     /// `VZEFIBootLoader`, bypassing the ISO's own GRUB. The only reason
@@ -201,6 +202,7 @@ public struct EFIBootConfig: Sendable, Equatable {
         cdromISO: URL? = nil,
         preferUSBCDROM: Bool = false,
         installPhase: Bool = false,
+        primaryDiskNVMe: Bool = false,
         linuxDirectKernel: URL? = nil,
         linuxDirectInitramfs: URL? = nil,
         linuxDirectCmdline: String? = nil,
@@ -211,6 +213,7 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.cdromISO = cdromISO
         self.preferUSBCDROM = preferUSBCDROM
         self.installPhase = installPhase
+        self.primaryDiskNVMe = primaryDiskNVMe
         self.linuxDirectKernel = linuxDirectKernel
         self.linuxDirectInitramfs = linuxDirectInitramfs
         self.linuxDirectCmdline = linuxDirectCmdline

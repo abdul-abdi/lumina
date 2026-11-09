@@ -90,15 +90,18 @@ public struct FirstBootDependencies: Sendable {
     public var extract: Extractor
     public var injectPreseed: Preseeder
     public var generateAutounattend: Autounattender
+    public var windowsDrivers: @Sendable () -> URL?
 
     public init(
         extract: @escaping Extractor,
         injectPreseed: @escaping Preseeder,
-        generateAutounattend: @escaping Autounattender
+        generateAutounattend: @escaping Autounattender,
+        windowsDrivers: @escaping @Sendable () -> URL? = { nil }
     ) {
         self.extract = extract
         self.injectPreseed = injectPreseed
         self.generateAutounattend = generateAutounattend
+        self.windowsDrivers = windowsDrivers
     }
 
     public static let live = FirstBootDependencies(
@@ -114,7 +117,8 @@ public struct FirstBootDependencies: Sendable {
         },
         generateAutounattend: { bundleRoot in
             try AutounattendSeed(bundleRootURL: bundleRoot).generate()
-        }
+        },
+        windowsDrivers: { WindowsDrivers.cachedISO }
     )
 }
 
@@ -266,6 +270,9 @@ public func prepareFirstBoot(
             let unattendISO = try dependencies.generateAutounattend(bundle.rootURL)
             plan.seedISOs.append(unattendISO)
             plan.events.append(.autounattendGenerated(iso: unattendISO))
+            if let drivers = dependencies.windowsDrivers() {
+                plan.seedISOs.append(drivers)
+            }
         } catch {
             // Recoverable — Win11 will hit the compat check, but we
             // still hand control to VZ rather than aborting.
@@ -304,6 +311,7 @@ extension VMBundle {
             cdromISO: cdrom,
             preferUSBCDROM: manifest.osFamily == .windows,
             installPhase: manifest.lastBootedAt == nil,
+            primaryDiskNVMe: manifest.osFamily == .windows,
             linuxDirectKernel: plan.linuxDirectKernel,
             linuxDirectInitramfs: plan.linuxDirectInitramfs,
             linuxDirectCmdline: plan.linuxDirectCmdline,

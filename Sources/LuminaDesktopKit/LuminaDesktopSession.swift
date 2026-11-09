@@ -172,6 +172,12 @@ public final class LuminaDesktopSession: Identifiable {
 
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
         let cdromURL = mutableBundle.pendingISO
+        if mutableBundle.manifest.osFamily == .windows, isInstallPhase, WindowsDrivers.cachedISO == nil {
+            _ = try? await WindowsDrivers.ensure { [weak self] fraction in
+                Task { @MainActor in self?.installProgress = ("Downloading Windows drivers", fraction) }
+            }
+            installProgress = nil
+        }
 
         // First-boot orchestration — preseed injection (Debian/Kali) and
         // Windows 11 autounattend sidecar. Same call the CLI makes from

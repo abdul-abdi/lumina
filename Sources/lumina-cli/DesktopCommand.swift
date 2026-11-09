@@ -320,6 +320,14 @@ enum DesktopRunner {
     ) async throws -> Stop {
         var bundle = bundle
         bundle.ensureMACAddress()
+        if bundle.manifest.osFamily == .windows, bundle.manifest.lastBootedAt == nil, WindowsDrivers.cachedISO == nil {
+            FileHandle.standardError.write(Data("Downloading the virtio drivers Windows needs for networking (~880 MB, cached)…\n".utf8))
+            do {
+                _ = try await WindowsDrivers.ensure()
+            } catch {
+                FileHandle.standardError.write(Data("warning: driver download failed (\(error)); Windows will install without network drivers\n".utf8))
+            }
+        }
         let plan = try prepareFirstBoot(
             bundle: bundle,
             attachedISO: cdrom,
