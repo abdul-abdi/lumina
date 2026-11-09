@@ -40,11 +40,13 @@ import Testing
         #expect(kali.contains("d-i mirror/suite string kali-rolling"))
         #expect(kali.contains("d-i apt-setup/components string main contrib non-free non-free-firmware"))
         #expect(!kali.contains("security.debian.org"))
+        #expect(kali.contains("kali-desktop-xfce"))
 
         let debian = PreseedSeed.cfg(forOSVariant: "debian-12")
         #expect(debian.contains("d-i mirror/http/hostname string deb.debian.org"))
         #expect(debian.contains("d-i apt-setup/security_host string security.debian.org"))
         #expect(!debian.contains("kali"))
+        #expect(debian.contains("gnome-desktop"))
 
         for cfg in [kali, debian] {
             #expect(cfg.contains("d-i netcfg/dhcp_retries string 4"))

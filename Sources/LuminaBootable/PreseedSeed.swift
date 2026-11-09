@@ -41,6 +41,7 @@ public struct PreseedSeed: Sendable {
     public static func cfg(forOSVariant osVariant: String) -> String {
         let mirror: String
         let apt: String
+        let packages: String
         if osVariant.lowercased().contains("kali") {
             mirror = """
             d-i mirror/http/hostname string http.kali.org
@@ -53,6 +54,10 @@ public struct PreseedSeed: Sendable {
             d-i apt-setup/services-select multiselect
             d-i apt-setup/components string main contrib non-free non-free-firmware
             """
+            packages = """
+            tasksel tasksel/first multiselect standard
+            d-i pkgsel/include string openssh-server kali-desktop-xfce
+            """
         } else {
             mirror = """
             d-i mirror/http/hostname string deb.debian.org
@@ -62,6 +67,10 @@ public struct PreseedSeed: Sendable {
             apt = """
             d-i apt-setup/services-select multiselect security, updates
             d-i apt-setup/security_host string security.debian.org
+            """
+            packages = """
+            tasksel tasksel/first multiselect standard, desktop, gnome-desktop, ssh-server
+            d-i pkgsel/include string openssh-server
             """
         }
         return """
@@ -97,8 +106,7 @@ public struct PreseedSeed: Sendable {
         d-i passwd/user-password-again password lumina
         d-i apt-setup/use_mirror boolean true
         \(apt)
-        tasksel tasksel/first multiselect standard
-        d-i pkgsel/include string openssh-server
+        \(packages)
         d-i pkgsel/upgrade select none
         popularity-contest popularity-contest/participate boolean false
         d-i grub-installer/only_debian boolean true
