@@ -72,7 +72,7 @@ public enum DesktopOSCatalog {
             sha256: "f12484464c7d4d73e2167e0a7dbda1e669f8fae9bcf778dc0944937034b320cb",
             isoSizeBytes: 3_825_512_448,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
@@ -83,7 +83,7 @@ public enum DesktopOSCatalog {
             sha256: "c4a7f9bf3a0ff07c8263fe9e9b0edba0cc3d9b408f1d8f06c066df0afce23072",
             isoSizeBytes: 4_051_513_344,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
@@ -94,7 +94,7 @@ public enum DesktopOSCatalog {
             sha256: "954a0d7d6553fdf2b6bcf7f393a2e41f9265a0a81de8c8e4f712f5924e40577f",
             isoSizeBytes: 2_200_000_000,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
@@ -104,8 +104,8 @@ public enum DesktopOSCatalog {
             isoURL: URL(string: "https://cdimage.debian.org/cdimage/archive/12.12.0/arm64/iso-cd/debian-12.12.0-arm64-netinst.iso")!,
             sha256: "0dd2f82a5dd53cb9c6abd92d30070d23bcbfd7dfb55309be4ac07245df3999b9",
             isoSizeBytes: 500_000_000,
-            recommendedMemoryBytes: 2 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 16 * 1024 * 1024 * 1024
         ),
     ]
