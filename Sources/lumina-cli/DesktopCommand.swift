@@ -351,10 +351,16 @@ enum DesktopRunner {
         }
         if graphics { opts.graphics = GraphicsConfig() }
         opts.rosetta = rosetta
-        return try await run(VM(options: opts), timeout: timeout, window: graphics ? bundle.manifest.name : nil) {
+        let stop = try await run(VM(options: opts), timeout: timeout, window: graphics ? bundle.manifest.name : nil) {
             try? bundle.recordBoot()
             FileHandle.standardError.write(Data(banner.utf8))
         }
+        guard stop == .guest, plan.bootDisk != nil, bundle.manifest.lastBootedAt != nil else { return stop }
+        FileHandle.standardError.write(Data("Install finished. Starting \(bundle.manifest.name) from its disk…\n".utf8))
+        return try await boot(
+            bundle, cdrom: nil, graphics: graphics, rosetta: rosetta, captureSerial: false,
+            serialFile: serialFile, timeout: timeout, banner: banner
+        )
     }
 
     static func run(

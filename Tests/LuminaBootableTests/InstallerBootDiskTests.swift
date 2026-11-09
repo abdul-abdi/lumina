@@ -38,3 +38,16 @@ import Testing
         }
     }
 }
+
+@Suite struct InstallerBootDiskSymlinkTests {
+    @Test func symlinkedKernelIsRejected() throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("lumina-bootdisk-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let link = tmp.appendingPathComponent("vmlinuz")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: URL(fileURLWithPath: "/etc/hosts"))
+        #expect(throws: InstallerBootDisk.Error.self) {
+            try InstallerBootDisk.requireRegularFile(link)
+        }
+    }
+}

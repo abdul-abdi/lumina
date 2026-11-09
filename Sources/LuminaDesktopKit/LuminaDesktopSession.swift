@@ -105,6 +105,7 @@ public final class LuminaDesktopSession: Identifiable {
     private var vm: VM?
     private var macVM: MacOSVM?
     private var installTask: Task<Void, any Error>?
+    private var restartAfterInstall = false
     private var installActivity: NSObjectProtocol?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
@@ -234,6 +235,7 @@ public final class LuminaDesktopSession: Identifiable {
             return
         }
         appendFirstBootLog(events: firstBootPlan.events, to: mutableBundle.logsDirectory)
+        restartAfterInstall = firstBootPlan.bootDisk != nil
 
         var opts = mutableBundle.vmOptions(cdrom: cdromURL, plan: firstBootPlan)
         opts.graphics = GraphicsConfig()
@@ -445,6 +447,8 @@ public final class LuminaDesktopSession: Identifiable {
 
     private func handleExternalStop(reason: String?) {
         if status.isTerminal { return }
+        let installFinished = restartAfterInstall && reason == nil
+        restartAfterInstall = false
         endInstallActivity()
 
         // Grab one final serial tail from the VM before we drop the
@@ -488,6 +492,10 @@ public final class LuminaDesktopSession: Identifiable {
                 serialDigest: serialDigest,
                 bootPhases: bootPhases
             ))
+        }
+        if installFinished {
+            flash("Installed. Starting \(bundle.manifest.name)…")
+            Task { [weak self] in await self?.boot() }
         }
     }
 
@@ -603,6 +611,7 @@ public final class LuminaDesktopSession: Identifiable {
         bootPhasesMirrorTask?.cancel()
         bootPhasesMirrorTask = nil
         installTask?.cancel()
+        restartAfterInstall = false
         endInstallActivity()
         if let vm = self.vm {
             await vm.setDelegate(nil)

@@ -271,10 +271,11 @@ public struct VMBundle: Sendable, Equatable {
     }
 
     public mutating func recordBoot(at date: Date = Date()) throws {
-        if manifest.lastBootedAt == nil {
-            for leftover in ["pending-iso.path", "cidata", "cidata.iso"] {
-                try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(leftover))
-            }
+        let leftovers = manifest.lastBootedAt == nil
+            ? ["pending-iso.path", "cidata", "cidata.iso"]
+            : ["installer-boot.cdr", "initrd.preseeded", "linux-direct"]
+        for leftover in leftovers {
+            try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(leftover))
         }
         manifest.lastBootedAt = date
         try save()
