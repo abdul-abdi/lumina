@@ -11,6 +11,12 @@ public enum InstallerSource {
 
     public static func fetch(variant: String, progress: @escaping @Sendable (Double) -> Void) async throws -> URL? {
         if variant == "omarchy" {
+            let cached = (try? FileManager.default.contentsOfDirectory(
+                at: cacheRoot.appendingPathComponent("omarchy"), includingPropertiesForKeys: nil
+            )) ?? []
+            if let newest = cached.filter({ $0.pathExtension == "iso" }).max(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                return newest
+            }
             struct Latest: Decodable { let url: URL; let sha256: String }
             let (data, _) = try await URLSession.shared.data(from: omarchyManifest)
             let latest = try JSONDecoder().decode(Latest.self, from: data)

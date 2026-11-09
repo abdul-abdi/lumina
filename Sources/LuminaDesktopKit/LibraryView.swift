@@ -36,8 +36,7 @@ public struct LibraryView: View {
     @Bindable public var model: AppModel
     @Bindable public var coordinator: LauncherCoordinator
     @State private var section: SidebarSection = .all
-    @State private var showingWizard = false
-    @State private var wizardInitialTile: String? = nil
+    @State private var wizardRequest: WizardRequest?
     @State private var showingLauncher = false
     @State private var lastSeenLauncherStamp: UUID? = nil
     @State private var appearanceState: AppearancePreference
@@ -83,7 +82,7 @@ public struct LibraryView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showingWizard = true
+                    showWizard()
                 } label: {
                     Label("New VM", systemImage: "plus")
                 }
@@ -92,10 +91,12 @@ public struct LibraryView: View {
             }
         }
         .tint(LuminaTheme.accent)
-        .sheet(isPresented: $showingWizard) {
-            NewVMWizard(model: model, isPresented: $showingWizard,
-                        initialTileID: wizardInitialTile)
-                .onDisappear { wizardInitialTile = nil }
+        .sheet(item: $wizardRequest) { request in
+            NewVMWizard(
+                model: model,
+                isPresented: Binding(get: { wizardRequest != nil }, set: { if !$0 { wizardRequest = nil } }),
+                initialTileID: request.tile
+            )
         }
         .sheet(isPresented: $showingLauncher) {
             CommandLauncher(model: model, coordinator: coordinator, isPresented: $showingLauncher)
@@ -145,16 +146,14 @@ public struct LibraryView: View {
             let url = URL(fileURLWithPath: p)
             let ext = url.pathExtension.lowercased()
             guard ["iso", "img", "ipsw"].contains(ext) else { continue }
-            wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
-            showingWizard = true
             UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
+            showWizard(preselect: ext == "ipsw" ? "macos-latest" : "byo-file")
             break
         }
     }
 
     fileprivate func showWizard(preselect tileID: String? = nil) {
-        wizardInitialTile = tileID
-        showingWizard = true
+        wizardRequest = WizardRequest(tile: tileID)
     }
 
     private var sidebar: some View {
@@ -396,4 +395,9 @@ public struct LuminaSearchField: View {
                 .stroke(LuminaTheme.rule2, lineWidth: 0.5)
         )
     }
+}
+
+private struct WizardRequest: Identifiable {
+    let id = UUID()
+    let tile: String?
 }

@@ -796,8 +796,10 @@ struct OSTileButton: View {
                 Text(tile.description)
                     .font(LuminaTheme.caption)
                     .foregroundStyle(LuminaTheme.inkDim)
-                    .lineLimit(2)
+                    .lineLimit(3)
                     .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
                 if let constraint = tile.constraint {
                     Text(constraint.uppercased())
                         .font(LuminaTheme.label)
@@ -805,8 +807,9 @@ struct OSTileButton: View {
                         .foregroundStyle(LuminaTheme.inkMute)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 190, alignment: .topLeading)
+            .contentShape(Rectangle())
             .background(
                 isSelected ? LuminaTheme.accent.opacity(0.08) :
                 hovering ? LuminaTheme.bg1 : Color.clear

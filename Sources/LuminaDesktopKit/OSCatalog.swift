@@ -30,19 +30,22 @@ public enum OSCatalog {
             constraint: "First boot installs Omarchy (10-15 min)",
             acquisition: .omarchy
         ),
-        tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill",
+        tile(for: "ubuntu-24.04", name: "Ubuntu 24.04", glyph: "circle.hexagongrid.fill",
              desc: "Stable LTS release. Installs unattended with the minimal GNOME desktop; sign in as lumina / lumina.",
              constraint: "First boot installs Ubuntu (20-30 min)"),
-        tile(for: "kali-rolling", glyph: "shield.lefthalf.filled",
-             desc: "Penetration-testing distribution, rolling release. Installs unattended with Xfce; sign in as lumina / lumina."),
-        tile(for: "fedora-42", glyph: "circle.grid.cross.fill",
-             desc: "Bleeding-edge GNOME experience from Red Hat. Live ISO boots straight into the desktop — no post-install steps."),
-        tile(for: "debian-12", glyph: "leaf.fill",
-             desc: "Conservative and dependable. Installs unattended with GNOME; sign in as lumina / lumina."),
+        tile(for: "kali-rolling", name: "Kali Linux", glyph: "shield.lefthalf.filled",
+             desc: "Penetration-testing distribution, rolling release. Installs unattended with Xfce; sign in as lumina / lumina.",
+             constraint: "First boot installs Kali (20-30 min)"),
+        tile(for: "fedora-42", name: "Fedora 42", glyph: "circle.grid.cross.fill",
+             desc: "Bleeding-edge GNOME from Red Hat. Boots straight into the live desktop.",
+             constraint: "Live session, install from the desktop"),
+        tile(for: "debian-12", name: "Debian 12", glyph: "leaf.fill",
+             desc: "Conservative and dependable. Installs unattended with GNOME; sign in as lumina / lumina.",
+             constraint: "First boot installs Debian (20-30 min)"),
 
         OSWizardTile(
             id: "windows-11-arm",
-            displayName: "Windows 11 (ARM64)",
+            displayName: "Windows 11",
             family: .windows,
             glyph: "macwindow",
             description: "Microsoft's ARM build of Windows 11. Activation needs your own license.",
@@ -52,7 +55,7 @@ public enum OSCatalog {
 
         OSWizardTile(
             id: "macos-latest",
-            displayName: "macOS (latest supported)",
+            displayName: "macOS",
             family: .macOS,
             glyph: "apple.logo",
             description: "Apple's macOS as a guest, restored from the newest IPSW this Mac supports (~18 GB download, cached).",
@@ -62,7 +65,7 @@ public enum OSCatalog {
 
         OSWizardTile(
             id: "byo-file",
-            displayName: "Use my own ISO",
+            displayName: "Your own ISO",
             family: .linux,  // displayed under linux family but can be anything
             glyph: "doc.badge.plus",
             description: "Drop a file you've already downloaded.",
@@ -73,6 +76,7 @@ public enum OSCatalog {
 
     private static func tile(
         for catalogID: String,
+        name: String,
         glyph: String,
         desc: String,
         constraint: String? = nil
@@ -85,7 +89,7 @@ public enum OSCatalog {
         }
         return OSWizardTile(
             id: catalogID,
-            displayName: entry.displayName,
+            displayName: name,
             family: entry.family,
             glyph: glyph,
             description: desc,
