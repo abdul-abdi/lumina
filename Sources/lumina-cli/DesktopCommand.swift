@@ -288,7 +288,7 @@ struct DesktopBoot: AsyncParsableCommand {
     mutating func run() async throws {
         let bundle = DesktopHelpers.loadBundleOrExit(bundlePath)
         if bundle.manifest.osFamily == .macOS {
-            _ = try await DesktopRunner.runMacOS(bundle, timeout: timeoutSec)
+            _ = try await DesktopRunner.runMacOS(bundle, timeout: timeoutSec, window: !headless)
             return
         }
         do {
@@ -351,7 +351,7 @@ enum DesktopRunner {
         }
         if graphics { opts.graphics = GraphicsConfig() }
         opts.rosetta = rosetta
-        return try await run(VM(options: opts), timeout: timeout) {
+        return try await run(VM(options: opts), timeout: timeout, window: graphics ? bundle.manifest.name : nil) {
             try? bundle.recordBoot()
             FileHandle.standardError.write(Data(banner.utf8))
         }
@@ -360,6 +360,7 @@ enum DesktopRunner {
     static func run(
         _ vm: VM,
         timeout: Int,
+        window: String? = nil,
         onBooted: () throws -> Void = {}
     ) async throws -> Stop {
         let guestStop = GuestStopSignal()
@@ -372,13 +373,17 @@ enum DesktopRunner {
             throw ExitCode(1)
         }
         try onBooted()
+        if let window {
+            let machine = await vm.vzMachine().machine
+            await DesktopWindow.show(machine, title: window)
+        }
         let stop = await waitForStop(guestStop, timeout: timeout)
         await vm.shutdown()
         withExtendedLifetime(guestStop) {}
         return stop
     }
 
-    static func runMacOS(_ bundle: VMBundle, timeout: Int) async throws -> Stop {
+    static func runMacOS(_ bundle: VMBundle, timeout: Int, window: Bool) async throws -> Stop {
         guard bundle.isMacOSInstalled else {
             FileHandle.standardError.write(Data("error: macOS is not installed in this bundle yet; run 'lumina desktop install-macos \(bundle.rootURL.path)'\n".utf8))
             throw ExitCode(1)
@@ -394,7 +399,11 @@ enum DesktopRunner {
         }
         var booted = bundle
         try? booted.recordBoot()
-        FileHandle.standardError.write(Data("Booted \(bundle.manifest.name) (headless; open it in Lumina.app to see the screen). Press Ctrl-C to stop.\n".utf8))
+        if window {
+            let machine = await vm.vzMachine().machine
+            await DesktopWindow.show(machine, title: bundle.manifest.name)
+        }
+        FileHandle.standardError.write(Data("Booted \(bundle.manifest.name). Press Ctrl-C to stop.\n".utf8))
         let stop = await waitForStop(guestStop, timeout: timeout)
         await vm.shutdown()
         withExtendedLifetime(guestStop) {}
