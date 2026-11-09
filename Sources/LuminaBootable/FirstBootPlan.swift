@@ -143,6 +143,10 @@ public func prepareFirstBoot(
         || osVariantLower.contains("ubuntu")
     let needsLinuxDirect = captureSerial || (isDebianFamily && isFirstBoot)
     let isWindowsFirstBoot = bundle.manifest.osFamily == .windows && isFirstBoot
+    let isUbuntu = osVariantLower.contains("ubuntu")
+    if isUbuntu, isFirstBoot, !FileManager.default.fileExists(atPath: bundle.seedDirectory.path) {
+        try? UbuntuAutoinstall.write(into: bundle.seedDirectory)
+    }
     let hasSeed = isFirstBoot
         && FileManager.default.fileExists(atPath: bundle.seedDirectory.path)
 
@@ -246,7 +250,9 @@ public func prepareFirstBoot(
             cmdlineParts.append(extracted.cmdlineExtra)
         }
 
-        if isDebianFamily && isFirstBoot {
+        if isUbuntu && isFirstBoot && hasSeed {
+            cmdlineParts.append("autoinstall")
+        } else if isDebianFamily && isFirstBoot {
             let preseedCfg = PreseedSeed.cfg(forOSVariant: bundle.manifest.osVariant)
             do {
                 let patched = try dependencies.injectPreseed(

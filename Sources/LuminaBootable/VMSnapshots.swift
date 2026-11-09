@@ -77,7 +77,7 @@ extension VMBundle {
     public var signIn: (user: String, password: String?)? {
         let variant = manifest.osVariant.lowercased()
         if variant == "omarchy" { return (NSUserName(), OmarchySeed.password(for: self)) }
-        if manifest.osFamily == .windows || variant.hasPrefix("debian") || variant.hasPrefix("kali") {
+        if manifest.osFamily == .windows || variant.hasPrefix("debian") || variant.hasPrefix("kali") || variant.hasPrefix("ubuntu") {
             return ("lumina", "lumina")
         }
         return nil

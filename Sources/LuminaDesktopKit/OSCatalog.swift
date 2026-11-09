@@ -31,14 +31,14 @@ public enum OSCatalog {
             acquisition: .omarchy
         ),
         tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill",
-             desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
-             constraint: "Server ISO · GUI is a one-liner post-install"),
+             desc: "Stable LTS release. Installs unattended with the minimal GNOME desktop; sign in as lumina / lumina.",
+             constraint: "First boot installs Ubuntu (20-30 min)"),
         tile(for: "kali-rolling", glyph: "shield.lefthalf.filled",
-             desc: "Penetration-testing distribution; rolling release. Installer offers XFCE desktop out of the box."),
+             desc: "Penetration-testing distribution, rolling release. Installs unattended with Xfce; sign in as lumina / lumina."),
         tile(for: "fedora-42", glyph: "circle.grid.cross.fill",
              desc: "Bleeding-edge GNOME experience from Red Hat. Live ISO boots straight into the desktop — no post-install steps."),
         tile(for: "debian-12", glyph: "leaf.fill",
-             desc: "Conservative, dependable; the foundation many other distros build on. Netinst lets you pick GNOME/KDE/XFCE during setup."),
+             desc: "Conservative and dependable. Installs unattended with GNOME; sign in as lumina / lumina."),
 
         OSWizardTile(
             id: "windows-11-arm",
