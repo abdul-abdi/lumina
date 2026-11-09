@@ -195,6 +195,7 @@ public struct EFIBootConfig: Sendable, Equatable {
     /// `autounattend.xml` it finds, which is normally the sidecar
     /// because the installer ISO doesn't ship one.
     public var extraCDROMs: [URL]
+    public var bootDisk: URL?
 
     public init(
         variableStoreURL: URL,
@@ -206,7 +207,8 @@ public struct EFIBootConfig: Sendable, Equatable {
         linuxDirectKernel: URL? = nil,
         linuxDirectInitramfs: URL? = nil,
         linuxDirectCmdline: String? = nil,
-        extraCDROMs: [URL] = []
+        extraCDROMs: [URL] = [],
+        bootDisk: URL? = nil
     ) {
         self.variableStoreURL = variableStoreURL
         self.primaryDisk = primaryDisk
@@ -218,6 +220,7 @@ public struct EFIBootConfig: Sendable, Equatable {
         self.linuxDirectInitramfs = linuxDirectInitramfs
         self.linuxDirectCmdline = linuxDirectCmdline
         self.extraCDROMs = extraCDROMs
+        self.bootDisk = bootDisk
     }
 }
 

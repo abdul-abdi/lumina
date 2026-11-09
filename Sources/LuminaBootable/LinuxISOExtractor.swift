@@ -336,7 +336,7 @@ public struct LinuxISOExtractor: Sendable {
     // thread drains stdout to EOF, then waits for the process. The
     // captured-var + DispatchQueue.async alternative trips Swift 6's
     // concurrent-capture diagnostic, hence the StderrBox lock pattern.
-    private static func runProcess(
+    static func runProcess(
         _ path: String, arguments: [String]
     ) -> (exitCode: Int32, stdout: String, stderr: String) {
         let process = Process()

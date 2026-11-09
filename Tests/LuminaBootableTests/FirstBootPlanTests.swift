@@ -127,6 +127,77 @@ import Testing
         #expect(plan.events.contains(.preseedInjected(initrd: patchedInitrd)))
     }
 
+    @Test func debian_firstBoot_bootsInstallerThroughFirmware() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let iso = URL(fileURLWithPath: "/fake/debian.iso")
+        let kernel = URL(fileURLWithPath: "/fake/extracted/vmlinuz")
+        let patched = URL(fileURLWithPath: "/fake/bundle/initrd.preseeded")
+        let disk = URL(fileURLWithPath: "/fake/bundle/installer-boot.cdr")
+
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: kernel,
+                    initramfs: URL(fileURLWithPath: "/fake/extracted/initrd.gz"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, _ in patched },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend,
+            makeBootDisk: { _, source, k, initrd, cmdline in
+                #expect(source == iso)
+                #expect(k == kernel)
+                #expect(initrd == patched)
+                #expect(cmdline.contains("preseed/file=/preseed.cfg"))
+                return disk
+            }
+        )
+
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        #expect(plan.bootDisk == disk)
+        #expect(plan.linuxDirectKernel == nil)
+        #expect(plan.linuxDirectInitramfs == nil)
+        #expect(plan.linuxDirectCmdline == nil)
+        #expect(bundle.vmOptions(cdrom: iso, plan: plan).efi?.bootDisk == disk)
+    }
+
+    @Test func debian_firstBoot_bootDiskFailureFallsBackToLinuxDirect() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/vmlinuz"),
+                    initramfs: URL(fileURLWithPath: "/fake/initrd.gz"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, _ in URL(fileURLWithPath: "/fake/initrd.preseeded") },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend,
+            makeBootDisk: { _, _, _, _, _ in throw NSError(domain: "test", code: 2) }
+        )
+
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: URL(fileURLWithPath: "/fake/debian.iso"),
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        #expect(plan.bootDisk == nil)
+        #expect(plan.linuxDirectKernel != nil)
+        #expect(plan.events.contains { if case .bootDiskFailed = $0 { return true } else { return false } })
+    }
+
     @Test func debian_firstBoot_noISO_throwsMissingISO() throws {
         let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
         do {

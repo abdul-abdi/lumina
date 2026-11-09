@@ -90,6 +90,7 @@ public struct PreseedSeed: Sendable {
         d-i clock-setup/utc boolean true
         d-i time/zone string Etc/UTC
         d-i clock-setup/ntp boolean true
+        d-i partman-auto/disk string /dev/vda
         d-i partman-auto/method string regular
         d-i partman-auto/choose_recipe select atomic
         d-i partman-lvm/device_remove_lvm boolean true
@@ -112,7 +113,9 @@ public struct PreseedSeed: Sendable {
         d-i grub-installer/only_debian boolean true
         d-i grub-installer/with_other_os boolean false
         d-i grub-installer/bootdev string /dev/vda
+        d-i grub-installer/force-efi-extra-removable boolean true
         d-i finish-install/reboot_in_progress note
+        d-i debian-installer/exit/poweroff boolean true
 
         """
     }

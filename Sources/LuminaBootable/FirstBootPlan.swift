@@ -24,6 +24,7 @@ public struct FirstBootPlan: Sendable, Equatable {
     public var linuxDirectInitramfs: URL?
     public var linuxDirectCmdline: String?
     public var seedISOs: [URL]
+    public var bootDisk: URL?
     public var events: [Event]
 
     public enum Event: Sendable, Equatable {
@@ -50,6 +51,8 @@ public struct FirstBootPlan: Sendable, Equatable {
         case autounattendFailed(reason: String)
         case seedAttached(iso: URL)
         case seedFailed(reason: String)
+        case installerBootDisk(URL)
+        case bootDiskFailed(reason: String)
     }
 
     public static let empty = FirstBootPlan(
@@ -57,6 +60,7 @@ public struct FirstBootPlan: Sendable, Equatable {
         linuxDirectInitramfs: nil,
         linuxDirectCmdline: nil,
         seedISOs: [],
+        bootDisk: nil,
         events: []
     )
 }
@@ -86,22 +90,26 @@ public struct FirstBootDependencies: Sendable {
     /// vs Kali mirror lines, etc.) — the closure just runs cpio + cat.
     public typealias Preseeder = @Sendable (_ bundleRoot: URL, _ originalInitrd: URL, _ cfg: String) throws -> URL
     public typealias Autounattender = @Sendable (_ bundleRoot: URL) throws -> URL
+    public typealias BootDiskMaker = @Sendable (_ bundleRoot: URL, _ iso: URL, _ kernel: URL, _ initrd: URL, _ cmdline: String) throws -> URL
 
     public var extract: Extractor
     public var injectPreseed: Preseeder
     public var generateAutounattend: Autounattender
     public var windowsDrivers: @Sendable () -> URL?
+    public var makeBootDisk: BootDiskMaker?
 
     public init(
         extract: @escaping Extractor,
         injectPreseed: @escaping Preseeder,
         generateAutounattend: @escaping Autounattender,
-        windowsDrivers: @escaping @Sendable () -> URL? = { nil }
+        windowsDrivers: @escaping @Sendable () -> URL? = { nil },
+        makeBootDisk: BootDiskMaker? = nil
     ) {
         self.extract = extract
         self.injectPreseed = injectPreseed
         self.generateAutounattend = generateAutounattend
         self.windowsDrivers = windowsDrivers
+        self.makeBootDisk = makeBootDisk
     }
 
     public static let live = FirstBootDependencies(
@@ -121,7 +129,13 @@ public struct FirstBootDependencies: Sendable {
             let language = iso.flatMap(AutounattendSeed.language(ofISO:)) ?? "en-US"
             return try AutounattendSeed(bundleRootURL: bundleRoot, language: language).generate()
         },
-        windowsDrivers: { WindowsDrivers.cachedISO }
+        windowsDrivers: { WindowsDrivers.cachedISO },
+        makeBootDisk: { bundleRoot, iso, kernel, initrd, cmdline in
+            try InstallerBootDisk.make(
+                iso: iso, kernel: kernel, initrd: initrd, cmdline: cmdline,
+                at: bundleRoot.appendingPathComponent("installer-boot.cdr")
+            )
+        }
     )
 }
 
@@ -270,8 +284,20 @@ public func prepareFirstBoot(
             }
         }
 
+        let cmdline = cmdlineParts.joined(separator: " ")
+        if !captureSerial, let makeBootDisk = dependencies.makeBootDisk {
+            do {
+                let disk = try makeBootDisk(bundle.rootURL, iso, extracted.kernel, initrdURL, cmdline)
+                plan.bootDisk = disk
+                plan.linuxDirectKernel = nil
+                plan.events.append(.installerBootDisk(disk))
+                return plan
+            } catch {
+                plan.events.append(.bootDiskFailed(reason: "\(error)"))
+            }
+        }
         plan.linuxDirectInitramfs = initrdURL
-        plan.linuxDirectCmdline = cmdlineParts.joined(separator: " ")
+        plan.linuxDirectCmdline = cmdline
     }
 
     if isWindowsFirstBoot {
@@ -325,7 +351,8 @@ extension VMBundle {
             linuxDirectKernel: plan.linuxDirectKernel,
             linuxDirectInitramfs: plan.linuxDirectInitramfs,
             linuxDirectCmdline: plan.linuxDirectCmdline,
-            extraCDROMs: plan.seedISOs
+            extraCDROMs: plan.seedISOs,
+            bootDisk: plan.bootDisk
         )
         return opts
     }

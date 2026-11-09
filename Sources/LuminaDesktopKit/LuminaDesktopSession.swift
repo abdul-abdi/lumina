@@ -436,6 +436,10 @@ public final class LuminaDesktopSession: Identifiable {
             return "seed: attached \(iso.lastPathComponent)"
         case .seedFailed(let reason):
             return "seed: failed (\(reason))"
+        case .installerBootDisk(let disk):
+            return "installer: EFI boot from \(disk.lastPathComponent)"
+        case .bootDiskFailed(let reason):
+            return "installer: boot disk failed (\(reason)); direct kernel boot"
         }
     }
 

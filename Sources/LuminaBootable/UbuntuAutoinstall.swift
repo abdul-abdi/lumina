@@ -26,7 +26,7 @@ public enum UbuntuAutoinstall {
               name: direct
           packages:
             - ubuntu-desktop-minimal
-          shutdown: reboot
+          shutdown: poweroff
 
         """
         try Data(userData.utf8).write(to: seed.appendingPathComponent("user-data"))

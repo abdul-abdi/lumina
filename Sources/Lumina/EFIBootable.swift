@@ -79,6 +79,14 @@ public struct EFIBootable: Sendable {
             throw Error.diskAttachmentFailed(config.primaryDisk, "\(error)")
         }
 
+        if let disk = config.bootDisk {
+            do {
+                storage.append(VZUSBMassStorageDeviceConfiguration(attachment: try Self.makeISOAttachment(url: disk)))
+            } catch {
+                throw Error.diskAttachmentFailed(disk, "\(error)")
+            }
+        }
+
         if let iso = config.cdromISO {
             do {
                 let isoAttachment = try Self.makeISOAttachment(url: iso)

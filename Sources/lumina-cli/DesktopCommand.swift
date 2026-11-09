@@ -474,7 +474,7 @@ private final class GuestStopSignal: NSObject, VZVirtualMachineDelegate, @unchec
 private func formatFirstBootEvent(_ event: FirstBootPlan.Event) -> String {
     switch event {
     case .linuxDirectMatched(let layoutName):
-        return "linux-direct: matched \(layoutName); booting via VZLinuxBootLoader\n"
+        return "installer: matched \(layoutName)\n"
     case .linuxDirectUnknownLayoutFallback(let tried, let supported):
         return "error: linux-direct: couldn't find a known kernel layout. "
             + "Supported: \(supported.joined(separator: ", ")). "
@@ -494,6 +494,10 @@ private func formatFirstBootEvent(_ event: FirstBootPlan.Event) -> String {
         return "seed: attached \(iso.lastPathComponent) (volume cidata)\n"
     case .seedFailed(let reason):
         return "warning: seed ISO failed (\(reason)); the installer will run interactively\n"
+    case .installerBootDisk(let disk):
+        return "installer: booting through EFI from \(disk.lastPathComponent)\n"
+    case .bootDiskFailed(let reason):
+        return "warning: installer boot disk failed (\(reason)); booting the kernel directly, the installed system may not boot\n"
     }
 }
 
