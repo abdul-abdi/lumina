@@ -6,6 +6,12 @@ import LuminaBootable
 public struct RunningVMView: View {
     @Bindable var session: LuminaDesktopSession
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
+    @State private var confirming: PowerAction?
+
+    private enum PowerAction: String, Identifiable {
+        case stop = "Stop", restart = "Restart"
+        var id: String { rawValue }
+    }
 
     private var appearance: AppearancePreference {
         AppearancePreference(rawValue: appearanceRaw) ?? .system
@@ -77,10 +83,7 @@ public struct RunningVMView: View {
                 .help(session.status == .paused ? "Resume the VM" : "Pause the VM")
 
                 Button {
-                    Task {
-                        await session.shutdown()
-                        await session.boot()
-                    }
+                    confirming = .restart
                 } label: {
                     Label("Restart", systemImage: "arrow.clockwise")
                 }
@@ -88,14 +91,26 @@ public struct RunningVMView: View {
                 .help("Stop and start the VM")
 
                 Button {
-                    Task {
-                        if session.status.isLive { await session.shutdown() } else { await session.boot() }
-                    }
+                    if session.status.isLive { confirming = .stop } else { Task { await session.boot() } }
                 } label: {
                     Label(session.status.isLive ? "Stop" : "Start", systemImage: "power")
                 }
                 .help(session.status.isLive ? "Stop the VM" : "Start the VM")
             }
+        }
+        .confirmationDialog(
+            "\(confirming?.rawValue ?? "Stop") \(session.bundle.manifest.name)?",
+            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            presenting: confirming
+        ) { action in
+            Button(action.rawValue, role: .destructive) {
+                Task {
+                    await session.shutdown()
+                    if action == .restart { await session.boot() }
+                }
+            }
+        } message: { _ in
+            Text("This cuts power to the VM. Anything unsaved inside it is lost.")
         }
         // Window title for accessibility + Expose / Dock / Window menu.
         // The on-screen toolbar shows the name via the `.principal`
