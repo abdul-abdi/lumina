@@ -49,7 +49,7 @@ import Testing
     // defaults them to (0, []) so old guests stay compatible.
     let data = Data("{\"type\":\"ready\"}\n".utf8)
     let msg = try Protocol.decodeGuest(data)
-    #expect(msg == .ready(protocolVersion: 0, capabilities: []))
+    #expect(msg == .ready(protocolVersion: 0))
 }
 
 @Test func decodeReadyMessageWithProtocolVersion() throws {
@@ -57,7 +57,7 @@ import Testing
     // can branch on guest features without message-shape probing.
     let json = #"{"type":"ready","protocol_version":1,"capabilities":["pty","port_forward","network_metrics"]}"# + "\n"
     let msg = try Protocol.decodeGuest(Data(json.utf8))
-    #expect(msg == .ready(protocolVersion: 1, capabilities: ["pty", "port_forward", "network_metrics"]))
+    #expect(msg == .ready(protocolVersion: 1))
 }
 
 @Test func decodeReadyMessagePartialCapabilities() throws {
@@ -65,7 +65,7 @@ import Testing
     // equality but the host should treat it as a set in practice.
     let json = #"{"type":"ready","protocol_version":2,"capabilities":[]}"# + "\n"
     let msg = try Protocol.decodeGuest(Data(json.utf8))
-    #expect(msg == .ready(protocolVersion: 2, capabilities: []))
+    #expect(msg == .ready(protocolVersion: 2))
 }
 
 @Test func decodeOutputMessage() throws {

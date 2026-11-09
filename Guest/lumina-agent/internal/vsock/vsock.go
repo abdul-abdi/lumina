@@ -13,7 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Listen binds a vsock listener on the given port, accepting from any CID.
 func Listen(port int) (net.Listener, error) {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -36,14 +35,12 @@ func Listen(port int) (net.Listener, error) {
 	return &listener{fd: fd}, nil
 }
 
-// ── listener ────────────────────────────────────────────────────────
-
 type listener struct {
 	fd int
 }
 
 func (l *listener) Accept() (net.Conn, error) {
-	nfd, _, err := unix.Accept(l.fd)
+	nfd, _, err := unix.Accept4(l.fd, unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
 	if err != nil {
 		return nil, err
 	}
@@ -53,8 +50,6 @@ func (l *listener) Accept() (net.Conn, error) {
 
 func (l *listener) Close() error   { return unix.Close(l.fd) }
 func (l *listener) Addr() net.Addr { return addr{} }
-
-// ── conn ────────────────────────────────────────────────────────────
 
 type conn struct {
 	file *os.File
@@ -69,8 +64,6 @@ func (c *conn) RemoteAddr() net.Addr               { return addr{} }
 func (c *conn) SetDeadline(t time.Time) error      { return c.file.SetDeadline(t) }
 func (c *conn) SetReadDeadline(t time.Time) error  { return c.file.SetReadDeadline(t) }
 func (c *conn) SetWriteDeadline(t time.Time) error { return c.file.SetWriteDeadline(t) }
-
-// ── addr ────────────────────────────────────────────────────────────
 
 type addr struct{}
 

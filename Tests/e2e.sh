@@ -16,6 +16,7 @@ SKIP=0
 FAILURES=()
 
 export LUMINA_FORMAT=json
+export LUMINA_DAEMON=0
 
 if [ -t 1 ]; then
   GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; NC='\033[0m'; BOLD='\033[1m'
@@ -102,32 +103,30 @@ fi
 section "3. STREAMING EDGE CASES"
 # ═══════════════════════════════════════════════════════════════
 
-# Legacy NDJSON streaming + download (was P1 bug: VM stuck in executing after stream)
+# Run + download (was P1 bug: VM stuck in executing after stream)
 rm -f /tmp/lumina-e2e-sdl.txt
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run --download "/tmp/sd.txt:/tmp/lumina-e2e-sdl.txt" "echo payload > /tmp/sd.txt && echo done" 2>/dev/null)
-if echo "$OUT" | grep -q '"exit_code":0' && [ -f /tmp/lumina-e2e-sdl.txt ] && grep -q "payload" /tmp/lumina-e2e-sdl.txt; then
-  pass "3.1 ndjson stream + download (P1 regression)"
+OUT=$($LUMINA run --download "/tmp/sd.txt:/tmp/lumina-e2e-sdl.txt" "echo payload > /tmp/sd.txt && echo done" 2>/dev/null)
+if echo "$OUT" | jq -e '.exit_code == 0 and .stdout == "done\n"' >/dev/null 2>&1 && [ -f /tmp/lumina-e2e-sdl.txt ] && grep -q "payload" /tmp/lumina-e2e-sdl.txt; then
+  pass "3.1 run + download (P1 regression)"
 else
-  fail "3.1 stream + download" "exit or file missing"
+  fail "3.1 run + download" "exit or file missing: $OUT"
 fi
 
-# Every NDJSON line must be valid JSON — no raw newlines or broken escaping
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "echo 'line with \"quotes\"'; echo 'tab\there'; echo done" 2>/dev/null)
-BAD=0; TOTAL=0
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  TOTAL=$((TOTAL + 1))
-  echo "$line" | jq . >/dev/null 2>&1 || BAD=$((BAD + 1))
-done <<< "$OUT"
-[ "$BAD" -eq 0 ] && pass "3.2 NDJSON validity ($TOTAL lines)" || fail "3.2 NDJSON" "$BAD/$TOTAL invalid"
-
-# Stream large output — tests backpressure and buffer handling (NDJSON legacy path)
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "seq 1 5000" --timeout 30s 2>/dev/null)
-EXIT_LINE=$(echo "$OUT" | tail -1)
-if echo "$EXIT_LINE" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-  pass "3.3 stream 5K lines"
+# Quotes and tabs must survive as escaped JSON, not break the envelope
+OUT=$($LUMINA run "echo 'line with \"quotes\"'; printf 'tab\there\n'; echo done" 2>/dev/null)
+if echo "$OUT" | jq -e '.stdout == "line with \"quotes\"\ntab\there\ndone\n"' >/dev/null 2>&1; then
+  pass "3.2 quotes and tabs escape in the envelope"
 else
-  fail "3.3 stream large" "no clean exit"
+  fail "3.2 escaping" "$OUT"
+fi
+
+# Large output — tests backpressure and buffer handling; every line must arrive
+OUT=$($LUMINA run "seq 1 5000" --timeout 30s 2>/dev/null)
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
+if echo "$OUT" | jq -e '.exit_code == 0 and (.stdout | endswith("\n5000\n"))' >/dev/null 2>&1 && [ "$LINES" -eq 5000 ]; then
+  pass "3.3 5K lines arrive complete"
+else
+  fail "3.3 large output" "lines=$LINES"
 fi
 
 # Run timeout emits unified envelope with error="timeout" (v0.6.0 contract)
@@ -219,13 +218,13 @@ if [ -n "$SID" ]; then
   done
   $OK && pass "5.2 three sequential execs" || fail "5.2 sequential execs" "failed at $i"
 
-  # Two NDJSON-legacy execs back-to-back (THE P1 regression test)
-  OUT1=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo stream_one" 2>/dev/null)
-  OUT2=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo stream_two" 2>/dev/null)
-  if echo "$OUT1" | grep -q "stream_one" && echo "$OUT2" | grep -q "stream_two"; then
-    pass "5.3 two legacy-ndjson execs (P1 state reset)"
+  # Two execs back-to-back (THE P1 regression test)
+  OUT1=$($LUMINA exec "$SID" "echo stream_one" 2>/dev/null)
+  OUT2=$($LUMINA exec "$SID" "echo stream_two" 2>/dev/null)
+  if echo "$OUT1" | jq -e '.stdout == "stream_one\n"' >/dev/null 2>&1 && echo "$OUT2" | jq -e '.stdout == "stream_two\n"' >/dev/null 2>&1; then
+    pass "5.3 two back-to-back execs (P1 state reset)"
   else
-    fail "5.3 streamed execs" "s1=$(echo "$OUT1" | head -1) s2=$(echo "$OUT2" | head -1)"
+    fail "5.3 back-to-back execs" "s1=$OUT1 s2=$OUT2"
   fi
 
   # Buffered exec after stream (must work — state back to ready)
@@ -337,28 +336,24 @@ for i in $(seq 1 10); do
 done
 $OK && pass "7.1 10 rapid sequential execs" || fail "7.1 rapid" "failed at $i"
 
-# Alternating legacy-ndjson/unified-envelope — stresses state machine transitions
+# Alternating streamed-text/unified-envelope — stresses state machine transitions
 OK=true
 for i in $(seq 1 5); do
-  O1=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo st_$i" 2>/dev/null)
+  O1=$(LUMINA_FORMAT=text $LUMINA exec "$SID" "echo st_$i" 2>/dev/null)
   O2=$($LUMINA exec "$SID" "echo bf_$i" 2>/dev/null)
-  if ! echo "$O1" | grep -q "st_$i" || ! echo "$O2" | grep -q "bf_$i"; then
+  if [ "$O1" != "st_$i" ] || ! echo "$O2" | jq -e ".stdout == \"bf_$i\n\"" >/dev/null 2>&1; then
     OK=false; break
   fi
 done
-$OK && pass "7.2 5 alternating ndjson/envelope pairs" || fail "7.2 alternating" "pair $i"
+$OK && pass "7.2 5 alternating text/envelope pairs" || fail "7.2 alternating" "pair $i"
 
-# Large stream through session (legacy NDJSON path, tests no dropped frames)
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "seq 1 3000" --timeout 30s 2>/dev/null)
-EXIT_LINE=$(echo "$OUT" | grep '"exit_code"' | head -1)
-if echo "$EXIT_LINE" | grep -q '"exit_code":0'; then
-  if echo "$OUT" | grep -q '"data":"3000'; then
-    pass "7.3 3K line ndjson session stream (no dropped frames)"
-  else
-    pass "7.3 3K line ndjson session stream (exit ok, last line may be batched)"
-  fi
+# Large output through a session — no dropped frames
+OUT=$($LUMINA exec "$SID" "seq 1 3000" --timeout 30s 2>/dev/null)
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
+if echo "$OUT" | jq -e '.exit_code == 0 and (.stdout | endswith("\n3000\n"))' >/dev/null 2>&1 && [ "$LINES" -eq 3000 ]; then
+  pass "7.3 3K line session output (no dropped frames)"
 else
-  fail "7.3 large session stream" "no clean exit"
+  fail "7.3 large session output" "lines=$LINES"
 fi
 
 $LUMINA session stop "$SID" 2>/dev/null
@@ -489,16 +484,11 @@ echo "$OUT" | jq . >/dev/null 2>&1 && pass "11.1 JSON when piped" || fail "11.1"
 OUT=$(LUMINA_FORMAT=json $LUMINA run "echo fmt" 2>/dev/null)
 echo "$OUT" | jq -e '.stdout | test("fmt")' >/dev/null 2>&1 && pass "11.2 LUMINA_FORMAT=json" || fail "11.2" "$OUT"
 
-# Session NDJSON legacy — every line must be valid JSON
+# Session exec envelope splits stdout from stderr
 SID=$($LUMINA session start 2>/dev/null | jq -r '.sid')
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA exec "$SID" "echo a; echo b >&2; echo c" 2>/dev/null)
-BAD=0; TOTAL=0
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  TOTAL=$((TOTAL + 1))
-  echo "$line" | jq . >/dev/null 2>&1 || BAD=$((BAD + 1))
-done <<< "$OUT"
-[ "$BAD" -eq 0 ] && pass "11.3 session NDJSON validity ($TOTAL lines)" || fail "11.3" "$BAD/$TOTAL invalid"
+OUT=$($LUMINA exec "$SID" "echo a; echo b >&2; echo c" 2>/dev/null)
+echo "$OUT" | jq -e '.stdout == "a\nc\n" and .stderr == "b\n" and .exit_code == 0' >/dev/null 2>&1 \
+  && pass "11.3 session exec envelope" || fail "11.3 session exec envelope" "$OUT"
 $LUMINA session stop "$SID" 2>/dev/null
 
 # ═══════════════════════════════════════════════════════════════
@@ -598,19 +588,23 @@ else
   fail "13.1 interleaved 1K" "stdout=$STDOUT_COUNT stderr=$STDERR_COUNT"
 fi
 
-# Stream 10K lines — tests chunking + buffering (legacy NDJSON path)
-OUT=$(LUMINA_OUTPUT=ndjson $LUMINA run "seq 1 10000" --timeout 60s 2>/dev/null)
-EXIT_LINE=$(echo "$OUT" | grep '"exit_code"' | head -1)
-if echo "$EXIT_LINE" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-  DATA_LINES=$(echo "$OUT" | grep '"data"' | wc -l | tr -d ' ')
-  pass "13.2 stream 10K lines ($DATA_LINES chunks, exit ok)"
+# 10K lines — tests chunking + buffering
+OUT=$($LUMINA run "seq 1 10000" --timeout 60s 2>/dev/null)
+LINES=$(echo "$OUT" | jq -j '.stdout' | wc -l | tr -d ' ')
+if echo "$OUT" | jq -e '.exit_code == 0' >/dev/null 2>&1 && [ "$LINES" -eq 10000 ]; then
+  pass "13.2 10K lines arrive complete"
 else
-  fail "13.2 stream 10K" "no clean exit"
+  fail "13.2 10K lines" "lines=$LINES"
 fi
 
 # Binary output — base64 doesn't break NDJSON
 OUT=$($LUMINA run "dd if=/dev/urandom bs=1024 count=10 2>/dev/null | base64" --timeout 30s 2>/dev/null)
 echo "$OUT" | jq -e '.exit_code == 0' >/dev/null 2>&1 && pass "13.3 binary data through base64" || fail "13.3 binary base64" "exit code"
+
+# stdout_bytes is byte-exact: a text chunk before a binary chunk must be in it
+OUT=$($LUMINA run "printf 'text\n'; sleep 0.3; printf '\377\376'" 2>/dev/null)
+BYTES=$(echo "$OUT" | jq -r '.stdout_bytes // ""' | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')
+[ "$BYTES" = "746578740afffe" ] && pass "13.3b stdout_bytes holds the full stream" || fail "13.3b stdout_bytes" "got $BYTES from $OUT"
 
 # Many small outputs very fast — can the protocol keep up?
 OUT=$($LUMINA run "for i in \$(seq 1 500); do echo \$i; done" --timeout 30s 2>/dev/null)
@@ -882,6 +876,61 @@ else
 fi
 
 $LUMINA session stop "$SID_T" 2>/dev/null
+
+section "19. WARM-POOL DAEMON"
+
+DSOCK="$HOME/.lumina/e2e-$$.sock"
+DLOG=/tmp/lumina-e2e-daemon.log
+LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA daemon serve --size 2 --socket "$DSOCK" > "$DLOG" 2>&1 &
+for _ in $(seq 1 150); do grep -q "ready on" "$DLOG" 2>/dev/null && break; sleep 0.2; done
+if ! grep -q "ready on" "$DLOG"; then
+  fail "19.0 daemon ready" "$(cat "$DLOG")"
+else
+  pass "19.0 daemon ready"
+  drun() { LUMINA_DAEMON=1 LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA run "$@" 2>/dev/null; }
+
+  OUT=$(drun "echo warm")
+  echo "$OUT" | jq -e '.stdout == "warm\n" and .exit_code == 0 and .duration_ms < 100' >/dev/null 2>&1 \
+    && pass "19.1 run routes through a running daemon" || fail "19.1 auto-route" "$OUT"
+
+  PIDS=(); for i in 1 2 3 4; do drun "echo c$i" > "/tmp/lumina-e2e-d$i.out" & PIDS+=($!); done; wait "${PIDS[@]}"
+  OK=0; for i in 1 2 3 4; do jq -e ".stdout == \"c$i\n\"" "/tmp/lumina-e2e-d$i.out" >/dev/null 2>&1 && OK=$((OK + 1)); done
+  [ "$OK" -eq 4 ] && pass "19.2 4 concurrent runs on a pool of 2" || fail "19.2 concurrent" "$OK/4 ok"
+
+  OUT=$(LUMINA_MEMORY=512MB drun "echo cold")
+  echo "$OUT" | jq -e '.stdout == "cold\n" and .duration_ms >= 100' >/dev/null 2>&1 \
+    && pass "19.3 pool-shape mismatch falls back to cold boot" || fail "19.3 decline" "$OUT"
+
+  OUT=$(drun --timeout 1s "sleep 5")
+  echo "$OUT" | jq -e '.error == "timeout"' >/dev/null 2>&1 \
+    && pass "19.4 daemon timeout surfaces as error=timeout" || fail "19.4 daemon timeout" "$OUT"
+
+  OUT=$(LUMINA_FORMAT=text drun "echo plain")
+  [ "$OUT" = "plain" ] && pass "19.5 text output on daemon path" || fail "19.5 text output" "$OUT"
+fi
+LUMINA_DAEMON_SOCKET="$DSOCK" $LUMINA daemon stop >/dev/null 2>&1
+
+section "20. GUEST CLOCK"
+
+SID_C=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+$LUMINA exec "$SID_C" 'date -s "2020-01-01 00:00:00" >/dev/null' >/dev/null 2>&1
+GUEST=$($LUMINA exec "$SID_C" 'date -u +%s' 2>/dev/null | jq -r '.stdout' | tr -d '\n')
+DRIFT=$(( $(date -u +%s) - ${GUEST:-0} ))
+[ "${DRIFT#-}" -le 3 ] && pass "20.1 exec resyncs a stale guest clock from the RTC" || fail "20.1 clock" "drift ${DRIFT}s"
+$LUMINA session stop "$SID_C" >/dev/null 2>&1
+
+section "21. SESSION SAVE"
+
+SID_S=$($LUMINA session start 2>/dev/null | jq -r '.sid')
+IMG="e2e-save-$$"
+$LUMINA exec "$SID_S" 'echo saved-state > /root/marker' >/dev/null 2>&1
+OUT=$($LUMINA session save "$SID_S" "$IMG" 2>/dev/null)
+echo "$OUT" | jq -e ".image == \"$IMG\"" >/dev/null 2>&1 && pass "21.1 session save" || fail "21.1 session save" "$OUT"
+OUT=$($LUMINA run --image "$IMG" 'cat /root/marker' 2>/dev/null)
+echo "$OUT" | jq -e '.stdout == "saved-state\n"' >/dev/null 2>&1 \
+  && pass "21.2 saved image boots with the session's files" || fail "21.2 saved image" "$OUT"
+$LUMINA session stop "$SID_S" >/dev/null 2>&1
+$LUMINA images remove "$IMG" >/dev/null 2>&1
 
 # ═══════════════════════════════════════════════════════════════
 # RESULTS

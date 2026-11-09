@@ -1,7 +1,3 @@
-// Sources/LuminaBootable/ISOInspector.swift
-//
-// v0.7.0 M4 — pre-flight check that an installer ISO is ARM64.
-//
 // Lumina only boots aarch64 guests (VZ framework limitation; we don't
 // emulate x86). Catching this at `lumina desktop create` time is much
 // friendlier than letting EFI sit at a black screen for 30 seconds and
@@ -34,8 +30,6 @@ public struct ISOInspector: Sendable {
         case readFailed(URL)
     }
 
-    /// Inspect the first 1 MB of the file for EFI bootloader filenames.
-    /// 1 MB easily covers the ISO9660 path table on small images.
     public static func detectArchitecture(at url: URL) throws -> Architecture {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw Error.fileNotFound(url)

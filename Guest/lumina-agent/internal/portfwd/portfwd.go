@@ -2,12 +2,6 @@
 // vsock. The host asks for a forward; we open a vsock listener,
 // reply with its port, and proxy each accepted connection to
 // 127.0.0.1:<guest_port> inside the VM.
-//
-// The vsock bind primitive is pluggable (see `listenFunc`) so
-// Manager's core logic — port allocation, recycling, collision
-// handling — is testable on any platform. The production wiring in
-// `New` uses the real `vsock` package; tests inject a net.Pipe-based
-// fake.
 package portfwd
 
 import (
@@ -32,8 +26,6 @@ const firstDynamicPort = uint32(1025)
 // return ports to the free list.
 const maxVsockPort = uint32(65535)
 
-// dialTimeout caps how long we wait for the local service before
-// dropping the proxied vsock connection.
 const dialTimeout = 5 * time.Second
 
 // listenFunc is the vsock bind primitive. Production uses vsock.Listen;
@@ -45,8 +37,6 @@ type listenFunc func(port int) (net.Listener, error)
 type Manager struct {
 	w *wire.Writer
 
-	// listen is the vsock bind primitive. Production uses vsock.Listen;
-	// tests inject a fake via NewWithListen.
 	listen listenFunc
 
 	mu             sync.Mutex
@@ -55,11 +45,6 @@ type Manager struct {
 	active         map[int]*forward
 }
 
-// NewWithListen creates an empty Manager with a pluggable vsock listener
-// factory. The production path is `New` which wires in `vsock.Listen`;
-// tests use this form to inject a net.Pipe-based listener so the
-// port-allocation and double-start paths can run on platforms that
-// don't support AF_VSOCK.
 func NewWithListen(w *wire.Writer, listen listenFunc) *Manager {
 	return &Manager{
 		w:             w,
@@ -69,7 +54,6 @@ func NewWithListen(w *wire.Writer, listen listenFunc) *Manager {
 	}
 }
 
-// forward is a single active mapping.
 type forward struct {
 	ln        net.Listener
 	cancel    context.CancelFunc
@@ -109,7 +93,6 @@ func (m *Manager) Start(guestPort int) {
 	ln, err := m.listen(int(vsockPort))
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "port_forward: vsock listen on %d failed: %v\n", vsockPort, err)
-		// Return the port to the free list — we never got to use it.
 		m.mu.Lock()
 		m.freeVsockPorts = append(m.freeVsockPorts, vsockPort)
 		m.mu.Unlock()
@@ -181,8 +164,6 @@ func (m *Manager) allocateVsockPortLocked() (uint32, bool) {
 	return port, true
 }
 
-// ── private ─────────────────────────────────────────────────────────
-
 func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener, guestPort int, vsockPort uint32) {
 	defer func() {
 		_ = ln.Close()
@@ -204,7 +185,6 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener, guestPort int
 		}
 		vsockConn, err := ln.Accept()
 		if err != nil {
-			// Cancellation path: ln.Close() makes Accept return an error.
 			if ctx.Err() != nil {
 				return
 			}
@@ -215,8 +195,6 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener, guestPort int
 	}
 }
 
-// proxy bridges vsockConn ↔ 127.0.0.1:guestPort. Both ends close on
-// ctx.Done() or when either side of the stream finishes.
 func proxy(ctx context.Context, vsockConn net.Conn, guestPort int) {
 	defer vsockConn.Close()
 
@@ -240,6 +218,5 @@ func proxy(ctx context.Context, vsockConn net.Conn, guestPort int) {
 		// returns and pushes to the buffered channel (capacity 2 so it
 		// won't block). We don't wait for it.
 	case <-ctx.Done():
-		// Forward torn down; defers close both ends.
 	}
 }

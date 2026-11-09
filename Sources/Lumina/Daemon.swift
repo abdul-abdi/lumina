@@ -1,4 +1,3 @@
-// Sources/Lumina/Daemon.swift
 //
 // Unix-socket daemon wrapping Pool. `lumina daemon serve` pre-boots N VMs and
 // listens on ~/.lumina/lumind.sock. `lumina run --via-daemon` dials the socket
@@ -27,10 +26,6 @@
 // Blocking I/O: Darwin read(2) wrapped in DispatchQueue.global().async +
 // withCheckedContinuation. FileHandle.availableData is FORBIDDEN
 // (cooperative-pool starvation — see swift-cooperative-pool-starvation learning).
-//
-// Accepted client fds get SO_RCVTIMEO so a client that connects and sends no
-// newline can't hold the (deliberately serial — see #33) accept loop open
-// forever.
 
 import Foundation
 import Darwin
@@ -62,7 +57,10 @@ public enum Daemon {
 
     /// `~/.lumina/lumind.sock`
     public static func socketPath() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let path = ProcessInfo.processInfo.environment["LUMINA_DAEMON_SOCKET"] {
+            return URL(fileURLWithPath: path)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".lumina")
             .appendingPathComponent("lumind.sock")
     }
@@ -73,6 +71,8 @@ public enum Daemon {
     /// Never throws on connection failure — callers fall back to cold boot on `nil`.
     public static func tryRun(
         image: String = "default",
+        memory: UInt64 = VMOptions.default.memory,
+        cpuCount: Int = VMOptions.default.cpuCount,
         command: String,
         timeout: Int = 60,
         env: [String: String] = [:],
@@ -88,30 +88,15 @@ public enum Daemon {
         guard let fd = unixConnect(path: sockURL.path) else { return nil }
         defer { Darwin.close(fd) }
 
-        // Build NDJSON request. Uploads/downloads carry host paths only —
-        // the daemon reads/writes them directly since it's on the same host.
-        var req: [String: Any] = [
-            "op": "run",
-            "cmd": command,
-            "timeout": timeout,
-            "env": env,
-        ]
-        if let c = cwd { req["cwd"] = c }
-        if !uploads.isEmpty {
-            req["uploads"] = uploads.map { ["local": $0.localPath.path, "remote": $0.remotePath, "mode": $0.mode] }
-        }
-        if !directoryUploads.isEmpty {
-            req["directory_uploads"] = directoryUploads.map { ["local": $0.localPath.path, "remote": $0.remotePath] }
-        }
-        if !downloads.isEmpty {
-            req["downloads"] = downloads.map { ["remote": $0.remotePath, "local": $0.localPath.path] }
-        }
-        if let stdinData, !stdinData.isEmpty {
-            req["stdin_b64"] = stdinData.base64EncodedString()
-        }
-        guard let reqData = try? JSONSerialization.data(withJSONObject: req) else { return nil }
-        var line = reqData
-        line.append(0x0a) // newline
+        let request = DaemonRequest(
+            op: "run", image: image, memory: memory, cpus: cpuCount, cmd: command, timeout: timeout,
+            env: env, cwd: cwd,
+            uploads: uploads.map { .init(local: $0.localPath.path, remote: $0.remotePath, mode: $0.mode) },
+            directory_uploads: directoryUploads.map { .init(local: $0.localPath.path, remote: $0.remotePath) },
+            downloads: downloads.map { .init(local: $0.localPath.path, remote: $0.remotePath) },
+            stdin_b64: stdinData.flatMap { $0.isEmpty ? nil : $0.base64EncodedString() }
+        )
+        guard let line = request.line else { return nil }
 
         // A failed write means the request never reliably reached the daemon —
         // treat it the same as a failed connect (safe to retry cold) rather
@@ -123,18 +108,27 @@ public enum Daemon {
         // "daemon unreachable" and the caller would re-run it cold — an
         // `apt install` or a migration executed twice, silently. Anything that
         // fails after the send must throw.
-        guard let respLine = try await asyncReadLine(fd: fd) else {
+        guard let respLine = await asyncReadLine(fd: fd) else {
             throw LuminaError.sessionFailed(
                 "daemon closed the connection after the request was sent; the command may have run — not retrying"
             )
         }
-        let dec = JSONDecoder()
+        if let declined = try? JSONDecoder().decode([String: String].self, from: respLine), declined["declined"] != nil {
+            return nil
+        }
+        let envelope: RunResultEnvelope
         do {
-            return try dec.decode(RunResultEnvelope.self, from: respLine).toRunResult()
+            envelope = try JSONDecoder().decode(RunResultEnvelope.self, from: respLine)
         } catch {
             throw LuminaError.protocolError(
                 "daemon sent an undecodable response after the request was sent; the command may have run — not retrying"
             )
+        }
+        switch envelope.error {
+        case nil: return envelope.toRunResult()
+        case "timeout": throw LuminaError.timeout
+        case let e? where e.hasPrefix("guestCrashed"): throw LuminaError.guestCrashed(serialOutput: "")
+        case let e?: throw LuminaError.sessionFailed("daemon: \(e)")
         }
     }
 
@@ -151,44 +145,27 @@ public enum Daemon {
         }
         defer { Darwin.close(fd) }
 
-        let req: [String: Any] = ["op": "ping"]
-        guard let reqData = try? JSONSerialization.data(withJSONObject: req) else {
-            return .unreachable(reason: "failed to encode ping request")
-        }
-        var line = reqData
-        line.append(0x0a)
-        guard writeAll(fd: fd, data: line) else {
+        guard let line = DaemonRequest(op: "ping").line, writeAll(fd: fd, data: line) else {
             return .unreachable(reason: "write to daemon socket failed")
         }
 
-        guard let respLine = try? await asyncReadLine(fd: fd) else {
+        guard let respLine = await asyncReadLine(fd: fd) else {
             return .unreachable(reason: "no response from daemon (timed out or disconnected)")
         }
-        guard let json = try? JSONSerialization.jsonObject(with: respLine) as? [String: Any] else {
-            return .unreachable(reason: "malformed (non-JSON) response from daemon")
+        guard let pong = try? JSONDecoder().decode(DaemonPong.self, from: respLine) else {
+            return .unreachable(reason: "malformed ping response from daemon")
         }
-        guard let poolSize = json["poolSize"] as? Int,
-              let warm = json["warm"] as? Int,
-              let image = json["image"] as? String
-        else {
-            return .unreachable(reason: "ping response missing poolSize/warm/image fields")
-        }
-
-        return .running(poolSize: poolSize, warm: warm, image: image)
+        return .running(poolSize: pong.poolSize, warm: pong.warm, image: pong.image)
     }
 
     // MARK: - Client: stop
 
-    /// Send shutdown op to daemon. Returns `true` if daemon was running, `false` otherwise.
     public static func stop(socketPath: URL? = nil) async -> Bool {
         let sockURL = socketPath ?? Daemon.socketPath()
         guard FileManager.default.fileExists(atPath: sockURL.path) else { return false }
         guard let fd = unixConnect(path: sockURL.path) else { return false }
 
-        let req: [String: Any] = ["op": "shutdown"]
-        if let reqData = try? JSONSerialization.data(withJSONObject: req) {
-            var line = reqData
-            line.append(0x0a)
+        if let line = DaemonRequest(op: "shutdown").line {
             writeAll(fd: fd, data: line)
         }
         Darwin.close(fd)
@@ -207,13 +184,11 @@ public enum Daemon {
     ) async throws -> Never {
         let sockURL = socketPath ?? Daemon.socketPath()
 
-        // Mkdir ~/.lumina defensively
         let luminaDir = sockURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(
             at: luminaDir, withIntermediateDirectories: true
         )
 
-        // Remove stale socket
         try? FileManager.default.removeItem(at: sockURL)
 
         guard let listenerFd = unixListen(path: sockURL.path) else {
@@ -228,24 +203,13 @@ public enum Daemon {
             ))
         }
 
-        // Install SIGINT/SIGTERM via DispatchSource (NOT C signal() — see learning)
-        Foundation.signal(SIGINT, SIG_IGN)
-        Foundation.signal(SIGTERM, SIG_IGN)
         let sockPathCopy = sockURL.path
-        let signalQueue = DispatchQueue(label: "com.lumina.daemon.signals")
-        let sigSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
-            let src = DispatchSource.makeSignalSource(signal: sig, queue: signalQueue)
-            src.setEventHandler {
-                FileHandle.standardError.write(Data("\nlumina daemon: shutting down\n".utf8))
-                try? FileManager.default.removeItem(atPath: sockPathCopy)
-                Darwin.exit(0)
-            }
-            src.resume()
-            return src
+        onTerminationSignal { _ in
+            FileHandle.standardError.write(Data("\nlumina daemon: shutting down\n".utf8))
+            try? FileManager.default.removeItem(atPath: sockPathCopy)
+            Darwin.exit(0)
         }
-        _ = sigSources // retain
 
-        // Boot pool
         let pool = Pool(size: size, image: image)
         FileHandle.standardError.write(Data(
             "lumina daemon: booting \(size) VM(s) (image: \(image))...\n".utf8
@@ -293,15 +257,14 @@ public enum Daemon {
             }
             consecutiveAcceptFailures = 0
 
-            // A client that connects and never sends a newline would otherwise
-            // block asyncReadLine's read(2) forever, wedging this serial loop
-            // for every subsequent --via-daemon caller.
             setReceiveTimeout(fd: clientFd, seconds: Self.clientReceiveTimeoutSeconds)
             disableSigpipe(fd: clientFd)
 
-            await handleDaemonClient(
-                fd: clientFd, pool: pool, image: image, socketPath: sockURL
-            )
+            Task {
+                await handleDaemonClient(
+                    fd: clientFd, pool: pool, image: image, socketPath: sockURL
+                )
+            }
         }
     }
 }
@@ -311,20 +274,15 @@ public enum Daemon {
 private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath: URL) async {
     defer { Darwin.close(fd) }
 
-    // Read one NDJSON line
-    guard let line = try? await asyncReadLine(fd: fd),
-          let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-          let op = json["op"] as? String
+    guard let line = await asyncReadLine(fd: fd),
+          let request = try? JSONDecoder().decode(DaemonRequest.self, from: line)
     else { return }
 
-    switch op {
+    switch request.op {
     case "ping":
-        let poolSize = pool.size // nonisolated
-        let warm = await pool.availableCount
-        let resp: [String: Any] = ["poolSize": poolSize, "warm": warm, "image": image]
-        if let data = try? JSONSerialization.data(withJSONObject: resp) {
-            var out = data; out.append(0x0a)
-            writeAll(fd: fd, data: out)
+        let pong = DaemonPong(poolSize: pool.size, warm: await pool.availableCount, image: image)
+        if let data = try? JSONEncoder().encode(pong) {
+            writeAll(fd: fd, data: data + [0x0a])
         }
 
     case "shutdown":
@@ -332,35 +290,43 @@ private func handleDaemonClient(fd: Int32, pool: Pool, image: String, socketPath
         Darwin.exit(0)
 
     case "run":
-        await runOnDaemon(json: json, fd: fd, pool: pool)
+        await runOnDaemon(request, fd: fd, pool: pool)
 
     default:
-        let err: [String: Any] = ["error": "unknown op: \(op)"]
-        if let data = try? JSONSerialization.data(withJSONObject: err) {
-            var out = data; out.append(0x0a)
-            writeAll(fd: fd, data: out)
+        if let data = try? JSONEncoder().encode(["error": "unknown op: \(request.op)"]) {
+            writeAll(fd: fd, data: data + [0x0a])
         }
     }
 }
 
-private func runOnDaemon(json: [String: Any], fd: Int32, pool: Pool) async {
-    let cmd = (json["cmd"] as? String) ?? ""
-    let env = (json["env"] as? [String: String]) ?? [:]
-    let cwd = json["cwd"] as? String
-    let timeoutSec = (json["timeout"] as? Int) ?? 60
-
+private func runOnDaemon(_ request: DaemonRequest, fd: Int32, pool: Pool) async {
+    let wanted = (
+        request.image ?? pool.options.image,
+        request.memory ?? pool.options.memory,
+        request.cpus ?? pool.options.cpuCount
+    )
+    guard wanted == (pool.options.image, pool.options.memory, pool.options.cpuCount) else {
+        writeAll(fd: fd, data: Data(#"{"declined":"pool shape differs"}"#.utf8 + [0x0a]))
+        return
+    }
     let start = ContinuousClock.now
     let result: RunResult
     do {
         result = try await pool.run(
-            cmd,
-            timeout: .seconds(timeoutSec),
-            env: env,
-            workingDirectory: cwd,
-            uploads: decodeFileUploads(json["uploads"]),
-            directoryUploads: decodeDirectoryUploads(json["directory_uploads"]),
-            downloads: decodeFileDownloads(json["downloads"]),
-            stdin: decodeStdin(json["stdin_b64"])
+            request.cmd ?? "",
+            timeout: .seconds(request.timeout ?? 60),
+            env: request.env ?? [:],
+            workingDirectory: request.cwd,
+            uploads: (request.uploads ?? []).map {
+                FileUpload(localPath: URL(fileURLWithPath: $0.local), remotePath: $0.remote, mode: $0.mode ?? "0644")
+            },
+            directoryUploads: (request.directory_uploads ?? []).map {
+                DirectoryUpload(localPath: URL(fileURLWithPath: $0.local), remotePath: $0.remote)
+            },
+            downloads: (request.downloads ?? []).map {
+                FileDownload(remotePath: $0.remote, localPath: URL(fileURLWithPath: $0.local))
+            },
+            stdin: request.stdin_b64.flatMap { Data(base64Encoded: $0) }.map(Stdin.oneShot) ?? .closed
         )
     } catch {
         let ms = Int((ContinuousClock.now - start).totalMilliseconds)
@@ -382,44 +348,6 @@ private func runOnDaemon(json: [String: Any], fd: Int32, pool: Pool) async {
     }
 }
 
-// MARK: - Request-side transfer / stdin decoding
-//
-// uploads/downloads carry host paths (see wire protocol note at the top of
-// this file) — decode straight into the same types Pool.run already accepts.
-
-private func decodeFileUploads(_ raw: Any?) -> [FileUpload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let local = spec["local"], let remote = spec["remote"] else { return nil }
-        return FileUpload(localPath: URL(fileURLWithPath: local), remotePath: remote, mode: spec["mode"] ?? "0644")
-    }
-}
-
-private func decodeDirectoryUploads(_ raw: Any?) -> [DirectoryUpload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let local = spec["local"], let remote = spec["remote"] else { return nil }
-        return DirectoryUpload(localPath: URL(fileURLWithPath: local), remotePath: remote)
-    }
-}
-
-private func decodeFileDownloads(_ raw: Any?) -> [FileDownload] {
-    guard let specs = raw as? [[String: String]] else { return [] }
-    return specs.compactMap { spec in
-        guard let remote = spec["remote"], let local = spec["local"] else { return nil }
-        return FileDownload(remotePath: remote, localPath: URL(fileURLWithPath: local))
-    }
-}
-
-/// Rehydrates the base64 stdin blob as a one-shot source — the request
-/// already carries the whole thing, so there's nothing left to stream.
-private func decodeStdin(_ raw: Any?) -> Stdin {
-    guard let b64 = raw as? String, let data = Data(base64Encoded: b64), !data.isEmpty else {
-        return .closed
-    }
-    return .oneShot(data)
-}
-
 extension Stdin {
     /// Wraps already-read bytes as a one-shot `Stdin.source`: the exec pump
     /// gets the whole blob on its first call, then EOF. Used where the real
@@ -433,6 +361,35 @@ extension Stdin {
         channel.close()
         return .source { @Sendable [channel] in await channel.next() }
     }
+}
+
+struct DaemonRequest: Codable {
+    struct Transfer: Codable {
+        var local: String
+        var remote: String
+        var mode: String?
+    }
+
+    var op: String
+    var image: String?
+    var memory: UInt64?
+    var cpus: Int?
+    var cmd: String?
+    var timeout: Int?
+    var env: [String: String]?
+    var cwd: String?
+    var uploads: [Transfer]?
+    var directory_uploads: [Transfer]?
+    var downloads: [Transfer]?
+    var stdin_b64: String?
+
+    var line: Data? { (try? JSONEncoder().encode(self)).map { $0 + [0x0a] } }
+}
+
+struct DaemonPong: Codable {
+    var poolSize: Int
+    var warm: Int
+    var image: String
 }
 
 // MARK: - Wire envelope (mirrors CLI's private ResultJSON shape exactly)
@@ -451,7 +408,6 @@ struct RunResultEnvelope: Codable, Sendable {
     var partial_stderr: String?
     var network_metrics: NetworkMetricsSummary?
 
-    /// Build from a successful `RunResult`.
     init(from result: RunResult, durationMs: Int) {
         self.stdout = result.stdout
         self.stderr = result.stderr
@@ -462,13 +418,11 @@ struct RunResultEnvelope: Codable, Sendable {
         self.network_metrics = result.networkMetrics
     }
 
-    /// Build for an error response.
     init(error: String, duration_ms: Int) {
         self.duration_ms = duration_ms
         self.error = error
     }
 
-    /// Decode back to `RunResult` on the client side.
     func toRunResult() -> RunResult {
         let stdoutData = stdout_bytes.flatMap { Data(base64Encoded: $0) }
         let stderrData = stderr_bytes.flatMap { Data(base64Encoded: $0) }
@@ -489,23 +443,23 @@ struct RunResultEnvelope: Codable, Sendable {
 /// Read bytes from `fd` until `\n`, returning the data (without the newline).
 /// Uses `read(2)` on a global DispatchQueue so the cooperative pool is not blocked.
 /// Returns `nil` on EOF or connection close.
-private func asyncReadLine(fd: Int32) async throws -> Data? {
-    return try await withCheckedThrowingContinuation { cont in
+private func asyncReadLine(fd: Int32) async -> Data? {
+    await withCheckedContinuation { cont in
         DispatchQueue.global().async {
             var buffer = Data()
-            var byte = UInt8(0)
+            var chunk = [UInt8](repeating: 0, count: 65_536)
             while true {
-                let n = Darwin.read(fd, &byte, 1)
+                let n = Darwin.read(fd, &chunk, chunk.count)
                 if n <= 0 {
-                    // EOF or error
                     cont.resume(returning: buffer.isEmpty ? nil : buffer)
                     return
                 }
-                if byte == 0x0a { // newline
+                if let newline = chunk[0..<n].firstIndex(of: 0x0a) {
+                    buffer.append(contentsOf: chunk[0..<newline])
                     cont.resume(returning: buffer.isEmpty ? nil : buffer)
                     return
                 }
-                buffer.append(byte)
+                buffer.append(contentsOf: chunk[0..<n])
             }
         }
     }
@@ -565,8 +519,7 @@ func acceptBackoffDelay(consecutiveFailures: Int) -> Duration {
 
 // MARK: - POSIX Unix socket helpers (mirrored from lumi/Pool.swift; internal for testability)
 
-/// Bind and listen on a Unix domain socket. Returns listener fd or nil on failure.
-func unixListen(path: String) -> Int32? {
+func unixListen(path: String, backlog: Int32 = 64) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 { return nil }
     var addr = sockaddr_un()
@@ -584,11 +537,10 @@ func unixListen(path: String) -> Int32? {
         ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, len) }
     }
     if bindRc != 0 { Darwin.close(fd); return nil }
-    if Darwin.listen(fd, 64) != 0 { Darwin.close(fd); return nil }
+    if Darwin.listen(fd, backlog) != 0 { Darwin.close(fd); return nil }
     return fd
 }
 
-/// Accept one incoming connection. Returns client fd (≥0) or -1 on failure.
 /// Designed to be called from a DispatchQueue.global() context.
 func unixAcceptFd(listener: Int32) -> Int32 {
     var caddr = sockaddr_un()
@@ -598,7 +550,6 @@ func unixAcceptFd(listener: Int32) -> Int32 {
     }
 }
 
-/// Connect to a Unix domain socket. Returns connected fd or nil on failure.
 func unixConnect(path: String) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     if fd < 0 { return nil }
@@ -618,4 +569,18 @@ func unixConnect(path: String) -> Int32? {
     }
     if rc != 0 { Darwin.close(fd); return nil }
     return fd
+}
+
+private let terminationQueue = DispatchQueue(label: "com.lumina.signals")
+nonisolated(unsafe) private var terminationSources: [DispatchSourceSignal] = []
+
+public func onTerminationSignal(_ handler: @escaping @Sendable (Int32) -> Void) {
+    let sources = [SIGINT, SIGTERM].map { sig in
+        Foundation.signal(sig, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: terminationQueue)
+        src.setEventHandler { handler(sig) }
+        src.resume()
+        return src
+    }
+    terminationQueue.sync { terminationSources += sources }
 }

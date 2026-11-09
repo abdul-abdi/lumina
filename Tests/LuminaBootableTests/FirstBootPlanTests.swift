@@ -71,7 +71,7 @@ import Testing
         #expect(plan.linuxDirectKernel == nil)
         #expect(plan.linuxDirectInitramfs == nil)
         #expect(plan.linuxDirectCmdline == nil)
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         #expect(plan.events.isEmpty)
     }
 
@@ -122,9 +122,80 @@ import Testing
         #expect(cmdline.contains("auto=true"))
         #expect(cmdline.contains("preseed/file=/preseed.cfg"))
 
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         #expect(plan.events.contains(.linuxDirectMatched(layoutName: "Debian arm64 netinst")))
         #expect(plan.events.contains(.preseedInjected(initrd: patchedInitrd)))
+    }
+
+    @Test func debian_firstBoot_bootsInstallerThroughFirmware() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let iso = URL(fileURLWithPath: "/fake/debian.iso")
+        let kernel = URL(fileURLWithPath: "/fake/extracted/vmlinuz")
+        let patched = URL(fileURLWithPath: "/fake/bundle/initrd.preseeded")
+        let disk = URL(fileURLWithPath: "/fake/bundle/installer-boot.cdr")
+
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: kernel,
+                    initramfs: URL(fileURLWithPath: "/fake/extracted/initrd.gz"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, _ in patched },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend,
+            makeBootDisk: { _, source, k, initrd, cmdline in
+                #expect(source == iso)
+                #expect(k == kernel)
+                #expect(initrd == patched)
+                #expect(cmdline.contains("preseed/file=/preseed.cfg"))
+                return disk
+            }
+        )
+
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: iso,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        #expect(plan.bootDisk == disk)
+        #expect(plan.linuxDirectKernel == nil)
+        #expect(plan.linuxDirectInitramfs == nil)
+        #expect(plan.linuxDirectCmdline == nil)
+        #expect(bundle.vmOptions(cdrom: iso, plan: plan).efi?.bootDisk == disk)
+    }
+
+    @Test func debian_firstBoot_bootDiskFailureFallsBackToLinuxDirect() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "debian-12")
+        let deps = FirstBootDependencies(
+            extract: { _, _ in
+                LinuxISOExtractor.Extracted(
+                    kernel: URL(fileURLWithPath: "/fake/vmlinuz"),
+                    initramfs: URL(fileURLWithPath: "/fake/initrd.gz"),
+                    layoutName: "Debian arm64 netinst",
+                    cmdlineExtra: ""
+                )
+            },
+            injectPreseed: { _, _, _ in URL(fileURLWithPath: "/fake/initrd.preseeded") },
+            generateAutounattend: Self.unreachableDeps.generateAutounattend,
+            makeBootDisk: { _, _, _, _, _ in throw NSError(domain: "test", code: 2) }
+        )
+
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: URL(fileURLWithPath: "/fake/debian.iso"),
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: deps
+        )
+
+        #expect(plan.bootDisk == nil)
+        #expect(plan.linuxDirectKernel != nil)
+        #expect(plan.events.contains { if case .bootDiskFailed = $0 { return true } else { return false } })
     }
 
     @Test func debian_firstBoot_noISO_throwsMissingISO() throws {
@@ -233,7 +304,7 @@ import Testing
             dependencies: deps
         )
         #expect(plan.linuxDirectKernel == nil)
-        #expect(plan.extraDisks == [unattendISO])
+        #expect(plan.seedISOs == [unattendISO])
         #expect(plan.events.contains(.autounattendGenerated(iso: unattendISO)))
     }
 
@@ -246,7 +317,7 @@ import Testing
             extract: Self.unreachableDeps.extract,
             injectPreseed: Self.unreachableDeps.injectPreseed,
             generateAutounattend: { _ in
-                throw AutounattendSeed.Error.hdiutilNotAvailable
+                throw SeedISO.Error(description: "hdiutil missing")
             }
         )
         let plan = try prepareFirstBoot(
@@ -256,7 +327,7 @@ import Testing
             isFirstBoot: true,
             dependencies: deps
         )
-        #expect(plan.extraDisks.isEmpty)
+        #expect(plan.seedISOs.isEmpty)
         if case .autounattendFailed = plan.events.first {
             // expected
         } else {
@@ -479,6 +550,40 @@ import Testing
             osVariant: "windows-11-arm",
             isFirstBoot: false
         )
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: false,
+            dependencies: Self.unreachableDeps
+        )
+        #expect(plan == FirstBootPlan.empty)
+    }
+
+    private func writeSeed(into bundle: VMBundle) throws {
+        try FileManager.default.createDirectory(at: bundle.seedDirectory, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: bundle.seedDirectory.appendingPathComponent("user_configuration.json"))
+    }
+
+    @Test func firstBoot_withSeedDirectory_attachesCidata() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "omarchy")
+        try writeSeed(into: bundle)
+        let plan = try prepareFirstBoot(
+            bundle: bundle,
+            attachedISO: nil,
+            captureSerial: false,
+            isFirstBoot: true,
+            dependencies: Self.unreachableDeps
+        )
+        let iso = bundle.rootURL.appendingPathComponent("cidata.iso")
+        #expect(plan.seedISOs == [iso])
+        #expect(plan.events == [.seedAttached(iso: iso)])
+        #expect(FileManager.default.fileExists(atPath: iso.path))
+    }
+
+    @Test func laterBoots_leaveSeedDetached() throws {
+        let bundle = try makeBundle(osFamily: .linux, osVariant: "omarchy", isFirstBoot: false)
+        try writeSeed(into: bundle)
         let plan = try prepareFirstBoot(
             bundle: bundle,
             attachedISO: nil,

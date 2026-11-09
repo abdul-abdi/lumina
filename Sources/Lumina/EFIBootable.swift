@@ -1,5 +1,3 @@
-// Sources/Lumina/EFIBootable.swift
-//
 // Configures a VZVirtualMachineConfiguration for EFI boot — the v0.7.0 M3
 // pipeline shared by Linux desktop installs (Ubuntu / Kali / Fedora /
 // Debian) and Windows 11 on ARM (M4).
@@ -9,26 +7,6 @@
 // on `Lumina`, so putting EFIBootable the other way around would cycle.
 // `LuminaBootable` keeps the higher-level surfaces (VMBundle, catalog,
 // disk allocator) which `VM` does NOT need at boot.
-//
-// Disk + CD-ROM strategy (hardened v0.7.1):
-//
-// - Primary disk uses `cachingMode:.automatic`. Synchronization is
-//   `.fsync` when `EFIBootConfig.installPhase == true` (halves the
-//   partman/mkfs install time on APFS by coalescing guest flushes into
-//   `fsync(2)` instead of barrier-fsync) and `.full` afterwards (real
-//   crash safety for the user's installed system).
-//
-// - Installer ISO uses `cachingMode:.cached`, `synchronizationMode:.none`.
-//   The ISO is read-only, so sync mode is meaningless, and `cached` keeps
-//   the hot blocks in the unified buffer cache so the second pass through
-//   the installer does not re-read from APFS.
-//
-// - When `preferUSBCDROM == true` the ISO is attached via
-//   `VZUSBMassStorageDeviceConfiguration` (macOS 13+, available since
-//   Ventura). Windows 11 ARM setup refuses virtio-block-as-CD-ROM; USB
-//   mass-storage presents as a genuine removable drive and works.
-//   Linux installers accept either. The virtio-block fallback remains
-//   for macOS 12 and for `preferUSBCDROM == false`.
 
 import Foundation
 import Virtualization
@@ -46,12 +24,10 @@ public struct EFIBootable: Sendable {
     }
 
     public func apply(to vzConfig: VZVirtualMachineConfiguration) throws {
-        // Platform: generic for both Linux and Windows guests.
         if !(vzConfig.platform is VZGenericPlatformConfiguration) {
             vzConfig.platform = VZGenericPlatformConfiguration()
         }
 
-        // Variable store: reuse an existing file or create a fresh one.
         let variableStore: VZEFIVariableStore
         if FileManager.default.fileExists(atPath: config.variableStoreURL.path) {
             variableStore = VZEFIVariableStore(url: config.variableStoreURL)
@@ -90,18 +66,25 @@ public struct EFIBootable: Sendable {
             vzConfig.bootLoader = loader
         }
 
-        // Storage devices: primary read-write disk, optional CD-ROM
-        // (USB mass-storage on macOS 13+ when preferred, else virtio
-        // block), then any extra disks.
         var storage: [VZStorageDeviceConfiguration] = []
         do {
             let primary = try Self.makePrimaryDiskAttachment(
                 url: config.primaryDisk,
                 installPhase: config.installPhase
             )
-            storage.append(VZVirtioBlockDeviceConfiguration(attachment: primary))
+            storage.append(config.primaryDiskNVMe
+                ? VZNVMExpressControllerDeviceConfiguration(attachment: primary)
+                : VZVirtioBlockDeviceConfiguration(attachment: primary))
         } catch {
             throw Error.diskAttachmentFailed(config.primaryDisk, "\(error)")
+        }
+
+        if let disk = config.bootDisk {
+            do {
+                storage.append(VZUSBMassStorageDeviceConfiguration(attachment: try Self.makeISOAttachment(url: disk)))
+            } catch {
+                throw Error.diskAttachmentFailed(disk, "\(error)")
+            }
         }
 
         if let iso = config.cdromISO {
@@ -116,13 +99,8 @@ public struct EFIBootable: Sendable {
             }
         }
 
-        // Additional CD-ROMs (Windows autounattend.xml sidecar, etc.).
-        // Always attached as USB mass-storage on macOS 13+ so Windows
-        // Setup sees them as removable drives and scans for
-        // autounattend.xml. On macOS 12 the only multi-CD-ROM path is
-        // virtio-block, which Windows Setup refuses — those callers
-        // should detect the macOS version and surface that constraint
-        // (the wizard / CLI does this at flag-time, not here).
+        // Always attached as USB mass-storage so Windows Setup sees them
+        // as removable drives and scans for autounattend.xml.
         for extraISO in config.extraCDROMs {
             do {
                 let att = try Self.makeISOAttachment(url: extraISO)
@@ -132,15 +110,6 @@ public struct EFIBootable: Sendable {
                 ))
             } catch {
                 throw Error.diskAttachmentFailed(extraISO, "\(error)")
-            }
-        }
-
-        for extra in config.extraDisks {
-            do {
-                let att = try VZDiskImageStorageDeviceAttachment(url: extra, readOnly: false)
-                storage.append(VZVirtioBlockDeviceConfiguration(attachment: att))
-            } catch {
-                throw Error.diskAttachmentFailed(extra, "\(error)")
             }
         }
 
@@ -156,16 +125,13 @@ public struct EFIBootable: Sendable {
         url: URL,
         installPhase: Bool
     ) throws -> VZDiskImageStorageDeviceAttachment {
-        if #available(macOS 12.0, *) {
-            let sync: VZDiskImageSynchronizationMode = installPhase ? .fsync : .full
-            return try VZDiskImageStorageDeviceAttachment(
-                url: url,
-                readOnly: false,
-                cachingMode: .automatic,
-                synchronizationMode: sync
-            )
-        }
-        return try VZDiskImageStorageDeviceAttachment(url: url, readOnly: false)
+        let sync: VZDiskImageSynchronizationMode = installPhase ? .fsync : .full
+        return try VZDiskImageStorageDeviceAttachment(
+            url: url,
+            readOnly: false,
+            cachingMode: .automatic,
+            synchronizationMode: sync
+        )
     }
 
     /// Build the installer-ISO attachment. The ISO is read-only so
@@ -174,19 +140,15 @@ public struct EFIBootable: Sendable {
     private static func makeISOAttachment(
         url: URL
     ) throws -> VZDiskImageStorageDeviceAttachment {
-        if #available(macOS 12.0, *) {
-            return try VZDiskImageStorageDeviceAttachment(
-                url: url,
-                readOnly: true,
-                cachingMode: .cached,
-                synchronizationMode: .none
-            )
-        }
-        return try VZDiskImageStorageDeviceAttachment(url: url, readOnly: true)
+        return try VZDiskImageStorageDeviceAttachment(
+            url: url,
+            readOnly: true,
+            cachingMode: .cached,
+            synchronizationMode: .none
+        )
     }
 
-    /// Wrap an ISO attachment in the appropriate `VZStorageDeviceConfiguration`.
-    /// On macOS 13+ with `preferUSB == true` (typically Windows guests),
+    /// With `preferUSB == true` (typically Windows guests),
     /// use `VZUSBMassStorageDeviceConfiguration` so EFI + guest setup see
     /// a genuine CD-ROM/removable drive. Otherwise fall back to virtio
     /// block, which every ARM64 Linux installer handles.
@@ -194,7 +156,7 @@ public struct EFIBootable: Sendable {
         attachment: VZDiskImageStorageDeviceAttachment,
         preferUSB: Bool
     ) -> VZStorageDeviceConfiguration {
-        if #available(macOS 13.0, *), preferUSB {
+        if preferUSB {
             return VZUSBMassStorageDeviceConfiguration(attachment: attachment)
         }
         return VZVirtioBlockDeviceConfiguration(attachment: attachment)

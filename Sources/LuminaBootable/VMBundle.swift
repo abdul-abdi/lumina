@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/VMBundle.swift
-//
 // Filesystem-backed model for a `.luminaVM` bundle.
 //
 // Layout:
@@ -138,11 +136,19 @@ public struct VMBundle: Sendable, Equatable {
     public var manifest: VMBundleManifest
 
     public var manifestURL: URL { rootURL.appendingPathComponent("manifest.json") }
+    public static var libraryRoot: URL {
+        if let override = ProcessInfo.processInfo.environment["LUMINA_DESKTOP_VMS"] {
+            return URL(fileURLWithPath: override)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".lumina/desktop-vms")
+    }
+
     public var primaryDiskURL: URL { rootURL.appendingPathComponent("disk.img") }
     public var efiVarsURL: URL { rootURL.appendingPathComponent("efi.vars") }
     public var auxiliaryStorageURL: URL { rootURL.appendingPathComponent("aux.img") }
     public var snapshotsDirectory: URL { rootURL.appendingPathComponent("snapshots") }
     public var logsDirectory: URL { rootURL.appendingPathComponent("logs") }
+    public var seedDirectory: URL { rootURL.appendingPathComponent("cidata") }
 
     public enum Error: Swift.Error, Equatable {
         case alreadyExists(URL)
@@ -262,6 +268,17 @@ public struct VMBundle: Sendable, Equatable {
 
     public func save() throws {
         try Self.writeManifest(manifest, into: rootURL)
+    }
+
+    public mutating func recordBoot(at date: Date = Date()) throws {
+        let leftovers = manifest.lastBootedAt == nil
+            ? ["pending-iso.path", "cidata", "cidata.iso"]
+            : ["installer-boot.cdr", "initrd.preseeded", "linux-direct"]
+        for leftover in leftovers {
+            try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(leftover))
+        }
+        manifest.lastBootedAt = date
+        try save()
     }
 
     private static func writeManifest(_ manifest: VMBundleManifest, into rootURL: URL) throws {

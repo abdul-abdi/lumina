@@ -3,24 +3,18 @@ import Foundation
 import Testing
 @testable import Lumina
 
-@Test func imageStoreResolveFindsLegacyImage() throws {
+@Test func imageStoreResolveRejectsLegacyInitrdImage() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-test-\(UUID().uuidString)")
     let imageDir = tempDir.appendingPathComponent("images/default")
     try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
 
-    try Data("kernel".utf8).write(to: imageDir.appendingPathComponent("vmlinuz"))
-    try Data("initrd".utf8).write(to: imageDir.appendingPathComponent("initrd"))
-    try Data("rootfs".utf8).write(to: imageDir.appendingPathComponent("rootfs.img"))
+    for file in ["vmlinuz", "initrd", "rootfs.img"] {
+        try Data(file.utf8).write(to: imageDir.appendingPathComponent(file))
+    }
 
     let store = ImageStore(baseDir: tempDir.appendingPathComponent("images"))
-    let paths = try store.resolve(name: "default")
-
-    #expect(paths.kernel.lastPathComponent == "vmlinuz")
-    #expect(paths.initrd?.lastPathComponent == "initrd")
-    #expect(paths.rootfs.lastPathComponent == "rootfs.img")
-    #expect(paths.bootContract == .legacyWithInitrd)
-
-    try FileManager.default.removeItem(at: tempDir)
+    #expect(throws: LuminaError.self) { try store.resolve(name: "default") }
 }
 
 @Test func imageStoreResolvesFindsBakedImage() throws {
@@ -28,7 +22,6 @@ import Testing
     let imageDir = tempDir.appendingPathComponent("images/default")
     try FileManager.default.createDirectory(at: imageDir, withIntermediateDirectories: true)
 
-    // Baked image: only vmlinuz + rootfs.img (no initrd, no agent, no modules)
     try Data("kernel".utf8).write(to: imageDir.appendingPathComponent("vmlinuz"))
     try Data("rootfs".utf8).write(to: imageDir.appendingPathComponent("rootfs.img"))
 
@@ -36,11 +29,7 @@ import Testing
     let paths = try store.resolve(name: "default")
 
     #expect(paths.kernel.lastPathComponent == "vmlinuz")
-    #expect(paths.initrd == nil)
     #expect(paths.rootfs.lastPathComponent == "rootfs.img")
-    #expect(paths.agent == nil)
-    #expect(paths.modulesDir == nil)
-    #expect(paths.bootContract == .baked)
 
     try FileManager.default.removeItem(at: tempDir)
 }
@@ -94,11 +83,7 @@ import Testing
     let baseDir = tmpDir.appendingPathComponent("default")
     try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
     try Data("kernel".utf8).write(to: baseDir.appendingPathComponent("vmlinuz"))
-    try Data("initrd".utf8).write(to: baseDir.appendingPathComponent("initrd"))
     try Data("rootfs".utf8).write(to: baseDir.appendingPathComponent("rootfs.img"))
-    try Data("agent".utf8).write(to: baseDir.appendingPathComponent("lumina-agent"))
-    let modulesDir = baseDir.appendingPathComponent("modules")
-    try FileManager.default.createDirectory(at: modulesDir, withIntermediateDirectories: true)
 
     // Create a modified rootfs (simulates what DiskClone.rootfs would contain)
     let modifiedRootfs = tmpDir.appendingPathComponent("modified-rootfs.img")
@@ -139,7 +124,6 @@ import Testing
     let baseDir = tmpDir.appendingPathComponent("default")
     try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
     try Data("k".utf8).write(to: baseDir.appendingPathComponent("vmlinuz"))
-    try Data("i".utf8).write(to: baseDir.appendingPathComponent("initrd"))
     try Data("r".utf8).write(to: baseDir.appendingPathComponent("rootfs.img"))
 
     let pythonDir = tmpDir.appendingPathComponent("python")
@@ -279,23 +263,4 @@ import Testing
 
     let info = try store.inspect(name: "alpine")
     #expect(info.rosetta == false)
-}
-
-@Test func imageStoreCleanStagingDirs() throws {
-    let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lumina-imgtest-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: tmpDir) }
-
-    let store = ImageStore(baseDir: tmpDir)
-
-    // Create staging dirs
-    let staging1 = tmpDir.appendingPathComponent(".tmp-aaa")
-    let staging2 = tmpDir.appendingPathComponent(".tmp-bbb")
-    try FileManager.default.createDirectory(at: staging1, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: staging2, withIntermediateDirectories: true)
-
-    #expect(FileManager.default.fileExists(atPath: staging1.path))
-    store.cleanStagingDirs()
-    #expect(!FileManager.default.fileExists(atPath: staging1.path))
-    #expect(!FileManager.default.fileExists(atPath: staging2.path))
 }

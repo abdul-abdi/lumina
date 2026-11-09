@@ -1,8 +1,7 @@
 name: Build baked image
 
-# Builds a custom minimal Linux kernel + baked-mode rootfs for Lumina's
-# agent-path. Baked images skip initrd + module loading → ~150ms
-# kernel-boot savings vs. the legacy Alpine virt image.
+# Builds the baked-mode rootfs for Lumina's agent path around the
+# Kata kernel (Guest/fetch-kernel.sh).
 #
 # Triggers:
 #   - Manual via `workflow_dispatch` ONLY.
@@ -14,11 +13,9 @@ name: Build baked image
 #
 # Runner:
 #   - `ubuntu-24.04-arm` (native ARM64; no QEMU emulation)
-#   - Alternative for non-ARM runners: `qemu-user-static` + --platform;
-#     native is ~4× faster, which matters for a 10-min kernel build.
 #
 # Output:
-#   - `vmlinuz` (custom kernel, CONFIG_MODULES=n, ~8MB)
+#   - `vmlinuz` (Kata arm64 kernel, ~19MB)
 #   - `rootfs.img` (ext4, ~1GB, contains agent + init)
 #   - Packaged as `lumina-image-default.tar.gz` release asset.
 
@@ -50,11 +47,7 @@ jobs:
       - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential flex bison bc \
-            libelf-dev libssl-dev libncurses-dev \
-            curl e2fsprogs
-          echo "Installed: $(gcc --version | head -1)"
+          sudo apt-get install -y curl e2fsprogs zstd
 
       - uses: actions/setup-go@v5
         with:
@@ -68,18 +61,10 @@ jobs:
             -ldflags="-s -w" -o lumina-agent .
           ls -la lumina-agent
 
-      - name: Build custom kernel (Linux arm64, CONFIG_MODULES=n)
-        run: |
-          mkdir -p /tmp/lumina-kernel
-          bash Guest/build-kernel.sh /tmp/lumina-kernel/vmlinuz
-          ls -la /tmp/lumina-kernel/
-          du -h /tmp/lumina-kernel/vmlinuz
-
-      - name: Build baked image (custom kernel + baked rootfs)
+      - name: Build baked image
         run: |
           mkdir -p /tmp/lumina-image-out
-          LUMINA_KERNEL=/tmp/lumina-kernel/vmlinuz \
-            bash Guest/build-image.sh /tmp/lumina-image-out
+          bash Guest/build-image.sh /tmp/lumina-image-out
           ls -la /tmp/lumina-image-out/
           # Baked-mode output is 2 files: vmlinuz + rootfs.img.
           # No initrd, no modules/ dir.

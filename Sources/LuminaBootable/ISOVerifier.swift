@@ -1,27 +1,13 @@
-// Sources/LuminaBootable/ISOVerifier.swift
-//
 // Shared SHA-256 verifier for user-picked ISO files. Consumed by both
 // Desktop (`NewVMWizard.createAndDismiss`) and CLI (`lumina desktop
 // create`). Guards against corrupted downloads, wrong-mirror fetches,
 // and captive-portal interception by refusing to stage an ISO whose
 // digest doesn't match what `DesktopOSCatalog` promised.
-//
-// Two entry points for the two call-site ergonomics:
-//   - `verify(at:expectedSHA256:)` — async; the wizard's on-main-actor
-//      staging closure wants an awaitable primitive that detaches to
-//      userInitiated while hashing.
-//   - `sha256Hex(ofFileAt:)` — sync throwing; the CLI runs inside an
-//      `AsyncParsableCommand.run()` and prefers plain throws to the
-//      `ISOVerdict` envelope.
-//
-// Both share the same 4 MB streaming chunk to keep the hash window
-// predictable; a 2 GB Ubuntu ISO hashes in ~512 chunks.
 
 import Foundation
 import CryptoKit
 
 public enum ISOVerdict: Sendable, Equatable {
-    /// File matched the expected digest.
     case match
     /// File hashed cleanly but didn't match. Attached string is the
     /// actual lowercase hex digest for diagnostics.
@@ -50,9 +36,6 @@ public enum ISOVerifier {
         }.value
     }
 
-    /// Stream-hash a file with SHA-256 in 4 MB chunks. Returns a
-    /// lowercase hex digest string. Throws any FileHandle error
-    /// encountered during reading.
     public static func sha256Hex(ofFileAt url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }

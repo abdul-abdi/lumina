@@ -1,13 +1,3 @@
-// Sources/LuminaDesktopKit/LuminaDesktopSession.swift
-//
-// v0.7.0 M6 — the MainActor bridge from `Lumina.VM` (an actor) to
-// SwiftUI views (which observe `@Observable @MainActor` state).
-//
-// The bridge owns a `Lumina.VM` and a snapshot of its observable state
-// (status, last error, serial output digest). SwiftUI views read these
-// `@Observable` properties; the actor mirrors changes into them via
-// `Task { @MainActor in ... }` after each mutation.
-//
 // Why not pass the actor directly into views: SwiftUI re-evaluates view
 // bodies on every state change. Calling `await session.vm.state` from
 // inside a body would suspend rendering and force every observer to
@@ -42,7 +32,6 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        /// True when `boot()` should actually start a new VZ machine.
         /// Used as the re-entry guard at the top of `boot()` to make
         /// concurrent boot calls idempotent from every UI path (card
         /// ▶ BOOT, ⌘K launcher, VM-window `.task`, menu bar). Two paths
@@ -57,7 +46,6 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        /// True when a terminal-state guard should early-return in
         /// `handleExternalStop`. `.shuttingDown` means the explicit
         /// `shutdown()` path owns the transition; `.stopped` means we
         /// already landed there. Without this guard the VZ delegate
@@ -70,33 +58,16 @@ public final class LuminaDesktopSession: Identifiable {
             }
         }
 
-        public var label: String {
-            switch self {
-            case .stopped: "Stopped"
-            case .booting: "Booting…"
-            case .running: "Running"
-            case .paused: "Paused"
-            case .crashed(let r): "Crashed: \(r)"
-            case .shuttingDown: "Shutting down…"
-            }
-        }
     }
 
     public var status: Status = .stopped
     public var lastError: String?
     public var bootDuration: Duration?
     public var serialDigest: String = ""
-    /// Per-phase breakdown of the most recent boot — populated from
-    /// `VM.bootPhases` in `boot()` at the success/crash transition.
-    /// `BootPhases()` when no boot has run yet. UI gates on
-    /// `.isValid` to avoid rendering empty rows.
     public var bootPhases: BootPhases = BootPhases()
+    public var installProgress: (label: String, fraction: Double)?
+    public var notice: String?
 
-    /// Atomic read of every observable session field as a single
-    /// `Sendable`, `Equatable` value. v0.7.1 #21: callers that want a
-    /// consistent view of session state (tests, debug dumps, future
-    /// `lumina ps --verbose`) read this instead of stitching together
-    /// four individual properties at different observation ticks.
     public var snapshot: SessionSnapshot {
         SessionSnapshot(
             status: status,
@@ -115,7 +86,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// Each field is only written when it actually differs from the
     /// current value, so idempotent applies (applyAtomic of the
     /// current snapshot) don't fire spurious observation ticks.
-    /// v0.7.1 #21.
     public func applyAtomic(_ next: SessionSnapshot) {
         if status != next.status { status = next.status }
         if lastError != next.lastError { lastError = next.lastError }
@@ -132,20 +102,17 @@ public final class LuminaDesktopSession: Identifiable {
     /// completes its actor hop.
     public var vzMachine: VZVirtualMachine?
 
-    /// The underlying VM actor. MainActor-isolated (inherits from the
-    /// enclosing `@MainActor` class). `VM` is an actor, so `VM?` is
-    /// `Sendable` and can be awaited from any isolation without friction.
     private var vm: VM?
+    private var macVM: MacOSVM?
+    private var installTask: Task<Void, any Error>?
+    private var restartAfterInstall = false
+    private var installActivity: NSObjectProtocol?
 
     /// Forwarder keeping `VZVirtualMachineDelegate` callbacks alive.
     /// VZ holds the delegate weakly, so we retain it here until the
     /// session is torn down.
     private var vmDelegate: VMStopForwarder?
 
-    /// Polling task that mirrors `VM.serialTail(...)` into
-    /// `serialDigest` for the booting / crashed tail UI. Lives for as
-    /// long as the VM actor is attached; cancelled in `shutdown()` /
-    /// `handleExternalStop()`.
     private var serialMirrorTask: Task<Void, Never>?
 
     /// Polling task that mirrors `VM.bootPhases` into `bootPhases` so
@@ -154,7 +121,6 @@ public final class LuminaDesktopSession: Identifiable {
     /// up at boot() entry, cancelled the moment boot() returns (success
     /// or failure), because after boot completes the phases are frozen
     /// and the final `applyAtomic` is the authoritative write.
-    /// v0.7.1 feature 3.2.
     private var bootPhasesMirrorTask: Task<Void, Never>?
 
     public init(bundle: VMBundle) {
@@ -163,7 +129,6 @@ public final class LuminaDesktopSession: Identifiable {
     }
 
     public func boot() async {
-        // Re-entry guard — see `Status.canBoot` for the full rationale.
         guard status.canBoot else { return }
 
         // Enter .booting with a clean error slate in a single tick.
@@ -202,11 +167,44 @@ public final class LuminaDesktopSession: Identifiable {
         // single-probe-timeout issue unfixable on the host side — the
         // workaround is "Retry network autoconfiguration" in the
         // installer's failure screen.)
-        let stableMAC = mutableBundle.ensureMACAddress()
+        mutableBundle.ensureMACAddress()
+        if mutableBundle.manifest.osFamily == .macOS {
+            await bootMacOS(mutableBundle, start: start)
+            return
+        }
 
-        let isWindows = mutableBundle.manifest.osFamily == .windows
         let isInstallPhase = mutableBundle.manifest.lastBootedAt == nil
-        let cdromURL = pendingCDROM()
+        if isInstallPhase, installActivity == nil {
+            installActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.idleSystemSleepDisabled, .userInitiated],
+                reason: "Installing \(mutableBundle.manifest.name)"
+            )
+        }
+        var cdromURL = mutableBundle.pendingISO
+        if cdromURL == nil, isInstallPhase, let name = InstallerSource.displayName(for: mutableBundle.manifest.osVariant) {
+            do {
+                cdromURL = try await mutableBundle.fetchInstaller { [weak self] fraction in
+                    Task { @MainActor in self?.installProgress = ("Downloading \(name)", fraction) }
+                }
+                installProgress = nil
+            } catch {
+                installProgress = nil
+                applyAtomic(SessionSnapshot(
+                    status: .crashed(reason: "installer download: \(error)"),
+                    lastError: "installer download: \(error)",
+                    bootDuration: bootDuration,
+                    serialDigest: serialDigest,
+                    bootPhases: BootPhases()
+                ))
+                return
+            }
+        }
+        if mutableBundle.manifest.osFamily == .windows, isInstallPhase, WindowsDrivers.cachedISO == nil {
+            _ = try? await WindowsDrivers.ensure { [weak self] fraction in
+                Task { @MainActor in self?.installProgress = ("Downloading Windows drivers", fraction) }
+            }
+            installProgress = nil
+        }
 
         // First-boot orchestration — preseed injection (Debian/Kali) and
         // Windows 11 autounattend sidecar. Same call the CLI makes from
@@ -236,48 +234,12 @@ public final class LuminaDesktopSession: Identifiable {
             ))
             return
         }
-        // Persist event log alongside the bundle so the user can post-
-        // mortem what happened on first boot from the framebuffer alone.
-        // Best-effort; failures are non-fatal.
         appendFirstBootLog(events: firstBootPlan.events, to: mutableBundle.logsDirectory)
+        restartAfterInstall = firstBootPlan.bootDisk != nil
 
-        var opts = VMOptions.default
-        opts.memory = mutableBundle.manifest.memoryBytes
-        opts.cpuCount = mutableBundle.manifest.cpuCount
-        opts.macAddress = stableMAC
-        // Resolve the network provider from the manifest. Nil / .nat keep
-        // the historical VZNAT path; .bridged swaps in a bridge to the
-        // host LAN so the guest's DHCP goes to the user's real router
-        // instead of vmnet's embedded bootpd — the only reliable fix
-        // for vmnet degradation and the Debian-netcfg first-probe race
-        // (user edits `manifest.json` `networkMode.mode = "bridged"` or
-        // passes `--network=bridged` on `lumina desktop create`).
-        opts.networkProvider = Self.networkProvider(for: mutableBundle.manifest.networkMode)
-        // Persist serial output to bundle/logs/serial.log for post-mortem
-        // diagnosis. When a Debian/Kali installer reaches "Network
-        // autoconfiguration failed" or Windows setup prints a cryptic
-        // error, this file is the ground truth for what the guest
-        // actually saw. Appended on every boot with a dated delimiter.
-        opts.serialLogURL = mutableBundle.logsDirectory
-            .appendingPathComponent("serial.log")
-        opts.bootable = .efi(EFIBootConfig(
-            variableStoreURL: mutableBundle.efiVarsURL,
-            primaryDisk: mutableBundle.primaryDiskURL,
-            cdromISO: cdromURL,
-            extraDisks: firstBootPlan.extraDisks,
-            preferUSBCDROM: isWindows,
-            installPhase: isInstallPhase,
-            linuxDirectKernel: firstBootPlan.linuxDirectKernel,
-            linuxDirectInitramfs: firstBootPlan.linuxDirectInitramfs,
-            linuxDirectCmdline: firstBootPlan.linuxDirectCmdline
-        ))
-        opts.graphics = GraphicsConfig(
-            widthInPixels: 1920,
-            heightInPixels: 1080,
-            keyboardKind: .usb,
-            pointingDeviceKind: .usbScreenCoordinate
-        )
-        opts.sound = SoundConfig(enabled: true)
+        var opts = mutableBundle.vmOptions(cdrom: cdromURL, plan: firstBootPlan)
+        opts.graphics = GraphicsConfig()
+        opts.sound = true
 
         // Migrate existing bundles to the Spotlight opt-out applied at
         // VMBundle.create() time. Old bundles pre-dating that change
@@ -294,14 +256,7 @@ public final class LuminaDesktopSession: Identifiable {
         // live; post-boot install (prior design) leaves a gap where a
         // kernel-boot-window crash silently lands on a nil delegate and
         // the UI sits at `.running` with a dead VM.
-        let forwarder = VMStopForwarder(
-            onGuestStop: { [weak self] in
-                Task { @MainActor in self?.handleExternalStop(reason: nil) }
-            },
-            onError: { [weak self] err in
-                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
-            }
-        )
+        let forwarder = makeStopForwarder()
         self.vmDelegate = forwarder
 
         let newVM = VM(options: opts)
@@ -311,8 +266,6 @@ public final class LuminaDesktopSession: Identifiable {
         startBootPhasesMirror(for: newVM)
         do {
             try await newVM.boot()
-            // Final authoritative phase snapshot; stop the poll task
-            // so the post-boot `applyAtomic` below is the last writer.
             bootPhasesMirrorTask?.cancel()
             bootPhasesMirrorTask = nil
             // Grab the VZ handle and publish it BEFORE flipping status
@@ -324,10 +277,6 @@ public final class LuminaDesktopSession: Identifiable {
             // land in the same observation tick.
             let handle = await newVM.vzMachine()
             self.vzMachine = handle.machine
-            // Snapshot the per-phase boot timings so the waterfall UI
-            // has the full breakdown in the same tick status flips to
-            // `.running`. Agent path populates every phase; EFI path
-            // fills configMs/vzStartMs/totalMs and leaves the rest 0.
             let phases = await newVM.bootPhases
             // Land status + bootDuration + phases in a single observation
             // tick so the UI never renders `.running` with a nil duration
@@ -339,24 +288,14 @@ public final class LuminaDesktopSession: Identifiable {
                 serialDigest: serialDigest,
                 bootPhases: phases
             ))
-            // Persist lastBootedAt. On the very first successful boot we
-            // also detach the installer ISO sidecar — the install has
-            // completed and EFI now prefers the HDD, so keeping the CD-ROM
-            // mounted just clutters every card with "installer attached"
-            // forever. Both writes are non-fatal.
-            persistBootRecord()
+            try? mutableBundle.recordBoot()
         } catch {
             bootPhasesMirrorTask?.cancel()
             bootPhasesMirrorTask = nil
-            // Best-effort phase snapshot before tearing down — useful
-            // diagnostic even on a crash. Zero-value on early failures.
             let partialPhases = await self.vm?.bootPhases ?? BootPhases()
             self.vm = nil
             self.vmDelegate = nil
             self.vzMachine = nil
-            // `error` is already `LuminaError` — `VM.boot()` is typed
-            // `throws(LuminaError)`, so Swift knows the concrete type in
-            // this catch. `isCancellation` is a LuminaError extension.
             if error.isCancellation {
                 // User clicked Stop mid-boot. The VM actor's cancellation
                 // path has already torn down the VZ machine, released the
@@ -379,6 +318,68 @@ public final class LuminaDesktopSession: Identifiable {
                 ))
             }
         }
+    }
+
+    private func bootMacOS(_ bundle: VMBundle, start: ContinuousClock.Instant) async {
+        var bundle = bundle
+        do {
+            if !bundle.isMacOSInstalled {
+                let installing = bundle
+                let task = Task { [weak self] in
+                    var target = installing
+                    try await target.installMacOS { phase, fraction in
+                        let label = phase == .downloading ? "Downloading macOS" : "Installing macOS"
+                        Task { @MainActor in self?.installProgress = (label, fraction) }
+                    }
+                }
+                installTask = task
+                try await task.value
+                installTask = nil
+                installProgress = nil
+                bundle = (try? VMBundle.load(from: bundle.rootURL)) ?? bundle
+            }
+            ensureSpotlightDisabled()
+            let forwarder = makeStopForwarder()
+            vmDelegate = forwarder
+            let newVM = bundle.macOSVM()
+            macVM = newVM
+            await newVM.setDelegate(forwarder)
+            try await newVM.boot()
+            vzMachine = await newVM.vzMachine().machine
+            applyAtomic(SessionSnapshot(
+                status: .running,
+                lastError: nil,
+                bootDuration: ContinuousClock.now - start,
+                serialDigest: "",
+                bootPhases: BootPhases()
+            ))
+            try? bundle.recordBoot()
+        } catch {
+            installTask = nil
+            installProgress = nil
+            macVM = nil
+            vmDelegate = nil
+            vzMachine = nil
+            let cancelled = error is CancellationError || status == .shuttingDown || status == .stopped
+            applyAtomic(SessionSnapshot(
+                status: cancelled ? .stopped : .crashed(reason: "\(error)"),
+                lastError: cancelled ? nil : "\(error)",
+                bootDuration: bootDuration,
+                serialDigest: serialDigest,
+                bootPhases: BootPhases()
+            ))
+        }
+    }
+
+    private func makeStopForwarder() -> VMStopForwarder {
+        VMStopForwarder(
+            onGuestStop: { [weak self] in
+                Task { @MainActor in self?.handleExternalStop(reason: nil) }
+            },
+            onError: { [weak self] err in
+                Task { @MainActor in self?.handleExternalStop(reason: "\(err)") }
+            }
+        )
     }
 
     private func ensureSpotlightDisabled() {
@@ -433,50 +434,22 @@ public final class LuminaDesktopSession: Identifiable {
             return "windows: autounattend sidecar at \(iso.lastPathComponent)"
         case .autounattendFailed(let reason):
             return "windows: autounattend failed (\(reason)); compat check will fire"
-        }
-    }
-
-    private func persistBootRecord() {
-        let isFirstBoot = bundle.manifest.lastBootedAt == nil
-        if isFirstBoot {
-            let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
-            try? FileManager.default.removeItem(at: sidecar)
-        }
-        var updated = bundle
-        updated.manifest.lastBootedAt = Date()
-        try? updated.save()
-    }
-
-    /// Map a persisted `NetworkMode` to the corresponding `NetworkProvider`.
-    ///
-    /// Nil → `.nat` for backward compatibility with pre-v0.7.1 bundles
-    /// and for every ad-hoc-signed install: the default distribution
-    /// does not carry the `com.apple.vm.networking` entitlement because
-    /// macOS 14+ refuses to launch ad-hoc binaries that declare it.
-    ///
-    /// `.bridged` uses `VZBridgedNetworkDeviceAttachment`. Requires a
-    /// signed build with the `com.apple.vm.networking` entitlement —
-    /// add an Apple ID in Xcode > Settings > Accounts, open the
-    /// xcodeproj, flip the target to Automatic signing with your
-    /// Personal Team, add `com.apple.vm.networking` under Signing &
-    /// Capabilities, Run. If the binary is missing the entitlement, VZ
-    /// rejects the config at `validate()` and `VM.boot()` surfaces a
-    /// `LuminaError.bootFailed` — no silent downgrade; the user flips
-    /// `manifest.json.networkMode` back to `nat` or rebuilds signed.
-    private static func networkProvider(for mode: NetworkMode?) -> any NetworkProvider {
-        switch mode ?? .nat {
-        case .nat:
-            return NATNetworkProvider()
-        case .bridged(let iface):
-            return BridgedNetworkProvider(interfaceIdentifier: iface)
+        case .seedAttached(let iso):
+            return "seed: attached \(iso.lastPathComponent)"
+        case .seedFailed(let reason):
+            return "seed: failed (\(reason))"
+        case .installerBootDisk(let disk):
+            return "installer: EFI boot from \(disk.lastPathComponent)"
+        case .bootDiskFailed(let reason):
+            return "installer: boot disk failed (\(reason)); direct kernel boot"
         }
     }
 
     private func handleExternalStop(reason: String?) {
-        // Terminal-state guard — see `Status.isTerminal`. Covers both
-        // the "shutdown() already owns the transition" and "already
-        // stopped" cases in one name.
         if status.isTerminal { return }
+        let installFinished = restartAfterInstall && reason == nil
+        restartAfterInstall = false
+        endInstallActivity()
 
         // Grab one final serial tail from the VM before we drop the
         // actor reference. On a kernel panic or EFI→kernel handoff
@@ -499,6 +472,7 @@ public final class LuminaDesktopSession: Identifiable {
         vmDelegate = nil
         vzMachine = nil
         vm = nil
+        macVM = nil
         // Atomic transition — crashed(reason) must not be observed
         // without lastError populated, and stopped must not carry a
         // stale lastError from a prior crash. Single observation tick.
@@ -519,16 +493,12 @@ public final class LuminaDesktopSession: Identifiable {
                 bootPhases: bootPhases
             ))
         }
+        if installFinished {
+            flash("Installed. Starting \(bundle.manifest.name)…")
+            Task { [weak self] in await self?.boot() }
+        }
     }
 
-    /// Poll the VM's serial console tail into `serialDigest` on a
-    /// ~250ms cadence. During `.booting` this feeds the bottom-docked
-    /// tail view — the only diagnostic available while the framebuffer
-    /// is blank (EFI → kernel handoff, early kernel messages before
-    /// the graphics driver claims the display). After the framebuffer
-    /// lights up the tail collapses in the UI but stays live so a
-    /// later crash preserves the last-known-good diagnostic lines.
-    ///
     /// **Back-pressure:** the loop captures `VM.serialVersion` each tick
     /// and short-circuits the tail+strip+publish pipeline when it hasn't
     /// changed since the previous iteration. An idle VM (no new serial
@@ -582,6 +552,53 @@ public final class LuminaDesktopSession: Identifiable {
         }
     }
 
+    public func takeSnapshot() async {
+        let wasRunning = status == .running
+        do {
+            if wasRunning { try await setPaused(true) }
+            _ = try bundle.takeSnapshot()
+            if wasRunning { try await setPaused(false) }
+            flash("Snapshot saved")
+        } catch {
+            if wasRunning { try? await setPaused(false) }
+            flash("Snapshot failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func togglePause() async {
+        guard status == .running || status == .paused else { return }
+        let pausing = status == .running
+        do {
+            try await setPaused(pausing)
+            status = pausing ? .paused : .running
+        } catch {
+            flash("Couldn't \(pausing ? "pause" : "resume"): \(error.localizedDescription)")
+        }
+    }
+
+    public func restore(_ snapshot: VMSnapshot) throws {
+        guard !status.isLive else { return }
+        try bundle.restore(snapshot)
+    }
+
+    private func setPaused(_ paused: Bool) async throws {
+        if let vm { try await vm.setPaused(paused) }
+        if let macVM { try await macVM.setPaused(paused) }
+    }
+
+    private func endInstallActivity() {
+        if let installActivity { ProcessInfo.processInfo.endActivity(installActivity) }
+        installActivity = nil
+    }
+
+    private func flash(_ message: String) {
+        notice = message
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            if self?.notice == message { self?.notice = nil }
+        }
+    }
+
     public func shutdown() async {
         status = .shuttingDown
         // Clear the handle immediately so the view stops rendering
@@ -593,40 +610,22 @@ public final class LuminaDesktopSession: Identifiable {
         serialMirrorTask = nil
         bootPhasesMirrorTask?.cancel()
         bootPhasesMirrorTask = nil
+        installTask?.cancel()
+        restartAfterInstall = false
+        endInstallActivity()
         if let vm = self.vm {
             await vm.setDelegate(nil)
             await vm.shutdown()
         }
+        if let macVM {
+            await macVM.setDelegate(nil)
+            await macVM.shutdown()
+        }
         self.vm = nil
+        self.macVM = nil
         status = .stopped
     }
 
-    /// Returns the underlying `VZVirtualMachine` for `LuminaVirtualMachineView`
-    /// to render. Nil when no VM is booted.
-    public func virtualMachine() async -> VZVirtualMachine? {
-        guard let vm = self.vm else { return nil }
-        let handle = await vm.vzMachine()
-        return handle.machine
-    }
-
-    /// Read the current pending-iso sidecar (set by `lumina desktop create
-    /// --iso`). Stale sidecars pointing at deleted/moved/temp files are
-    /// silently cleared — VZ would fail with POSIX 45 (Operation not
-    /// supported) on a missing volume, and forcing the user to diagnose
-    /// that is hostile when the fix is "just boot without the CD-ROM."
-    private func pendingCDROM() -> URL? {
-        let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
-        guard let data = try? Data(contentsOf: sidecar),
-              let path = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = URL(fileURLWithPath: trimmed)
-        if FileManager.default.fileExists(atPath: url.path) {
-            return url
-        }
-        // Stale sidecar — remove it so subsequent boots don't hit this path.
-        try? FileManager.default.removeItem(at: sidecar)
-        return nil
-    }
 }
 
 /// NSObject-backed forwarder for `VZVirtualMachineDelegate`. VZ calls the

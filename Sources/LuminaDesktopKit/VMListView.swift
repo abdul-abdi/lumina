@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/VMListView.swift
-//
-// Dense-row library layout — Activity Monitor / `lumina ps` feel.
-// Columns: name + OS variant, state chip, last boot, disk usage,
-// snapshot count, action. The working view when you have many VMs
-// and need to scan them at once. Extracted from LibraryView.swift.
-
 import SwiftUI
 import LuminaBootable
 
@@ -22,7 +15,6 @@ public struct VMListView: View {
     public var body: some View {
         ScrollView {
             VStack(spacing: 4) {
-                // Column header — dense like Activity Monitor / Linear / `lumina ps`
                 HStack(spacing: 12) {
                     columnHeader("NAME", width: nil, align: .leading)
                     columnHeader("STATE", width: 80)
@@ -54,10 +46,6 @@ public struct VMListView: View {
         }
     }
 
-    /// Primary tap action on a row. Opens the VM window in every case;
-    /// when the VM is idle (`.stopped` or `.crashed`) also kicks off
-    /// `boot()` so the user doesn't land on a separate boot screen.
-    /// Parity with VMCard's activate().
     private func activate(_ bundle: VMBundle) {
         openWindow(id: "vm-window", value: bundle.manifest.id)
         let session = model.session(for: bundle)
@@ -88,8 +76,6 @@ public struct VMRow: View {
         self.bundle = bundle
     }
 
-    // Stats are model-owned (issue #11). Shared with VMCard when the
-    // user swaps grid ↔ list on the same bundle.
     private var stats: VMLiveStats { model.liveStats(for: bundle) }
 
     private var session: LuminaDesktopSession {
@@ -105,7 +91,6 @@ public struct VMRow: View {
                 .frame(width: 3)
                 .frame(maxHeight: 44)
             HStack(spacing: 12) {
-                // NAME + live heartbeat when running + distro glyph
                 HStack(spacing: 10) {
                     Image(systemName: brand.glyph)
                         .font(.system(size: 14))
@@ -129,20 +114,17 @@ public struct VMRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                // STATE
                 HStack {
                     StateChip(status: session.status)
                     Spacer()
                 }
                 .frame(width: 80)
 
-                // LAST BOOT
                 Text(bundle.lastBootedRelative)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(LuminaTheme.inkDim)
                     .frame(width: 100, alignment: .leading)
 
-                // DISK — text + live sparkline (per-OS brand accent).
                 VStack(alignment: .leading, spacing: 3) {
                     Text("\(bundle.diskUsedFormatted) / \(bundle.diskCapFormatted)")
                         .font(.system(size: 11, design: .monospaced))
@@ -155,14 +137,12 @@ public struct VMRow: View {
                 }
                 .frame(width: 120, alignment: .leading)
 
-                // SNAPS
                 Text("\(bundle.snapshotCount)")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(LuminaTheme.inkDim)
                     .frame(width: 50, alignment: .leading)
                     .monospacedDigit()
 
-                // ACTION (always visible in list — this is the working view)
                 VMActionButton(session: session, compact: true)
                     .frame(width: 72, alignment: .trailing)
             }

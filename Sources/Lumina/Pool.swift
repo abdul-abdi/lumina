@@ -1,5 +1,3 @@
-// Sources/Lumina/Pool.swift
-//
 // Pre-warmed VM pool. Boot N VMs once, serve run() calls from warm
 // inventory, automatically refill after each use.
 //
@@ -34,16 +32,13 @@ public actor Pool {
     /// Ready-to-use VMs. May contain fewer than `size` while slots refill.
     private var available: [VM] = []
 
-    /// Callers blocked waiting for a VM.
     private var waiters: [CheckedContinuation<VM, any Error>] = []
 
     /// Count of slots currently booting (prevents over-spawning).
     private var booting: Int = 0
 
-    /// True after shutdown() is called — rejects new runs.
     private var isShutdown = false
 
-    /// Exposed for testing only. Count of VMs currently in inventory.
     internal var availableCount: Int { available.count }
 
     // MARK: - Init
@@ -55,20 +50,13 @@ public actor Pool {
 
     public init(size: Int = 4, image: String) {
         self.size = size
-        self.options = VMOptions(image: image)
+        self.options = VMOptions(image: image, rosetta: ImageStore().readMeta(name: image)?.rosetta ?? false)
     }
 
     // MARK: - Boot
 
     /// Pre-boot all pool slots. Call once before `run()`.
     /// Boots VMs concurrently via detached tasks.
-    ///
-    /// **Network note:** VMs use NAT networking. The gateway discovery heuristic
-    /// picks the first available vmnet bridge, which is correct for sequential boots.
-    /// When multiple slots boot simultaneously on a host with several active vmnet
-    /// bridges, a VM may pick the wrong bridge (rare in practice — Apple typically
-    /// assigns one bridge per process). Call `boot()` and let it complete before
-    /// serving traffic if strict per-VM networking is required.
     public func boot() async throws {
         guard !isShutdown else { throw LuminaError.sessionFailed("Pool is shut down") }
         await withTaskGroup(of: Void.self) { group in
@@ -99,20 +87,13 @@ public actor Pool {
         uploads: [FileUpload] = [],
         directoryUploads: [DirectoryUpload] = [],
         downloads: [FileDownload] = [],
-        directoryDownloads: [DirectoryDownload] = [],
         stdin: Stdin = .closed
     ) async throws -> RunResult {
         guard !isShutdown else { throw LuminaError.sessionFailed("Pool is shut down") }
         let vm = try await acquire()
         defer { Task { await self.releaseAndRefill(vm) } }
 
-        // Upload files before exec
-        if !uploads.isEmpty {
-            try await vm.uploadFiles(uploads)
-        }
-        for dir in directoryUploads {
-            try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
-        }
+        try await vm.upload(files: uploads, directories: directoryUploads)
 
         let timeoutSecs = max(Int(timeout.components.seconds), 1)
         let result = try await vm.exec(
@@ -123,34 +104,19 @@ public actor Pool {
             stdin: stdin
         )
 
-        // Download after exec — auto-detect file vs directory on guest (mirrors Lumina.run)
-        for dl in downloads {
-            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
-            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
-            if check.exitCode == 0 {
-                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
-            } else {
-                try await vm.downloadFiles([dl])
-            }
-        }
-        for dir in directoryDownloads {
-            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
-        }
+        try await vm.download(downloads)
 
         return result
     }
 
     // MARK: - Shutdown
 
-    /// Shut down all pooled VMs and reject future run() calls.
     public func shutdown() async {
         isShutdown = true
-        // Fail all waiting callers
         for waiter in waiters {
             waiter.resume(throwing: LuminaError.sessionFailed("Pool shut down"))
         }
         waiters.removeAll()
-        // Shut down ready VMs
         let vms = available
         available.removeAll()
         for vm in vms {
@@ -187,7 +153,6 @@ public actor Pool {
     /// Return a used VM, boot a replacement, hand off to the next waiter or inventory.
     private func releaseAndRefill(_ used: VM) async {
         await used.shutdown()
-        // Boot a fresh replacement slot asynchronously
         Task.detached { [self] in
             let fresh = await self.bootSingleVM()
             await self.depositVM(fresh)
@@ -212,8 +177,6 @@ public actor Pool {
             return
         }
         booting = max(0, booting - 1)
-        // If shutdown() was called while this VM was booting, shut it down
-        // immediately rather than adding it to inventory — prevents leaked VMs.
         if isShutdown {
             await vm.shutdown()
             return
@@ -228,7 +191,6 @@ public actor Pool {
 
     // MARK: - Private: Boot Helpers
 
-    /// Boot one slot concurrently (for initial boot).
     private func bootOneSlot() async {
         let vm = await bootSingleVM()
         await depositVM(vm)
@@ -249,32 +211,6 @@ public actor Pool {
             NSLog("[Lumina.Pool] Slot boot failed: %@", String(describing: error))
             return nil
         }
-    }
-}
-
-// MARK: - Lumina.pool convenience
-
-extension Lumina {
-    /// Create and boot a pre-warmed VM pool.
-    ///
-    /// VMs use NAT networking. The gateway heuristic is correct for typical
-    /// single-process usage. See ``Pool/boot()`` for known limitations.
-    ///
-    /// ```swift
-    /// let pool = try await Lumina.pool(size: 4, image: "default")
-    /// let result = try await pool.run("echo hello")
-    /// await pool.shutdown()
-    /// ```
-    public static func pool(
-        size: Int = 4,
-        image: String = "default",
-        memory: UInt64 = 1024 * 1024 * 1024,
-        cpuCount: Int = 2
-    ) async throws -> Pool {
-        let opts = VMOptions(memory: memory, cpuCount: cpuCount, image: image)
-        let pool = Pool(size: size, options: opts)
-        try await pool.boot()
-        return pool
     }
 }
 

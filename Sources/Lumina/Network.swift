@@ -1,4 +1,3 @@
-// Sources/Lumina/Network.swift
 import Foundation
 
 /// Manages a group of VMs on a shared private network.
@@ -39,11 +38,6 @@ public actor Network {
         let vm = VM(options: vmOpts)
         try await vm.boot()
 
-        // Configure the NAT eth0 interface (host-driven; replaces the
-        // udhcpc fallback that was removed from the guest init in
-        // v0.7.2). Network.swift VMs still want NAT outbound for
-        // package installs / DNS even though VM-to-VM traffic flows
-        // over the private eth1 set up via kernel cmdline.
         try await vm.configureNetwork()
 
         sessions.append((name: sessionName, ip: ip, vm: vm))
@@ -53,7 +47,6 @@ public actor Network {
         }
 
         // Update /etc/hosts on all previously booted VMs with the full peer list.
-        // This ensures earlier VMs can resolve later peers by name.
         if sessions.count > 1 {
             let hostsContent = NetworkSwitch.generateHosts(peers: allPeers)
             let escaped = hostsContent.replacingOccurrences(of: "'", with: "'\\''")
@@ -66,7 +59,6 @@ public actor Network {
         return vm
     }
 
-    /// Shutdown all VMs and close the network.
     public func shutdown() async {
         for (_, _, vm) in sessions {
             await vm.shutdown()

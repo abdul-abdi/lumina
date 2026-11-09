@@ -116,10 +116,6 @@ import Virtualization
     }
 
     @Test func configure_usesUSBMassStorageCDROMWhenPreferred() throws {
-        // macOS 13+ only — older hosts always get virtio block and this
-        // test degrades gracefully to pass-through.
-        guard #available(macOS 13.0, *) else { return }
-
         let vars = tmp.appendingPathComponent("efi.vars")
         let disk = tmp.appendingPathComponent("disk.img")
         let iso = tmp.appendingPathComponent("windows.iso")
@@ -162,27 +158,5 @@ import Virtualization
             installPhase: false
         )
         try EFIBootable(config: normalCfg).apply(to: baseConfig())
-    }
-
-    @Test func configure_attachesExtraDisks() throws {
-        let vars = tmp.appendingPathComponent("efi.vars")
-        let disk = tmp.appendingPathComponent("disk.img")
-        let extra1 = tmp.appendingPathComponent("data1.img")
-        let extra2 = tmp.appendingPathComponent("data2.img")
-        try DiskImageAllocator.allocate(at: disk, logicalSize: 64 * 1024 * 1024)
-        try DiskImageAllocator.allocate(at: extra1, logicalSize: 64 * 1024 * 1024)
-        try DiskImageAllocator.allocate(at: extra2, logicalSize: 64 * 1024 * 1024)
-
-        let cfg = EFIBootConfig(
-            variableStoreURL: vars,
-            primaryDisk: disk,
-            extraDisks: [extra1, extra2]
-        )
-        let vzConfig = baseConfig()
-
-        try EFIBootable(config: cfg).apply(to: vzConfig)
-
-        // 1 primary + 2 extras = 3 storage devices.
-        #expect(vzConfig.storageDevices.count == 3)
     }
 }

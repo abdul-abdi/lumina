@@ -1,7 +1,3 @@
-// Sources/LuminaDesktopKit/NewVMWizard.swift
-//
-// v0.7.0 M6 — 4-step wizard: choose OS → variant → resources → review.
-
 import SwiftUI
 import Lumina
 import LuminaBootable
@@ -62,13 +58,16 @@ public struct NewVMWizard: View {
         }
         .frame(width: 760, height: 560)
         .background(LuminaTheme.bg)
-        // Inherit from parent — respects AppearancePreference toggle.
         .animation(.easeInOut(duration: 0.18), value: step)
         .onAppear {
             if let id = initialTileID, let tile = OSCatalog.tile(id: id) {
                 selectedTile = tile
                 step = .variant  // skip step 1 since tile is pre-picked
                 applyOSDefaults()
+            }
+            if let dropped = UserDefaults.standard.string(forKey: "lumina.wizard.droppedFile") {
+                UserDefaults.standard.removeObject(forKey: "lumina.wizard.droppedFile")
+                byoFile = URL(fileURLWithPath: dropped)
             }
         }
         // Swapping the attached ISO invalidates any prior SHA-256 verdict;
@@ -188,56 +187,36 @@ public struct NewVMWizard: View {
 
                 switch tile.acquisition {
                 case .catalogISO(let entry):
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("INSTALLER ISO")
-                            .font(LuminaTheme.label).tracking(1.5)
-                            .foregroundStyle(LuminaTheme.inkMute)
-                        Text(entry.isoURL.absoluteString)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(LuminaTheme.inkDim)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                        HStack(spacing: 8) {
-                            Button("Open in Browser") {
-                                NSWorkspace.shared.open(entry.isoURL)
-                            }
-                            Button("Copy URL") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(entry.isoURL.absoluteString, forType: .string)
-                            }
+                    automaticDownloadPanel(size: formatBytesHuman(entry.isoSizeBytes), source: entry.isoURL.host ?? "the vendor")
+                case .omarchy:
+                    automaticDownloadPanel(size: "6.7 GB", source: "nightly.omarchy.org")
+                case .microsoftAccountDownload:
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Microsoft only hands out the Windows 11 ARM64 ISO in a browser.")
+                            .font(.headline)
+                        Button("Get Windows 11 from Microsoft") {
+                            NSWorkspace.shared.open(URL(string: "https://www.microsoft.com/software-download/windows11arm64")!)
                         }
-                        Text("≈ \(formatGB(entry.isoSizeBytes)) download. Once you have the ISO on disk, attach it below.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(LuminaTheme.inkMute)
-                            .padding(.top, 4)
+                        .buttonStyle(.borderedProminent)
+                        .tint(LuminaTheme.accent)
+                        Text(byoFile == nil
+                             ? "Pick \"Windows 11 (multi-edition ISO for Arm64)\". Lumina spots the ISO in Downloads as soon as it finishes."
+                             : "Found \(byoFile!.lastPathComponent). Windows installs unattended and signs in as lumina / lumina.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(byoFile == nil ? LuminaTheme.inkDim : LuminaTheme.ok)
                         isoPicker
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(LuminaTheme.bg1)
                     .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
-                case .microsoftAccountDownload:
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Microsoft requires a Microsoft Account to download the ISO.")
-                                .font(.headline)
-                            Text("Lumina opens the download page in your browser. After downloading, drop the ISO here.")
-                                .foregroundStyle(.secondary)
-                            Button("Open Microsoft Download Page") {
-                                NSWorkspace.shared.open(URL(string: "https://www.microsoft.com/en-us/software-download/windows11arm64")!)
-                            }
-                            .padding(.top, 4)
-                            isoPicker
-                            windowsTPMAdvisory
-                        }
-                        .padding(8)
-                    }
+                    .task(id: tile.id) { await watchDownloadsForWindowsISO() }
                 case .appleIPSW:
                     GroupBox {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Lumina downloads the macOS IPSW directly from Apple (~15 GB).")
+                            Text("Lumina downloads the newest macOS IPSW this Mac supports from Apple (~18 GB) on first boot.")
                                 .font(.headline)
-                            Text("By continuing you accept Apple's licensing terms. You can also pick an IPSW file you already have.")
+                            Text("By continuing you accept Apple's licensing terms. You can also pick an IPSW you already have.")
                                 .foregroundStyle(.secondary)
                             ipswPicker
                         }
@@ -263,7 +242,6 @@ public struct NewVMWizard: View {
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                // Host chip bar — numbers that constrain the choices below.
                 HostChipBar(host: host, freeDisk: freeDisk)
 
                 sliderRow(label: "Memory", value: $memoryGB,
@@ -476,24 +454,41 @@ public struct NewVMWizard: View {
     /// retail ISOs refuse OOBE without TPM 2.0, which means users download
     /// a 5 GB file that won't boot through Setup. Cheap to warn up-front.
     @ViewBuilder
-    private var windowsTPMAdvisory: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("⚠ KNOWN CONSTRAINT: WINDOWS 11 TPM")
-                .font(LuminaTheme.label).tracking(1.3)
-                .foregroundStyle(LuminaTheme.warn)
-            Text("Apple's Virtualization.framework exposes no TPM. Stock Windows 11 Home/Pro retail ISOs refuse Setup without TPM 2.0. Known workable paths on Apple Silicon:")
-                .font(.system(size: 11))
+    private func automaticDownloadPanel(size: String, source: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Lumina downloads the installer (\(size)) from \(source) on first boot, checks its SHA-256 and keeps it for next time.", systemImage: "arrow.down.circle")
+                .font(.system(size: 12))
                 .foregroundStyle(LuminaTheme.ink)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("  • Tiny11 ARM ISO (pre-bypassed). Not Microsoft-signed.\n  • Windows Insider Preview ISO (TPM bypass during Insider flighting).\n  • Inject LabConfig\\BypassTPMCheck=1 via unattend.xml on a FAT32 sidecar.")
-                .font(.system(size: 10, design: .monospaced))
+            Text("Already have the ISO? Attach it instead.")
+                .font(.system(size: 11))
                 .foregroundStyle(LuminaTheme.inkMute)
-                .fixedSize(horizontal: false, vertical: true)
+            isoPicker
         }
-        .padding(10)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(Rectangle().stroke(LuminaTheme.warn.opacity(0.5), lineWidth: 1))
-        .padding(.top, 6)
+        .background(LuminaTheme.bg1)
+        .overlay(Rectangle().stroke(LuminaTheme.rule, lineWidth: 1))
+    }
+
+    private func modified(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+
+    private func watchDownloadsForWindowsISO() async {
+        let downloads = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+        while !Task.isCancelled, byoFile == nil {
+            let candidates = (try? FileManager.default.contentsOfDirectory(
+                at: downloads, includingPropertiesForKeys: [.contentModificationDateKey]
+            )) ?? []
+            let found = candidates
+                .filter { $0.pathExtension.lowercased() == "iso" && $0.lastPathComponent.lowercased().contains("arm64") && $0.lastPathComponent.lowercased().hasPrefix("win") }
+                .max { modified($0) < modified($1) }
+            if let found {
+                byoFile = found
+                return
+            }
+            try? await Task.sleep(for: .seconds(2))
+        }
     }
 
     private var isoPicker: some View {
@@ -516,8 +511,8 @@ public struct NewVMWizard: View {
                 // Empty allowedContentTypes would block all files. Nil = allow any.
                 // We accept anything since users may have .iso, .img, .dmg,
                 // or a renamed distribution ISO.
-                panel.title = "Pick an ISO or IPSW file"
-                panel.message = "Select a .iso, .img, or .ipsw file"
+                panel.title = "Pick an ISO file"
+                panel.message = "Select a .iso or .img file"
                 if panel.runModal() == .OK { byoFile = panel.url }
             }
             .buttonStyle(.borderedProminent)
@@ -527,15 +522,7 @@ public struct NewVMWizard: View {
 
     private var ipswPicker: some View {
         HStack {
-            if let f = byoFile {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc.fill")
-                        .foregroundStyle(LuminaTheme.accent)
-                    Text(f.lastPathComponent).foregroundStyle(LuminaTheme.ink)
-                }
-            } else {
-                Text("No file selected").foregroundStyle(LuminaTheme.inkMute)
-            }
+            Text(byoFile?.lastPathComponent ?? "Download the latest").foregroundStyle(byoFile == nil ? LuminaTheme.inkMute : LuminaTheme.ink)
             Spacer()
             Button("Choose IPSW…") {
                 let panel = NSOpenPanel()
@@ -546,8 +533,7 @@ public struct NewVMWizard: View {
                 panel.message = "Apple macOS restore image (.ipsw)"
                 if panel.runModal() == .OK { byoFile = panel.url }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(LuminaTheme.accent)
+            .buttonStyle(.bordered)
         }
     }
 
@@ -558,13 +544,9 @@ public struct NewVMWizard: View {
             guard let tile = selectedTile else { return false }
             if isVerifying { return false }
             switch tile.acquisition {
-            case .userProvided, .microsoftAccountDownload, .catalogISO:
-                // User must attach the ISO before we can proceed — we don't
-                // run a background downloader in v0.7.0.
+            case .userProvided, .microsoftAccountDownload:
                 return byoFile != nil
-            case .appleIPSW:
-                // macOS IPSW can go without a pre-picked file; the restore
-                // runs through `lumina desktop install-macos` with the URL.
+            case .appleIPSW, .catalogISO, .omarchy:
                 return true
             }
         case .resources: return true
@@ -588,7 +570,7 @@ public struct NewVMWizard: View {
             //      they can re-attach a fresh download without losing
             //      configuration.
             guard let tile = selectedTile else { step = .resources; return }
-            if let picked = byoFile, !architectureCheck(tile: tile, file: picked) {
+            if tile.family != .macOS, let picked = byoFile, !architectureCheck(tile: tile, file: picked) {
                 return // architectureCheck surfaced the error already
             }
             if case .catalogISO(let entry) = tile.acquisition,
@@ -665,10 +647,10 @@ public struct NewVMWizard: View {
             memoryGB = Double(entry.recommendedMemoryBytes / (1024 * 1024 * 1024))
             cpus = entry.recommendedCPUs
             diskGB = Double(entry.recommendedDiskBytes / (1024 * 1024 * 1024))
-        case .microsoftAccountDownload:
+        case .microsoftAccountDownload, .appleIPSW:
             memoryGB = 8; cpus = 4; diskGB = 64
-        case .appleIPSW:
-            memoryGB = 8; cpus = 4; diskGB = 64
+        case .omarchy:
+            memoryGB = 8; cpus = 6; diskGB = 80
         case .userProvided:
             break
         }
@@ -706,7 +688,9 @@ public struct NewVMWizard: View {
                 id: id
             )
             try DiskImageAllocator.allocate(at: bundle.primaryDiskURL, logicalSize: diskBytes)
-            // Stage BYO file if provided.
+            if osVariant == "omarchy" {
+                try OmarchySeed.write(into: bundle)
+            }
             if let f = byoFile {
                 let sidecar = bundle.rootURL.appendingPathComponent("pending-iso.path")
                 try? Data(f.path.utf8).write(to: sidecar, options: .atomic)
@@ -732,14 +716,6 @@ public struct NewVMWizard: View {
     }
 
 
-    private func formatGB(_ bytes: UInt64) -> String {
-        String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))
-    }
-
-    /// Collapse the UI choice + selected bridge interface into the
-    /// persisted `NetworkMode` shape. Returns nil for NAT so older
-    /// bundle readers (pre-networkMode schema) still load cleanly —
-    /// `LuminaDesktopSession.networkProvider(for:)` maps nil → .nat.
     private func resolvedNetworkMode() -> NetworkMode? {
         switch networkMode {
         case .nat:
@@ -756,16 +732,11 @@ public struct NewVMWizard: View {
     }
 }
 
-/// UI-local representation of the network attachment choice. Maps to
-/// `LuminaBootable.NetworkMode` at persist time via `resolvedNetworkMode()`.
 enum NetworkModeChoice: Equatable {
     case nat
     case bridged
 }
 
-/// Thin bar showing host constraints above the resource sliders.
-/// Host RAM / core count / free disk — the numbers that should shape
-/// the user's choices are made visible.
 @MainActor
 struct HostChipBar: View {
     let host: HostInfo
@@ -825,8 +796,10 @@ struct OSTileButton: View {
                 Text(tile.description)
                     .font(LuminaTheme.caption)
                     .foregroundStyle(LuminaTheme.inkDim)
-                    .lineLimit(2)
+                    .lineLimit(3)
                     .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
                 if let constraint = tile.constraint {
                     Text(constraint.uppercased())
                         .font(LuminaTheme.label)
@@ -834,8 +807,9 @@ struct OSTileButton: View {
                         .foregroundStyle(LuminaTheme.inkMute)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 190, maxHeight: 190, alignment: .topLeading)
+            .contentShape(Rectangle())
             .background(
                 isSelected ? LuminaTheme.accent.opacity(0.08) :
                 hovering ? LuminaTheme.bg1 : Color.clear

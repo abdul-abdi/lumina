@@ -1,4 +1,3 @@
-// Sources/Lumina/VM.swift
 import Foundation
 import os
 @preconcurrency import Virtualization
@@ -41,16 +40,9 @@ actor VmnetBridgeRegistry {
     ///
     /// Precondition: `candidates` is non-empty.
     func claim(
-        mac: UInt8?,
+        mac: UInt8,
         candidates: [(gateway: String, subnetPrefix: String, name: String)]
     ) -> (gateway: String, subnetPrefix: String, name: String) {
-        guard let mac else {
-            // No MAC hint — caller is pre-v0.7.1 agent path. Legacy
-            // behaviour: first candidate. Don't record a claim; we
-            // have no stable identity to key on.
-            return candidates[0]
-        }
-
         // If this MAC already claimed a bridge, return it (idempotent
         // for the polling loop, re-connects, etc.). Drop the claim
         // transparently if the bridge has gone away between calls.
@@ -140,13 +132,9 @@ final class StdinPumpGate: @unchecked Sendable {
 }
 
 public actor VM {
-    // TODO: Remove once all deployed images include the pre-register fix
-    // (Guest/lumina-agent >v0.5.0). The fixed agent inserts the runningCmd entry
-    // synchronously before spawning the goroutine, so stdin/stdin_close cannot race.
-    private static let stdinPumpWarmupMs: Int = 5
-
     private var virtualMachine: VZVirtualMachine?
     private var commandRunner: CommandRunner?
+    private var clipboard: ClipboardBridge?
     private let serialConsole = SerialConsole()
     private let options: VMOptions
     private let imageStore: ImageStore
@@ -154,15 +142,6 @@ public actor VM {
     private var _state: VMState = .idle
     private var pipeHandles: [FileHandle] = []
 
-    /// Delegate to install on the VZ machine as soon as it exists but
-    /// before `vm.start(…)` is invoked. Callers register it via
-    /// `setDelegate(_:)` prior to `boot()`; the boot path then applies it
-    /// synchronously on the executor queue just after
-    /// `VZVirtualMachine(configuration:queue:)` returns, so any crash in
-    /// the 300–500 ms kernel→init window fires `guestDidStop` /
-    /// `didStopWithError` into a live observer instead of a nil delegate.
-    /// Delegate install is also idempotent post-boot through the same
-    /// accessor so existing post-boot callers keep working.
     private var pendingDelegate: (any VZVirtualMachineDelegate)?
 
     /// Latest boot-phase timings, populated by `recordPhase(…)` during
@@ -173,16 +152,8 @@ public actor VM {
     private var _bootPhases = BootPhases()
 
     public var bootPhases: BootPhases { _bootPhases }
-
-    /// Background tasks reading serial console output. Retained so
-    /// `shutdownVM()` can cancel them explicitly rather than relying
-    /// on EOF-from-pipe-close as the termination signal.
-    private var serialReadTasks: [Task<Void, Never>] = []
     private var macLastByte: UInt8?  // Last byte of MAC for IP derivation
 
-    /// The actor executor, backed by a serial DispatchQueue.
-    /// VZVirtualMachine is created with executor.queue so all VZ calls
-    /// happen on the correct queue automatically.
     private nonisolated let executor: VMExecutor
 
     nonisolated public var unownedExecutor: UnownedSerialExecutor {
@@ -190,26 +161,6 @@ public actor VM {
     }
 
     public var state: VMState { _state }
-
-    /// Expose the current disk clone for image creation workflows.
-    public var diskClone: DiskClone? { clone }
-
-    /// Wire-format protocol version the guest agent reported on its
-    /// `ready` frame. 0 when no handshake has happened yet, or when
-    /// the guest pre-dates v0.7.2 (no `protocol_version` field on
-    /// `ready`). Diagnostic only today; future host code can branch
-    /// on this to refuse incompatible guests rather than misdecoding.
-    public var guestProtocolVersion: Int {
-        commandRunner?.guestProtocolVersion ?? 0
-    }
-
-    /// Capability strings the guest agent reported on its `ready`
-    /// frame. Empty when no handshake has happened yet, or when the
-    /// guest pre-dates v0.7.2. Hosts can consult this before issuing
-    /// capability-gated requests like `pty_exec` or `port_forward_start`.
-    public var guestCapabilities: [String] {
-        commandRunner?.guestCapabilities ?? []
-    }
 
     public init(options: VMOptions = .default) {
         self.options = options
@@ -238,25 +189,9 @@ public actor VM {
         }
         _state = .booting
 
-        // v0.7.0 M3: route non-agent profiles off the hot agent path.
-        // The .agent case is a single-cmp-and-branch before falling through
-        // to the v0.6.0 code below — the CI agent-boot P50 gate is the
-        // source of truth on timing.
-        switch options.effectiveBootable {
-        case .agent:
-            break  // fall through to the v0.6.0 agent boot path
-        case .efi(let cfg):
+        if let cfg = options.efi {
             try await bootEFIPath(cfg: cfg)
             return
-        case .macOS:
-            // Library callers with `VMOptions.bootable = .macOS(...)` must
-            // go through `MacOSVM` directly; `VM` drives VZVirtualMachine
-            // and cannot configure a VZMacOSVirtualMachine. The CLI wires
-            // this correctly at DesktopCommand.bootMacOS().
-            _state = .idle
-            throw .bootFailed(underlying: VMError.invalidState(
-                "VM.boot() does not support macOS guests — use MacOSVM directly"
-            ))
         }
 
         // Phase instrumentation — each recordPhase() resets the phase
@@ -276,11 +211,9 @@ public actor VM {
         // orphans get swept next time instead. v0.7.1 perf.
         Task.detached { _ = DiskClone.cleanOrphans() }
 
-        // Resolve image
         let imagePaths = try imageStore.resolve(name: options.image)
         phaseMark = recordPhase(\.imageResolveMs, since: phaseMark)
 
-        // Create COW clone (and resize if requested)
         let diskClone = try DiskClone.create(from: imagePaths.rootfs)
         if let diskSize = options.diskSize {
             try diskClone.resize(to: diskSize)
@@ -288,57 +221,16 @@ public actor VM {
         self.clone = diskClone
         phaseMark = recordPhase(\.cloneMs, since: phaseMark)
 
-        // Configure VM
         let config = VZVirtualMachineConfiguration()
         config.platform = VZGenericPlatformConfiguration()
         config.cpuCount = options.cpuCount
         config.memorySize = options.memory
 
-        // Boot loader
-        // ── Boot loader: initrd setup ──
         let bootLoader = VZLinuxBootLoader(kernelURL: imagePaths.kernel)
 
-        if let baseInitrd = imagePaths.initrd {
-            // Legacy image: has initrd (Alpine kernel with modules)
-            if let agentURL = imagePaths.agent {
-                let combinedInitrd = diskClone.directory.appendingPathComponent("initrd.combined")
-                try InitrdPatcher.createCombinedInitrd(
-                    baseInitrd: baseInitrd,
-                    agentBinary: agentURL,
-                    modulesDir: imagePaths.modulesDir,
-                    outputURL: combinedInitrd
-                )
-                if let hosts = options.networkHosts, let ip = options.networkIP {
-                    try InitrdPatcher.appendNetworkOverlay(
-                        initrdURL: combinedInitrd,
-                        hosts: hosts,
-                        ip: ip
-                    )
-                }
-                bootLoader.initialRamdiskURL = combinedInitrd
-            } else {
-                bootLoader.initialRamdiskURL = baseInitrd
-            }
-        }
-        // else: baked image — no initrd, kernel boots directly to rootfs
-
-        // ── Kernel command line ──
-        // All cmdline params built in one block. Both paths share mounts and IP;
-        // baked images additionally pass hosts via cmdline (legacy uses initrd overlay).
-        //
         // md=noautodetect — skip the kernel's autodetect-RAID-arrays pass
         //   at init time. Negligible on its own (<50ms), but semantically
         //   correct: Lumina VMs never host MD devices.
-        //
-        // Note: the single largest boot cost on current images is the
-        //   kernel's 8-way RAID6 algorithm benchmark (~545ms on M3 Pro,
-        //   measured 2026-04-24). That benchmark runs only when the
-        //   kernel is compiled with RAID6 code (CONFIG_RAID6_PQ=y),
-        //   and there is no runtime cmdline to skip it on upstream
-        //   kernels. The eliminating fix is in `Guest/build-kernel.sh`
-        //   which now disables CONFIG_MD — next image build drops ~550ms
-        //   cold-boot. Existing images continue to pay the cost until
-        //   a new image tarball ships.
         var cmdLine = "console=hvc0 root=/dev/vda rw md=noautodetect"
 
         if !options.mounts.isEmpty {
@@ -348,16 +240,12 @@ public actor VM {
         if let ip = options.networkIP {
             cmdLine += " lumina_ip=\(ip)"
         }
-        // For baked images, hosts go through the kernel cmdline (no initrd overlay
-        // available). For legacy images, InitrdPatcher.appendNetworkOverlay writes
-        // them into /lumina-hosts instead.
-        if imagePaths.bootContract == .baked, let hosts = options.networkHosts {
+        if let hosts = options.networkHosts {
             cmdLine += " lumina_hosts=\(Self.encodeHosts(hosts))"
         }
 
         config.bootLoader = bootLoader
 
-        // Disk
         do {
             let diskAttachment = try VZDiskImageStorageDeviceAttachment(
                 url: diskClone.rootfs,
@@ -370,7 +258,6 @@ public actor VM {
             throw .bootFailed(underlying: error)
         }
 
-        // Serial console — pipe pair for host<->guest communication
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
         let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
         let (guestToHostRead, guestToHostWrite) = try createPipePair()
@@ -381,21 +268,13 @@ public actor VM {
         config.serialPorts = [serialPort]
         pipeHandles = [hostToGuestRead, hostToGuestWrite, guestToHostRead, guestToHostWrite]
 
-        // Drain serial output in the background. Retained so teardown can
-        // cancel explicitly; the blocking `availableData` read still
-        // unblocks via pipe-close EOF, but cooperative cancellation is
-        // now expressed in the loop condition rather than implicit.
         let console = self.serialConsole
-        serialReadTasks.append(Task.detached {
-            let handle = guestToHostRead
-            while !Task.isCancelled {
-                let data = handle.availableData
-                if data.isEmpty { break }
+        spawnBlockingThread("lumina.serial") {
+            while case let data = guestToHostRead.availableData, !data.isEmpty {
                 console.append(data)
             }
-        })
+        }
 
-        // Network (pluggable via NetworkProvider protocol)
         let networkDevice = VZVirtioNetworkDeviceConfiguration()
         do {
             networkDevice.attachment = try options.networkProvider.createAttachment()
@@ -404,11 +283,6 @@ public actor VM {
             _state = .idle
             throw .bootFailed(underlying: error)
         }
-        // Pin the MAC if the caller provided one. Desktop bundles persist a
-        // stable MAC in their manifest so every boot uses the same L2 id —
-        // vmnet's DHCP lease stays hot and the guest's IP is reproducible.
-        // A malformed string silently falls through to VZ's default (random
-        // locally-administered on every boot).
         if let macString = options.macAddress,
            let mac = VZMACAddress(string: macString) {
             networkDevice.macAddress = mac
@@ -416,7 +290,6 @@ public actor VM {
         self.macLastByte = networkDevice.macAddress.ethernetAddress.octet.5
         var networkDevices: [VZVirtioNetworkDeviceConfiguration] = [networkDevice]
 
-        // Private network interface (eth1) for VM-to-VM networking
         if let netFd = options.privateNetworkFd {
             let privateNet = VZVirtioNetworkDeviceConfiguration()
             let netHandle = FileHandle(fileDescriptor: netFd, closeOnDealloc: false)
@@ -425,11 +298,9 @@ public actor VM {
         }
         config.networkDevices = networkDevices
 
-        // vsock
         let vsockDevice = VZVirtioSocketDeviceConfiguration()
         config.socketDevices = [vsockDevice]
 
-        // Directory sharing (virtio-fs) for --mount
         if !options.mounts.isEmpty {
             var sharingDevices: [VZDirectorySharingDeviceConfiguration] = []
             for (index, mount) in options.mounts.enumerated() {
@@ -443,42 +314,35 @@ public actor VM {
             config.directorySharingDevices = sharingDevices
         }
 
-        // Rosetta for x86_64 binary translation in Linux guests
         if options.rosetta {
-            if #available(macOS 13.0, *) {
-                let availability = VZLinuxRosettaDirectoryShare.availability
-                switch availability {
-                case .installed:
-                    do {
-                        let rosettaShare = try VZLinuxRosettaDirectoryShare()
-                        let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
-                        rosettaDevice.share = rosettaShare
-                        var sharingDevices = config.directorySharingDevices
-                        sharingDevices.append(rosettaDevice)
-                        config.directorySharingDevices = sharingDevices
-                        cmdLine += " lumina_rosetta=1"
-                    } catch {
-                        clone?.remove()
-                        _state = .idle
-                        throw .bootFailed(underlying: error)
-                    }
-                case .notSupported:
+            let availability = VZLinuxRosettaDirectoryShare.availability
+            switch availability {
+            case .installed:
+                do {
+                    let rosettaShare = try VZLinuxRosettaDirectoryShare()
+                    let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+                    rosettaDevice.share = rosettaShare
+                    var sharingDevices = config.directorySharingDevices
+                    sharingDevices.append(rosettaDevice)
+                    config.directorySharingDevices = sharingDevices
+                    cmdLine += " lumina_rosetta=1"
+                } catch {
                     clone?.remove()
                     _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not supported on this Mac"))
-                case .notInstalled:
-                    clone?.remove()
-                    _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Rosetta is not installed. Run: softwareupdate --install-rosetta"))
-                @unknown default:
-                    clone?.remove()
-                    _state = .idle
-                    throw .bootFailed(underlying: VMError.invalidState("Unknown Rosetta availability status"))
+                    throw .bootFailed(underlying: error)
                 }
-            } else {
+            case .notSupported:
                 clone?.remove()
                 _state = .idle
-                throw .bootFailed(underlying: VMError.invalidState("Rosetta requires macOS 13.0 or later"))
+                throw .bootFailed(underlying: VMError.invalidState("Rosetta is not supported on this Mac"))
+            case .notInstalled:
+                clone?.remove()
+                _state = .idle
+                throw .bootFailed(underlying: VMError.invalidState("Rosetta is not installed. Run: softwareupdate --install-rosetta"))
+            @unknown default:
+                clone?.remove()
+                _state = .idle
+                throw .bootFailed(underlying: VMError.invalidState("Unknown Rosetta availability status"))
             }
         }
 
@@ -495,10 +359,8 @@ public actor VM {
 
         bootLoader.commandLine = cmdLine
 
-        // Entropy
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
-        // v0.7.0: Optional display + input devices for the desktop use case.
         // The agent path leaves `options.graphics` nil and both `if let`s
         // compile to a single nil-check + branch-not-taken — measurably
         // within the CI agent-boot P50 budget
@@ -506,8 +368,8 @@ public actor VM {
         if let graphics = options.graphics {
             attachGraphicsDevices(to: config, graphics: graphics)
         }
-        if let sound = options.sound, sound.enabled {
-            attachSoundDevice(to: config, sound: sound)
+        if options.sound {
+            attachSoundDevice(to: config)
         }
 
         do {
@@ -518,15 +380,10 @@ public actor VM {
             throw .bootFailed(underlying: error)
         }
 
-        // Create VM on the executor's queue.
         let queue = executor.queue
         let vm = VZVirtualMachine(configuration: config, queue: queue)
         self.virtualMachine = vm
 
-        // Install the delegate BEFORE `vm.start(…)` so crashes in the
-        // kernel-boot window fire `didStopWithError` into a live observer
-        // instead of a nil delegate. See `setDelegate(_:)` for full
-        // rationale.
         if let d = pendingDelegate {
             vm.delegate = d
         }
@@ -569,7 +426,6 @@ public actor VM {
         }
         phaseMark = recordPhase(\.vzStartMs, since: phaseMark)
 
-        // Connect CommandRunner via vsock
         let socketDevice: VZVirtioSocketDevice
         do {
             let vmBox = UncheckedSendable(vm)
@@ -632,10 +488,6 @@ public actor VM {
     /// validation, failed `start(…)`, and Task cancellation — funnel into a
     /// single `catch` that calls `shutdownVM()` to tear down pipes, serial
     /// drain tasks, and the VZ machine if it was already instantiated.
-    /// That way a cancelled boot (user clicks Stop at any phase) releases
-    /// the `flock()` on `disk.img` + `efi.vars` and the next `boot()`
-    /// succeeds cold — the prior design leaked those locks and produced
-    /// `VZErrorDomain Code 2` on retry.
     private func bootEFIPath(cfg: EFIBootConfig) async throws(LuminaError) {
         let phaseStart = ContinuousClock.now
         var phaseMark = phaseStart
@@ -645,16 +497,8 @@ public actor VM {
             config.cpuCount = options.cpuCount
             config.memorySize = options.memory
 
-            // Boot loader + storage. configMs is recorded once at the
-            // end of the config block (after VZ instantiation + delegate
-            // install), matching the agent path's single-accumulation
-            // pattern. The earlier double-call here was numerically
-            // correct (both calls used `+=`) but split a single
-            // semantic phase into two redundant writes, making the
-            // boot trace harder to reason about.
             try EFIBootable(config: cfg).apply(to: config)
 
-            // Serial console — capture guest output for diagnostics.
             let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
             let (hostToGuestRead, hostToGuestWrite) = try createPipePair()
             let (guestToHostRead, guestToHostWrite) = try createPipePair()
@@ -686,24 +530,17 @@ public actor VM {
                 return h
             }()
             if let h = persistHandle {
-                // Record a boot-delimiter marker so humans reading the
-                // file can tell where one boot ends and the next begins.
                 let marker = "\n--- lumina boot \(ISO8601DateFormatter().string(from: Date())) ---\n"
                 do { try h.write(contentsOf: Data(marker.utf8)) } catch { /* non-fatal */ }
                 pipeHandles.append(h)
             }
 
-            serialReadTasks.append(Task.detached {
-                let handle = guestToHostRead
-                while !Task.isCancelled {
-                    let data = handle.availableData
-                    if data.isEmpty { break }
+            spawnBlockingThread("lumina.serial") {
+                while case let data = guestToHostRead.availableData, !data.isEmpty {
                     console.append(data)
-                    if let h = persistHandle {
-                        _ = try? h.write(contentsOf: data)
-                    }
+                    _ = try? persistHandle?.write(contentsOf: data)
                 }
-            })
+            }
 
             // Network — same pluggable provider as the agent path, plus the
             // same MAC-pinning behavior so desktop .luminaVM bundles present a
@@ -732,15 +569,18 @@ public actor VM {
             if let graphics = options.graphics {
                 attachGraphicsDevices(to: config, graphics: graphics)
             }
-            if let sound = options.sound, sound.enabled {
-                attachSoundDevice(to: config, sound: sound)
+            if options.sound {
+                attachSoundDevice(to: config)
+            }
+            if options.graphics != nil {
+                config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
             }
 
             // v0.7.0 M8: optional Rosetta directory share — Linux guests can
             // run x86_64 user binaries via /run/lumina-rosetta. Same VZ class
             // as the agent path; gated behind options.rosetta.
             if options.rosetta {
-                if #available(macOS 13.0, *), VZLinuxRosettaDirectoryShare.availability == .installed {
+                if VZLinuxRosettaDirectoryShare.availability == .installed {
                     if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {
                         let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
                         device.share = rosettaShare
@@ -758,9 +598,6 @@ public actor VM {
             let vm = VZVirtualMachine(configuration: config, queue: queue)
             self.virtualMachine = vm
 
-            // Install the delegate BEFORE `vm.start(…)` so guest crashes
-            // during the kernel boot window surface as delegate callbacks
-            // rather than silent hangs at `.running`.
             if let d = pendingDelegate {
                 vm.delegate = d
             }
@@ -768,13 +605,6 @@ public actor VM {
             try Task.checkCancellation()
             phaseMark = recordPhase(\.configMs, since: phaseMark)
 
-            // Start — with cooperative cancellation. If the outer Task is
-            // cancelled (user clicked Stop mid-boot, window closed, host
-            // shutdown), the `onCancel` block calls `vm.stop(…)` on the
-            // executor queue. That causes the `start` completion to fire
-            // with an error, resuming the continuation and unwinding cleanly
-            // into the outer `catch` — no orphaned continuations, no leaked
-            // `flock()`.
             let vmBox = UncheckedSendable(vm)
             let startQueue = queue
             try await withTaskCancellationHandler(
@@ -797,6 +627,9 @@ public actor VM {
             _bootPhases.totalMs = msSince(phaseStart)
 
             _state = .ready
+            if let socket = vm.socketDevices.first as? VZVirtioSocketDevice {
+                clipboard = ClipboardBridge(socket: socket)
+            }
 
             if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
                 FileHandle.standardError.write(Data((_bootPhases.formatTrace() + "\n").utf8))
@@ -840,7 +673,6 @@ public actor VM {
         }
     }
 
-    /// Download files from the guest.
     public func downloadFiles(_ downloads: [FileDownload]) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
@@ -863,19 +695,9 @@ public actor VM {
         let tarLocal = FileManager.default.temporaryDirectory.appendingPathComponent(tarName)
         defer { try? FileManager.default.removeItem(at: tarLocal) }
 
-        let tarProcess = Process()
-        tarProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tarProcess.arguments = ["czf", tarLocal.path, "-C", localPath.path, "."]
-        tarProcess.standardOutput = FileHandle.nullDevice
-        tarProcess.standardError = FileHandle.nullDevice
-        do {
-            try tarProcess.run()
-            tarProcess.waitUntilExit()
-        } catch {
-            throw .uploadFailed(path: localPath.path, reason: "Failed to create tarball: \(error)")
-        }
-        guard tarProcess.terminationStatus == 0 else {
-            throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tarProcess.terminationStatus)")
+        let tar = runProcess("/usr/bin/tar", arguments: ["czf", tarLocal.path, "-C", localPath.path, "."])
+        guard tar.exitCode == 0 else {
+            throw .uploadFailed(path: localPath.path, reason: "tar exited with code \(tar.exitCode): \(tar.stderr)")
         }
 
         let guestTar = "/tmp/\(tarName)"
@@ -892,7 +714,6 @@ public actor VM {
         }
     }
 
-    /// Download a remote directory from the guest.
     public func downloadDirectory(remotePath: String, localPath: URL) async throws(LuminaError) {
         guard _state == .ready, let runner = commandRunner else {
             throw .bootFailed(underlying: VMError.invalidState("Cannot download from state: \(_state)"))
@@ -918,19 +739,9 @@ public actor VM {
             throw .downloadFailed(path: remotePath, reason: "Failed to create local directory: \(error)")
         }
 
-        let extractProcess = Process()
-        extractProcess.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        extractProcess.arguments = ["xzf", tarLocal.path, "-C", localPath.path]
-        extractProcess.standardOutput = FileHandle.nullDevice
-        extractProcess.standardError = FileHandle.nullDevice
-        do {
-            try extractProcess.run()
-            extractProcess.waitUntilExit()
-        } catch {
-            throw .downloadFailed(path: remotePath, reason: "Failed to extract tarball: \(error)")
-        }
-        guard extractProcess.terminationStatus == 0 else {
-            throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(extractProcess.terminationStatus)")
+        let tar = runProcess("/usr/bin/tar", arguments: ["xzf", tarLocal.path, "-C", localPath.path])
+        guard tar.exitCode == 0 else {
+            throw .downloadFailed(path: remotePath, reason: "tar extract exited with code \(tar.exitCode): \(tar.stderr)")
         }
     }
 
@@ -947,7 +758,6 @@ public actor VM {
             throw .bootFailed(underlying: VMError.invalidState("Cannot exec from state: \(_state)"))
         }
 
-        // Reconnect if the CommandRunner lost its connection
         if runner.state == .failed || runner.state == .disconnected {
             try await runner.reconnect()
         }
@@ -982,7 +792,6 @@ public actor VM {
         )
     }
 
-    /// Stream output chunks from a command in real time.
     /// Multiple streams can be active concurrently on the same VM.
     public func stream(
         _ command: String,
@@ -1051,26 +860,14 @@ public actor VM {
         case .closed:
             return Task.detached {
                 await gate.wait()
-                // Defensive delay for agents predating the pre-register fix
-                // (see Guest/lumina-agent/main.go serveConnection exec case).
-                // With the fixed guest, stdin/stdin_close cannot race goroutine
-                // registration because the scanner loop inserts the runningCmd
-                // entry synchronously before spawning. This delay is harmless
-                // on fixed agents (~5ms added to cold boot) and load-bearing
-                // for older images until they are rebuilt in CI.
-                try? await Task.sleep(for: .milliseconds(Self.stdinPumpWarmupMs))
                 try? runner.closeStdin(id: execId)
             }
         case .source(let source):
             return Task.detached {
                 await gate.wait()
-                try? await Task.sleep(for: .milliseconds(Self.stdinPumpWarmupMs))
                 do {
                     while !Task.isCancelled {
                         guard let chunk = try await source() else { break }  // EOF
-                        // Today's protocol stdin is UTF-8. Non-UTF-8 bytes are
-                        // lossy-converted via String(decoding:as:). Binary-safe
-                        // stdin rides on the binary-stdout base64 work.
                         let s = String(decoding: chunk, as: UTF8.self)
                         try runner.sendStdin(id: execId, data: s)
                     }
@@ -1081,36 +878,6 @@ public actor VM {
                 try? runner.closeStdin(id: execId)
             }
         }
-    }
-
-    // MARK: - Stdin
-
-    /// Send stdin data to a running command.
-    public func sendStdin(_ data: String, execId: String) throws(LuminaError) {
-        guard let runner = commandRunner else { throw .connectionFailed }
-        try runner.sendStdin(id: execId, data: data)
-    }
-
-    /// Close the stdin pipe for a running command.
-    public func closeStdin(execId: String) throws(LuminaError) {
-        guard let runner = commandRunner else { throw .connectionFailed }
-        try runner.closeStdin(id: execId)
-    }
-
-    /// Low-level streaming exec with a caller-supplied exec ID.
-    /// Use this when you need to interleave sendStdin(_:execId:) calls during execution.
-    /// The caller is responsible for stdin timing — no StdinPumpGate is applied.
-    public func execStream(
-        id: String,
-        _ command: String,
-        timeout: Int = 60,
-        env: [String: String] = [:],
-        cwd: String? = nil
-    ) throws(LuminaError) -> AsyncThrowingStream<OutputChunk, any Error> {
-        guard _state == .ready, let runner = commandRunner else {
-            throw .bootFailed(underlying: VMError.invalidState("Cannot stream from state: \(_state)"))
-        }
-        return try runner.execStream(id: id, command: command, timeout: timeout, env: env, cwd: cwd)
     }
 
     // MARK: - PTY Exec (v0.6.0)
@@ -1133,13 +900,11 @@ public actor VM {
         return try runner.execPty(id: id, command: command, timeout: timeout, env: env, cols: cols, rows: rows)
     }
 
-    /// Send raw bytes to a running PTY session's master fd.
     public func sendPtyInput(id: String, data: Data) throws(LuminaError) {
         guard let runner = commandRunner else { throw .connectionFailed }
         try runner.sendPtyInput(id: id, data: data)
     }
 
-    /// Resize the window of a running PTY session (triggers SIGWINCH in guest).
     public func sendWindowResize(id: String, cols: Int, rows: Int) throws(LuminaError) {
         guard let runner = commandRunner else { throw .connectionFailed }
         try runner.sendWindowResize(id: id, cols: cols, rows: rows)
@@ -1149,10 +914,6 @@ public actor VM {
 
     /// Ask the guest agent to open a TCP listener on `guestPort` and return the
     /// vsock port the host should dial for each new proxied connection.
-    ///
-    /// Actor-isolated: runs on the VM's executor queue. Callers (e.g. the
-    /// SessionProcess port-forward proxy) await this method, and the write to
-    /// the vsock happens on the correct queue.
     public func requestPortForward(guestPort: Int) async throws(LuminaError) -> Int {
         guard _state == .ready, let runner = commandRunner else {
             throw .connectionFailed
@@ -1188,10 +949,6 @@ public actor VM {
             throw .connectionFailed
         }
         let queue = executor.queue
-        // Dup the connection's fd inside the callback so the non-Sendable
-        // VZVirtioSocketConnection never crosses the actor boundary — only
-        // an Int32 does. The VZ object drops out of scope on the queue and its
-        // underlying fd is closed on dealloc; the dup'd fd remains valid.
         let fd: Int32
         do {
             let socketBox = UncheckedSendable(socketDevice)
@@ -1218,20 +975,6 @@ public actor VM {
         return fd
     }
 
-    /// Attempt to reconnect to the guest agent after a connection drop.
-    /// State is only set to `.ready` after the reconnect succeeds.
-    public func reconnect() async throws(LuminaError) {
-        guard let runner = commandRunner else {
-            throw .connectionFailed
-        }
-        try await runner.reconnect()
-        _state = .ready
-    }
-
-    /// Configure guest network via host-driven protocol.
-    /// Derives IP from the VZ-assigned MAC address, sends config to the guest agent,
-    /// and waits for network_ready before returning — ensuring DNS is live for all
-    /// subsequent exec commands.
     /// Confirm every requested share is mounted before the caller's first
     /// command runs. The guest mounts these from init with stderr discarded
     /// and no report back, so a failure produced the worst kind of answer:
@@ -1272,7 +1015,7 @@ public actor VM {
         // VM already holds .64. Falling back silently was the worst case: the
         // guest installs a .64 address and route, verifies its own handiwork,
         // and reports ready — a plausible address that routes nothing.
-        let discovered = await Self.discoverVmnetGateway(macLastByte: self.macLastByte)
+        let discovered = await Self.discoverVmnetGateway(macLastByte: lastByte)
         if discovered == nil {
             FileHandle.standardError.write(Data(
                 "[lumina] warning: could not read a vmnet bridge address; assuming 192.168.64.1. If vmnet chose another subnet this VM will not reach the network — `lumina doctor` lists the bridges.\n".utf8
@@ -1312,13 +1055,8 @@ public actor VM {
     ///
     /// Returns (gatewayIP, subnetPrefix) e.g. ("192.168.65.1", "192.168.65"), or nil
     /// if no suitable bridge is found within the timeout.
-    ///
-    /// Note: with multiple concurrent VMs each VM gets its own bridge. This heuristic
-    /// picks the first one found, which is correct for sequential boots but may pick
-    /// the wrong bridge when several VMs boot simultaneously. MAC-based matching would
-    /// be needed for a fully correct multi-VM implementation.
     private static func discoverVmnetGateway(
-        macLastByte: UInt8? = nil
+        macLastByte: UInt8
     ) async -> (gateway: String, subnetPrefix: String)? {
         // Poll up to 300ms in 25ms increments. The bridge IPv4 typically appears
         // within 50ms of boot; 300ms gives comfortable headroom.
@@ -1340,20 +1078,13 @@ public actor VM {
     /// Single-bridge case: return the one bridge, no ambiguity.
     /// Multi-bridge case: consult `VmnetBridgeRegistry`, which records
     /// first-come claims by MAC last byte so concurrent VM boots in the
-    /// same process don't double-assign. If the registry is short-
-    /// circuited (nil MAC), falls back to the first candidate — the
-    /// legacy behaviour that pre-v0.7.1 callers relied on.
+    /// same process don't double-assign.
     ///
     /// Sorted by bridge name so the candidate order is stable across
     /// discovery polls; the registry's first-come claim then becomes
     /// deterministic for a given sequence of boots.
-    ///
-    /// This fixes within-process concurrency. Across-process concurrent
-    /// boots (two `lumina run` processes racing) still fall back to the
-    /// legacy heuristic — that needs a host-level lock (or vmnet's
-    /// private MAC→bridge mapping API) and is out of scope.
     static func discoverVmnetGatewayOnce(
-        preferringMAC macLastByte: UInt8? = nil
+        preferringMAC macLastByte: UInt8
     ) async -> (gateway: String, subnetPrefix: String)? {
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0, let head = ifap else { return nil }
@@ -1377,8 +1108,6 @@ public actor VM {
                                  nil, 0, NI_NUMERICHOST)
             guard rc == 0 else { continue }
 
-            // Decode the null-terminated C string into Swift without the
-            // deprecated `String(cString: [CChar])` initializer.
             let ip = host.withUnsafeBufferPointer { buf -> String in
                 guard let base = buf.baseAddress else { return "" }
                 return String(cString: base)
@@ -1392,51 +1121,25 @@ public actor VM {
 
         guard !candidates.isEmpty else { return nil }
 
-        // Sort by bridge name so registry claim order is deterministic
-        // across discovery polls and across processes; "sorted" is the
-        // invariant the registry assumes.
         candidates.sort { $0.name < $1.name }
 
         if candidates.count == 1 {
-            let c = candidates[0]
-            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@", c.gateway, c.name)
-            return (gateway: c.gateway, subnetPrefix: c.subnetPrefix)
+            return (gateway: candidates[0].gateway, subnetPrefix: candidates[0].subnetPrefix)
         }
 
-        // Multiple bridges: go through the process-wide registry so
-        // concurrent VMs in this Lumina process deterministically claim
-        // distinct bridges. Cross-process concurrency is not fully
-        // solved — two lumina-cli invocations still race on claim
-        // order — but the common concurrency pattern (Pool, Desktop
-        // multi-VM) lives inside a single process.
         let claimed = await VmnetBridgeRegistry.shared.claim(
             mac: macLastByte, candidates: candidates
         )
-        if let mac = macLastByte {
-            NSLog("[Lumina.VM] Claimed vmnet gateway %@ on %@ (MAC last byte 0x%02X)",
-                  claimed.gateway, claimed.name, mac)
-        } else {
-            NSLog("[Lumina.VM] Discovered vmnet gateway %@ on %@ (no MAC hint — first-found)",
-                  claimed.gateway, claimed.name)
-        }
         return (gateway: claimed.gateway, subnetPrefix: claimed.subnetPrefix)
     }
 
-    /// Number of exec commands currently in flight on this VM.
     public var activeExecCount: Int {
         commandRunner?.activeExecCount ?? 0
     }
 
-    /// Send a signal to a running guest command (by ID) or all commands (nil).
     public func cancel(signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
         guard let runner = commandRunner else { return }
         try runner.cancel(id: nil, signal: signal, gracePeriod: gracePeriod)
-    }
-
-    /// Send a signal to a specific running guest command.
-    public func cancel(execId: String, signal: Int32 = 15, gracePeriod: Int = 5) throws(LuminaError) {
-        guard let runner = commandRunner else { return }
-        try runner.cancel(id: execId, signal: signal, gracePeriod: gracePeriod)
     }
 
     public func shutdown() async {
@@ -1453,22 +1156,25 @@ public actor VM {
         }
     }
 
-    /// Detach the disk clone from this VM (caller takes ownership).
+    public func saveDisk(asImage name: String, from base: String) async throws {
+        guard let clone else { throw LuminaError.sessionFailed("VM has no disk clone") }
+        let sync = try await exec("sync", timeout: 60)
+        guard sync.exitCode == 0 else { throw LuminaError.sessionFailed("guest sync failed: \(sync.stderr)") }
+        let fd = open(clone.rootfs.path, O_RDONLY)
+        guard fd >= 0, fcntl(fd, F_FULLFSYNC) == 0 else {
+            if fd >= 0 { Darwin.close(fd) }
+            throw LuminaError.sessionFailed("flushing \(clone.rootfs.lastPathComponent) failed: \(String(cString: strerror(errno)))")
+        }
+        Darwin.close(fd)
+        try imageStore.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: "lumina session save")
+    }
+
     public func detachClone() -> DiskClone? {
         let c = clone
         clone = nil
         return c
     }
 
-    public var serialOutput: String {
-        serialConsole.output
-    }
-
-    /// Monotonic version counter bumped by `SerialConsole.append`.
-    /// Exposed so Desktop-app polling loops can skip the full
-    /// `serialTail` pipeline when nothing new arrived since the last
-    /// tick. Agent-path callers have no use for this — the agent path
-    /// doesn't poll the serial console.
     public var serialVersion: UInt64 {
         serialConsole.version
     }
@@ -1491,7 +1197,6 @@ public actor VM {
         var iter = raw.unicodeScalars.makeIterator()
         while let c = iter.next() {
             if c == "\u{1B}" {
-                // Swallow ESC + possible [ + parameter bytes + final.
                 if let next = iter.next(), next == "[" {
                     while let p = iter.next() {
                         if (0x40...0x7E).contains(p.value) { break }
@@ -1517,11 +1222,16 @@ public actor VM {
         public let machine: VZVirtualMachine?
     }
 
-    /// Direct accessor for the underlying VZVirtualMachine, used by the
-    /// SwiftUI display layer (`LuminaVirtualMachineView` in
-    /// LuminaDesktopKit).
     public func vzMachine() -> VZMachineHandle {
         VZMachineHandle(machine: virtualMachine)
+    }
+
+    public func setPaused(_ paused: Bool) async throws {
+        guard let vm = virtualMachine else { return }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+            let done: (Result<Void, any Swift.Error>) -> Void = { cont.resume(with: $0) }
+            if paused { vm.pause(completionHandler: done) } else { vm.resume(completionHandler: done) }
+        }
     }
 
     /// Install a `VZVirtualMachineDelegate`. Safe to call before or
@@ -1547,6 +1257,9 @@ public actor VM {
     // MARK: - Private
 
     private func shutdownVM() async {
+        commandRunner?.close()
+        clipboard?.stop()
+        clipboard = nil
         if let vm = virtualMachine {
             let queue = executor.queue
             let vmBox = UncheckedSendable(vm)
@@ -1560,12 +1273,7 @@ public actor VM {
             virtualMachine = nil
         }
         commandRunner = nil
-        // Cancel serial drain tasks before closing handles so the cooperative
-        // cancellation signal arrives first; the handle close then delivers
-        // the EOF that unblocks any in-flight `availableData` read.
-        for task in serialReadTasks { task.cancel() }
-        serialReadTasks = []
-        for handle in pipeHandles {
+        for handle in pipeHandles.reversed() {
             try? handle.close()
         }
         pipeHandles = []
@@ -1632,15 +1340,6 @@ extension VMError: LocalizedError {
 /// Consumed by the cold-boot regression bench (see `Tests/LuminaTests/
 /// BootPhaseTests.swift`) and by the `LUMINA_BOOT_TRACE=1` environment
 /// variable which prints the struct to stderr after `boot()` returns.
-///
-/// **Phase coverage:**
-///   - `imageResolveMs` — `ImageStore.resolve()` (agent path only)
-///   - `cloneMs`        — `DiskClone.create()` + optional resize (agent path only)
-///   - `configMs`       — `VZVirtualMachineConfiguration` build + validate (both)
-///   - `vzStartMs`      — VZ `start()` callback from queue.async to completion (both)
-///   - `vsockConnectMs` — `connect(toPort: 1024)` on the socket device (agent path only)
-///   - `runnerReadyMs`  — wait for the guest agent's `ready` frame (agent path only)
-///   - `totalMs`        — wall-clock from `boot()` entry to `.ready`
 ///
 /// **Agent-path vs EFI-path:** The agent path populates every field;
 /// the EFI path writes `configMs`, `vzStartMs`, `totalMs` only
@@ -1749,22 +1448,14 @@ struct UncheckedSendable<T>: @unchecked Sendable {
 
 // MARK: - Sound (v0.7.0 M4, agent-path-neutral)
 
-/// Attach a `VZVirtioSoundDeviceConfiguration` with `sound.streamCount`
-/// output streams. Free function so it doesn't pull anything into the
-/// agent path until `options.sound` is non-nil. `internal` so MacOSVM
-/// (same target) can reuse it.
-internal func attachSoundDevice(
-    to config: VZVirtualMachineConfiguration,
-    sound: SoundConfig
-) {
+/// Attach a `VZVirtioSoundDeviceConfiguration` with one output stream.
+/// Free function so it doesn't pull anything into the agent path until
+/// `options.sound` is set. `internal` so MacOSVM (same target) can reuse it.
+internal func attachSoundDevice(to config: VZVirtualMachineConfiguration) {
     let device = VZVirtioSoundDeviceConfiguration()
-    var streams: [VZVirtioSoundDeviceStreamConfiguration] = []
-    for _ in 0..<max(1, sound.streamCount) {
-        let output = VZVirtioSoundDeviceOutputStreamConfiguration()
-        output.sink = VZHostAudioOutputStreamSink()
-        streams.append(output)
-    }
-    device.streams = streams
+    let output = VZVirtioSoundDeviceOutputStreamConfiguration()
+    output.sink = VZHostAudioOutputStreamSink()
+    device.streams = [output]
     var existing = config.audioDevices
     existing.append(device)
     config.audioDevices = existing
@@ -1782,59 +1473,14 @@ private func attachGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    // Virtio-GPU scanouts: primary display plus any `additionalDisplays`.
-    // The SwiftUI running-VM window still renders display 0 only; extra
-    // scanouts are live on the VZ side (Linux guests see multiple
-    // framebuffers via `/sys/class/drm/`) for callers driving the VM from
-    // their own view layer. Multi-display UI in the Desktop app is
-    // follow-up work.
     let gfx = VZVirtioGraphicsDeviceConfiguration()
-    var scanouts: [VZVirtioGraphicsScanoutConfiguration] = [
+    gfx.scanouts = [
         VZVirtioGraphicsScanoutConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels
         )
     ]
-    for extra in graphics.additionalDisplays {
-        scanouts.append(VZVirtioGraphicsScanoutConfiguration(
-            widthInPixels: extra.widthInPixels,
-            heightInPixels: extra.heightInPixels
-        ))
-    }
-    gfx.scanouts = scanouts
     config.graphicsDevices = [gfx]
-
-    // Keyboard. `.mac` only makes sense on macOS guests (M5); on a generic
-    // VM it falls back to USB so the caller doesn't get a validation error.
-    switch graphics.keyboardKind {
-    case .usb:
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-    case .mac:
-        #if swift(>=6)
-        if #available(macOS 14.0, *) {
-            config.keyboards = [VZMacKeyboardConfiguration()]
-        } else {
-            config.keyboards = [VZUSBKeyboardConfiguration()]
-        }
-        #else
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        #endif
-    }
-
-    // Pointing device. Trackpad requires a macOS guest for full fidelity;
-    // on Linux/Windows it doesn't validate, so fall back to USB mouse.
-    switch graphics.pointingDeviceKind {
-    case .usbScreenCoordinate:
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-    case .trackpad:
-        #if swift(>=6)
-        if #available(macOS 14.0, *) {
-            config.pointingDevices = [VZMacTrackpadConfiguration()]
-        } else {
-            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        }
-        #else
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
-        #endif
-    }
+    config.keyboards = [VZUSBKeyboardConfiguration()]
+    config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
 }

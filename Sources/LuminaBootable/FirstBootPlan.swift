@@ -1,10 +1,7 @@
-// Sources/LuminaBootable/FirstBootPlan.swift
-//
 // Pure orchestration of the install-time seeds we apply on the first boot
 // of a desktop VM bundle. Both the CLI (`lumina desktop boot`) and the
 // GUI (`LuminaDesktopSession.boot()`) call this — without a single
 // shared entry point, the GUI silently bypassed the fixes the CLI was
-// applying. See [[wiki/projects/lumina]] for the v0.7.2 incident.
 //
 // Shape:
 //   - `prepareFirstBoot(...)` returns a `FirstBootPlan` value (artifacts
@@ -20,17 +17,17 @@
 //     in non-capture mode) emit an `Event` and the plan continues.
 
 import Foundation
+import Lumina
 
 public struct FirstBootPlan: Sendable, Equatable {
     public var linuxDirectKernel: URL?
     public var linuxDirectInitramfs: URL?
     public var linuxDirectCmdline: String?
-    public var extraDisks: [URL]
+    public var seedISOs: [URL]
+    public var bootDisk: URL?
     public var events: [Event]
 
     public enum Event: Sendable, Equatable {
-        /// `LinuxISOExtractor` matched a known layout. `layoutName` is
-        /// the human-readable distro string (e.g. "Debian arm64 netinst").
         case linuxDirectMatched(layoutName: String)
         /// Extractor returned `unknownLayout` and the caller is NOT in
         /// `--capture-serial` mode, so we fell back to standard EFI boot
@@ -47,18 +44,23 @@ public struct FirstBootPlan: Sendable, Equatable {
         /// Preseed injection failed; we kept the unpatched initrd and
         /// the user will see d-i's "DHCP autoconfig failed" screen.
         case preseedFailed(reason: String)
-        /// `autounattend.iso` written + appended to `extraDisks`.
+        /// `autounattend.iso` written + appended to `seedISOs`.
         case autounattendGenerated(iso: URL)
         /// Autounattend generation failed; Win11 Setup will hit the
         /// compat check.
         case autounattendFailed(reason: String)
+        case seedAttached(iso: URL)
+        case seedFailed(reason: String)
+        case installerBootDisk(URL)
+        case bootDiskFailed(reason: String)
     }
 
     public static let empty = FirstBootPlan(
         linuxDirectKernel: nil,
         linuxDirectInitramfs: nil,
         linuxDirectCmdline: nil,
-        extraDisks: [],
+        seedISOs: [],
+        bootDisk: nil,
         events: []
     )
 }
@@ -88,23 +90,28 @@ public struct FirstBootDependencies: Sendable {
     /// vs Kali mirror lines, etc.) — the closure just runs cpio + cat.
     public typealias Preseeder = @Sendable (_ bundleRoot: URL, _ originalInitrd: URL, _ cfg: String) throws -> URL
     public typealias Autounattender = @Sendable (_ bundleRoot: URL) throws -> URL
+    public typealias BootDiskMaker = @Sendable (_ bundleRoot: URL, _ iso: URL, _ kernel: URL, _ initrd: URL, _ cmdline: String) throws -> URL
 
     public var extract: Extractor
     public var injectPreseed: Preseeder
     public var generateAutounattend: Autounattender
+    public var windowsDrivers: @Sendable () -> URL?
+    public var makeBootDisk: BootDiskMaker?
 
     public init(
         extract: @escaping Extractor,
         injectPreseed: @escaping Preseeder,
-        generateAutounattend: @escaping Autounattender
+        generateAutounattend: @escaping Autounattender,
+        windowsDrivers: @escaping @Sendable () -> URL? = { nil },
+        makeBootDisk: BootDiskMaker? = nil
     ) {
         self.extract = extract
         self.injectPreseed = injectPreseed
         self.generateAutounattend = generateAutounattend
+        self.windowsDrivers = windowsDrivers
+        self.makeBootDisk = makeBootDisk
     }
 
-    /// Production wiring: real `LinuxISOExtractor`, `PreseedSeed`,
-    /// `AutounattendSeed`.
     public static let live = FirstBootDependencies(
         extract: { iso, destination in
             try LinuxISOExtractor.extract(iso: iso, destination: destination)
@@ -117,13 +124,23 @@ public struct FirstBootDependencies: Sendable {
             ).patch()
         },
         generateAutounattend: { bundleRoot in
-            try AutounattendSeed(bundleRootURL: bundleRoot).generate()
+            let iso = (try? String(contentsOf: bundleRoot.appendingPathComponent("pending-iso.path"), encoding: .utf8))
+                .map { URL(fileURLWithPath: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            let language = iso.flatMap(AutounattendSeed.language(ofISO:)) ?? "en-US"
+            return try AutounattendSeed(bundleRootURL: bundleRoot, language: language).generate()
+        },
+        windowsDrivers: { WindowsDrivers.cachedISO },
+        makeBootDisk: { bundleRoot, iso, kernel, initrd, cmdline in
+            try InstallerBootDisk.make(
+                iso: iso, kernel: kernel, initrd: initrd, cmdline: cmdline,
+                at: bundleRoot.appendingPathComponent("installer-boot.cdr")
+            )
         }
     )
 }
 
 /// Returns a `FirstBootPlan` of artifacts + diagnostic events. Callers
-/// assign the linux-direct fields and `extraDisks` into their
+/// assign the linux-direct fields and `seedISOs` into their
 /// `EFIBootConfig`, and translate `events` into whatever surface they
 /// want (CLI: stderr writes; GUI: boot waterfall / serial log).
 ///
@@ -143,8 +160,14 @@ public func prepareFirstBoot(
         || osVariantLower.contains("ubuntu")
     let needsLinuxDirect = captureSerial || (isDebianFamily && isFirstBoot)
     let isWindowsFirstBoot = bundle.manifest.osFamily == .windows && isFirstBoot
+    let isUbuntu = osVariantLower.contains("ubuntu")
+    if isUbuntu, isFirstBoot, !FileManager.default.fileExists(atPath: bundle.seedDirectory.path) {
+        try? UbuntuAutoinstall.write(into: bundle.seedDirectory)
+    }
+    let hasSeed = isFirstBoot
+        && FileManager.default.fileExists(atPath: bundle.seedDirectory.path)
 
-    if !needsLinuxDirect && !isWindowsFirstBoot {
+    if !needsLinuxDirect && !isWindowsFirstBoot && !hasSeed {
         return .empty
     }
 
@@ -160,6 +183,20 @@ public func prepareFirstBoot(
     }
 
     var plan = FirstBootPlan.empty
+
+    if hasSeed {
+        do {
+            let iso = try SeedISO.make(
+                directory: bundle.seedDirectory,
+                volumeName: "cidata",
+                at: bundle.rootURL.appendingPathComponent("cidata.iso")
+            )
+            plan.seedISOs.append(iso)
+            plan.events.append(.seedAttached(iso: iso))
+        } catch {
+            plan.events.append(.seedFailed(reason: "\(error)"))
+        }
+    }
 
     if needsLinuxDirect {
         guard let iso = attachedISO else {
@@ -201,8 +238,6 @@ public func prepareFirstBoot(
         plan.events.append(.linuxDirectMatched(layoutName: extracted.layoutName))
         plan.linuxDirectKernel = extracted.kernel
 
-        // Default to the extracted initrd; the preseed step (if it runs)
-        // overwrites this with the patched copy.
         var initrdURL = extracted.initramfs
 
         // Linux uses the LAST `console=` flag as /dev/console — that's
@@ -232,7 +267,9 @@ public func prepareFirstBoot(
             cmdlineParts.append(extracted.cmdlineExtra)
         }
 
-        if isDebianFamily && isFirstBoot {
+        if isUbuntu && isFirstBoot && hasSeed {
+            cmdlineParts.append("autoinstall")
+        } else if isDebianFamily && isFirstBoot {
             let preseedCfg = PreseedSeed.cfg(forOSVariant: bundle.manifest.osVariant)
             do {
                 let patched = try dependencies.injectPreseed(
@@ -247,15 +284,30 @@ public func prepareFirstBoot(
             }
         }
 
+        let cmdline = cmdlineParts.joined(separator: " ")
+        if !captureSerial, let makeBootDisk = dependencies.makeBootDisk {
+            do {
+                let disk = try makeBootDisk(bundle.rootURL, iso, extracted.kernel, initrdURL, cmdline)
+                plan.bootDisk = disk
+                plan.linuxDirectKernel = nil
+                plan.events.append(.installerBootDisk(disk))
+                return plan
+            } catch {
+                plan.events.append(.bootDiskFailed(reason: "\(error)"))
+            }
+        }
         plan.linuxDirectInitramfs = initrdURL
-        plan.linuxDirectCmdline = cmdlineParts.joined(separator: " ")
+        plan.linuxDirectCmdline = cmdline
     }
 
     if isWindowsFirstBoot {
         do {
             let unattendISO = try dependencies.generateAutounattend(bundle.rootURL)
-            plan.extraDisks.append(unattendISO)
+            plan.seedISOs.append(unattendISO)
             plan.events.append(.autounattendGenerated(iso: unattendISO))
+            if let drivers = dependencies.windowsDrivers() {
+                plan.seedISOs.append(drivers)
+            }
         } catch {
             // Recoverable — Win11 will hit the compat check, but we
             // still hand control to VZ rather than aborting.
@@ -264,4 +316,44 @@ public func prepareFirstBoot(
     }
 
     return plan
+}
+
+extension VMBundle {
+    public var pendingISO: URL? {
+        let sidecar = rootURL.appendingPathComponent("pending-iso.path")
+        guard let path = try? String(contentsOf: sidecar, encoding: .utf8) else { return nil }
+        let url = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            try? FileManager.default.removeItem(at: sidecar)
+            return nil
+        }
+        return url
+    }
+
+    public func vmOptions(cdrom: URL?, plan: FirstBootPlan) -> VMOptions {
+        var opts = VMOptions.default
+        opts.memory = manifest.memoryBytes
+        opts.cpuCount = manifest.cpuCount
+        opts.macAddress = manifest.macAddress
+        switch manifest.networkMode ?? .nat {
+        case .nat: opts.networkProvider = NATNetworkProvider()
+        case .bridged(let iface): opts.networkProvider = BridgedNetworkProvider(interfaceIdentifier: iface)
+        }
+        opts.serialLogURL = logsDirectory.appendingPathComponent("serial.log")
+        opts.efi = EFIBootConfig(
+            variableStoreURL: efiVarsURL,
+            primaryDisk: primaryDiskURL,
+            cdromISO: cdrom,
+            preferUSBCDROM: manifest.osFamily == .windows
+                || ["debian", "kali"].contains { manifest.osVariant.lowercased().hasPrefix($0) },
+            installPhase: manifest.lastBootedAt == nil,
+            primaryDiskNVMe: manifest.osFamily == .windows,
+            linuxDirectKernel: plan.linuxDirectKernel,
+            linuxDirectInitramfs: plan.linuxDirectInitramfs,
+            linuxDirectCmdline: plan.linuxDirectCmdline,
+            extraCDROMs: plan.seedISOs,
+            bootDisk: plan.bootDisk
+        )
+        return opts
+    }
 }

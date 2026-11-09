@@ -1,4 +1,3 @@
-// Sources/Lumina/NetworkProvider.swift
 @preconcurrency import Virtualization
 
 /// Abstraction over network attachment creation. Allows swapping

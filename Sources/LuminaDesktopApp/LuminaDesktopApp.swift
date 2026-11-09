@@ -1,9 +1,3 @@
-// Apps/LuminaDesktop/LuminaDesktop/LuminaDesktopApp.swift
-//
-// v0.7.0 M6 — @main entry for the Lumina Desktop app.
-// All UI lives in the LuminaDesktopKit SPM target; this file is just the
-// scene + window orchestration.
-
 import SwiftUI
 import LuminaDesktopKit
 import LuminaBootable
@@ -49,11 +43,6 @@ struct LuminaDesktopApp: App {
             PreferencesView(model: model)
         }
 
-        // ── MENU BAR EXTRA ──────────────────────────────────────
-        // Always-visible status item in the system menu bar. Shows the
-        // number of running VMs next to a Lumina glyph; click to reveal
-        // a dropdown with quick actions. Works even when the main
-        // window is hidden or the app is in fullscreen.
         MenuBarExtra {
             MenuBarContent(model: model, coordinator: coordinator)
         } label: {
@@ -64,7 +53,6 @@ struct LuminaDesktopApp: App {
 
 }
 
-// ── MENU BAR GLYPH + COUNT ────────────────────────────────────────
 @MainActor
 struct MenuBarLabel: View {
     @Bindable var model: AppModel
@@ -161,12 +149,6 @@ struct MenuBarContent: View {
     }
 }
 
-// ── MENU BAR ──────────────────────────────────────────────────────
-/// Full macOS menu bar. The native place for every verb. Fullscreen
-/// users get a menu at the top of the screen via the OS's automatic
-/// menu-reveal-on-hover. First-time discovery happens here, not in a
-/// floating toast.
-// ── APP-LEVEL UI STATE ────────────────────────────────────────────
 /// Tracks cross-window UI state the menu bar needs to observe:
 /// whether any Lumina window is currently in fullscreen. The VM menu
 /// uses this to switch the label between "Enter Full Screen" and
@@ -207,7 +189,6 @@ struct LuminaCommands: Commands {
     @Bindable var coordinator: LauncherCoordinator
 
     var body: some Commands {
-        // ── Lumina menu (app menu) ──
         CommandGroup(replacing: .appInfo) {
             Button("About Lumina") {
                 NSApplication.shared.orderFrontStandardAboutPanel(options: [
@@ -221,7 +202,6 @@ struct LuminaCommands: Commands {
             }
         }
 
-        // ── File menu ──
         CommandGroup(replacing: .newItem) {
             Button("New VM…") {
                 coordinator.openWizard(preselecting: "ubuntu-24.04")
@@ -229,6 +209,7 @@ struct LuminaCommands: Commands {
             .keyboardShortcut("n", modifiers: .command)
 
             Menu("New VM from OS") {
+                Button("Omarchy") { openWizard(tile: "omarchy") }
                 Button("Ubuntu 24.04 LTS") { openWizard(tile: "ubuntu-24.04") }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Kali (rolling)") { openWizard(tile: "kali-rolling") }
@@ -240,51 +221,13 @@ struct LuminaCommands: Commands {
                 Button("macOS (latest)") { openWizard(tile: "macos-latest") }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
                 Divider()
-                Button("From ISO or IPSW file…") { openWizard(tile: "byo-file") }
+                Button("From ISO file…") { openWizard(tile: "byo-file") }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
             }
 
-            Divider()
-
-            Button("Open Bundle…") {
-                let panel = NSOpenPanel()
-                panel.allowsMultipleSelection = false
-                panel.canChooseDirectories = true
-                panel.canChooseFiles = false
-                panel.title = "Open .luminaVM bundle"
-                if panel.runModal() == .OK, let _ = panel.url {
-                    model.refresh()
-                }
-            }
-            .keyboardShortcut("o", modifiers: .command)
         }
 
-        // ── VM menu ──
         CommandMenu("VM") {
-            Button("Boot Selected") { runSelected(.boot) }
-                .keyboardShortcut("b", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Stop Selected") { runSelected(.stop) }
-                .keyboardShortcut(".", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Restart Selected") { runSelected(.restart) }
-                .keyboardShortcut("r", modifiers: .command)
-                .disabled(model.selection == nil)
-            Divider()
-            Button("Take Snapshot") { runSelected(.snapshot) }
-                .keyboardShortcut("t", modifiers: .command)
-                .disabled(model.selection == nil)
-            Button("Clone VM…") { runSelected(.clone) }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(model.selection == nil)
-            Divider()
-            Button("Reveal in Finder") { runSelected(.reveal) }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(model.selection == nil)
-            Button("Delete…") { runSelected(.delete) }
-                .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(model.selection == nil)
-            Divider()
             // Standard macOS pattern: label flips based on whether any
             // window is already fullscreen. No floating chrome — the
             // menu bar itself is the escape route (OS reveals it on
@@ -295,7 +238,6 @@ struct LuminaCommands: Commands {
             .keyboardShortcut("f", modifiers: [.command, .control])
         }
 
-        // ── View menu ──
         CommandGroup(after: .toolbar) {
             Button("Open Command Launcher") {
                 coordinator.showLauncher()
@@ -318,7 +260,6 @@ struct LuminaCommands: Commands {
             }
         }
 
-        // ── Help menu ──
         CommandGroup(replacing: .help) {
             Button("Lumina Documentation") {
                 NSWorkspace.shared.open(URL(string: "https://github.com/abdul-abdi/lumina/wiki")!)
@@ -337,38 +278,6 @@ struct LuminaCommands: Commands {
         }
     }
 
-    // ── Helpers ──
-
-    private enum VMAction {
-        case boot, stop, restart, snapshot, clone, reveal, delete
-    }
-
-    private func runSelected(_ action: VMAction) {
-        guard let id = model.selection,
-              let bundle = model.bundles.first(where: { $0.manifest.id == id }) else { return }
-        let session = model.session(for: bundle)
-        switch action {
-        case .boot: Task { await session.boot() }
-        case .stop: Task { await session.shutdown() }
-        case .restart: Task {
-            await session.shutdown()
-            await session.boot()
-        }
-        case .snapshot: break  // wired in M8
-        case .clone: break
-        case .reveal: NSWorkspace.shared.activateFileViewerSelecting([bundle.rootURL])
-        case .delete:
-            let alert = NSAlert()
-            alert.messageText = "Move '\(bundle.manifest.name)' to Trash?"
-            alert.informativeText = "The bundle disk image and snapshots will be moved. You can restore from Trash."
-            alert.addButton(withTitle: "Move to Trash")
-            alert.addButton(withTitle: "Cancel")
-            alert.alertStyle = .warning
-            if alert.runModal() == .alertFirstButtonReturn {
-                model.deleteBundle(bundle)
-            }
-        }
-    }
 
     private func openWizard(tile: String) {
         coordinator.openWizard(preselecting: tile)
@@ -405,11 +314,6 @@ struct PreferencesView: View {
                     Text(o.rawValue).tag(o)
                 }
             }
-            Picker("Group by", selection: $model.groupBy) {
-                ForEach(AppModel.GroupBy.allCases, id: \.rawValue) { g in
-                    Text(g.rawValue).tag(g)
-                }
-            }
         }
         .padding(20)
     }
@@ -441,7 +345,7 @@ struct PreferencesView: View {
                 ))
             Text("Lumina Desktop")
                 .font(.title3.weight(.semibold))
-            Text("v0.7.1")
+            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
                 .foregroundStyle(.secondary)
             Text("Native Apple Workload Runtime for Agents")
                 .font(.caption)

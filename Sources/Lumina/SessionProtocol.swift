@@ -1,4 +1,3 @@
-// Sources/Lumina/SessionProtocol.swift
 import Foundation
 
 // MARK: - Session Request (host → session server)
@@ -21,6 +20,7 @@ public enum SessionRequest: Sendable, Equatable {
     /// v0.6.0: Query the server for live session status (uptime + active execs).
     /// Used by `lumina ps` for observability.
     case status
+    case save(image: String)
 }
 
 // MARK: - Session Response (session server → host)
@@ -45,201 +45,160 @@ public enum SessionResponse: Sendable, Equatable {
 
 // MARK: - Codec
 
+private struct Frame: Codable {
+    var type: String
+    var cmd: String?
+    var timeout: Int?
+    var env: [String: String]?
+    var cwd: String?
+    var local_path: String?
+    var remote_path: String?
+    var signal: Int?
+    var grace_period: Int?
+    var data: String?
+    var cols: Int?
+    var rows: Int?
+    var image: String?
+    var stream: OutputStream?
+    var base64: String?
+    var code: Int?
+    var duration_ms: Int?
+    var message: String?
+    var path: String?
+    var uptime: Double?
+    var active_execs: Int?
+
+    func need<T>(_ value: T?, _ kind: String) throws -> T {
+        guard let value else { throw LuminaError.protocolError("Malformed \(type) \(kind)") }
+        return value
+    }
+}
+
 public enum SessionProtocol {
     static let maxMessageSize = 65_536
 
     public static func encode(_ request: SessionRequest) throws -> Data {
-        let dict: [String: Any]
         switch request {
         case .exec(let cmd, let timeout, let env, let cwd):
-            var d: [String: Any] = ["type": "exec", "cmd": cmd, "timeout": timeout, "env": env]
-            if let cwd = cwd { d["cwd"] = cwd }
-            dict = d
+            return try encode(Frame(type: "exec", cmd: cmd, timeout: timeout, env: env, cwd: cwd))
         case .upload(let localPath, let remotePath):
-            dict = ["type": "upload", "local_path": localPath, "remote_path": remotePath]
+            return try encode(Frame(type: "upload", local_path: localPath, remote_path: remotePath))
         case .download(let remotePath, let localPath):
-            dict = ["type": "download", "remote_path": remotePath, "local_path": localPath]
+            return try encode(Frame(type: "download", local_path: localPath, remote_path: remotePath))
         case .cancel(let signal, let gracePeriod):
-            dict = ["type": "cancel", "signal": Int(signal), "grace_period": gracePeriod]
+            return try encode(Frame(type: "cancel", signal: Int(signal), grace_period: gracePeriod))
         case .stdin(let data):
-            dict = ["type": "stdin", "data": data]
+            return try encode(Frame(type: "stdin", data: data))
         case .stdinClose:
-            dict = ["type": "stdin_close"]
+            return try encode(Frame(type: "stdin_close"))
         case .shutdown:
-            dict = ["type": "shutdown"]
+            return try encode(Frame(type: "shutdown"))
         case .ptyExec(let cmd, let timeout, let env, let cols, let rows):
-            dict = ["type": "pty_exec", "cmd": cmd, "timeout": timeout, "env": env, "cols": cols, "rows": rows]
+            return try encode(Frame(type: "pty_exec", cmd: cmd, timeout: timeout, env: env, cols: cols, rows: rows))
         case .ptyInput(let data):
-            dict = ["type": "pty_input", "data": data]
+            return try encode(Frame(type: "pty_input", data: data))
         case .windowResize(let cols, let rows):
-            dict = ["type": "window_resize", "cols": cols, "rows": rows]
+            return try encode(Frame(type: "window_resize", cols: cols, rows: rows))
         case .status:
-            dict = ["type": "status"]
+            return try encode(Frame(type: "status"))
+        case .save(let image):
+            return try encode(Frame(type: "save", image: image))
         }
-        var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        data.append(contentsOf: [UInt8(ascii: "\n")])
-        return data
     }
 
     public static func encode(_ response: SessionResponse) throws -> Data {
-        let dict: [String: Any]
         switch response {
         case .output(let stream, let data):
-            dict = ["type": "output", "stream": stream.rawValue, "data": data]
+            return try encode(Frame(type: "output", data: data, stream: stream))
         case .outputBytes(let stream, let base64):
-            dict = ["type": "output_bytes", "stream": stream.rawValue, "base64": base64]
+            return try encode(Frame(type: "output_bytes", stream: stream, base64: base64))
         case .exit(let code, let durationMs):
-            dict = ["type": "exit", "code": Int(code), "duration_ms": durationMs]
+            return try encode(Frame(type: "exit", code: Int(code), duration_ms: durationMs))
         case .error(let message):
-            dict = ["type": "error", "message": message]
+            return try encode(Frame(type: "error", message: message))
         case .uploadDone(let path):
-            dict = ["type": "upload_done", "path": path]
+            return try encode(Frame(type: "upload_done", path: path))
         case .downloadDone(let path):
-            dict = ["type": "download_done", "path": path]
+            return try encode(Frame(type: "download_done", path: path))
         case .ptyOutput(let data):
-            dict = ["type": "pty_output", "data": data]
+            return try encode(Frame(type: "pty_output", data: data))
         case .status(let uptime, let activeExecs, let image):
-            dict = [
-                "type": "status",
-                "uptime": uptime,
-                "active_execs": activeExecs,
-                "image": image,
-            ]
+            return try encode(Frame(type: "status", image: image, uptime: uptime, active_execs: activeExecs))
         }
-        var data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        data.append(contentsOf: [UInt8(ascii: "\n")])
-        return data
     }
 
     public static func decodeRequest(_ data: Data) throws -> SessionRequest {
-        let trimmed = data.prefix(while: { $0 != UInt8(ascii: "\n") })
-        guard let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any],
-              let type = json["type"] as? String
-        else {
-            throw LuminaError.protocolError("Invalid JSON in session request")
-        }
-
-        switch type {
+        let f = try decode(data, "request")
+        let kind = "request"
+        switch f.type {
         case "exec":
-            guard let cmd = json["cmd"] as? String,
-                  let timeout = json["timeout"] as? Int else {
-                throw LuminaError.protocolError("Malformed exec request")
-            }
-            let env = json["env"] as? [String: String] ?? [:]
-            let cwd = json["cwd"] as? String
-            return .exec(cmd: cmd, timeout: timeout, env: env, cwd: cwd)
+            return .exec(cmd: try f.need(f.cmd, kind), timeout: try f.need(f.timeout, kind), env: f.env ?? [:], cwd: f.cwd)
         case "upload":
-            guard let localPath = json["local_path"] as? String,
-                  let remotePath = json["remote_path"] as? String else {
-                throw LuminaError.protocolError("Malformed upload request")
-            }
-            return .upload(localPath: localPath, remotePath: remotePath)
+            return .upload(localPath: try f.need(f.local_path, kind), remotePath: try f.need(f.remote_path, kind))
         case "download":
-            guard let remotePath = json["remote_path"] as? String,
-                  let localPath = json["local_path"] as? String else {
-                throw LuminaError.protocolError("Malformed download request")
-            }
-            return .download(remotePath: remotePath, localPath: localPath)
+            return .download(remotePath: try f.need(f.remote_path, kind), localPath: try f.need(f.local_path, kind))
         case "cancel":
-            let signal = (json["signal"] as? Int).map { Int32($0) } ?? Int32(SIGTERM)
-            let gracePeriod = json["grace_period"] as? Int ?? 5
-            return .cancel(signal: signal, gracePeriod: gracePeriod)
+            return .cancel(signal: Int32(f.signal ?? Int(SIGTERM)), gracePeriod: f.grace_period ?? 5)
         case "stdin":
-            guard let data = json["data"] as? String else {
-                throw LuminaError.protocolError("Malformed stdin request")
-            }
-            return .stdin(data: data)
+            return .stdin(data: try f.need(f.data, kind))
         case "stdin_close":
             return .stdinClose
         case "shutdown":
             return .shutdown
         case "pty_exec":
-            guard let cmd = json["cmd"] as? String,
-                  let timeout = json["timeout"] as? Int,
-                  let cols = json["cols"] as? Int,
-                  let rows = json["rows"] as? Int else {
-                throw LuminaError.protocolError("Malformed pty_exec request")
-            }
-            let env = json["env"] as? [String: String] ?? [:]
-            return .ptyExec(cmd: cmd, timeout: timeout, env: env, cols: cols, rows: rows)
+            return .ptyExec(
+                cmd: try f.need(f.cmd, kind), timeout: try f.need(f.timeout, kind), env: f.env ?? [:],
+                cols: try f.need(f.cols, kind), rows: try f.need(f.rows, kind)
+            )
         case "pty_input":
-            guard let data = json["data"] as? String else {
-                throw LuminaError.protocolError("Malformed pty_input request")
-            }
-            return .ptyInput(data: data)
+            return .ptyInput(data: try f.need(f.data, kind))
+        case "save":
+            return .save(image: try f.need(f.image, kind))
         case "window_resize":
-            guard let cols = json["cols"] as? Int,
-                  let rows = json["rows"] as? Int else {
-                throw LuminaError.protocolError("Malformed window_resize request")
-            }
-            return .windowResize(cols: cols, rows: rows)
+            return .windowResize(cols: try f.need(f.cols, kind), rows: try f.need(f.rows, kind))
         case "status":
             return .status
         default:
-            throw LuminaError.protocolError("Unknown session request type: \(type)")
+            throw LuminaError.protocolError("Unknown session request type: \(f.type)")
         }
     }
 
     public static func decodeResponse(_ data: Data) throws -> SessionResponse {
-        let trimmed = data.prefix(while: { $0 != UInt8(ascii: "\n") })
-        guard let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any],
-              let type = json["type"] as? String
-        else {
-            throw LuminaError.protocolError("Invalid JSON in session response")
-        }
-
-        switch type {
+        let f = try decode(data, "response")
+        let kind = "response"
+        switch f.type {
         case "output":
-            guard let streamStr = json["stream"] as? String,
-                  let stream = OutputStream(rawValue: streamStr),
-                  let data = json["data"] as? String else {
-                throw LuminaError.protocolError("Malformed output response")
-            }
-            return .output(stream: stream, data: data)
+            return .output(stream: try f.need(f.stream, kind), data: try f.need(f.data, kind))
         case "output_bytes":
-            guard let streamStr = json["stream"] as? String,
-                  let stream = OutputStream(rawValue: streamStr),
-                  let base64 = json["base64"] as? String else {
-                throw LuminaError.protocolError("Malformed output_bytes response")
-            }
-            return .outputBytes(stream: stream, base64: base64)
+            return .outputBytes(stream: try f.need(f.stream, kind), base64: try f.need(f.base64, kind))
         case "exit":
-            guard let code = json["code"] as? Int,
-                  let durationMs = json["duration_ms"] as? Int else {
-                throw LuminaError.protocolError("Malformed exit response")
-            }
-            return .exit(code: Int32(code), durationMs: durationMs)
+            return .exit(code: Int32(try f.need(f.code, kind)), durationMs: try f.need(f.duration_ms, kind))
         case "error":
-            guard let message = json["message"] as? String else {
-                throw LuminaError.protocolError("Malformed error response")
-            }
-            return .error(message: message)
+            return .error(message: try f.need(f.message, kind))
         case "upload_done":
-            guard let path = json["path"] as? String else {
-                throw LuminaError.protocolError("Malformed upload_done response")
-            }
-            return .uploadDone(path: path)
+            return .uploadDone(path: try f.need(f.path, kind))
         case "download_done":
-            guard let path = json["path"] as? String else {
-                throw LuminaError.protocolError("Malformed download_done response")
-            }
-            return .downloadDone(path: path)
+            return .downloadDone(path: try f.need(f.path, kind))
         case "pty_output":
-            guard let data = json["data"] as? String else {
-                throw LuminaError.protocolError("Malformed pty_output response")
-            }
-            return .ptyOutput(data: data)
+            return .ptyOutput(data: try f.need(f.data, kind))
         case "status":
-            // Tolerant decode — any missing field degrades to a sensible default
-            // so a future server that adds fields stays parseable here.
-            let uptime = (json["uptime"] as? TimeInterval)
-                ?? (json["uptime"] as? Double)
-                ?? Double(json["uptime"] as? Int ?? 0)
-            let activeExecs = json["active_execs"] as? Int ?? 0
-            let image = json["image"] as? String ?? "unknown"
-            return .status(uptime: uptime, activeExecs: activeExecs, image: image)
+            return .status(uptime: f.uptime ?? 0, activeExecs: f.active_execs ?? 0, image: f.image ?? "unknown")
         default:
-            throw LuminaError.protocolError("Unknown session response type: \(type)")
+            throw LuminaError.protocolError("Unknown session response type: \(f.type)")
+        }
+    }
+
+    private static func encode(_ frame: Frame) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(frame) + [UInt8(ascii: "\n")]
+    }
+
+    private static func decode(_ data: Data, _ kind: String) throws -> Frame {
+        do {
+            return try JSONDecoder().decode(Frame.self, from: data.prefix(while: { $0 != UInt8(ascii: "\n") }))
+        } catch {
+            throw LuminaError.protocolError("Invalid JSON in session \(kind)")
         }
     }
 }

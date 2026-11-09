@@ -1,8 +1,3 @@
-// Sources/LuminaDesktopKit/VMStore.swift
-//
-// v0.7.0 M6 — enumerates `.luminaVM` bundles for the Desktop app.
-// Watches `~/.lumina/desktop-vms/` for additions/removals.
-
 import Foundation
 import LuminaBootable
 
@@ -13,10 +8,7 @@ public struct VMStore: Sendable {
         self.rootURL = rootURL
     }
 
-    public static var defaultRoot: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".lumina/desktop-vms")
-    }
+    public static var defaultRoot: URL { VMBundle.libraryRoot }
 
     /// Read all `.luminaVM` bundles under `rootURL`. Bundles whose
     /// manifest fails to parse are silently dropped (they show up as
@@ -43,7 +35,6 @@ public struct VMStore: Sendable {
         return bundles.sorted { $0.manifest.createdAt < $1.manifest.createdAt }
     }
 
-    /// Soft-delete a bundle to the user's Trash. Returns true on success.
     public func moveToTrash(_ bundle: VMBundle) -> Bool {
         var resultingURL: NSURL?
         do {

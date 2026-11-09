@@ -7,8 +7,6 @@
 // suite (via the fixture golden bytes).
 package protocol
 
-// ── Wire-level constants ────────────────────────────────────────────
-
 const (
 	// MaxChunkSize is the ceiling on a single NDJSON frame. Matches
 	// the host-side SessionServer limit and the Swift ProtocolTests
@@ -51,19 +49,14 @@ const (
 	TypePortForwardError = "port_forward_error"
 )
 
-// Stream names used in OutputMsg.
 const (
 	StreamStdout = "stdout"
 	StreamStderr = "stderr"
 )
 
-// Envelope is the minimal header used to peek at the Type before
-// decoding into a concrete struct.
 type Envelope struct {
 	Type string `json:"type"`
 }
-
-// ── Host → guest messages ──────────────────────────────────────────
 
 type ExecRequest struct {
 	Type    string            `json:"type"`
@@ -146,8 +139,6 @@ type PortForwardStopMsg struct {
 	GuestPort int    `json:"guest_port"`
 }
 
-// ── Guest → host messages ──────────────────────────────────────────
-
 // Version is the wire-format version this agent speaks. Typed (not
 // a bare int) so future v2 branching is greppable and `go vet`
 // flags missed comparison sites. JSON-encodes as a plain integer —
@@ -222,13 +213,8 @@ type NetworkReadyMsg struct {
 	// to network_ready emission on the guest. Host uses this to
 	// populate BootPhases.networkReadyMs without round-trip jitter
 	// contaminating the measurement.
-	ConfigMs int `json:"config_ms,omitempty"`
-	// Stage annotates which readiness gate fired: "operstate",
-	// "carrier", "route-verified", or "timeout-anyway". "timeout-
-	// anyway" means the guest shipped network_ready on the
-	// defensive fallback; host should treat this as a warning
-	// signal, not a hard guarantee. Absent on pre-v0.7.1 agents.
-	Stage string `json:"stage,omitempty"`
+	ConfigMs int    `json:"config_ms,omitempty"`
+	Stage    string `json:"stage,omitempty"`
 	// DnsOk reports whether /etc/resolv.conf was written and read back
 	// with the expected content — the postcondition the whole point
 	// of awaiting network_ready rests on (see RunOptions.awaitNetworkReady).
@@ -262,12 +248,6 @@ type NetworkMetricsMsg struct {
 	Interfaces map[string]InterfaceCounters `json:"interfaces"`
 }
 
-// NetworkErrorMsg signals the guest failed to bring up the network.
-// Sent when the `ip -batch` command failed AND the individual retry
-// attempts also failed — the interface is unusable. Host propagates
-// this to the waiting configureNetwork() caller as a typed error.
-// Distinct from "timeout-anyway" which means network_ready fired on
-// a softer guarantee; NetworkErrorMsg means the setup itself broke.
 type NetworkErrorMsg struct {
 	Type   string `json:"type"`
 	Reason string `json:"reason"`

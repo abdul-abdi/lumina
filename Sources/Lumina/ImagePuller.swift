@@ -1,6 +1,6 @@
-// Sources/Lumina/ImagePuller.swift
 import Foundation
 import CryptoKit
+import os
 
 /// Downloads pre-built VM images from GitHub Releases.
 ///
@@ -21,12 +21,8 @@ public struct ImagePuller: Sendable {
     /// API can't be reached (offline, rate-limited, 5xx). Bump in
     /// lockstep with the host release so the fallback never points
     /// at a more-than-one-minor-version-older image.
-    public static let fallbackTag = "lumina-v0.7.4"
+    public static let fallbackTag = "lumina-v0.8.0"
     public static let defaultAssetName = "lumina-image-default.tar.gz"
-
-    /// Back-compat alias — older code reads `ImagePuller.defaultTag`.
-    /// Reports the fallback, not the resolved tag.
-    public static var defaultTag: String { fallbackTag }
 
     private let repo: String
     /// nil means "resolve at pull time" (env → API latest → fallback).
@@ -34,63 +30,31 @@ public struct ImagePuller: Sendable {
     private let tag: String?
     private let assetName: String
     private let imageStore: ImageStore
-    /// When set, download this URL directly instead of constructing
-    /// one from repo/tag/assetName. Used by `lumina images pull <id>`
-    /// against the catalog.
-    private let directURL: URL?
-    /// When set, verify the downloaded tarball matches this digest
-    /// before extraction. Refuses to install a mismatched tarball
-    /// even if --force is set.
-    private let expectedSHA256: String?
-    /// When set, install into ~/.lumina/images/<imageName>/ instead
-    /// of the default `default/`.
-    private let imageName: String?
 
     public init(
         repo: String = ImagePuller.defaultRepo,
         tag: String? = nil,
         assetName: String = ImagePuller.defaultAssetName,
-        imageStore: ImageStore = ImageStore(),
-        directURL: URL? = nil,
-        expectedSHA256: String? = nil,
-        imageName: String? = nil
+        imageStore: ImageStore = ImageStore()
     ) {
         self.repo = repo
         self.tag = tag
         self.assetName = assetName
         self.imageStore = imageStore
-        self.directURL = directURL
-        self.expectedSHA256 = expectedSHA256
-        self.imageName = imageName
     }
 
-    /// Check if the default image is already available.
     public func imageExists(name: String = "default") -> Bool {
         (try? imageStore.resolve(name: name)) != nil
     }
 
-    /// Pull the default image from GitHub Releases.
-    /// Downloads the tarball, verifies integrity, extracts vmlinuz + initrd + rootfs.img.
     public func pull(
-        name requestedName: String = "default",
+        name: String = "default",
         progress: @Sendable (_ message: String) -> Void = { _ in }
     ) async throws(LuminaError) {
-        // Resolve destination name and download URL. Catalog pulls
-        // override both via init; defaults preserve v0.5.0 behaviour.
-        let name = imageName ?? requestedName
-        let releaseURL: String
-        let resolvedTag: String
-        if let directURL {
-            releaseURL = directURL.absoluteString
-            resolvedTag = tag ?? Self.fallbackTag  // display-only for errors
-            progress("Downloading \(directURL.lastPathComponent) → image '\(name)'...")
-        } else {
-            resolvedTag = await resolveTag(progress: progress)
-            releaseURL = "https://github.com/\(repo)/releases/download/\(resolvedTag)/\(assetName)"
-            progress("Downloading \(assetName) from \(repo) (\(resolvedTag))...")
-        }
+        let resolvedTag = await resolveTag(progress: progress)
+        let releaseURL = "https://github.com/\(repo)/releases/download/\(resolvedTag)/\(assetName)"
+        progress("Downloading \(assetName) from \(repo) (\(resolvedTag))...")
 
-        // 1. Download the tarball
         let downloadedFile: URL
         do {
             downloadedFile = try await download(from: releaseURL)
@@ -100,7 +64,6 @@ public struct ImagePuller: Sendable {
             throw .imageNotFound("Network error: \(error.localizedDescription)")
         }
 
-        // 2. Verify download is not empty / corrupted
         let fileSize: Int
         do {
             let attrs = try FileManager.default.attributesOfItem(atPath: downloadedFile.path)
@@ -115,19 +78,8 @@ public struct ImagePuller: Sendable {
             )
         }
 
-        // 3. Compute SHA256 and verify against expected when set
-        //    (catalog pulls). Mismatch = refuse to install even if
-        //    the caller passed --force.
         let sha256 = hashFile(at: downloadedFile)
         progress("Downloaded \(formatBytes(fileSize)) (SHA256: \(sha256.prefix(12))...)")
-        if let expected = expectedSHA256 {
-            if sha256.lowercased() != expected.lowercased() {
-                throw .imageNotFound(
-                    "SHA-256 mismatch for downloaded tarball. expected=\(expected), actual=\(sha256). Refusing to install."
-                )
-            }
-            progress("SHA-256 verified against catalog entry.")
-        }
 
         // 4. Extract into a staging directory and swap only once every check
         //    has passed. Extracting over the live directory meant a corrupt
@@ -142,6 +94,7 @@ public struct ImagePuller: Sendable {
         } catch {
             throw .imageNotFound("Cannot create image directory: \(error.localizedDescription)")
         }
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
 
         // 5. Pre-scan tarball for path-traversal attempts before extraction.
         //    BSD tar on macOS rejects `..` members by default, but relying on
@@ -154,7 +107,6 @@ public struct ImagePuller: Sendable {
             "/usr/bin/tar", arguments: ["-tzf", downloadedFile.path]
         )
         guard listResult.exitCode == 0 else {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Tarball listing failed (exit \(listResult.exitCode)): \(listResult.stderr)"
             )
@@ -164,7 +116,6 @@ public struct ImagePuller: Sendable {
             let path = String(member).trimmingCharacters(in: .whitespaces)
             if path.isEmpty { continue }
             if path.hasPrefix("/") {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains absolute path: \(path). Refusing to extract."
                 )
@@ -172,7 +123,6 @@ public struct ImagePuller: Sendable {
             // Split on `/` and reject any `..` component after normalisation.
             let parts = path.split(separator: "/")
             if parts.contains(where: { $0 == ".." }) {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound(
                     "Tarball contains path-traversal member: \(path). Refusing to extract."
                 )
@@ -203,13 +153,11 @@ public struct ImagePuller: Sendable {
         )
 
         guard tarResult.exitCode == 0 else {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Extraction failed (exit \(tarResult.exitCode)): \(tarResult.stderr)"
             )
         }
 
-        // 6. Verify required files exist (initrd is optional for baked images)
         let requiredFiles = ["vmlinuz", "rootfs.img"]
         var missingFiles: [String] = []
         for file in requiredFiles {
@@ -220,21 +168,18 @@ public struct ImagePuller: Sendable {
         }
 
         if !missingFiles.isEmpty {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "Image tarball is missing required files: \(missingFiles.joined(separator: ", ")). "
                 + "The release may be malformed."
             )
         }
 
-        // 7. Verify rootfs.img is non-trivial (at least 1MB)
         let rootfsPath = stagingDir.appendingPathComponent("rootfs.img")
         let rootfsSize = (try? FileManager.default.attributesOfItem(
             atPath: rootfsPath.path
         )[.size] as? Int) ?? 0
 
         if rootfsSize < 1_048_576 {
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound(
                 "rootfs.img is suspiciously small (\(formatBytes(rootfsSize))). "
                 + "The image may be corrupted."
@@ -250,7 +195,6 @@ public struct ImagePuller: Sendable {
             do {
                 try FileManager.default.moveItem(at: imageDir, to: retiredDir)
             } catch {
-                try? FileManager.default.removeItem(at: stagingDir)
                 throw .imageNotFound("Cannot replace existing image: \(error.localizedDescription)")
             }
         }
@@ -258,7 +202,6 @@ public struct ImagePuller: Sendable {
             try FileManager.default.moveItem(at: stagingDir, to: imageDir)
         } catch {
             if hadExisting { try? FileManager.default.moveItem(at: retiredDir, to: imageDir) }
-            try? FileManager.default.removeItem(at: stagingDir)
             throw .imageNotFound("Cannot install image: \(error.localizedDescription)")
         }
         if hadExisting { try? FileManager.default.removeItem(at: retiredDir) }
@@ -315,15 +258,6 @@ public struct ImagePuller: Sendable {
         }
     }
 
-    /// Resolve which GitHub release tag to pull from. Order:
-    ///   1. explicit `self.tag` set at init (pin mode — no network)
-    ///   2. `LUMINA_IMAGE_TAG` env var (easy override for testing)
-    ///   3. GitHub API latest release containing `assetName` (normal path)
-    ///   4. `Self.fallbackTag` (offline / rate-limited / unexpected error)
-    ///
-    /// The API call is bounded to 3 seconds. If it fails for any
-    /// reason, we log once and fall through to the hardcoded fallback
-    /// — never block the boot on a transient GitHub issue.
     private func resolveTag(
         progress: @Sendable (_ message: String) -> Void
     ) async -> String {
@@ -342,10 +276,6 @@ public struct ImagePuller: Sendable {
         return Self.fallbackTag
     }
 
-    /// Query GitHub's releases endpoint and return the most recent
-    /// release tag whose asset list includes `assetName`. Nil on any
-    /// failure — caller falls back to the pinned tag.
-    ///
     /// We list `per_page=10` rather than hit `/latest` because a
     /// release that doesn't ship the image asset (e.g. a CLI-only
     /// patch release) would mislead `/latest` into 404-ing the image
@@ -375,7 +305,6 @@ public struct ImagePuller: Sendable {
             return nil
         }
 
-        // Minimal decode: only the two fields we need off each release.
         struct Asset: Decodable { let name: String }
         struct Release: Decodable {
             let tag_name: String
@@ -403,29 +332,6 @@ public struct ImagePuller: Sendable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func runProcess(
-        _ path: String, arguments: [String]
-    ) -> (exitCode: Int32, stderr: String, stdout: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        let stderrPipe = Pipe()
-        let stdoutPipe = Pipe()
-        process.standardError = stderrPipe
-        process.standardOutput = stdoutPipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return (-1, error.localizedDescription, "")
-        }
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
-        return (process.terminationStatus, stderr, stdout)
-    }
-
     private func formatBytes(_ bytes: Int) -> String {
         if bytes >= 1_073_741_824 {
             return String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
@@ -440,4 +346,35 @@ public struct ImagePuller: Sendable {
 
 private struct PullError: Error {
     let message: String
+}
+
+func runProcess(
+    _ path: String, arguments: [String]
+) -> (exitCode: Int32, stderr: String, stdout: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = arguments
+    let stderrPipe = Pipe()
+    let stdoutPipe = Pipe()
+    process.standardError = stderrPipe
+    process.standardOutput = stdoutPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, error.localizedDescription, "")
+    }
+    let stderrHandle = stderrPipe.fileHandleForReading
+    let stderrData = OSAllocatedUnfairLock(initialState: Data())
+    let stderrDrained = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        let data = stderrHandle.readDataToEndOfFile()
+        stderrData.withLock { $0 = data }
+        stderrDrained.signal()
+    }
+    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    stderrDrained.wait()
+    process.waitUntilExit()
+    let stderr = String(data: stderrData.withLock { $0 }, encoding: .utf8) ?? ""
+    let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+    return (process.terminationStatus, stderr, stdout)
 }

@@ -1,5 +1,3 @@
-// Sources/Lumina/MacOSVM.swift
-//
 // v0.7.0 M5 — actor wrapping VZVirtualMachine for macOS guests.
 // Parallel to `VM` (which handles Linux + Windows). VZ exposes
 // VZMacOSVirtualMachine in framework documentation as a "type" but the
@@ -32,16 +30,34 @@ public actor MacOSVM {
     }
 
     private var virtualMachine: VZVirtualMachine?
+    private var pendingDelegate: (any VZVirtualMachineDelegate)?
     private var _state: State = .idle
     private var _bootConfig: MacOSBootConfig
     private let memoryBytes: UInt64
     private let cpuCount: Int
     private let graphics: GraphicsConfig?
-    private let sound: SoundConfig?
+    private let sound: Bool
     private let macAddressString: String?
 
     public var state: State { _state }
     public var bootConfig: MacOSBootConfig { _bootConfig }
+
+    public func vzMachine() -> VM.VZMachineHandle {
+        VM.VZMachineHandle(machine: virtualMachine)
+    }
+
+    public func setPaused(_ paused: Bool) async throws {
+        guard let vm = virtualMachine else { return }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Swift.Error>) in
+            let done: (Result<Void, any Swift.Error>) -> Void = { cont.resume(with: $0) }
+            if paused { vm.pause(completionHandler: done) } else { vm.resume(completionHandler: done) }
+        }
+    }
+
+    public func setDelegate(_ delegate: (any VZVirtualMachineDelegate)?) {
+        pendingDelegate = delegate
+        virtualMachine?.delegate = delegate
+    }
 
     public init(
         bootConfig: MacOSBootConfig,
@@ -49,11 +65,9 @@ public actor MacOSVM {
         cpuCount: Int = 4,
         graphics: GraphicsConfig? = GraphicsConfig(
             widthInPixels: 2560,
-            heightInPixels: 1440,
-            keyboardKind: .mac,
-            pointingDeviceKind: .trackpad
+            heightInPixels: 1440
         ),
-        sound: SoundConfig? = SoundConfig(enabled: true),
+        sound: Bool = true,
         macAddress: String? = nil
     ) {
         self._bootConfig = bootConfig
@@ -116,8 +130,8 @@ public actor MacOSVM {
         if let graphics {
             attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
         }
-        if let sound, sound.enabled {
-            attachSoundDevice(to: vzConfig, sound: sound)
+        if sound {
+            attachSoundDevice(to: vzConfig)
         }
 
         do {
@@ -126,11 +140,6 @@ public actor MacOSVM {
             throw Error.installFailed("config validation: \(error)")
         }
 
-        // Cooperative cancellation gates matching VM.boot: a cancel
-        // that lands between config-build and VZ machine construction
-        // should exit here rather than allocate the VZ instance and
-        // immediately tear it down. UX symmetry with `⌘.` on boot
-        // (issue #23).
         try Task.checkCancellation()
 
         let queue = executor.queue
@@ -225,14 +234,6 @@ public actor MacOSVM {
         _state = .idle
     }
 
-    /// Boot a macOS guest that's already installed.
-    ///
-    /// A mid-boot Task cancel (user clicks Stop in the desktop app before
-    /// the guest reaches userspace) triggers `onCancel` on the start
-    /// continuation, which invokes `vm.stop(…)` on the executor queue.
-    /// That resumes `start`'s completion with an error; the `catch` funnels
-    /// through `stopVZMachineIfRunning` to release `flock()` on the
-    /// primary disk, so a subsequent `boot()` succeeds cold.
     public func boot() async throws {
         guard _state == .idle else {
             throw Error.invalidState("boot requires .idle state, was \(_state)")
@@ -257,8 +258,8 @@ public actor MacOSVM {
             if let graphics {
                 attachMacGraphicsDevices(to: vzConfig, graphics: graphics)
             }
-            if let sound, sound.enabled {
-                attachSoundDevice(to: vzConfig, sound: sound)
+            if sound {
+                attachSoundDevice(to: vzConfig)
             }
 
             try vzConfig.validate()
@@ -266,6 +267,7 @@ public actor MacOSVM {
 
             let queue = executor.queue
             let vm = VZVirtualMachine(configuration: vzConfig, queue: queue)
+            vm.delegate = pendingDelegate
             self.virtualMachine = vm
 
             let vmBox = UncheckedSendable(vm)
@@ -330,20 +332,13 @@ private func attachMacGraphicsDevices(
     to config: VZVirtualMachineConfiguration,
     graphics: GraphicsConfig
 ) {
-    var displays: [VZMacGraphicsDisplayConfiguration] = [
+    let displays: [VZMacGraphicsDisplayConfiguration] = [
         VZMacGraphicsDisplayConfiguration(
             widthInPixels: graphics.widthInPixels,
             heightInPixels: graphics.heightInPixels,
             pixelsPerInch: 220
         )
     ]
-    for extra in graphics.additionalDisplays {
-        displays.append(VZMacGraphicsDisplayConfiguration(
-            widthInPixels: extra.widthInPixels,
-            heightInPixels: extra.heightInPixels,
-            pixelsPerInch: 220
-        ))
-    }
     let gpu = VZMacGraphicsDeviceConfiguration()
     gpu.displays = displays
     config.graphicsDevices = [gpu]

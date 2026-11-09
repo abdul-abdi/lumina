@@ -1,9 +1,3 @@
-// Sources/LuminaDesktopKit/LibraryEmptyStates.swift
-//
-// Empty-library hero and filter-empty placeholder. Extracted from
-// LibraryView.swift so the library entry-point stays focused on the
-// NavigationSplitView composition.
-
 import SwiftUI
 
 @MainActor
@@ -20,31 +14,23 @@ public struct EmptyStateView: View {
             VStack(spacing: 28) {
                 BrandMarkLarge()
                     .frame(width: 80, height: 80)
-                VStack(spacing: 8) {
-                    Text("subprocess.run()")
-                        .foregroundStyle(LuminaTheme.accent)
-                        .font(.system(size: 36, weight: .medium, design: .monospaced))
+                VStack(spacing: 10) {
+                    Text("Any OS, one click away.")
+                        .foregroundStyle(LuminaTheme.ink)
+                        .font(.system(size: 34, weight: .semibold))
                         .tracking(-0.5)
-
-                    HStack(spacing: 10) {
-                        Text("for")
-                            .font(.system(size: 36, weight: .medium, design: .monospaced))
-                            .foregroundStyle(LuminaTheme.ink)
-                            .tracking(-0.5)
-                        Text("virtual machines.")
-                            .font(.system(.title, design: .serif).italic())
-                            .foregroundStyle(LuminaTheme.inkDim)
-                    }
+                    Text("Lumina downloads the installer, sets the OS up for you and opens its desktop.")
+                        .font(.system(size: 14))
+                        .foregroundStyle(LuminaTheme.inkDim)
+                        .multilineTextAlignment(.center)
                 }
-                Text("Spin up Ubuntu, Kali, Windows 11 ARM, or macOS — \nand throw it away when you're done.")
-                    .font(.system(size: 14))
-                    .foregroundStyle(LuminaTheme.inkDim)
-                    .multilineTextAlignment(.center)
-                    .lineSpacing(4)
 
                 HStack(spacing: 10) {
                     PrimaryAction(label: "Try Ubuntu", systemImage: "circle.hexagongrid.fill", isPrimary: true) {
                         onChoose("ubuntu-24.04")
+                    }
+                    PrimaryAction(label: "Omarchy", systemImage: "terminal.fill") {
+                        onChoose("omarchy")
                     }
                     PrimaryAction(label: "Install Windows 11", systemImage: "macwindow") {
                         onChoose("windows-11-arm")
@@ -52,7 +38,7 @@ public struct EmptyStateView: View {
                     PrimaryAction(label: "Install macOS", systemImage: "apple.logo") {
                         onChoose("macos-latest")
                     }
-                    PrimaryAction(label: "Use my own…", systemImage: "doc.badge.plus") {
+                    PrimaryAction(label: "Other ISO…", systemImage: "doc.badge.plus") {
                         onChoose("byo-file")
                     }
                 }
@@ -101,12 +87,10 @@ public struct BrandMarkLarge: View {
     public init() {}
     public var body: some View {
         ZStack {
-            // back square (cream)
             RoundedRectangle(cornerRadius: 8)
                 .stroke(LuminaTheme.ink.opacity(0.4), lineWidth: 2)
                 .frame(width: 56, height: 56)
                 .offset(x: 12, y: 12)
-            // front square (amber, with subtle glow)
             RoundedRectangle(cornerRadius: 8)
                 .stroke(LuminaTheme.accent, lineWidth: 2)
                 .frame(width: 56, height: 56)

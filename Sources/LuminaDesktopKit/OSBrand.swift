@@ -1,11 +1,3 @@
-// Sources/LuminaDesktopKit/OSBrand.swift
-//
-// v0.7.0 M6 — visual identity per guest OS. Each card in the library
-// speaks its guest's brand: Ubuntu gets orange warmth, Kali gets the
-// dark-blue + dragon feel, macOS gets silver, Windows gets the fluent
-// blue. The goal is at-a-glance recognition — you look at 10 cards
-// and know which is which without reading a label.
-
 import SwiftUI
 import LuminaBootable
 
@@ -15,7 +7,6 @@ public struct OSBrand: Sendable {
     public let textOnAccent: Color
     public let glyph: String             // SF Symbol name
     public let bodyGradient: [Color]     // top → bottom subtle tint
-    public let stripeWidth: CGFloat
     public let nameStyle: NameStyle
 
     public enum NameStyle: Sendable {
@@ -26,22 +17,17 @@ public struct OSBrand: Sendable {
 
     public init(displayName: String, accent: Color, textOnAccent: Color,
                 glyph: String, bodyGradient: [Color],
-                stripeWidth: CGFloat = 3,
                 nameStyle: NameStyle = .caps) {
         self.displayName = displayName
         self.accent = accent
         self.textOnAccent = textOnAccent
         self.glyph = glyph
         self.bodyGradient = bodyGradient
-        self.stripeWidth = stripeWidth
         self.nameStyle = nameStyle
     }
 }
 
 public enum OSBranding {
-    /// Resolve a brand from a catalog variant ID or a freeform OS string
-    /// (manifest.osVariant). Falls back to the family default when the
-    /// variant is unrecognised.
     public static func brand(for variant: String, family: OSFamily) -> OSBrand {
         let v = variant.lowercased()
 
@@ -116,7 +102,6 @@ public enum OSBranding {
             )
         }
 
-        // Family fallback.
         switch family {
         case .linux:
             return OSBrand(
@@ -158,15 +143,4 @@ public enum OSBranding {
             return .system(size: 12, weight: .semibold, design: .default)
         }
     }
-}
-
-private func hex(_ s: String) -> Color {
-    var t = s
-    if t.hasPrefix("#") { t.removeFirst() }
-    guard t.count == 6, let v = UInt32(t, radix: 16) else { return .gray }
-    return Color(
-        red: Double((v >> 16) & 0xFF) / 255,
-        green: Double((v >> 8) & 0xFF) / 255,
-        blue: Double(v & 0xFF) / 255
-    )
 }

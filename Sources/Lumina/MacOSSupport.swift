@@ -1,4 +1,3 @@
-// Sources/Lumina/MacOSSupport.swift
 //
 // v0.7.0 M5 — VZMacOSVirtualMachine glue. Lives in `Lumina` (not
 // `LuminaBootable`) for the same reason as `EFIBootable`: `MacOSVM`
@@ -84,6 +83,7 @@ public struct MacOSBootable: Sendable {
         case invalidMachineIdentifier
         case auxiliaryStorageFailed(String)
         case primaryDiskFailed(String)
+        case missingRestoreImage
     }
 
     public func apply(to vzConfig: VZVirtualMachineConfiguration) throws {
@@ -118,7 +118,6 @@ public struct MacOSBootable: Sendable {
 
         vzConfig.bootLoader = VZMacOSBootLoader()
 
-        // Primary disk — read-write virtio block.
         do {
             let primaryAttachment = try VZDiskImageStorageDeviceAttachment(
                 url: config.primaryDisk,
@@ -140,7 +139,8 @@ public struct MacOSBootable: Sendable {
     public static func prepare(
         bootConfig: MacOSBootConfig
     ) async throws -> (config: MacOSBootConfig, restoreImage: VZMacOSRestoreImage) {
-        let restore = try await VZMacOSRestoreImage.image(from: bootConfig.ipsw)
+        guard let ipsw = bootConfig.ipsw else { throw Error.missingRestoreImage }
+        let restore = try await VZMacOSRestoreImage.image(from: ipsw)
         guard let supported = restore.mostFeaturefulSupportedConfiguration else {
             throw Error.invalidHardwareModel
         }

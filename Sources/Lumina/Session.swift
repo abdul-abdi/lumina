@@ -1,4 +1,3 @@
-// Sources/Lumina/Session.swift
 import Foundation
 
 public struct SessionPaths: Sendable {
@@ -6,7 +5,6 @@ public struct SessionPaths: Sendable {
     public let directory: URL
     public let socket: URL
     public let metaFile: URL
-    public let runDir: URL
 
     public static let defaultSessionsDir: URL = {
         FileManager.default.homeDirectoryForCurrentUser
@@ -18,11 +16,8 @@ public struct SessionPaths: Sendable {
         self.directory = sessionsDir.appendingPathComponent(sid)
         self.socket = self.directory.appendingPathComponent("control.sock")
         self.metaFile = self.directory.appendingPathComponent("meta.json")
-        self.runDir = self.directory.appendingPathComponent("run")
     }
 
-    /// Write session metadata to disk.
-    ///
     /// Creates the session directory with mode 0700 so the control
     /// socket + meta.json inside are shielded from other users on the
     /// host even if umask widens file perms. The enclosing
@@ -48,24 +43,20 @@ public struct SessionPaths: Sendable {
         _ = chmod(metaFile.path, 0o600)
     }
 
-    /// Read session metadata from disk. Returns nil if file doesn't exist.
     public func readMeta() -> SessionInfo? {
         guard let data = try? Data(contentsOf: metaFile) else { return nil }
         return try? JSONDecoder().decode(SessionInfo.self, from: data)
     }
 
-    /// Check if the session's process is alive.
     public func isAlive() -> Bool {
         guard let info = readMeta() else { return false }
         return kill(info.pid, 0) == 0
     }
 
-    /// Remove the session directory and all contents.
     public func cleanup() {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    /// List all sessions, checking liveness.
     public static func listAll(sessionsDir: URL = SessionPaths.defaultSessionsDir) -> [SessionInfo] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(

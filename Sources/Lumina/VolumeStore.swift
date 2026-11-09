@@ -1,4 +1,3 @@
-// Sources/Lumina/VolumeStore.swift
 import Foundation
 
 public struct VolumeInfo: Sendable {
@@ -83,7 +82,6 @@ public struct VolumeStore: Sendable {
         return VolumeInfo(name: name, created: created, lastUsed: lastUsed, sizeBytes: size)
     }
 
-    /// Update last_used timestamp when a volume is mounted.
     public func touch(name: String) {
         let metaFile = baseDir.appendingPathComponent(name).appendingPathComponent("meta.json")
         guard let data = try? Data(contentsOf: metaFile),

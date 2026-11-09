@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/DiskImageAllocator.swift
-//
 // Creates sparse disk image files for use as
 // `VZDiskImageStorageDeviceAttachment` backing storage.
 //

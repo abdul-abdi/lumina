@@ -28,7 +28,6 @@ const DownloadChunkSize = 45 * 1024
 // dispatch once the transfer finishes — see internal/agent's
 // handleUpload.
 func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadMsg) (leftover [][]byte) {
-	// Ensure parent directory exists.
 	if err := os.MkdirAll(filepath.Dir(first.Path), 0o755); err != nil {
 		sendUploadError(w, first.Path, err)
 		return leftover
@@ -41,14 +40,12 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 	}
 	defer f.Close()
 
-	// First chunk.
 	if err := writeChunk(f, first.Data); err != nil {
 		sendUploadError(w, first.Path, err)
 		return leftover
 	}
 	_ = w.Send(protocol.UploadAckMsg{Type: protocol.TypeUploadAck, Seq: first.Seq})
 
-	// Remaining chunks if any.
 	sawEOF := first.Eof
 	if !first.Eof {
 		for scanner.Scan() {
@@ -109,8 +106,6 @@ func HandleUpload(w *wire.Writer, scanner *bufio.Scanner, first protocol.UploadM
 	return leftover
 }
 
-// HandleDownload streams a file back to the host as base64 chunks,
-// terminated by an Eof=true frame.
 func HandleDownload(w *wire.Writer, req protocol.DownloadReqMsg) {
 	f, err := os.Open(req.Path)
 	if err != nil {

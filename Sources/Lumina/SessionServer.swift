@@ -1,4 +1,3 @@
-// Sources/Lumina/SessionServer.swift
 import Foundation
 
 /// Listens on a Unix domain socket and dispatches SessionRequest messages
@@ -8,10 +7,6 @@ import Foundation
 /// CommandRunner enforces mutual exclusion of file transfers. Per-connection
 /// state is local to handleConnection; there is no shared state beyond the
 /// VM actor itself, which is already thread-safe.
-///
-/// On shutdown (one client sends `.shutdown`, or bind/accept fails), the
-/// serve() task group awaits all in-flight connection tasks before returning
-/// so each client gets a clean response before the process exits.
 public final class SessionServer: @unchecked Sendable {
     private let socketPath: URL
     private var serverFd: Int32 = -1
@@ -46,10 +41,6 @@ public final class SessionServer: @unchecked Sendable {
         ptyLock.withLock {
             if activePtyId == id { activePtyId = nil }
         }
-    }
-
-    private func currentPtyId() -> String? {
-        ptyLock.withLock { activePtyId }
     }
 
     /// Wall-clock instant of the most recent client activity. Used by the
@@ -95,7 +86,6 @@ public final class SessionServer: @unchecked Sendable {
 
             if Date().timeIntervalSince(lastSeen) >= ttl {
                 NSLog("[Lumina.Session] Idle TTL reached (%.0fs), auto-shutting down", ttl)
-                // Close the listening fd so accept() returns and serve() exits.
                 lock.withLock {
                     if serverFd >= 0 {
                         Darwin.close(serverFd)
@@ -109,61 +99,18 @@ public final class SessionServer: @unchecked Sendable {
 
     /// Bind and listen on the Unix domain socket.
     public func bind() throws {
-        // Remove stale socket file
         try? FileManager.default.removeItem(at: socketPath)
 
-        serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard serverFd >= 0 else {
-            throw LuminaError.sessionFailed("Failed to create socket: \(errno)")
-        }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
         let path = socketPath.path
-        let pathBytes = path.utf8CString
-        // sockaddr_un.sun_path is 104 bytes on macOS (including null terminator).
-        // A path longer than 103 bytes would be silently truncated — fail early.
-        guard path.utf8.count <= 103 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed(
-                "Socket path too long (\(path.utf8.count) bytes, max 103): \(path)"
-            )
-        }
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
-                pathBytes.withUnsafeBufferPointer { src in
-                    // src.baseAddress is nil only for an empty buffer; the guard
-                    // above requires a non-empty path (count <= 103) so this is
-                    // defensive, not expected.
-                    guard let base = src.baseAddress else { return }
-                    let count = min(src.count, 104)
-                    dest.update(from: base, count: count)
-                }
-            }
-        }
-
-        let bindResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                Darwin.bind(serverFd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed("Failed to bind socket: \(errno)")
-        }
-
         // Use SOMAXCONN (128 on macOS). A larger backlog has no cost on a
         // Unix domain socket and prevents parallel CLI clients from hanging
         // when their connect() is deferred past the accept queue. The
         // previous value of 5 was observed to hang at ~8 concurrent
         // `lumina exec` invocations against a single session.
-        guard listen(serverFd, Int32(SOMAXCONN)) == 0 else {
-            Darwin.close(serverFd)
-            serverFd = -1
-            throw LuminaError.sessionFailed("Failed to listen on socket: \(errno)")
+        guard let fd = unixListen(path: path, backlog: SOMAXCONN) else {
+            throw LuminaError.sessionFailed("Failed to bind and listen on \(path)")
         }
+        serverFd = fd
 
         // v0.7.1 isolation probe finding: the socket file inherits the
         // process umask (0022 on macOS default), landing as 0755. Any
@@ -188,8 +135,6 @@ public final class SessionServer: @unchecked Sendable {
         }
     }
 
-    /// Accept a client connection. Blocks until a client connects.
-    /// Returns file handles for reading and writing.
     public func accept() throws -> (read: FileHandle, write: FileHandle) {
         let clientFd = Darwin.accept(serverFd, nil, nil)
         guard clientFd >= 0 else {
@@ -215,13 +160,7 @@ public final class SessionServer: @unchecked Sendable {
     /// frees cooperative threads for dispatch.
     public func readMessage(from handle: FileHandle, buffer: inout Data) async throws -> Data {
         while true {
-            // Check if buffer already has a complete line
-            if let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let lineEnd = buffer.index(after: newlineIndex)
-                let line = Data(buffer[buffer.startIndex..<lineEnd])
-                buffer.removeSubrange(buffer.startIndex..<lineEnd)
-                return line
-            }
+            if let line = takeLine(from: &buffer) { return line }
 
             let chunk = await Self.asyncReadChunk(fd: handle.fileDescriptor)
             if chunk.isEmpty {
@@ -279,25 +218,11 @@ public final class SessionServer: @unchecked Sendable {
     /// write. With NSFileHandle this crashes the server; with POSIX write()
     /// the error is returned as a Swift error that `try?` can suppress.
     public func writeResponse(_ response: SessionResponse, to handle: FileHandle) throws {
-        let data = try SessionProtocol.encode(response)
-        let fd = handle.fileDescriptor
-        try data.withUnsafeBytes { buffer in
-            guard let base = buffer.baseAddress else { return }
-            var remaining = buffer.count
-            var offset = 0
-            while remaining > 0 {
-                var written: Int
-                repeat { written = Darwin.write(fd, base + offset, remaining) } while written < 0 && errno == EINTR
-                if written <= 0 {
-                    throw LuminaError.sessionFailed("Write failed: \(errno)")
-                }
-                offset += written
-                remaining -= written
-            }
+        guard writeAll(fd: handle.fileDescriptor, data: try SessionProtocol.encode(response)) else {
+            throw LuminaError.sessionFailed("Write failed: \(errno)")
         }
     }
 
-    /// Close the server socket.
     public func close() {
         if serverFd >= 0 {
             Darwin.close(serverFd)
@@ -350,7 +275,6 @@ public final class SessionServer: @unchecked Sendable {
                     await self?.handleConnection(handles: handles, vm: vm, onShutdown: onShutdown)
                 }
             }
-            // TaskGroup auto-awaits remaining children on scope exit.
         }
     }
 
@@ -368,9 +292,6 @@ public final class SessionServer: @unchecked Sendable {
         let clientFd = handles.read.fileDescriptor
         defer { Darwin.close(clientFd) }
 
-        // Read and dispatch messages until client disconnects.
-        // The buffer persists across reads for this connection to
-        // handle coalesced NDJSON frames.
         var readBuf = Data()
         while true {
             let msgData: Data
@@ -431,9 +352,6 @@ public final class SessionServer: @unchecked Sendable {
                 return
 
             case .ptyExec(let cmd, let timeout, let env, let cols, let rows):
-                // Pass current read buffer so any pty_input/window_resize bytes
-                // already buffered (coalesced NDJSON) are not dropped — same
-                // pattern as the exec handler.
                 let bufSnapshot = readBuf
                 readBuf = Data()
                 await handlePtyExec(
@@ -443,11 +361,16 @@ public final class SessionServer: @unchecked Sendable {
                 )
 
             case .ptyInput, .windowResize:
-                // PTY frames outside of a pty_exec context are no-ops. During
-                // a PTY session, handlePtyExec reads them inline from the
-                // socket. Guard defensively in case a buggy client sends them
-                // outside that window.
                 break
+
+            case .save(let image):
+                let start = ContinuousClock.now
+                do {
+                    try await vm.saveDisk(asImage: image, from: imageName)
+                    try? writeResponse(.exit(code: 0, durationMs: (ContinuousClock.now - start).totalMilliseconds), to: handles.write)
+                } catch {
+                    try? writeResponse(.error(message: "save failed: \(error.localizedDescription)"), to: handles.write)
+                }
 
             case .status:
                 let uptime = Date().timeIntervalSince(bootTime)
@@ -484,72 +407,65 @@ public final class SessionServer: @unchecked Sendable {
         let channel = StdinChannel()
         let stdin = Stdin.source { @Sendable [channel] in await channel.next() }
 
-        await withTaskGroup(of: Void.self) { group in
-            // Task 1: run the exec and forward output chunks to the client.
-            // When the exec finishes (success, error, or timeout), signals
-            // EOF to the stdin channel and shuts down the read side of the
-            // socket to unblock Task 2.
-            group.addTask { [weak self] in
-                guard let self else { return }
-                let start = ContinuousClock.now
-                do {
-                    let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd, stdin: stdin)
-                    for try await chunk in chunks {
-                        switch chunk {
-                        case .stdout(let data):
-                            try? self.writeResponse(.output(stream: .stdout, data: data), to: writeHandle)
-                        case .stderr(let data):
-                            try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
-                        case .stdoutBytes(let bytes):
-                            try? self.writeResponse(.outputBytes(stream: .stdout, base64: bytes.base64EncodedString()), to: writeHandle)
-                        case .stderrBytes(let bytes):
-                            try? self.writeResponse(.outputBytes(stream: .stderr, base64: bytes.base64EncodedString()), to: writeHandle)
-                        case .exit(let code):
-                            let ms = (ContinuousClock.now - start).totalMilliseconds
-                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
-                        }
+        await bridge(readHandle: readHandle, initialBuffer: initialBuffer, onClose: { channel.close() }) { [weak self] in
+            guard let self else { return }
+            let start = ContinuousClock.now
+            do {
+                let chunks = try await vm.stream(cmd, timeout: timeout, env: env, cwd: cwd, stdin: stdin)
+                for try await chunk in chunks {
+                    switch chunk {
+                    case .stdout(let data):
+                        try? self.writeResponse(.output(stream: .stdout, data: data), to: writeHandle)
+                    case .stderr(let data):
+                        try? self.writeResponse(.output(stream: .stderr, data: data), to: writeHandle)
+                    case .stdoutBytes(let bytes):
+                        try? self.writeResponse(.outputBytes(stream: .stdout, base64: bytes.base64EncodedString()), to: writeHandle)
+                    case .stderrBytes(let bytes):
+                        try? self.writeResponse(.outputBytes(stream: .stderr, base64: bytes.base64EncodedString()), to: writeHandle)
+                    case .exit(let code):
+                        let ms = (ContinuousClock.now - start).totalMilliseconds
+                        try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
                     }
-                } catch {
-                    try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
                 }
-                // Signal EOF to the stdin pump so the pump task exits cleanly.
+            } catch {
+                try? self.writeResponse(.error(message: String(describing: error)), to: writeHandle)
+            }
+            channel.close()
+        } onRequest: { request in
+            switch request {
+            case .stdin(let data):
+                channel.send(Data(data.utf8))
+            case .stdinClose:
                 channel.close()
-                // Unblock Task 2's blocking availableData call by shutting
-                // down the read direction of the socket. The write direction
-                // remains open for subsequent responses after exec.
+            case .cancel(let signal, let gracePeriod):
+                try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+            default:
+                break
+            }
+        }
+    }
+
+    private func bridge(
+        readHandle: FileHandle,
+        initialBuffer: Data,
+        onClose: @escaping @Sendable () -> Void = {},
+        drive: @escaping @Sendable () async -> Void,
+        onRequest: @escaping @Sendable (SessionRequest) async -> Void
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await drive()
                 Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
             }
-
-            // Task 2: read stdin/stdinClose/cancel messages from the client
-            // socket and route them to the appropriate handler during exec.
-            // Exits when the socket read side is shut down (by Task 1 on
-            // exec completion) or when the client disconnects.
             group.addTask { [weak self] in
                 guard let self else { return }
                 var buf = initialBuffer
-                while !Task.isCancelled {
-                    let msgData: Data
-                    do {
-                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
-                    } catch {
-                        break // socket closed or shut down
-                    }
-                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
-                    switch request {
-                    case .stdin(let data):
-                        channel.send(Data(data.utf8))
-                    case .stdinClose:
-                        channel.close()
-                    case .cancel(let signal, let gracePeriod):
-                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
-                    default:
-                        // Other message types are not expected during exec;
-                        // ignore to avoid protocol confusion.
-                        break
-                    }
+                while !Task.isCancelled,
+                      let data = try? await self.readMessage(from: readHandle, buffer: &buf),
+                      let request = try? SessionProtocol.decodeRequest(data) {
+                    await onRequest(request)
                 }
-                // Ensure channel is closed even if socket closed unexpectedly.
-                channel.close()
+                onClose()
             }
         }
     }
@@ -592,63 +508,34 @@ public final class SessionServer: @unchecked Sendable {
             return
         }
 
-        await withTaskGroup(of: Void.self) { group in
-            // Task 1: drive the PTY stream, forward output + exit to client.
-            // On completion, shuts down the read side of the socket to unblock
-            // Task 2 (blocked in availableData).
-            group.addTask { [weak self] in
-                guard let self else { return }
-                let start = ContinuousClock.now
-                do {
-                    for try await chunk in stream {
-                        switch chunk {
-                        case .output(let data):
-                            try? self.writeResponse(
-                                .ptyOutput(data: data.base64EncodedString()),
-                                to: writeHandle
-                            )
-                        case .exit(let code):
-                            let ms = (ContinuousClock.now - start).totalMilliseconds
-                            try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
-                        }
+        await bridge(readHandle: readHandle, initialBuffer: initialBuffer) { [weak self] in
+            guard let self else { return }
+            let start = ContinuousClock.now
+            do {
+                for try await chunk in stream {
+                    switch chunk {
+                    case .output(let data):
+                        try? self.writeResponse(.ptyOutput(data: data.base64EncodedString()), to: writeHandle)
+                    case .exit(let code):
+                        let ms = (ContinuousClock.now - start).totalMilliseconds
+                        try? self.writeResponse(.exit(code: code, durationMs: ms), to: writeHandle)
                     }
-                } catch {
-                    try? self.writeResponse(
-                        .error(message: "PTY stream error: \(error)"),
-                        to: writeHandle
-                    )
                 }
-                Darwin.shutdown(readHandle.fileDescriptor, SHUT_RD)
+            } catch {
+                try? self.writeResponse(.error(message: "PTY stream error: \(error)"), to: writeHandle)
             }
-
-            // Task 2: read pty_input / window_resize / cancel from the client
-            // and forward to the VM. Exits when the read side is shut down
-            // (by Task 1 on stream completion) or the client disconnects.
-            group.addTask { [weak self] in
-                guard let self else { return }
-                var buf = initialBuffer
-                while !Task.isCancelled {
-                    let msgData: Data
-                    do {
-                        msgData = try await self.readMessage(from: readHandle, buffer: &buf)
-                    } catch {
-                        break // socket closed or shut down
-                    }
-                    guard let request = try? SessionProtocol.decodeRequest(msgData) else { break }
-                    switch request {
-                    case .ptyInput(let b64):
-                        if let raw = Data(base64Encoded: b64) {
-                            try? await vm.sendPtyInput(id: id, data: raw)
-                        }
-                    case .windowResize(let cols, let rows):
-                        try? await vm.sendWindowResize(id: id, cols: cols, rows: rows)
-                    case .cancel(let signal, let gracePeriod):
-                        try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
-                    default:
-                        // Other frames are not meaningful during a PTY session.
-                        break
-                    }
+        } onRequest: { request in
+            switch request {
+            case .ptyInput(let b64):
+                if let raw = Data(base64Encoded: b64) {
+                    try? await vm.sendPtyInput(id: id, data: raw)
                 }
+            case .windowResize(let cols, let rows):
+                try? await vm.sendWindowResize(id: id, cols: cols, rows: rows)
+            case .cancel(let signal, let gracePeriod):
+                try? await vm.cancel(signal: signal, gracePeriod: gracePeriod)
+            default:
+                break
             }
         }
     }
@@ -692,7 +579,6 @@ final class StdinChannel: @unchecked Sendable {
     private var closed = false
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    /// Enqueue a chunk of stdin data.
     /// If `next()` is currently suspended waiting for data, resumes it immediately.
     func send(_ data: Data) {
         lock.withLock {
@@ -705,7 +591,6 @@ final class StdinChannel: @unchecked Sendable {
         }
     }
 
-    /// Signal EOF. Subsequent calls to `next()` return nil.
     /// Safe to call multiple times (idempotent).
     func close() {
         lock.withLock {
@@ -717,7 +602,6 @@ final class StdinChannel: @unchecked Sendable {
         }
     }
 
-    /// Return the next stdin chunk, suspending until one is available.
     /// Returns nil when the channel is closed (EOF).
     func next() async -> Data? {
         await withCheckedContinuation { cont in

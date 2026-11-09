@@ -1,5 +1,3 @@
-// Sources/LuminaDesktopKit/SessionSnapshot.swift
-//
 // Value-type bundle of every session-observable field on
 // `LuminaDesktopSession`. Introduced in v0.7.1 as the foundation for
 // #21's value-type decomposition: an explicit Sendable, Equatable
@@ -17,12 +15,6 @@
 //      is one struct, encodable for debug dumps or a future
 //      `lumina ps --verbose` snapshot view.
 //
-// Intentionally minimal for v0.7.1: the fields are exactly what
-// `LuminaDesktopSession` already exposes. Additional fields the
-// issue mentioned (`bootPhases`, `lastBootedAt`) are not mirrored
-// onto the session today — adding them here is a follow-up, not
-// part of the decomposition groundwork.
-//
 // The Status type lives on `LuminaDesktopSession` so existing view
 // code keeps compiling; we re-export it through the typealias below
 // for snapshot callers that want a single import.
@@ -30,9 +22,6 @@
 import Foundation
 import Lumina
 
-/// Every observable field of a `LuminaDesktopSession` bundled into
-/// one value type. Populate via `LuminaDesktopSession.snapshot`;
-/// apply atomically via `LuminaDesktopSession.applyAtomic(_:)`.
 public struct SessionSnapshot: Sendable, Equatable {
     public var status: LuminaDesktopSession.Status
     public var lastError: String?
@@ -58,14 +47,9 @@ public struct SessionSnapshot: Sendable, Equatable {
         self.bootPhases = bootPhases
     }
 
-    /// The canonical "nothing has happened yet" snapshot.
     public static let initial = SessionSnapshot()
 
-    /// True when the snapshot represents a VM that's either running,
-    /// booting, or paused — the conditions under which the SwiftUI
-    /// running-VM window should stay open.
     public var isLive: Bool { status.isLive }
 
-    /// Re-entry guard convenience — see `Status.canBoot`.
     public var canBoot: Bool { status.canBoot }
 }

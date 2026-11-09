@@ -1,17 +1,3 @@
-// Sources/LuminaDesktopKit/LibraryView.swift
-//
-// v0.7.0 M6 — Mac-native rewrite. NavigationSplitView + materials +
-// proper sidebar + detail pane. Phosphor-amber accent on a translucent
-// dark surface that picks up the desktop wallpaper through the window.
-//
-// Split across files for locatability:
-//   - `HostStatusRibbon.swift`     — top-of-detail metric strip
-//   - `LibraryEmptyStates.swift`   — empty-library hero + filter empties
-//   - `VMCard.swift`               — grid card + state chip + preview + action + distro chip
-//   - `VMListView.swift`           — dense-row list layout
-//   - `Heartbeat.swift`            — pulse indicator used by card and row
-//   - this file: top-level library composition + toolbar chrome
-
 import SwiftUI
 import LuminaBootable
 
@@ -50,8 +36,7 @@ public struct LibraryView: View {
     @Bindable public var model: AppModel
     @Bindable public var coordinator: LauncherCoordinator
     @State private var section: SidebarSection = .all
-    @State private var showingWizard = false
-    @State private var wizardInitialTile: String? = nil
+    @State private var wizardRequest: WizardRequest?
     @State private var showingLauncher = false
     @State private var lastSeenLauncherStamp: UUID? = nil
     @State private var appearanceState: AppearancePreference
@@ -65,9 +50,6 @@ public struct LibraryView: View {
     public init(model: AppModel, coordinator: LauncherCoordinator) {
         self.model = model
         self.coordinator = coordinator
-        // Seed local @State from whatever AppStorage held last session so
-        // the initial render matches the persisted choice without an
-        // extra propagation cycle.
         let raw = UserDefaults.standard.string(forKey: "lumina.appearance") ?? "system"
         self._appearanceState = State(initialValue: AppearancePreference(rawValue: raw) ?? .system)
     }
@@ -100,7 +82,7 @@ public struct LibraryView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showingWizard = true
+                    showWizard()
                 } label: {
                     Label("New VM", systemImage: "plus")
                 }
@@ -109,16 +91,17 @@ public struct LibraryView: View {
             }
         }
         .tint(LuminaTheme.accent)
-        .sheet(isPresented: $showingWizard) {
-            NewVMWizard(model: model, isPresented: $showingWizard,
-                        initialTileID: wizardInitialTile)
-                .onDisappear { wizardInitialTile = nil }
+        .sheet(item: $wizardRequest) { request in
+            NewVMWizard(
+                model: model,
+                isPresented: Binding(get: { wizardRequest != nil }, set: { if !$0 { wizardRequest = nil } }),
+                initialTileID: request.tile
+            )
         }
         .sheet(isPresented: $showingLauncher) {
             CommandLauncher(model: model, coordinator: coordinator, isPresented: $showingLauncher)
         }
         .background(
-            // Global ⌘K / ⌘P shortcut even when focus is on sidebar
             Button("") { showingLauncher = true }
                 .keyboardShortcut("k", modifiers: .command)
                 .opacity(0)
@@ -163,19 +146,16 @@ public struct LibraryView: View {
             let url = URL(fileURLWithPath: p)
             let ext = url.pathExtension.lowercased()
             guard ["iso", "img", "ipsw"].contains(ext) else { continue }
-            wizardInitialTile = ext == "ipsw" ? "macos-latest" : "byo-file"
-            showingWizard = true
             UserDefaults.standard.set(url.path, forKey: "lumina.wizard.droppedFile")
+            showWizard(preselect: ext == "ipsw" ? "macos-latest" : "byo-file")
             break
         }
     }
 
     fileprivate func showWizard(preselect tileID: String? = nil) {
-        wizardInitialTile = tileID
-        showingWizard = true
+        wizardRequest = WizardRequest(tile: tileID)
     }
 
-    // ── SIDEBAR ──────────────────────────────────────────────────
     private var sidebar: some View {
         List(selection: $section) {
             sectionHeader("LIBRARY")
@@ -194,8 +174,8 @@ public struct LibraryView: View {
             sidebarRow(.agentImages, count: 0)
 
             sectionHeader("ACTIVITY")
-            sidebarRow(.downloads, count: 0)
-            sidebarRow(.snapshots, count: 0)
+            sidebarRow(.downloads, count: DownloadsView.cachedFiles().count)
+            sidebarRow(.snapshots, count: model.bundles.reduce(0) { $0 + $1.snapshots.count })
         }
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 300)
@@ -251,13 +231,16 @@ public struct LibraryView: View {
         .tag(s)
     }
 
-    // ── DETAIL ───────────────────────────────────────────────────
     @ViewBuilder
     private var detail: some View {
         ZStack {
             MaterialBackground(material: .contentBackground).ignoresSafeArea()
             if section == .agentImages {
                 CustomImagesView(layout: layout)
+            } else if section == .downloads {
+                DownloadsView(model: model)
+            } else if section == .snapshots {
+                SnapshotsView(model: model)
             } else if filteredForSection.isEmpty && model.bundles.isEmpty {
                 EmptyStateView(onChoose: { tileID in showWizard(preselect: tileID) })
             } else if filteredForSection.isEmpty {
@@ -297,7 +280,6 @@ public struct LibraryView: View {
     }
 }
 
-// ── LAYOUT PICKER ─────────────────────────────────────────────────
 @MainActor
 public struct LayoutPicker: View {
     @Binding var layoutRaw: String
@@ -321,7 +303,6 @@ public struct LayoutPicker: View {
     }
 }
 
-// ── APPEARANCE TOGGLE ─────────────────────────────────────────────
 @MainActor
 public struct AppearanceMenu: View {
     @Binding var current: AppearancePreference
@@ -379,7 +360,6 @@ public struct AppearanceMenu: View {
     }
 }
 
-// ── SEARCH ────────────────────────────────────────────────────────
 @MainActor
 public struct LuminaSearchField: View {
     @Binding var text: String
@@ -415,4 +395,9 @@ public struct LuminaSearchField: View {
                 .stroke(LuminaTheme.rule2, lineWidth: 0.5)
         )
     }
+}
+
+private struct WizardRequest: Identifiable {
+    let id = UUID()
+    let tile: String?
 }

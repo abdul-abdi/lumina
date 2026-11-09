@@ -1,5 +1,3 @@
-// Sources/LuminaBootable/AutounattendSeed.swift
-//
 // Generates a sidecar autounattend.xml ISO that lets stock Microsoft
 // Windows 11 ARM64 installers complete OOBE on Apple Virtualization.framework,
 // which exposes no TPM device.
@@ -33,48 +31,34 @@ public struct AutounattendSeed: Sendable {
         bundleRootURL: URL,
         username: String = "lumina",
         hostname: String = "lumina-vm",
+        language: String = "en-US",
         xml: String? = nil
     ) {
         self.bundleRootURL = bundleRootURL
         self.username = username
         self.hostname = hostname
-        self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname)
+        self.xml = xml ?? AutounattendSeed.defaultXML(username: username, hostname: hostname, language: language)
     }
 
-    public enum Error: Swift.Error, CustomStringConvertible {
-        case hdiutilNotAvailable
-        case hdiutilFailed(Int32, String)
-        case writeFailed(URL, String)
-
-        public var description: String {
-            switch self {
-            case .hdiutilNotAvailable: return "hdiutil missing"
-            case .hdiutilFailed(let c, let s): return "hdiutil exit \(c): \(s)"
-            case .writeFailed(let u, let s): return "write \(u.lastPathComponent): \(s)"
-            }
-        }
-    }
-
-    /// Standard autounattend covering:
-    ///   1. WindowsPE pass — registry bypass for TPM, SecureBoot, RAM, CPU,
-    ///      storage. These are the five compatibility checks the Win11
-    ///      installer enforces; setting `LabConfig\Bypass*Check=1` skips
-    ///      the matching check.
-    ///   2. specialize pass — disable telemetry, set computer name.
-    ///   3. oobeSystem pass — accept EULA, skip Microsoft Account, create
-    ///      a local user, suppress every "set up your PC" screen.
-    ///
     /// `BypassNRO` is the magic OOBE step that lets us skip the
     /// "you must connect to internet and sign in to Microsoft" gate.
     /// Without it, recent Win11 ARM ISOs (post-23H2) brick OOBE in a VM
     /// with no working network/MSA.
-    public static func defaultXML(username: String, hostname: String) -> String {
+    public static func language(ofISO iso: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: iso) else { return nil }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: 16 * 2048 + 40)
+        guard let label = (try? handle.read(upToCount: 32)).map({ String(decoding: $0, as: UTF8.self) }),
+              let match = label.firstMatch(of: /_([A-Z]{2})-([A-Z]{2})_/) else { return nil }
+        return "\(match.1.lowercased())-\(match.2)"
+    }
+
+    public static func defaultXML(username: String, hostname: String, language: String = "en-US") -> String {
         // Use the Pro Volume License key — accepts unattended install
         // and skips product-key prompts. Same key Microsoft documents in
         // their Volume Activation guide; functionally a "deferred
         // activation" placeholder, not a license.
         let proVLKey = "W269N-WFGWX-YVC9B-4J6C9-T83GX"
-        // Escape XML reserved chars conservatively.
         let xName = xmlEscape(username)
         let xHost = xmlEscape(hostname)
         return #"""
@@ -168,12 +152,12 @@ public struct AutounattendSeed: Sendable {
                        publicKeyToken="31bf3856ad364e35" language="neutral"
                        versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
               <SetupUILanguage>
-                <UILanguage>en-US</UILanguage>
+                <UILanguage>\#(language)</UILanguage>
               </SetupUILanguage>
               <InputLocale>0409:00000409</InputLocale>
-              <SystemLocale>en-US</SystemLocale>
-              <UILanguage>en-US</UILanguage>
-              <UserLocale>en-US</UserLocale>
+              <SystemLocale>\#(language)</SystemLocale>
+              <UILanguage>\#(language)</UILanguage>
+              <UserLocale>\#(language)</UserLocale>
             </component>
           </settings>
 
@@ -184,6 +168,16 @@ public struct AutounattendSeed: Sendable {
                        versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
               <ComputerName>\#(xHost)</ComputerName>
               <TimeZone>UTC</TimeZone>
+            </component>
+            <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64"
+                       publicKeyToken="31bf3856ad364e35" language="neutral"
+                       versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+              <RunSynchronous>
+                <RunSynchronousCommand wcm:action="add">
+                  <Order>1</Order>
+                  <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+                </RunSynchronousCommand>
+              </RunSynchronous>
             </component>
           </settings>
 
@@ -226,8 +220,8 @@ public struct AutounattendSeed: Sendable {
               <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
                   <Order>1</Order>
-                  <CommandLine>cmd.exe /c reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</CommandLine>
-                  <Description>Allow OOBE to skip Microsoft Account requirement</Description>
+                  <CommandLine>cmd.exe /c for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %d:\NetKVM\w11\ARM64\netkvm.inf for %i in (NetKVM viorng vioserial Balloon) do pnputil /add-driver %d:\%i\w11\ARM64\*.inf /install</CommandLine>
+                  <Description>Install the virtio network, entropy, serial and balloon drivers</Description>
                 </SynchronousCommand>
               </FirstLogonCommands>
               <RegisteredOrganization>Lumina VM</RegisteredOrganization>
@@ -240,61 +234,13 @@ public struct AutounattendSeed: Sendable {
         """#
     }
 
-    /// Generate `<bundle>/autounattend.iso`. Returns the URL.
     public func generate() throws -> URL {
-        let hdiutilPath = "/usr/bin/hdiutil"
-        guard FileManager.default.isExecutableFile(atPath: hdiutilPath) else {
-            throw Error.hdiutilNotAvailable
-        }
-
-        let outURL = bundleRootURL.appendingPathComponent("autounattend.iso")
-        // hdiutil makehybrid refuses to overwrite — pre-delete so a
-        // bundle with a stale ISO from a prior boot regenerates cleanly.
-        // Without this, the orchestrator's autounattendFailed path
-        // fires on every subsequent boot and Win11 Setup hits the
-        // compat check on a black framebuffer.
-        try? FileManager.default.removeItem(at: outURL)
-        let staging = bundleRootURL.appendingPathComponent("autounattend-staging-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: staging) }
-
-        do {
-            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-            // Windows Setup looks at the root for `autounattend.xml`. The
-            // Setup binary also accepts `unattend.xml` later in the install,
-            // so we drop both — same content. Belt + suspenders.
-            try Data(xml.utf8).write(to: staging.appendingPathComponent("autounattend.xml"))
-            try Data(xml.utf8).write(to: staging.appendingPathComponent("unattend.xml"))
-        } catch {
-            throw Error.writeFailed(staging, "\(error)")
-        }
-
-        // Volume label "AUTOUNATTEND" — Windows finds the file by its
-        // filename + drive root, label is just for human readability.
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: hdiutilPath)
-        proc.arguments = [
-            "makehybrid",
-            "-iso", "-joliet",
-            "-default-volume-name", "AUTOUNATTEND",
-            "-o", outURL.path,
-            staging.path,
-        ]
-        proc.standardOutput = FileHandle.nullDevice
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            throw Error.hdiutilFailed(-1, "\(error)")
-        }
-        if proc.terminationStatus != 0 {
-            let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw Error.hdiutilFailed(proc.terminationStatus, stderr)
-        }
-
-        return outURL
+        let data = Data(xml.utf8)
+        return try SeedISO.make(
+            files: ["autounattend.xml": data, "unattend.xml": data],
+            volumeName: "AUTOUNATTEND",
+            at: bundleRootURL.appendingPathComponent("autounattend.iso")
+        )
     }
 
     private static func xmlEscape(_ s: String) -> String {

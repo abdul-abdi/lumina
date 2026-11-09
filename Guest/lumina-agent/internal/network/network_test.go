@@ -306,54 +306,6 @@ func TestPickInterface_prefersVirtioEthernet(t *testing.T) {
 	}
 }
 
-func TestLooksLikeEthernet(t *testing.T) {
-	cases := []struct {
-		name string
-		want bool
-	}{
-		{"eth0", true},
-		{"eth1", true},
-		{"en0", true},
-		{"enp0s1", true},
-		{"ens3", true},
-		{"eno1", true},
-		{"lo", false},
-		{"wlan0", false},
-		{"docker0", false}, // note: isVirtualInterface catches this separately
-		{"br0", false},
-		{"tap0", false},
-	}
-	for _, c := range cases {
-		if got := looksLikeEthernet(c.name); got != c.want {
-			t.Errorf("looksLikeEthernet(%q) = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
-func TestIsVirtualInterface(t *testing.T) {
-	cases := []struct {
-		name string
-		want bool
-	}{
-		{"br0", true},
-		{"bridge100", true},
-		{"docker0", true},
-		{"veth0abc", true},
-		{"tap0", true},
-		{"tun0", true},
-		{"wg0", true},
-		{"vnet0", true},
-		{"eth0", false},
-		{"enp0s1", false},
-		{"en0", false},
-	}
-	for _, c := range cases {
-		if got := isVirtualInterface(c.name); got != c.want {
-			t.Errorf("isVirtualInterface(%q) = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
 func TestIsEthernet_readsTypeFile(t *testing.T) {
 	orig := readNetSysfs
 	defer func() { readNetSysfs = orig }()

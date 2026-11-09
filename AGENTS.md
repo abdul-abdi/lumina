@@ -6,9 +6,57 @@
 
 This file describes Lumina from the perspective of an AI coding agent driving it. If you
 are any such agent and you have been told to use Lumina, read this page first. Everything
-here reflects what ships in v0.7.3.
+here reflects what ships in v0.8.0.
 
-## v0.7.3 deltas (current — read these first)
+## v0.8.0 deltas (current — read these first)
+
+The CLI dropped surfaces that were deprecated or could not work:
+`LUMINA_OUTPUT=ndjson` (piped `run` and `exec` always emit the unified
+envelope), `LUMINA_STREAM` (text output always streams), `pool run`
+(run `lumina daemon serve`; parallel `lumina run` calls route through
+it), `images catalog` and `images pull` (every catalog digest was a
+placeholder, so pulls were refused), `doctor --iso` (use `lumina iso
+inspect`) and the no-op `run --wait-network`.
+
+`stdout_bytes` / `stderr_bytes` now hold the whole stream whenever any
+chunk was binary. The cold `run` path used to include only the binary
+chunks.
+
+`run --image <name>` fails at once with "image not found" when the
+image is missing; a piped caller still gets
+`{"error": "connection_failed", "error_detail": "image '<name>' not found"}`.
+
+**Warm daemon by default.** When `lumina daemon serve` (or the LaunchAgent
+from `lumina daemon install`) is running, `lumina run` routes through it in
+~20 ms instead of booting cold, as long as the pool's image, memory and CPU
+count match and no `--volume` or disk size is requested. `LUMINA_DAEMON=0`
+forces the cold path. The daemon needs stdin read to EOF up front, so a
+run whose stdin is a pipe with no data and no EOF within 50 ms boots cold
+and streams stdin instead of waiting. A request that reached the daemon
+is never re-run cold: a daemon-side failure comes back as an error
+envelope.
+
+**`lumina session save <sid> <image>`** flushes the session's disk and
+saves it as a new image.
+
+**Guest clock.** The guest resyncs its clock from the RTC before each exec
+when it has drifted by 2 s or more, so a session that sat idle across a
+host sleep no longer reports stale times.
+
+**CLI errors.** Parse errors emit `{"error": "usage_error"}` and exit 64;
+runtime failures in commands without an envelope emit
+`{"error": "failed", "message": ...}`.
+
+**macOS guests boot.** Before, a restored macOS bundle could not be
+booted at all. Now the app's macOS tile downloads the newest IPSW this Mac
+supports (cached in `~/.lumina/cache/ipsw`), installs it on first boot with
+progress, and later boots go straight to the desktop. From the CLI:
+`lumina desktop create --os-variant macos …`, then `lumina desktop
+install-macos <bundle> [--ipsw FILE]`, then `lumina desktop boot <bundle>`
+(headless). The agent image catalog is gone; no catalog image was ever
+published.
+
+## v0.7.3 deltas
 
 ### Guest networking actually works now
 
@@ -99,7 +147,7 @@ The integration gate that runs, in CI and locally, is `make test-integration` �
 - **Windows 11 ARM** uses USB mass-storage for the installer ISO (`EFIBootConfig.preferUSBCDROM = true` for `osFamily == .windows`) instead of virtio-block; fixes "Windows cannot find media." `EFIBootConfig.installPhase` flips the primary disk sync mode to `.fsync` during first install for ~2× faster partman; reverts to `.full` on subsequent boots.
 - **Guest agent split** — `main.go` is now 48 lines (accept loop only); state lives in `*Manager` structs under `Guest/lumina-agent/internal/`. Heartbeat failure now also kills active PTY process groups (previously leaked).
 - **Idle-TTL sessions** — `lumina session start --ttl 30m` auto-shuts-down when idle (no client activity + zero active execs) for the TTL window. Default `0` disables.
-- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each card/row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove". v0.7.1 also: tap anywhere on the row/card to launch in Terminal (no button-hunt); the section now respects the global LayoutPicker and offers full grid/list parity with the VM library (`ImageCard` + `CatalogCard` match `VMCard`'s dimensions). Catalog entries support tap-to-pull, with dimmed state while another pull is in flight.
+- **Desktop library** has an **Agent Images** sidebar section that surfaces `~/.lumina/images/*`. Each card/row shows build metadata and offers "Copy `run`", "Open in Terminal" (spawns Terminal.app with `lumina session start --image <name>`), and "Remove". v0.7.1 also: tap anywhere on the row/card to launch in Terminal (no button-hunt); the section now respects the global LayoutPicker and offers full grid/list parity with the VM library (`ImageCard` matches `VMCard`'s dimensions).
 - **Desktop tap-to-boot + auto-boot on create.** Clicking a stopped/crashed VM's card or row now opens the VM window AND kicks off `session.boot()` in one gesture — no intermediate "click BOOT" screen. The New-VM wizard does the same on completion: finish the wizard, the VM window is already open and booting. Re-entry guard (`Status.canBoot`) keeps concurrent taps idempotent.
 - **Boot-phase UI waterfall (new).** During the Desktop booting screen, a live SwiftUI waterfall renders each phase (`image resolve → disk clone → config build → vz start → vsock connect → guest agent ready`) as a proportional bar, filling in as phases complete (polled at 150ms from `await vm.bootPhases`). Same waterfall appears post-mortem on the crashed screen so you can see which phase was running when the VM fell over. EFI-path guests render a 3-bar subset (only `configMs`, `vzStartMs`, `totalMs` populate); the view self-gates on `BootPhases.isValid`.
 - **NetworkMode** — `manifest.json` can carry `"networkMode": {"mode": "nat"}` (default) or `"networkMode": {"mode": "bridged", "interfaceIdentifier": "en0"}`. Bridged requires `com.apple.vm.networking` entitlement (paid Apple Developer Program); ad-hoc builds reject the config at `validate()`.
@@ -310,20 +358,13 @@ user-picked catalog ISO through SHA-256 before creating the VM and refuses
 mismatches. `lumina desktop create --iso` (CLI path) does not yet verify —
 if you're scripting and integrity matters, `shasum -a 256` the file
 yourself before passing it to `--iso`, or drive creation through the app.
-BYO / Windows-MSA / Apple-IPSW paths have no catalog digest to check
-against — Apple IPSWs are signed and verified by `VZMacOSRestoreImage`.
+BYO and Windows-MSA paths have no catalog digest to check against.
 
 #### Windows 11 ARM caveats
 
 - The ISO must be Microsoft's "Windows 11 (multi-edition) ARM64" retail
   ISO. Microsoft requires a Microsoft Account to download; Lumina cannot
   redistribute. Drop the downloaded ISO on `desktop create --iso`.
-- A few keys hit a translation gap between macOS HID and Windows 11 ARM's
-  inbox keyboard driver — most visibly the backslash and the F-key row.
-  v0.7.0 ships the remap table at `Sources/LuminaBootable/WindowsSupport.swift`
-  (`WindowsInputQuirks`); the Desktop app applies it at the input
-  layer when the focused VM is `osFamily == .windows`. Headless `lumina
-  desktop boot` users won't notice — there's no keyboard input over serial.
 - **v0.7.1**: the installer ISO attaches via `VZUSBMassStorageDeviceConfiguration`
   (not virtio-block) for `osFamily == .windows`. Windows setup was
   refusing to detect virtio-block-as-CD-ROM ("Windows cannot find media");
@@ -402,12 +443,6 @@ it as opt-in diagnostic, not a contract — missing field ≠ error.
    not an error envelope. The command ran to completion, just returned
    non-zero. Parse `exit_code` second.
 
-### Legacy NDJSON
-
-If a consumer cannot migrate immediately, set `LUMINA_OUTPUT=ndjson` to get the
-pre-v0.6.0 streaming NDJSON format for `exec`. This opt-in is scheduled for
-removal in v0.8.0. New code should not use it.
-
 ## Error States — How to Handle Each
 
 | State                   | What happened                               | Retry?                                     |
@@ -449,8 +484,6 @@ of a command that returned non-zero. `make: *** [build] Error 1` is a
   binds `127.0.0.1`. This is intentional.
 - **Do not parse `lumina ps` TTY output.** Pipe it so you get JSON, or it will
   break on the next column tweak.
-- **Do not assume `LUMINA_OUTPUT=ndjson` will exist forever.** It is removed in
-  v0.8.0. Treat the unified envelope as the stable format.
 
 ## Example Agent Workflow
 

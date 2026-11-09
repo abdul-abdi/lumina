@@ -1,0 +1,35 @@
+#!/bin/bash
+set -euo pipefail
+render=${LUMINA_RENDER_SCALE:-2}
+settings=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/monitors/settings
+saved_scale() {
+  [[ -f $settings ]] || return 0
+  local identity
+  identity=$(omarchy-hyprland-monitor-identity "$1" 2>/dev/null || echo "$1")
+  awk -F'\t' -v id="$identity" '$NF == id && $3 != "" { print $3 }' "$settings"
+}
+apply() {
+  local connector output preferred width height mode scale
+  for connector in /sys/class/drm/card*-*; do
+    [[ $(<"$connector/status") == connected ]] || continue
+    preferred=$(head -1 "$connector/modes")
+    [[ -n $preferred ]] || continue
+    output=${connector##*/}
+    output=${output#*-}
+    width=$(awk -v n="${preferred%x*}" -v s="$render" 'BEGIN { printf "%d", n * s / 2 + 0.5 }')
+    height=$(awk -v n="${preferred#*x}" -v s="$render" 'BEGIN { printf "%d", n * s / 2 + 0.5 }')
+    mode=${width}x${height}@60
+    scale=$(saved_scale "$output")
+    scale=${scale:-$render}
+    if command -v omarchy-hyprland-monitor-persist >/dev/null; then
+      omarchy-hyprland-monitor-persist "$output" "$scale" "$mode" >/dev/null
+    fi
+    hyprctl eval "hl.monitor({ output = \"$output\", mode = \"$mode\", position = \"auto\", scale = $scale })" >/dev/null
+  done
+}
+apply
+udevadm monitor --udev --subsystem-match=drm | while IFS= read -r line; do
+  [[ $line == *change* ]] || continue
+  while IFS= read -r -t 0.3 _; do :; done
+  apply
+done

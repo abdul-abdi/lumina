@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/OSCatalog.swift
-//
-// v0.7.0 M6 — unified catalog of OS tiles for the New VM wizard.
-// Wraps `LuminaBootable.DesktopOSCatalog` (Linux distros) and adds
-// Windows 11 ARM (BYO ISO only — Microsoft can't be redistributed) and
-// macOS (downloaded from `MesuIPSWCatalogScraper`).
-
 import Foundation
 import LuminaBootable
 
@@ -13,7 +6,6 @@ public struct OSWizardTile: Sendable, Identifiable {
     public let displayName: String
     public let family: OSFamily
     public let glyph: String       // SF Symbol name
-    public let accentHex: String   // Catppuccin-aligned per OS
     public let description: String
     public let constraint: String? // e.g. "Needs retail license"
     public let acquisition: Acquisition
@@ -21,55 +13,61 @@ public struct OSWizardTile: Sendable, Identifiable {
     public enum Acquisition: Sendable {
         case catalogISO(DesktopOSEntry)        // Linux — URL + checksum
         case microsoftAccountDownload          // Windows 11 ARM — opens browser
-        case appleIPSW                          // macOS — IPSW catalog
+        case appleIPSW
+        case omarchy
         case userProvided                       // BYO file
     }
 }
 
 public enum OSCatalog {
     public static let allTiles: [OSWizardTile] = [
-        // Linux from DesktopOSCatalog
-        tile(for: "ubuntu-24.04", glyph: "circle.hexagongrid.fill", accentHex: "#E95420",
-             desc: "Stable LTS release. Canonical's ARM64 ISO is server-only — after install, run `sudo apt install ubuntu-desktop-minimal` inside the VM for GUI.",
-             constraint: "Server ISO · GUI is a one-liner post-install"),
-        tile(for: "kali-rolling", glyph: "shield.lefthalf.filled", accentHex: "#367BF0",
-             desc: "Penetration-testing distribution; rolling release. Installer offers XFCE desktop out of the box."),
-        tile(for: "fedora-42", glyph: "circle.grid.cross.fill", accentHex: "#3C6EB4",
-             desc: "Bleeding-edge GNOME experience from Red Hat. Live ISO boots straight into the desktop — no post-install steps."),
-        tile(for: "debian-12", glyph: "leaf.fill", accentHex: "#A80030",
-             desc: "Conservative, dependable; the foundation many other distros build on. Netinst lets you pick GNOME/KDE/XFCE during setup."),
+        OSWizardTile(
+            id: "omarchy",
+            displayName: "Omarchy",
+            family: .linux,
+            glyph: "terminal.fill",
+            description: "Arch Linux with Hyprland, set up by Omarchy. Installs itself unattended; you sign in as yourself.",
+            constraint: "First boot installs Omarchy (10-15 min)",
+            acquisition: .omarchy
+        ),
+        tile(for: "ubuntu-24.04", name: "Ubuntu 24.04", glyph: "circle.hexagongrid.fill",
+             desc: "Stable LTS release. Installs unattended with the minimal GNOME desktop; sign in as lumina / lumina.",
+             constraint: "First boot installs Ubuntu (20-30 min)"),
+        tile(for: "kali-rolling", name: "Kali Linux", glyph: "shield.lefthalf.filled",
+             desc: "Penetration-testing distribution, rolling release. Installs unattended with Xfce; sign in as lumina / lumina.",
+             constraint: "First boot installs Kali (20-30 min)"),
+        tile(for: "fedora-42", name: "Fedora 42", glyph: "circle.grid.cross.fill",
+             desc: "Bleeding-edge GNOME from Red Hat. Boots straight into the live desktop.",
+             constraint: "Live session, install from the desktop"),
+        tile(for: "debian-12", name: "Debian 12", glyph: "leaf.fill",
+             desc: "Conservative and dependable. Installs unattended with GNOME; sign in as lumina / lumina.",
+             constraint: "First boot installs Debian (20-30 min)"),
 
-        // Windows
         OSWizardTile(
             id: "windows-11-arm",
-            displayName: "Windows 11 (ARM64)",
+            displayName: "Windows 11",
             family: .windows,
             glyph: "macwindow",
-            accentHex: "#0078D4",
             description: "Microsoft's ARM build of Windows 11. Activation needs your own license.",
             constraint: "Needs retail license",
             acquisition: .microsoftAccountDownload
         ),
 
-        // macOS
         OSWizardTile(
             id: "macos-latest",
-            displayName: "macOS (latest available)",
+            displayName: "macOS",
             family: .macOS,
             glyph: "apple.logo",
-            accentHex: "#1D1D1F",
-            description: "Apple's macOS as a guest. Restored from an IPSW (~15 GB).",
-            constraint: "Apple Silicon host only",
+            description: "Apple's macOS as a guest, restored from the newest IPSW this Mac supports (~18 GB download, cached).",
+            constraint: "First boot installs macOS (15-30 min)",
             acquisition: .appleIPSW
         ),
 
-        // BYO
         OSWizardTile(
             id: "byo-file",
-            displayName: "Use my own ISO/IPSW",
+            displayName: "Your own ISO",
             family: .linux,  // displayed under linux family but can be anything
             glyph: "doc.badge.plus",
-            accentHex: "#9CA3AF",
             description: "Drop a file you've already downloaded.",
             constraint: nil,
             acquisition: .userProvided
@@ -78,8 +76,8 @@ public enum OSCatalog {
 
     private static func tile(
         for catalogID: String,
+        name: String,
         glyph: String,
-        accentHex: String,
         desc: String,
         constraint: String? = nil
     ) -> OSWizardTile {
@@ -91,10 +89,9 @@ public enum OSCatalog {
         }
         return OSWizardTile(
             id: catalogID,
-            displayName: entry.displayName,
+            displayName: name,
             family: entry.family,
             glyph: glyph,
-            accentHex: accentHex,
             description: desc,
             constraint: constraint,
             acquisition: .catalogISO(entry)

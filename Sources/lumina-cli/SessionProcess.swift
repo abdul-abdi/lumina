@@ -1,8 +1,8 @@
-// Sources/lumina-cli/SessionProcess.swift
 import ArgumentParser
 import Darwin
 import Foundation
 import Lumina
+import os
 
 /// Hidden subcommand spawned by `session start`. Boots a VM, starts a
 /// SessionServer on a Unix socket, and runs until shutdown or signal.
@@ -45,25 +45,7 @@ struct SessionServe: AsyncParsableCommand {
 
         let paths = SessionPaths(sid: sid)
 
-        // Parse --volume: host path or named volume
-        let volumeStore = VolumeStore()
-        var mounts: [MountPoint] = []
-        for spec in volume {
-            guard let colonIndex = spec.firstIndex(of: ":") else { continue }
-            let left = String(spec[spec.startIndex..<colonIndex])
-            let guestPath = String(spec[spec.index(after: colonIndex)...])
-
-            if left.hasPrefix("/") || left.hasPrefix(".") {
-                let hostURL = URL(fileURLWithPath: left)
-                mounts.append(MountPoint(hostPath: hostURL, guestPath: guestPath))
-            } else {
-                guard let hostDir = volumeStore.resolve(name: left) else {
-                    FileHandle.standardError.write(Data("lumina: volume '\(left)' not found\n".utf8))
-                    throw ExitCode.failure
-                }
-                mounts.append(MountPoint(hostPath: hostDir, guestPath: guestPath))
-            }
-        }
+        let mounts = try parseVolumeSpecs(volume, volumeStore: VolumeStore())
 
         // Parse --forward early so bad input fails before boot.
         var forwardSpecs: [ForwardSpec] = []
@@ -75,16 +57,13 @@ struct SessionServe: AsyncParsableCommand {
             forwardSpecs.append(parsed)
         }
 
-        // Auto-detect rosetta from image metadata
         let imageRosetta = ImageStore().readMeta(name: image)?.rosetta ?? false
 
-        // Parse disk size if provided
         var parsedDiskSize: UInt64? = nil
         if let ds = diskSize, let size = parseMemory(ds) {
             parsedDiskSize = size
         }
 
-        // Boot VM
         let vmOptions = VMOptions(
             memory: memory,
             cpuCount: cpus,
@@ -124,7 +103,6 @@ struct SessionServe: AsyncParsableCommand {
             }
         }
 
-        // Write session metadata
         let info = SessionInfo(
             sid: sid,
             pid: ProcessInfo.processInfo.processIdentifier,
@@ -174,7 +152,6 @@ struct SessionServe: AsyncParsableCommand {
             await forwarder.teardownAll()
         }
 
-        // Cleanup
         paths.cleanup()
     }
 }
@@ -188,10 +165,6 @@ final class ActiveForward: @unchecked Sendable {
     let guestPort: Int
     let vsockPort: UInt32
     let listenerFd: Int32
-    /// Accept loop task — cancelling it stops new connections. Active proxy
-    /// tasks spawned by the accept loop are tracked separately so they are
-    /// torn down on teardown() too.
-    var acceptTask: Task<Void, Never>?
     private let connLock = NSLock()
     private var connFds: Set<Int32> = []
 
@@ -253,7 +226,6 @@ actor PortForwarder {
         // Ask the guest to listen; it replies with a reverse-channel vsock port.
         let vsockPort = try await vm.requestPortForward(guestPort: guestPort)
 
-        // Bind host TCP listener on loopback.
         let listenerFd: Int32
         do {
             listenerFd = try Self.bindLoopbackListener(port: hostPort)
@@ -271,15 +243,9 @@ actor PortForwarder {
         )
         forwards[guestPort] = fwd
 
-        // Spawn accept loop — runs until the listener fd is closed.
-        let vmRef = vm
-        fwd.acceptTask = Task.detached {
-            await PortForwarder.runAcceptLoop(forward: fwd, vm: vmRef)
-        }
+        PortForwarder.startAcceptLoop(forward: fwd, vm: vm)
     }
 
-    /// Tear down every active forward: close listeners, shut down proxy
-    /// connections, and notify the guest. Must be called before vm.shutdown().
     func teardownAll() async {
         let active = Array(forwards.values)
         forwards.removeAll()
@@ -288,7 +254,6 @@ actor PortForwarder {
             // Stop new connections by closing the listener fd (forces accept
             // to return EBADF and the loop to exit).
             Darwin.close(fwd.listenerFd)
-            fwd.acceptTask?.cancel()
             // Close any in-flight proxy connections so their pump tasks exit.
             fwd.closeTrackedConnections()
             // Notify the guest last — best effort, connection may already be
@@ -299,8 +264,6 @@ actor PortForwarder {
 
     // MARK: - Private helpers
 
-    /// Bind a TCP socket on 127.0.0.1:port and start listening.
-    /// Returns the listener fd on success. Throws on bind/listen failure.
     private static func bindLoopbackListener(port: Int) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else {
@@ -335,84 +298,55 @@ actor PortForwarder {
         return fd
     }
 
-    /// Accept loop for one active forward. Runs until the listener fd is
-    /// closed (accept returns EBADF) or the task is cancelled.
-    private static func runAcceptLoop(forward: ActiveForward, vm: VM) async {
-        while !Task.isCancelled {
-            let clientFd = Darwin.accept(forward.listenerFd, nil, nil)
-            if clientFd < 0 {
-                // EBADF on close, EINTR on signal — terminate the loop.
-                if errno == EBADF || errno == EINVAL { return }
-                if errno == EINTR { continue }
-                NSLog(
-                    "[Lumina.Session] port-forward %d accept failed: %s",
-                    forward.hostPort, strerror(errno)
-                )
-                return
-            }
-
-            forward.track(clientFd)
-
-            // Dial the guest on the reverse vsock channel. `connectVsock`
-            // returns a dup'd fd the proxy owns — no VZ object crosses the
-            // actor boundary. If the dial fails, drop the TCP connection but
-            // keep the listener running for subsequent attempts.
-            let vsockFd: Int32
-            do {
-                vsockFd = try await vm.connectVsock(port: forward.vsockPort)
-            } catch {
-                NSLog(
-                    "[Lumina.Session] port-forward %d vsock dial failed: %@",
-                    forward.hostPort, String(describing: error)
-                )
-                forward.untrack(clientFd)
-                _ = Darwin.shutdown(clientFd, SHUT_RDWR)
-                Darwin.close(clientFd)
-                continue
-            }
-            forward.track(vsockFd)
-
-            // Two-way proxy: one task per direction. When either side closes,
-            // both fds are shut down so the other pump returns promptly.
-            Task.detached {
-                await PortForwarder.proxyBidirectional(
-                    tcpFd: clientFd, vsockFd: vsockFd, forward: forward
-                )
+    private static func startAcceptLoop(forward: ActiveForward, vm: VM) {
+        spawnBlockingThread("lumina.port-forward.accept") {
+            while true {
+                let clientFd = Darwin.accept(forward.listenerFd, nil, nil)
+                if clientFd < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                forward.track(clientFd)
+                Task {
+                    do {
+                        let vsockFd = try await vm.connectVsock(port: forward.vsockPort)
+                        forward.track(vsockFd)
+                        proxy(tcpFd: clientFd, vsockFd: vsockFd, forward: forward)
+                    } catch {
+                        NSLog(
+                            "[Lumina.Session] port-forward %d vsock dial failed: %@",
+                            forward.hostPort, String(describing: error)
+                        )
+                        forward.untrack(clientFd)
+                        _ = Darwin.shutdown(clientFd, SHUT_RDWR)
+                        Darwin.close(clientFd)
+                    }
+                }
             }
         }
     }
 
-    /// Pump bytes bidirectionally between a TCP fd and a vsock fd. Returns
-    /// when either side closes or errors. Closes both fds on exit.
-    private static func proxyBidirectional(
-        tcpFd: Int32, vsockFd: Int32, forward: ActiveForward
-    ) async {
-        // Run both directions in parallel. The first to finish shuts down
-        // the other side, so the second pump exits promptly via EOF or
-        // EBADF on its next read/write.
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                PortForwarder.pumpBytes(from: tcpFd, to: vsockFd)
-                // Half-close the write side of the peer so the other direction
-                // can still drain its buffered bytes. Darwin.shutdown is a no-op
-                // if already closed.
-                _ = Darwin.shutdown(vsockFd, SHUT_WR)
-                _ = Darwin.shutdown(tcpFd, SHUT_RD)
-            }
-            group.addTask {
-                PortForwarder.pumpBytes(from: vsockFd, to: tcpFd)
-                _ = Darwin.shutdown(tcpFd, SHUT_WR)
-                _ = Darwin.shutdown(vsockFd, SHUT_RD)
+    /// One thread per direction; each half-closes its peer when its source
+    /// ends so the other direction can drain, and the last one out closes both.
+    private static func proxy(tcpFd: Int32, vsockFd: Int32, forward: ActiveForward) {
+        let remaining = OSAllocatedUnfairLock(initialState: 2)
+        func pump(from src: Int32, to dst: Int32) {
+            spawnBlockingThread("lumina.port-forward.pump") {
+                pumpBytes(from: src, to: dst)
+                _ = Darwin.shutdown(dst, SHUT_WR)
+                _ = Darwin.shutdown(src, SHUT_RD)
+                let last = remaining.withLock { n in n -= 1; return n == 0 }
+                guard last else { return }
+                forward.untrack(tcpFd)
+                forward.untrack(vsockFd)
+                Darwin.close(tcpFd)
+                Darwin.close(vsockFd)
             }
         }
-        forward.untrack(tcpFd)
-        forward.untrack(vsockFd)
-        Darwin.close(tcpFd)
-        Darwin.close(vsockFd)
+        pump(from: tcpFd, to: vsockFd)
+        pump(from: vsockFd, to: tcpFd)
     }
 
-    /// Blocking copy loop. Reads from `src` and writes everything to `dst`
-    /// until EOF or error. Nonisolated-safe.
     private static func pumpBytes(from src: Int32, to dst: Int32) {
         let bufferSize = 32 * 1024
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)

@@ -29,7 +29,6 @@ func readUptime() string {
 	if err != nil {
 		return "0"
 	}
-	// /proc/uptime is "<active> <idle>"; take just the active seconds.
 	if i := bytes.IndexByte(data, ' '); i > 0 {
 		return string(data[:i])
 	}

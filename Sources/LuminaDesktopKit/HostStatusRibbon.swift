@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/HostStatusRibbon.swift
-//
-// Top-of-detail metric strip. Surfaces the host/guest contract:
-// hardware, available memory, free disk under ~/.lumina, total VMs,
-// disk used across bundles, running count. Victor's "make the
-// invisible visible" applied to the library chrome.
-
 import SwiftUI
 
 @MainActor

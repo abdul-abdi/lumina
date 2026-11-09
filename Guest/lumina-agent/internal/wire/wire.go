@@ -10,20 +10,15 @@ import (
 	"sync"
 )
 
-// Writer serializes concurrent writes to a net.Conn as NDJSON frames.
 type Writer struct {
 	conn net.Conn
 	mu   sync.Mutex
 }
 
-// NewWriter wraps conn; call Send from any goroutine.
 func NewWriter(conn net.Conn) *Writer {
 	return &Writer{conn: conn}
 }
 
-// Send marshals v as JSON, appends a newline, and writes it. Errors
-// bubble up so the caller (typically heartbeat) can detect connection
-// loss.
 func (w *Writer) Send(v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {

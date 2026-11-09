@@ -1,4 +1,4 @@
-// Sources/lumina-cli/Helpers.swift
+import ArgumentParser
 import Foundation
 import Lumina
 
@@ -60,7 +60,6 @@ func installSignalHandlers() {
 /// Install signal forwarding that sends a cancel message to the session client
 /// on SIGINT/SIGTERM. Returns a cleanup closure that removes the signal sources.
 func installSignalForwarding(client: SessionClient) -> () -> Void {
-    // Ignore default signal handling — we'll handle it ourselves
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
 
@@ -68,7 +67,6 @@ func installSignalForwarding(client: SessionClient) -> () -> Void {
     let sources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
         let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
         source.setEventHandler {
-            // Send cancel to guest via session IPC
             try? client.send(.cancel(signal: Int32(sig), gracePeriod: 5))
 
             // After sending cancel, restore default handler and re-raise
@@ -99,7 +97,6 @@ enum OutputFormat {
 /// Determine output format: JSON (for agents/pipes) or text (for humans/TTYs).
 /// Priority: LUMINA_FORMAT env > isatty() auto-detection.
 func resolveOutputFormat() -> OutputFormat {
-    // 1. LUMINA_FORMAT env var takes highest priority
     if let envFormat = ProcessInfo.processInfo.environment["LUMINA_FORMAT"]?.lowercased() {
         switch envFormat {
         case "json": return .json
@@ -108,14 +105,10 @@ func resolveOutputFormat() -> OutputFormat {
         }
     }
 
-    // 2. Auto-detect: TTY -> text, pipe -> JSON
     return isatty(STDOUT_FILENO) != 0 ? .text : .json
 }
 
 // MARK: - Env Var Defaults
-//
-// Priority: CLI flag > env var > built-in default.
-// Env vars: LUMINA_MEMORY, LUMINA_CPUS, LUMINA_TIMEOUT, LUMINA_DISK_SIZE
 
 import Lumina
 
@@ -147,21 +140,6 @@ func resolveDiskSize(flag: String?) -> String? {
     return ProcessInfo.processInfo.environment["LUMINA_DISK_SIZE"]
 }
 
-// MARK: - Streaming Mode (text format only)
-//
-// Default: TTY = stream (humans want real-time), pipe = buffer.
-// Override: LUMINA_STREAM=0|1 env var.
-// JSON format uses the unified envelope (buffered) by default; set
-// LUMINA_OUTPUT=ndjson for legacy per-chunk NDJSON streaming.
-
-/// Resolve streaming mode for text output: LUMINA_STREAM env > isatty auto-detect.
-func resolveStreaming() -> Bool {
-    if let envVal = ProcessInfo.processInfo.environment["LUMINA_STREAM"]?.lowercased() {
-        return envVal == "1" || envVal == "true"
-    }
-    return isatty(STDOUT_FILENO) != 0
-}
-
 // MARK: - Session ID Parsing
 
 /// Parse a session ID from either a bare UUID string or a JSON {"sid":"UUID"} object.
@@ -178,10 +156,54 @@ func parseSID(_ input: String) -> String {
     return trimmed
 }
 
+func connectSession(_ sid: String) throws -> SessionClient {
+    let client = SessionClient()
+    do {
+        try client.connect(sid: sid)
+    } catch let error as LuminaError {
+        switch error {
+        case .sessionNotFound:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' not found\n".utf8))
+        case .sessionDead:
+            FileHandle.standardError.write(Data("lumina: session '\(sid)' is dead (cleaned up)\n".utf8))
+        default:
+            FileHandle.standardError.write(Data("lumina: \(error)\n".utf8))
+        }
+        throw ExitCode.failure
+    }
+    return client
+}
+
+func ensureImage(_ name: String) async throws {
+    let puller = ImagePuller()
+    guard !puller.imageExists(name: name) else { return }
+    guard name == "default" else {
+        FileHandle.standardError.write(Data("lumina: image '\(name)' not found. Use 'lumina images list' to see available images.\n".utf8))
+        throw ExitCode.failure
+    }
+    FileHandle.standardError.write(Data("Image not found. Pulling default image...\n".utf8))
+    do {
+        try await puller.pull { msg in
+            FileHandle.standardError.write(Data("\(msg)\n".utf8))
+        }
+    } catch {
+        FileHandle.standardError.write(Data("lumina: auto-pull failed: \(error)\n".utf8))
+        FileHandle.standardError.write(Data("Build locally: cd Guest && sudo ./build-image.sh\n".utf8))
+        throw ExitCode.failure
+    }
+}
+
+func stdinIsSettled() -> Bool {
+    if isatty(STDIN_FILENO) != 0 { return true }
+    var info = stat()
+    guard fstat(STDIN_FILENO, &info) == 0 else { return true }
+    let kind = info.st_mode & S_IFMT
+    if kind == S_IFREG || kind == S_IFCHR { return true }
+    var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    return poll(&pfd, 1, 50) > 0
+}
+
 // MARK: - Stdin Auto-Detect
-//
-// Default: TTY = closed (send EOF immediately, matches `cat </dev/null`),
-// pipe = streamed (agents pipe data in, matches shell conventions).
 
 /// Resolve stdin source: if host stdin is a TTY, return `.closed` so the guest
 /// sees EOF immediately. Otherwise, return a `.source` that reads from
@@ -192,51 +214,23 @@ func resolveStdin() -> Stdin {
     }
     let handle = FileHandle.standardInput
     return .source { @Sendable in
-        // availableData blocks until data is ready or EOF. Returns empty
-        // Data on EOF, which we signal to the pump as nil.
-        let chunk = handle.availableData
-        return chunk.isEmpty ? nil : chunk
+        await withCheckedContinuation { continuation in
+            spawnBlockingThread("lumina.run-stdin") {
+                // availableData blocks until data is ready or EOF. Returns empty
+                // Data on EOF, which we signal to the pump as nil.
+                let chunk = handle.availableData
+                continuation.resume(returning: chunk.isEmpty ? nil : chunk)
+            }
+        }
     }
 }
 
-// MARK: - Legacy Output Mode
-
-/// Check if legacy NDJSON output is requested for exec.
-/// `LUMINA_OUTPUT=ndjson` preserves pre-v0.6.0 streaming behavior for exec when piped.
-/// Default (absent or any other value) = unified envelope. Removed in v0.8.0.
-func useLegacyExecOutput() -> Bool {
-    ProcessInfo.processInfo.environment["LUMINA_OUTPUT"]?.lowercased() == "ndjson"
-}
-
-// MARK: - NDJSON Output Types (streaming / session exec)
-
-/// Stream chunk: stdout or stderr data.
-struct StreamChunk: Encodable {
-    var stream: String
-    var data: String
-}
-
-/// Exit status for streaming / session exec.
-struct ExitChunk: Encodable {
-    var exit_code: Int
-    var duration_ms: Int
-}
-
-/// Error for streaming / session exec.
-struct ErrorChunk: Encodable {
-    var error: String
-    var duration_ms: Int
-}
-
-/// Print a Codable value as a single NDJSON line, flushing immediately for real-time output.
-/// Uses JSONEncoder which always properly escapes control characters (\n, \r, \t, etc.).
-func printNDJSONLine<T: Encodable>(_ value: T) {
+func encodeAndPrint<T: Encodable>(_ value: T, pretty: Bool = false) {
     let encoder = JSONEncoder()
-    encoder.outputFormatting = .sortedKeys
+    encoder.outputFormatting = pretty ? [.sortedKeys, .prettyPrinted] : .sortedKeys
     if let data = try? encoder.encode(value),
        let str = String(data: data, encoding: .utf8) {
         print(str)
-        fflush(stdout)
     }
 }
 
@@ -274,15 +268,12 @@ func enableRawMode() -> termios? {
     return original
 }
 
-/// Restore the terminal (stdin) to the original termios captured by `enableRawMode`.
 func restoreTerminal(_ original: termios) {
     var t = original
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &t)
     savedTermios = nil
 }
 
-/// Return the current terminal window size (cols, rows) from stdout, or nil if
-/// stdout is not attached to a TTY.
 func getTerminalSize() -> (cols: Int, rows: Int)? {
     var ws = winsize()
     // `TIOCGWINSZ` type varies by SDK (UInt on some, UInt32 on others); force to UInt.
@@ -303,7 +294,6 @@ func installPtySignalHandlers(
 ) -> () -> Void {
     let queue = DispatchQueue(label: "com.lumina.pty-signals")
 
-    // SIGINT/SIGTERM: restore terminal, then re-raise with default disposition
     let termSources: [DispatchSourceSignal] = [SIGINT, SIGTERM].map { sig in
         Foundation.signal(sig, SIG_IGN) // Let the dispatch source deliver it
         let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
@@ -319,7 +309,6 @@ func installPtySignalHandlers(
         return source
     }
 
-    // SIGWINCH: report new size to caller
     Foundation.signal(SIGWINCH, SIG_IGN)
     let winchSource = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: queue)
     winchSource.setEventHandler {

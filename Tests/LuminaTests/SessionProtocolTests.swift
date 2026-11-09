@@ -235,3 +235,8 @@ import Testing
     let decoded = try SessionProtocol.decodeResponse(data)
     #expect(decoded == resp)
 }
+
+@Test func saveRequestRoundTrips() throws {
+    let data = try SessionProtocol.encode(SessionRequest.save(image: "py-dev"))
+    #expect(try SessionProtocol.decodeRequest(data) == .save(image: "py-dev"))
+}

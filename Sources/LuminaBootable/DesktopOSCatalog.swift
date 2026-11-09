@@ -1,12 +1,6 @@
-// Sources/LuminaBootable/DesktopOSCatalog.swift
-//
-// Static registry of supported desktop guests. Consumed by the New VM wizard
-// (M6). Entries point at vendor-canonical ARM64 ISO URLs with published
-// SHA-256 checksums.
-//
 // PRE-SHIP VERIFICATION:
 //   URL + checksum values were last verified against each vendor's signed
-//   SHA256SUMS / CHECKSUM file on 2026-04-20. ARM64 release paths and
+//   SHA256SUMS / CHECKSUM file on 2026-04-20 (Ubuntu and Kali on 2026-11-09). ARM64 release paths and
 //   filenames move with point releases, so re-verify before any tagged
 //   release. `DesktopOSCatalogTests.allEntriesHaveRealChecksums` rejects
 //   any build that still carries the `placeholderSHA256` sentinel.
@@ -70,32 +64,26 @@ public enum DesktopOSCatalog {
     public static let placeholderSHA256 = String(repeating: "0", count: 64)
 
     public static let all: [DesktopOSEntry] = [
-        // URLs + SHA-256 digests verified against each vendor's signed
-        // SHA256SUMS / CHECKSUM file on 2026-04-20 (Ubuntu 24.04.3, Kali
-        // 2026.1, Fedora 42, Debian 12.12.0). The digests are load-bearing
-        // — NewVMWizard.createAndDismiss hashes any user-picked file and
-        // refuses to create the VM unless the digest matches an entry
-        // below, rejecting tampered or partially-downloaded files.
         DesktopOSEntry(
             id: "ubuntu-24.04",
             displayName: "Ubuntu 24.04 LTS (Server, ARM64)",
             family: .linux,
-            isoURL: URL(string: "https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.3-live-server-arm64.iso")!,
-            sha256: "2ee2163c9b901ff5926400e80759088ff3b879982a3956c02100495b489fd555",
-            isoSizeBytes: 2_800_000_000,
+            isoURL: URL(string: "https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.5-live-server-arm64.iso")!,
+            sha256: "f12484464c7d4d73e2167e0a7dbda1e669f8fae9bcf778dc0944937034b320cb",
+            isoSizeBytes: 3_825_512_448,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
             id: "kali-rolling",
-            displayName: "Kali Linux 2026.1 (installer, ARM64)",
+            displayName: "Kali Linux 2026.3 (installer, ARM64)",
             family: .linux,
-            isoURL: URL(string: "https://cdimage.kali.org/kali-2026.1/kali-linux-2026.1-installer-arm64.iso")!,
-            sha256: "c92c79d7267c93245962cf696c9da8105bf40855744513fbaaec41db17d307e1",
-            isoSizeBytes: 4_200_000_000,
+            isoURL: URL(string: "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-installer-arm64.iso")!,
+            sha256: "c4a7f9bf3a0ff07c8263fe9e9b0edba0cc3d9b408f1d8f06c066df0afce23072",
+            isoSizeBytes: 4_051_513_344,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
@@ -106,7 +94,7 @@ public enum DesktopOSCatalog {
             sha256: "954a0d7d6553fdf2b6bcf7f393a2e41f9265a0a81de8c8e4f712f5924e40577f",
             isoSizeBytes: 2_200_000_000,
             recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 32 * 1024 * 1024 * 1024
         ),
         DesktopOSEntry(
@@ -116,8 +104,8 @@ public enum DesktopOSCatalog {
             isoURL: URL(string: "https://cdimage.debian.org/cdimage/archive/12.12.0/arm64/iso-cd/debian-12.12.0-arm64-netinst.iso")!,
             sha256: "0dd2f82a5dd53cb9c6abd92d30070d23bcbfd7dfb55309be4ac07245df3999b9",
             isoSizeBytes: 500_000_000,
-            recommendedMemoryBytes: 2 * 1024 * 1024 * 1024,
-            recommendedCPUs: 2,
+            recommendedMemoryBytes: 4 * 1024 * 1024 * 1024,
+            recommendedCPUs: 4,
             recommendedDiskBytes: 16 * 1024 * 1024 * 1024
         ),
     ]

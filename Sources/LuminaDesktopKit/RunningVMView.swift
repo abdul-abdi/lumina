@@ -1,15 +1,3 @@
-// Sources/LuminaDesktopKit/RunningVMView.swift
-//
-// v0.7.0 M6 — per-VM running window. Embeds LuminaVirtualMachineView
-// edge-to-edge with a centered VM name and right-aligned toolbar
-// buttons (STOP / RESTART / SNAPSHOT). Fullscreen is handled by
-// macOS — toggled via ⌘⌃F or the VM menu's `Enter / Exit Full
-// Screen` item. In fullscreen the entire toolbar auto-hides and
-// reveals on hover-to-top: on macOS 15+ via the Scene-level
-// `.windowToolbarFullScreenVisibility(.onHover)` modifier; on macOS
-// 14 via `LegacyFullscreenConfigurator` below, which flips
-// `NSApp.presentationOptions` on the enter/exit notifications.
-
 import SwiftUI
 @preconcurrency import Virtualization
 import LuminaBootable
@@ -18,6 +6,12 @@ import LuminaBootable
 public struct RunningVMView: View {
     @Bindable var session: LuminaDesktopSession
     @AppStorage("lumina.appearance") private var appearanceRaw: String = AppearancePreference.system.rawValue
+    @State private var confirming: PowerAction?
+
+    private enum PowerAction: String, Identifiable {
+        case stop = "Stop", restart = "Restart"
+        var id: String { rawValue }
+    }
 
     private var appearance: AppearancePreference {
         AppearancePreference(rawValue: appearanceRaw) ?? .system
@@ -28,10 +22,20 @@ public struct RunningVMView: View {
     }
 
     public var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             LuminaTheme.bgInset
             framebuffer
+            if let notice = session.notice {
+                Text(notice)
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.top, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
+        .animation(.easeOut(duration: 0.2), value: session.notice)
         .preferredColorScheme(appearance.colorScheme)
         .toolbar {
             // Centered VM name. `.principal` puts the item in the title
@@ -45,24 +49,68 @@ public struct RunningVMView: View {
                     .foregroundStyle(LuminaTheme.ink)
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                toolbarButton("⏻ STOP", color: LuminaTheme.err) {
-                    Task { await session.shutdown() }
-                }
-                .disabled(!session.status.isLive)
-
-                toolbarButton("↻ RESTART") {
-                    Task {
-                        await session.shutdown()
-                        await session.boot()
+                if let signIn = session.bundle.signIn {
+                    Menu {
+                        Text("User: \(signIn.user)")
+                        if let password = signIn.password {
+                            Button("Copy Password") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(password, forType: .string)
+                            }
+                        }
+                    } label: {
+                        Label("Sign-in Details", systemImage: "key")
                     }
+                    .help("How to sign in to this VM")
                 }
 
-                toolbarButton("⌘ SNAPSHOT") {
-                    // wired in M8
+                Button {
+                    Task { await session.takeSnapshot() }
+                } label: {
+                    Label("Take Snapshot", systemImage: "camera")
                 }
                 .keyboardShortcut("t", modifiers: .command)
+                .disabled(session.status == .booting || session.status == .shuttingDown)
+                .help("Save the VM's disks so you can return to this point")
+
+                Button {
+                    Task { await session.togglePause() }
+                } label: {
+                    Label(session.status == .paused ? "Resume" : "Pause",
+                          systemImage: session.status == .paused ? "play.fill" : "pause.fill")
+                }
+                .disabled(session.status != .running && session.status != .paused)
+                .help(session.status == .paused ? "Resume the VM" : "Pause the VM")
+
+                Button {
+                    confirming = .restart
+                } label: {
+                    Label("Restart", systemImage: "arrow.clockwise")
+                }
                 .disabled(!session.status.isLive)
+                .help("Stop and start the VM")
+
+                Button {
+                    if session.status.isLive { confirming = .stop } else { Task { await session.boot() } }
+                } label: {
+                    Label(session.status.isLive ? "Stop" : "Start", systemImage: "power")
+                }
+                .help(session.status.isLive ? "Stop the VM" : "Start the VM")
             }
+        }
+        .confirmationDialog(
+            "\(confirming?.rawValue ?? "Stop") \(session.bundle.manifest.name)?",
+            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            presenting: confirming
+        ) { action in
+            Button(action.rawValue, role: .destructive) {
+                Task {
+                    await session.shutdown()
+                    if action == .restart { await session.boot() }
+                }
+            }
+        } message: { _ in
+            Text("This cuts power to the VM. Anything unsaved inside it is lost.")
         }
         // Window title for accessibility + Expose / Dock / Window menu.
         // The on-screen toolbar shows the name via the `.principal`
@@ -92,19 +140,6 @@ public struct RunningVMView: View {
         }
     }
 
-    private func toolbarButton(_ label: String, color: Color = LuminaTheme.ink, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(LuminaTheme.label)
-                .tracking(1.5)
-                .foregroundStyle(color)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .overlay(Rectangle().stroke(LuminaTheme.rule2, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-    }
-
     @ViewBuilder
     private var framebuffer: some View {
         switch session.status {
@@ -128,7 +163,6 @@ public struct RunningVMView: View {
     private var bootingScreen: some View {
         VStack(spacing: 16) {
             Spacer()
-            // ASCII brand mark, big
             VStack(alignment: .leading, spacing: 0) {
                 Text("[ BOOTING ]")
                     .font(LuminaTheme.label)
@@ -142,11 +176,24 @@ public struct RunningVMView: View {
                     .foregroundStyle(LuminaTheme.inkDim)
             }
             .padding(.bottom, 12)
-            HStack(spacing: 10) {
-                Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
-                Text("vm.boot() — initializing virtio devices, EFI variable store…")
-                    .font(LuminaTheme.caption)
-                    .foregroundStyle(LuminaTheme.inkDim)
+            if let progress = session.installProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("\(progress.label) — \(Int(progress.fraction * 100))%")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                    ProgressView(value: progress.fraction)
+                        .tint(LuminaTheme.accent)
+                }
+                .frame(maxWidth: 520)
+            } else {
+                HStack(spacing: 10) {
+                    Circle().fill(LuminaTheme.accent).frame(width: 6, height: 6)
+                    Text(session.bundle.manifest.osFamily == .macOS
+                         ? "vm.boot() — starting macOS…"
+                         : "vm.boot() — initializing virtio devices, EFI variable store…")
+                        .font(LuminaTheme.caption)
+                        .foregroundStyle(LuminaTheme.inkDim)
+                }
             }
             // Live phase waterfall — fills in as each phase completes
             // via the session's bootPhasesMirrorTask. The view itself
@@ -313,13 +360,6 @@ public struct RunningVMView: View {
 
 }
 
-// ── FULLSCREEN TOOLBAR AUTO-HIDE ─────────────────────────────────
-/// Applies `.windowToolbarFullScreenVisibility(.onHover)` on macOS
-/// 15+, a no-op on earlier versions. The modifier tells the SwiftUI
-/// runtime to treat the window's toolbar the same way as the system
-/// menu bar in fullscreen: hide it while the guest has focus, and
-/// reveal it briefly when the cursor crosses the top-edge reveal
-/// threshold.
 struct FullscreenToolbarAutoHide: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 15.0, *) {
@@ -330,7 +370,6 @@ struct FullscreenToolbarAutoHide: ViewModifier {
     }
 }
 
-// ── LEGACY FULLSCREEN CONFIG (macOS 14 fallback) ─────────────────
 /// macOS 14 fallback for toolbar auto-hide in fullscreen. On macOS
 /// 15+ the SwiftUI-native `.windowToolbarFullScreenVisibility(.onHover)`
 /// Scene modifier handles this declaratively — this type is only
@@ -352,11 +391,9 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
         DispatchQueue.main.async {
             guard let window = v.window else { return }
 
-            // (1) Allow true fullscreen primary mode.
             window.collectionBehavior.insert(.fullScreenPrimary)
             window.collectionBehavior.remove(.fullScreenNone)
 
-            // (2) Hide NSWindow's own title rendering in the title bar.
             // `.navigationTitle(...)` sets the window title for system
             // services (Window menu, Dock, Expose, accessibility) — we
             // want those to work, but NOT see a duplicate left-aligned
@@ -364,7 +401,6 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
             // VM name centered.
             window.titleVisibility = .hidden
 
-            // (3) Enter-fullscreen: apply immersive presentation options.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didEnterFullScreenNotification,
                 object: window, queue: .main
@@ -379,7 +415,6 @@ struct LegacyFullscreenConfigurator: NSViewRepresentable {
                 }
             }
 
-            // (4) Exit-fullscreen: restore default.
             NotificationCenter.default.addObserver(
                 forName: NSWindow.didExitFullScreenNotification,
                 object: window, queue: .main

@@ -58,3 +58,16 @@ import Testing
         #expect(firstSize != nil)
     }
 }
+
+@Suite struct AutounattendLanguageTests {
+    @Test func readsTheLanguageFromTheVolumeLabel() throws {
+        let iso = FileManager.default.temporaryDirectory.appendingPathComponent("win-\(UUID().uuidString).iso")
+        var bytes = Data(count: 16 * 2048 + 72)
+        bytes.replaceSubrange((16 * 2048 + 40)..<(16 * 2048 + 63), with: Data("CCCOMA_A64FRE_EN-GB_DV9".utf8))
+        try bytes.write(to: iso)
+        #expect(AutounattendSeed.language(ofISO: iso) == "en-GB")
+        let xml = AutounattendSeed.defaultXML(username: "lumina", hostname: "vm", language: "en-GB")
+        #expect(xml.contains("<UILanguage>en-GB</UILanguage>"))
+        #expect(xml.contains("<InputLocale>0409:00000409</InputLocale>"))
+    }
+}

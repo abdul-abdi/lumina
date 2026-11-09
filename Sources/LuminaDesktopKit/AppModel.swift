@@ -1,10 +1,3 @@
-// Sources/LuminaDesktopKit/AppModel.swift
-//
-// v0.7.0 M6 — top-level @Observable @MainActor state for the
-// Lumina Desktop app. Owned by the `LuminaDesktopApp` (the @main scene
-// entry point in Apps/LuminaDesktop/) and passed into views via
-// `@Environment` / `.environmentObject` patterns.
-
 import Foundation
 import Observation
 import Darwin
@@ -16,9 +9,7 @@ public final class AppModel {
     public var bundles: [VMBundle] = []
     public var sessions: [UUID: LuminaDesktopSession] = [:]
     public var sortOrder: SortOrder = .lastUsed
-    public var groupBy: GroupBy = .none
     public var search: String = ""
-    public var selection: UUID?
     public var pendingError: String?
 
     public let store: VMStore
@@ -60,7 +51,6 @@ public final class AppModel {
 
     private func installFilesystemWatcher() {
         let path = store.rootURL.path
-        // Ensure the directory exists so we can open it.
         try? FileManager.default.createDirectory(
             at: store.rootURL, withIntermediateDirectories: true
         )
@@ -106,12 +96,6 @@ public final class AppModel {
         case osFamily = "OS"
     }
 
-    public enum GroupBy: String, CaseIterable, Sendable {
-        case none = "None"
-        case status = "Status"
-        case osFamily = "OS"
-    }
-
     public func refresh() {
         bundles = store.loadBundles()
     }
@@ -142,9 +126,6 @@ public final class AppModel {
         }
     }
 
-    /// Get-or-create a session for a bundle. Sessions are kept in the
-    /// dictionary so the running-VM window doesn't lose state when the
-    /// user navigates away and back.
     public func session(for bundle: VMBundle) -> LuminaDesktopSession {
         if let existing = sessions[bundle.manifest.id] { return existing }
         let s = LuminaDesktopSession(bundle: bundle)
@@ -163,19 +144,10 @@ public final class AppModel {
         return s
     }
 
-    /// Stop and retire the live-stats timer for a bundle. Called from
-    /// `deleteBundle` and from the session reaper when a session gets
-    /// evicted. Safe to call with no live entry.
     public func retireLiveStats(for id: UUID) {
         liveStatsByBundle.removeValue(forKey: id)?.stop()
     }
 
-    /// Start the periodic reaper. On each tick it evicts any session
-    /// whose status has been `.stopped` or `.crashed` for more than
-    /// `reaperIdleThreshold` seconds, along with its live-stats entry.
-    /// Sessions with live status (`.booting`/`.running`/`.paused`/
-    /// `.shuttingDown`) are never touched. Idempotent: re-entry returns
-    /// immediately if the task is already running. Issue #13.
     private func startSessionReaper() {
         guard reaperTask == nil else { return }
         reaperTask = Task { @MainActor [weak self] in
@@ -186,8 +158,6 @@ public final class AppModel {
         }
     }
 
-    /// Run one reaper pass. Exposed for tests; called by the periodic
-    /// task in production.
     public func reapIdleSessions(now: Date = Date()) {
         for (id, session) in sessions {
             if session.status.isLive {
@@ -196,7 +166,6 @@ public final class AppModel {
             }
             let markedAt = lastInactiveAt[id] ?? now
             if markedAt == now {
-                // First observation of this session as inactive — stamp it.
                 lastInactiveAt[id] = now
                 continue
             }
@@ -220,7 +189,6 @@ public final class AppModel {
     }
 
     public func deleteBundle(_ bundle: VMBundle) {
-        // Stop any running session first.
         if let session = sessions[bundle.manifest.id], session.status.isLive {
             Task { await session.shutdown() }
         }

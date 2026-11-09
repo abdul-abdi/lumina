@@ -1,62 +1,15 @@
-// Sources/Lumina/Lumina.swift
 import Foundation
 
 public struct Lumina {
-    /// Run a command in a disposable VM, return result when complete.
-    /// The VM is created, booted, used, and destroyed automatically.
-    /// Throws `LuminaError` on failure.
     public static func run(
         _ command: String,
         options: RunOptions = .default
     ) async throws -> RunResult {
         try await withVM(options: options) { vm in
             let start = ContinuousClock.now
-
-            try await vm.boot()
-
-            // Host-driven network config, awaited by default since
-            // v0.7.3 — see the RunOptions.awaitNetworkReady docstring
-            // for why the v0.7.2 fire-and-forget default was wrong.
-            if options.awaitNetworkReady {
-                try await vm.configureNetwork()
-            } else {
-                // Fire-and-forget: start the config, don't await.
-                Task.detached { try? await vm.configureNetwork() }
-            }
-
-            let elapsed = ContinuousClock.now - start
-            guard elapsed < options.timeout else {
-                throw LuminaError.timeout
-            }
-
-            // Upload files before exec
-            if !options.uploads.isEmpty {
-                try await vm.uploadFiles(options.uploads)
-            }
-            // Upload directories before exec
-            for dir in options.directoryUploads {
-                try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
-            }
-
-            // Round up: truncating gave `--timeout 2s` a 1-second command
-            // budget once ~250ms of boot came off the top.
-            let remaining = options.timeout - elapsed
-            let result = try await vm.exec(command, timeout: remaining.secondsRoundedUp, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
-
-            // Download after exec — auto-detect file vs directory on guest
-            for dl in options.downloads {
-                let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
-                let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
-                if check.exitCode == 0 {
-                    try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
-                } else {
-                    try await vm.downloadFiles([dl])
-                }
-            }
-            // Explicit directory downloads (library API)
-            for dir in options.directoryDownloads {
-                try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
-            }
+            let timeout = try await prepare(vm, options: options, start: start)
+            let result = try await vm.exec(command, timeout: timeout, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
+            try await vm.download(options.downloads)
 
             let totalWallTime = ContinuousClock.now - start
             return RunResult(
@@ -71,7 +24,6 @@ public struct Lumina {
         }
     }
 
-    /// Stream output from a command in a disposable VM.
     /// Output chunks are yielded in real time as the guest agent sends them.
     public static func stream(
         _ command: String,
@@ -81,62 +33,12 @@ public struct Lumina {
             Task {
                 do {
                     try await withVM(options: options) { vm in
-                        let start = ContinuousClock.now
-                        try await vm.boot()
-                        let bootDone = ContinuousClock.now
-
-                        // Host-driven network config. See `Lumina.run`.
-                        if options.awaitNetworkReady {
-                            try await vm.configureNetwork()
-                        } else {
-                            // Fire-and-forget: start the config, don't await.
-                            Task.detached { try? await vm.configureNetwork() }
-                        }
-                        let netDone = ContinuousClock.now
-
-                        if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
-                            let bootMs = (bootDone - start).totalMilliseconds
-                            let netMs = (netDone - bootDone).totalMilliseconds
-                            FileHandle.standardError.write(Data(
-                                "  boot total:         \(String(format: "%7d", bootMs)) ms\n  configure network:  \(String(format: "%7d", netMs)) ms\n".utf8
-                            ))
-                        }
-
-                        let elapsed = ContinuousClock.now - start
-                        guard elapsed < options.timeout else {
-                            throw LuminaError.timeout
-                        }
-
-                        // Upload files before exec
-                        if !options.uploads.isEmpty {
-                            try await vm.uploadFiles(options.uploads)
-                        }
-                        for dir in options.directoryUploads {
-                            try await vm.uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
-                        }
-
-                        let remaining = options.timeout - elapsed
-                        let remainingSeconds = max(Int(remaining.components.seconds), 1)
-
-                        let chunks = try await vm.stream(command, timeout: remainingSeconds, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
+                        let timeout = try await prepare(vm, options: options, start: .now)
+                        let chunks = try await vm.stream(command, timeout: timeout, env: options.env, cwd: options.workingDirectory, stdin: options.stdin)
                         for try await chunk in chunks {
                             continuation.yield(chunk)
                         }
-
-                        // Download after stream — auto-detect file vs directory on guest
-                        for dl in options.downloads {
-                            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
-                            let check = try await vm.exec("test -d '\(escaped)'", timeout: 10)
-                            if check.exitCode == 0 {
-                                try await vm.downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
-                            } else {
-                                try await vm.downloadFiles([dl])
-                            }
-                        }
-                        for dir in options.directoryDownloads {
-                            try await vm.downloadDirectory(remotePath: dir.remotePath, localPath: dir.localPath)
-                        }
-
+                        try await vm.download(options.downloads)
                         continuation.finish()
                     }
                 } catch {
@@ -152,7 +54,6 @@ public struct Lumina {
     /// Unlike `run`, this manages the VM lifecycle manually: after the build
     /// command completes, the clone is detached, the VM is shut down cleanly
     /// (flushing the ext4 journal), and then the rootfs is copied to the image store.
-    /// Delegates to the multi-command overload with a single-element array.
     public static func createImage(
         name: String,
         from base: String = "default",
@@ -223,7 +124,6 @@ public struct Lumina {
         try store.createImage(name: name, from: base, rootfsSource: clone.rootfs, command: commands.joined(separator: " && "), rosetta: rosetta)
     }
 
-    /// Run a closure with a private network of VMs.
     /// All VMs share a virtual switch for VM-to-VM communication.
     public static func withNetwork<T: Sendable>(
         _ name: String = "default",
@@ -241,6 +141,40 @@ public struct Lumina {
     }
 
     // MARK: - Internal
+
+    private static func prepare(
+        _ vm: VM,
+        options: RunOptions,
+        start: ContinuousClock.Instant
+    ) async throws -> Int {
+        try await vm.boot()
+        let bootDone = ContinuousClock.now
+
+        if options.awaitNetworkReady {
+            try await vm.configureNetwork()
+        } else {
+            Task.detached { try? await vm.configureNetwork() }
+        }
+        let netDone = ContinuousClock.now
+
+        if ProcessInfo.processInfo.environment["LUMINA_BOOT_TRACE"] == "1" {
+            let bootMs = (bootDone - start).totalMilliseconds
+            let netMs = (netDone - bootDone).totalMilliseconds
+            FileHandle.standardError.write(Data(
+                "  boot total:         \(String(format: "%7d", bootMs)) ms\n  configure network:  \(String(format: "%7d", netMs)) ms\n".utf8
+            ))
+        }
+
+        let elapsed = ContinuousClock.now - start
+        guard elapsed < options.timeout else {
+            throw LuminaError.timeout
+        }
+        try await vm.upload(files: options.uploads, directories: options.directoryUploads)
+
+        // Round up: truncating gave `--timeout 2s` a 1-second command
+        // budget once ~250ms of boot came off the top.
+        return (options.timeout - elapsed).secondsRoundedUp
+    }
 
     /// Lifecycle scope: creates a VM, runs the body, and always shuts down.
     /// One shutdown call site, guaranteed to run on every path.
@@ -279,6 +213,30 @@ public struct Lumina {
         } catch {
             await vm.shutdown()
             throw error
+        }
+    }
+}
+
+extension VM {
+    func upload(files: [FileUpload], directories: [DirectoryUpload]) async throws(LuminaError) {
+        if !files.isEmpty {
+            try await uploadFiles(files)
+        }
+        for dir in directories {
+            try await uploadDirectory(localPath: dir.localPath, remotePath: dir.remotePath)
+        }
+    }
+
+    // Auto-detects file vs directory on the guest.
+    func download(_ downloads: [FileDownload]) async throws(LuminaError) {
+        for dl in downloads {
+            let escaped = dl.remotePath.replacingOccurrences(of: "'", with: "'\\''")
+            let check = try await exec("test -d '\(escaped)'", timeout: 10)
+            if check.exitCode == 0 {
+                try await downloadDirectory(remotePath: dl.remotePath, localPath: dl.localPath)
+            } else {
+                try await downloadFiles([dl])
+            }
         }
     }
 }

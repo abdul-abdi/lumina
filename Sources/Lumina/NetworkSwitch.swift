@@ -1,4 +1,3 @@
-// Sources/Lumina/NetworkSwitch.swift
 import Foundation
 
 /// A port on the virtual switch — one end for the VM, one for the relay.
@@ -15,14 +14,10 @@ public struct SwitchPort: Sendable {
 public final class NetworkSwitch: @unchecked Sendable {
     private let lock = NSLock()
     private var ports: [SwitchPort] = []
-    private var relayThread: Thread?
     private var running = false
 
     public init() {}
 
-    /// Create a new port on the switch. Returns a pair of fds:
-    /// vmFd goes to VZFileHandleNetworkDeviceAttachment,
-    /// switchFd is used by the relay loop.
     public func createPort() throws -> SwitchPort {
         var fds: [Int32] = [0, 0]
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds) == 0 else {
@@ -35,7 +30,6 @@ public final class NetworkSwitch: @unchecked Sendable {
         return port
     }
 
-    /// Start the relay loop on a background thread.
     /// Reads datagrams from each port's switchFd and writes to all other ports.
     public func startRelay() {
         lock.lock()
@@ -47,10 +41,8 @@ public final class NetworkSwitch: @unchecked Sendable {
         }
         thread.qualityOfService = .userInitiated
         thread.start()
-        relayThread = thread
     }
 
-    /// Stop the relay and close all fds.
     public func close() {
         lock.lock()
         running = false
@@ -72,7 +64,6 @@ public final class NetworkSwitch: @unchecked Sendable {
         "192.168.100.\(index + 2)"
     }
 
-    /// Generate /etc/hosts content for all peers.
     public static func generateHosts(peers: [(name: String, ip: String)]) -> String {
         var lines = ["127.0.0.1 localhost"]
         for peer in peers {
@@ -94,7 +85,6 @@ public final class NetworkSwitch: @unchecked Sendable {
             let currentPorts = ports
             lock.unlock()
 
-            // Set any new fds to non-blocking
             for port in currentPorts where !knownFds.contains(port.switchFd) {
                 let flags = fcntl(port.switchFd, F_GETFL)
                 _ = fcntl(port.switchFd, F_SETFL, flags | O_NONBLOCK)
@@ -107,7 +97,6 @@ public final class NetworkSwitch: @unchecked Sendable {
                 let n = Darwin.read(srcPort.switchFd, &buffer, maxFrame)
                 if n > 0 {
                     didWork = true
-                    // Broadcast to all other ports
                     for (j, dstPort) in currentPorts.enumerated() where j != i {
                         _ = buffer.withUnsafeBufferPointer { buf in
                             Darwin.write(dstPort.switchFd, buf.baseAddress!, n)
